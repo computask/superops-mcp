@@ -17,7 +17,8 @@ const LIST_CLIENTS_QUERY = `
         stage
         status
         emailDomains
-        phone
+        /**
+        *phone*/
         website
         industry
         employeeCount
@@ -52,7 +53,8 @@ const GET_CLIENT_QUERY = `
       status
       emailDomains
       website
-      phone
+        /**
+        *phone*/
       industry
       employeeCount
       annualRevenue
@@ -98,8 +100,8 @@ const SEARCH_CLIENTS_QUERY = `
         name
         emailDomains
         status
-        stage
-        phone
+          /**
+        *phone*/
       }
       listInfo {
         totalCount
