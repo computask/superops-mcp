@@ -17,21 +17,10 @@ const LIST_CLIENTS_QUERY = `
         stage
         status
         emailDomains
-        website
-        industry
-        employeeCount
-        accountManager {
-          id
-          name
-          email
-        }
-        primaryContact {
-          id
-          name
-          email
-        }
-        createdTime
-        lastUpdatedTime
+        accountManager
+        primaryContact
+        hqSite
+        customFields
       }
       listInfo {
         totalCount
@@ -50,40 +39,12 @@ const GET_CLIENT_QUERY = `
       stage
       status
       emailDomains
-      website
-      industry
-      employeeCount
-      annualRevenue
-      address {
-        street
-        city
-        state
-        country
-        postalCode
-      }
-      accountManager {
-        id
-        name
-        email
-        phone
-      }
-      primaryContact {
-        id
-        name
-        email
-        phone
-      }
-      sites {
-        id
-        name
-        isDefault
-      }
-      customFields {
-        name
-        value
-      }
-      createdTime
-      lastUpdatedTime
+      accountManager
+      primaryContact
+      secondaryContact
+      hqSite
+      technicianGroups
+      customFields
     }
   }
 `;
@@ -96,6 +57,7 @@ const SEARCH_CLIENTS_QUERY = `
         name
         emailDomains
         status
+        stage
       }
       listInfo {
         totalCount
