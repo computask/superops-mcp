@@ -2,5 +2,12 @@
   "name": "superops-mcp",
   "main": "src/worker.ts",
   "compatibility_date": "2026-02-01",
-  "compatibility_flags": ["nodejs_compat"]
+  "compatibility_flags": ["nodejs_compat"],
+  "keep_vars": true,
+  "vars": {
+    "AUTH_MODE": "env",
+    "SUPEROPS_SUBDOMAIN": "computaskltd",
+    "SUPEROPS_REGION": "us",
+    "LOG_LEVEL": "warn"
+  }
 }
