@@ -492,15 +492,17 @@ export function getTicketsTools(): DomainTools {
               categoryName?: string;
             };
 
-            const input: Record<string, unknown> = {
-              subject: params.subject,
-              client: { accountId: params.clientId },
-              status: "New",
-              source: "FORM",
-            };
-            if (params.description) input.description = params.description;
-            if (params.priority) input.priority = params.priority;
-            if (params.categoryName) input.category = params.categoryName;
+			const input: Record<string, unknown> = {
+			  subject: params.subject,
+			  client: { accountId: params.clientId },
+			  status: "New",
+			  requestType: "Incident",
+			  source: "FORM",
+			};
+			if (params.description) input.description = params.description;
+			// Priority appears to require a SuperOps priority ID, not a friendly label like "Low".
+			// Leave it unset until priority ID mapping is implemented.
+			if (params.categoryName) input.category = params.categoryName;
             // TODO: Map requesterEmail and techGroupName only after IDs can be
             // resolved safely to ClientUserIdentifierInput and TechnicianGroupIdentifierInput.
 

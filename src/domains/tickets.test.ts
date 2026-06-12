@@ -142,15 +142,15 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).toHaveBeenCalledWith(
       expect.stringContaining("createTicket"),
       {
-        input: {
-          subject: "New Issue",
-          client: { accountId: "client-123" },
-          status: "New",
-          source: "FORM",
-          description: "Detailed description",
-          priority: "High",
-          category: "Hardware",
-        },
+		input: {
+		  subject: "New Issue",
+		  client: { accountId: "client-123" },
+		  status: "New",
+		  requestType: "Incident",
+		  source: "FORM",
+		  description: "Detailed description",
+		  category: "Hardware",
+		},
       }
     );
     expect(mockClient.mutate.mock.calls[0][0]).toContain("displayId");
