@@ -23,9 +23,10 @@ const LIST_CLIENTS_QUERY = `
         customFields
       }
       listInfo {
+        page
+        pageSize
+        hasMore
         totalCount
-        hasNextPage
-        endCursor
       }
     }
   }
@@ -60,9 +61,10 @@ const SEARCH_CLIENTS_QUERY = `
         stage
       }
       listInfo {
+        page
+        pageSize
+        hasMore
         totalCount
-        hasNextPage
-        endCursor
       }
     }
   }
