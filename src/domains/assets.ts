@@ -7,36 +7,28 @@
 import { getClient } from "../client.js";
 import type { DomainTools, Asset, ListInfo } from "../types.js";
 
+const DEFAULT_LIST_PAGE = 1;
+
 const LIST_ASSETS_QUERY = `
   query getAssetList($input: ListInfoInput!) {
     getAssetList(input: $input) {
       assets {
         assetId
         name
+        assetClass
+        client
+        site
         status
         platform
-        lastSeen
-        ipAddress
-        osName
-        osVersion
-        client {
-          accountId
-          name
-        }
-        site {
-          id
-          name
-        }
-        patchStatus {
-          pendingCount
-          installedCount
-          failedCount
-        }
+        lastCommunicatedTime
+        patchStatus
+        deviceCategory
       }
       listInfo {
+        page
+        pageSize
+        hasMore
         totalCount
-        hasNextPage
-        endCursor
       }
     }
   }
@@ -47,79 +39,84 @@ const GET_ASSET_QUERY = `
     getAsset(input: $input) {
       assetId
       name
-      status
-      platform
-      lastSeen
-      ipAddress
-      macAddress
-      publicIp
-      hostname
+      assetClass
+      client
+      site
+      requester
+      primaryMac
+      loggedInUser
+      serialNumber
       manufacturer
       model
-      serialNumber
-      processorName
-      processorCores
-      totalMemory
-      osName
-      osVersion
-      osBuild
-      architecture
-      totalDiskSpace
-      freeDiskSpace
-      client {
-        accountId
-        name
-      }
-      site {
-        id
-        name
-      }
-      tags
-      customFields {
-        name
-        value
-      }
+      hostName
+      publicIp
+      gateway
+      platform
+      domain
+      status
+      sysUptime
+      lastCommunicatedTime
       agentVersion
+      platformFamily
+      platformCategory
+      platformVersion
+      patchStatus
+      warrantyExpiryDate
+      purchasedDate
+      customFields
+      lastReportedTime
+      deviceCategory
     }
   }
 `;
 
 const GET_ASSET_SOFTWARE_QUERY = `
-  query getAssetSoftwareList($input: AssetSoftwareListInput!) {
+  query getAssetSoftwareList($input: AssetDetailsListInput!) {
     getAssetSoftwareList(input: $input) {
-      software {
-        name
+      assetSoftwares {
+        id
+        software
         version
-        publisher
-        installDate
-        size
+        installedDate
+        bitVersion
+        installedPath
       }
       listInfo {
+        page
+        pageSize
+        hasMore
         totalCount
-        hasNextPage
-        endCursor
       }
     }
   }
 `;
 
 const GET_ASSET_PATCHES_QUERY = `
-  query getAssetPatchDetails($input: AssetPatchInput!) {
+  query getAssetPatchDetails($input: AssetDetailsListInput!) {
     getAssetPatchDetails(input: $input) {
-      patches {
-        patchId
-        title
-        severity
-        status
-        releaseDate
-        kbNumber
-        category
+      assetPatches {
+        patchDetail {
+          patchId
+          patchKey
+          title
+          publishedDate
+          category
+          severity
+          kbNumbers {
+            kbNumber
+          }
+          restartRequired
+        }
+        approvalStatus
+        installationTime
+        installationStatus
+        failedMessage
       }
-      summary {
-        pendingCount
-        installedCount
-        failedCount
-        lastScanDate
+      listInfo {
+        page
+        pageSize
+        hasMore
+        totalCount
       }
     }
   }
@@ -137,40 +134,108 @@ interface GetAssetResponse {
 }
 
 interface Software {
-  name: string;
+  id?: string;
+  software?: unknown;
   version?: string;
-  publisher?: string;
-  installDate?: string;
-  size?: number;
+  installedDate?: string;
+  bitVersion?: string;
+  installedPath?: string;
 }
 
 interface GetSoftwareResponse {
   getAssetSoftwareList: {
-    software: Software[];
+    assetSoftwares: Software[];
     listInfo: ListInfo;
   };
 }
 
-interface Patch {
+interface PatchDetails {
   patchId: string;
-  title: string;
-  severity?: string;
-  status?: string;
-  releaseDate?: string;
-  kbNumber?: string;
+  patchKey?: string;
+  title?: string;
+  publishedDate?: string;
   category?: string;
+  severity?: string;
+  kbNumbers?: { kbNumber?: string }[];
+  restartRequired?: boolean;
+}
+
+interface PatchData {
+  patchDetail?: PatchDetails;
+  approvalStatus?: string;
+  installationTime?: string;
+  installationStatus?: string;
+  failedMessage?: string;
 }
 
 interface GetPatchesResponse {
   getAssetPatchDetails: {
-    patches: Patch[];
-    summary: {
-      pendingCount: number;
-      installedCount: number;
-      failedCount: number;
-      lastScanDate?: string;
-    };
+    assetPatches: PatchData[];
+    listInfo: ListInfo;
   };
+}
+
+function pageInput(max: number | undefined, defaultPageSize: number, page?: number) {
+  return {
+    page: page ?? DEFAULT_LIST_PAGE,
+    pageSize: Math.min(max ?? defaultPageSize, 500),
+  };
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
+}
+
+function applyAssetFilters(
+  assets: Asset[],
+  filters: { status?: string; platform?: string; clientId?: string }
+): Asset[] {
+  return assets.filter((asset) => {
+    if (filters.status && asset.status !== filters.status) return false;
+    if (filters.platform && !asset.platform?.includes(filters.platform)) return false;
+
+    const clientInfo = jsonRecord(asset.client);
+    if (filters.clientId && clientInfo?.accountId !== filters.clientId) return false;
+
+    return true;
+  });
+}
+
+function applySoftwareSearch(assetSoftwares: Software[], search?: string): Software[] {
+  if (!search) return assetSoftwares;
+  const query = search.toLowerCase();
+
+  return assetSoftwares.filter((softwareEntry) => {
+    const software = jsonRecord(softwareEntry.software);
+    const softwareName = typeof software?.name === "string" ? software.name : "";
+    return softwareName.toLowerCase().includes(query);
+  });
+}
+
+function applyPatchFilters(
+  assetPatches: PatchData[],
+  filters: { status?: string; severity?: string[] }
+): PatchData[] {
+  return assetPatches.filter((patch) => {
+    if (
+      filters.status &&
+      patch.approvalStatus !== filters.status &&
+      patch.installationStatus !== filters.status
+    ) {
+      return false;
+    }
+    if (
+      filters.severity &&
+      (!patch.patchDetail?.severity || !filters.severity.includes(patch.patchDetail.severity))
+    ) {
+      return false;
+    }
+
+    return true;
+  });
 }
 
 export function getAssetsTools(): DomainTools {
@@ -202,9 +267,10 @@ export function getAssetsTools(): DomainTools {
               description: "Maximum number of results (default: 100, max: 500)",
               default: 100,
             },
-            cursor: {
-              type: "string",
-              description: "Pagination cursor for fetching next page",
+            page: {
+              type: "number",
+              description: "Page number to fetch (default: 1)",
+              default: 1,
             },
           },
         },
@@ -284,22 +350,18 @@ export function getAssetsTools(): DomainTools {
               platform?: string;
               clientId?: string;
               max?: number;
-              cursor?: string;
+              page?: number;
             };
 
-            const filter: Record<string, unknown> = {};
-            if (params.status) filter.status = params.status;
-            if (params.platform) filter.platform = params.platform;
-            if (params.clientId) filter.client = { accountId: params.clientId };
-
             const response = await client.query<ListAssetsResponse>(LIST_ASSETS_QUERY, {
-              input: {
-                first: Math.min(params.max ?? 100, 500),
-                ...(params.cursor && { after: params.cursor }),
-                ...(Object.keys(filter).length > 0 && { filter }),
-                orderBy: { field: "name", direction: "ASC" },
-              },
+              // TODO: Replace local filtering with ListInfoInput.condition after
+              // SuperOps documents per-list condition operators and attributes.
+              input: pageInput(params.max, 100, params.page),
             });
+            response.getAssetList.assets = applyAssetFilters(
+              response.getAssetList.assets,
+              params
+            );
 
             return {
               content: [
@@ -335,16 +397,16 @@ export function getAssetsTools(): DomainTools {
               max?: number;
             };
 
-            const filter: Record<string, unknown> = {};
-            if (params.search) filter.name = { contains: params.search };
-
             const response = await client.query<GetSoftwareResponse>(GET_ASSET_SOFTWARE_QUERY, {
               input: {
                 assetId: params.assetId,
-                first: Math.min(params.max ?? 100, 500),
-                ...(Object.keys(filter).length > 0 && { filter }),
+                listInfo: pageInput(params.max, 100),
               },
             });
+            response.getAssetSoftwareList.assetSoftwares = applySoftwareSearch(
+              response.getAssetSoftwareList.assetSoftwares,
+              params.search
+            );
 
             return {
               content: [
@@ -363,16 +425,18 @@ export function getAssetsTools(): DomainTools {
               severity?: string[];
             };
 
-            const filter: Record<string, unknown> = {};
-            if (params.status) filter.status = params.status;
-            if (params.severity) filter.severity = params.severity;
-
             const response = await client.query<GetPatchesResponse>(GET_ASSET_PATCHES_QUERY, {
               input: {
                 assetId: params.assetId,
-                ...(Object.keys(filter).length > 0 && { filter }),
+                // TODO: Replace local filtering with ListInfoInput.condition after
+                // SuperOps documents condition syntax for patch fields.
+                listInfo: pageInput(undefined, 100),
               },
             });
+            response.getAssetPatchDetails.assetPatches = applyPatchFilters(
+              response.getAssetPatchDetails.assetPatches,
+              params
+            );
 
             return {
               content: [

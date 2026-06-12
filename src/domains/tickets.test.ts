@@ -6,7 +6,6 @@
 
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 
-// Mock the client module
 vi.mock("../client.js", () => ({
   getClient: vi.fn(() => ({
     query: vi.fn(),
@@ -32,530 +31,229 @@ describe("Tickets Domain", () => {
     vi.clearAllMocks();
   });
 
-  describe("getTicketsTools", () => {
-    it("returns tools array with expected tools", () => {
-      const domain = getTicketsTools();
-      expect(domain.tools).toHaveLength(6);
-      expect(domain.tools.map((t) => t.name)).toEqual([
-        "superops_tickets_list",
-        "superops_tickets_get",
-        "superops_tickets_create",
-        "superops_tickets_update",
-        "superops_tickets_add_note",
-        "superops_tickets_log_time",
-      ]);
-    });
+  it("returns the expected public tools", () => {
+    const domain = getTicketsTools();
 
-    it("returns handleCall function", () => {
-      const domain = getTicketsTools();
-      expect(typeof domain.handleCall).toBe("function");
-    });
+    expect(domain.tools.map((tool) => tool.name)).toEqual([
+      "superops_tickets_list",
+      "superops_tickets_get",
+      "superops_tickets_create",
+      "superops_tickets_update",
+      "superops_tickets_add_note",
+      "superops_tickets_log_time",
+    ]);
   });
 
-  describe("superops_tickets_list tool", () => {
-    it("has correct definition", () => {
-      const domain = getTicketsTools();
-      const tool = domain.tools.find((t) => t.name === "superops_tickets_list");
-
-      expect(tool).toBeDefined();
-      expect(tool?.description).toContain("List tickets");
-      expect(tool?.inputSchema.properties).toHaveProperty("status");
-      expect(tool?.inputSchema.properties).toHaveProperty("priority");
-      expect(tool?.inputSchema.properties).toHaveProperty("clientId");
-      expect(tool?.inputSchema.properties).toHaveProperty("assigneeId");
-      expect(tool?.inputSchema.properties).toHaveProperty("unassigned");
+  it("uses page/pageSize list variables and local status filtering", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketList: {
+        tickets: [
+          { ticketId: "1", displayId: "062822-0001", subject: "Open", status: "Open" },
+          { ticketId: "2", displayId: "062822-0002", subject: "Closed", status: "Closed" },
+        ],
+        listInfo: { page: 1, pageSize: 50, hasMore: false, totalCount: 2 },
+      },
     });
 
-    it("calls query with default parameters", async () => {
-      const mockResponse = {
-        getTicketList: {
-          tickets: [{ ticketId: "1", subject: "Test Ticket" }],
-          listInfo: { totalCount: 1, hasNextPage: false },
-        },
-      };
-      mockClient.query.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      const result = await domain.handleCall("superops_tickets_list", {});
-
-      expect(mockClient.query).toHaveBeenCalledWith(
-        expect.stringContaining("getTicketList"),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            first: 50,
-            orderBy: { field: "createdTime", direction: "DESC" },
-          }),
-        })
-      );
-      expect(result.content[0].text).toContain("Test Ticket");
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_list", {
+      status: ["Open"],
+      max: 75,
+      page: 2,
     });
 
-    it("applies status filter as array", async () => {
-      const mockResponse = {
-        getTicketList: {
-          tickets: [],
-          listInfo: { totalCount: 0, hasNextPage: false },
-        },
-      };
-      mockClient.query.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_list", {
-        status: ["Open", "In Progress"],
-      });
-
-      expect(mockClient.query).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            filter: expect.objectContaining({
-              status: ["Open", "In Progress"],
-            }),
-          }),
-        })
-      );
-    });
-
-    it("applies priority filter", async () => {
-      const mockResponse = {
-        getTicketList: {
-          tickets: [],
-          listInfo: { totalCount: 0, hasNextPage: false },
-        },
-      };
-      mockClient.query.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_list", {
-        priority: ["High", "Critical"],
-      });
-
-      expect(mockClient.query).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            filter: expect.objectContaining({
-              priority: ["High", "Critical"],
-            }),
-          }),
-        })
-      );
-    });
-
-    it("applies clientId filter", async () => {
-      const mockResponse = {
-        getTicketList: {
-          tickets: [],
-          listInfo: { totalCount: 0, hasNextPage: false },
-        },
-      };
-      mockClient.query.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_list", { clientId: "client-123" });
-
-      expect(mockClient.query).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            filter: expect.objectContaining({
-              client: { accountId: "client-123" },
-            }),
-          }),
-        })
-      );
-    });
-
-    it("filters for unassigned tickets", async () => {
-      const mockResponse = {
-        getTicketList: {
-          tickets: [],
-          listInfo: { totalCount: 0, hasNextPage: false },
-        },
-      };
-      mockClient.query.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_list", { unassigned: true });
-
-      expect(mockClient.query).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            filter: expect.objectContaining({
-              assignee: null,
-            }),
-          }),
-        })
-      );
-    });
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining("getTicketList"),
+      { input: { page: 2, pageSize: 75 } }
+    );
+    expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("first");
+    expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
+    expect(result.content[0].text).toContain("Open");
+    expect(result.content[0].text).not.toContain("Closed");
   });
 
-  describe("superops_tickets_get tool", () => {
-    it("has correct definition", () => {
-      const domain = getTicketsTools();
-      const tool = domain.tools.find((t) => t.name === "superops_tickets_get");
-
-      expect(tool).toBeDefined();
-      expect(tool?.inputSchema.properties).toHaveProperty("ticketId");
-      expect(tool?.inputSchema.required).toContain("ticketId");
+  it("uses documented ticket fields in list and get queries", async () => {
+    mockClient.query.mockResolvedValueOnce({
+      getTicketList: {
+        tickets: [],
+        listInfo: { page: 1, pageSize: 50, hasMore: false, totalCount: 0 },
+      },
+    });
+    mockClient.query.mockResolvedValueOnce({
+      getTicket: { ticketId: "ticket-123", displayId: "062822-0001", subject: "Test" },
     });
 
-    it("calls query with ticketId", async () => {
-      const mockResponse = {
-        getTicket: {
-          ticketId: "ticket-123",
-          subject: "Test Issue",
-          status: "Open",
-        },
-      };
-      mockClient.query.mockResolvedValue(mockResponse);
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_list", { page: 1 });
+    await domain.handleCall("superops_tickets_get", { ticketId: "ticket-123" });
 
-      const domain = getTicketsTools();
-      const result = await domain.handleCall("superops_tickets_get", {
+    const listQuery = mockClient.query.mock.calls[0][0];
+    const getQuery = mockClient.query.mock.calls[1][0];
+    expect(listQuery).toContain("displayId");
+    expect(listQuery).toContain("technician");
+    expect(listQuery).not.toContain("ticketNumber");
+    expect(listQuery).not.toContain("hasNextPage");
+    expect(getQuery).toContain("updatedTime");
+    expect(getQuery).toContain("customFields");
+    expect(getQuery).not.toContain("description");
+    expect(getQuery).not.toContain("assignee");
+  });
+
+  it("gets a ticket by documented TicketIdentifierInput", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicket: {
         ticketId: "ticket-123",
-      });
-
-      expect(mockClient.query).toHaveBeenCalledWith(
-        expect.stringContaining("getTicket"),
-        expect.objectContaining({
-          input: { ticketId: "ticket-123" },
-        })
-      );
-      expect(result.content[0].text).toContain("Test Issue");
+        subject: "Test Issue",
+      },
     });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_get", {
+      ticketId: "ticket-123",
+    });
+
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining("getTicket"),
+      { input: { ticketId: "ticket-123" } }
+    );
+    expect(result.content[0].text).toContain("Test Issue");
   });
 
-  describe("superops_tickets_create tool", () => {
-    it("has correct definition", () => {
-      const domain = getTicketsTools();
-      const tool = domain.tools.find((t) => t.name === "superops_tickets_create");
-
-      expect(tool).toBeDefined();
-      expect(tool?.inputSchema.properties).toHaveProperty("subject");
-      expect(tool?.inputSchema.properties).toHaveProperty("description");
-      expect(tool?.inputSchema.properties).toHaveProperty("clientId");
-      expect(tool?.inputSchema.properties).toHaveProperty("priority");
-      expect(tool?.inputSchema.required).toContain("subject");
-      expect(tool?.inputSchema.required).toContain("clientId");
-    });
-
-    it("calls mutate with required fields", async () => {
-      const mockResponse = {
-        createTicket: {
-          ticketId: "new-ticket",
-          ticketNumber: "TKT-001",
-          subject: "New Issue",
-        },
-      };
-      mockClient.mutate.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      const result = await domain.handleCall("superops_tickets_create", {
+  it("creates tickets with documented input names and response fields", async () => {
+    mockClient.mutate.mockResolvedValue({
+      createTicket: {
+        ticketId: "new-ticket",
+        displayId: "062822-0005",
         subject: "New Issue",
-        clientId: "client-123",
-      });
-
-      expect(mockClient.mutate).toHaveBeenCalledWith(
-        expect.stringContaining("createTicket"),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            subject: "New Issue",
-            client: { accountId: "client-123" },
-          }),
-        })
-      );
-      expect(result.content[0].text).toContain("new-ticket");
+      },
     });
 
-    it("includes optional fields when provided", async () => {
-      const mockResponse = {
-        createTicket: { ticketId: "new-ticket", subject: "Issue" },
-      };
-      mockClient.mutate.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_create", {
-        subject: "Issue",
-        clientId: "client-123",
-        description: "Detailed description",
-        priority: "High",
-        requesterEmail: "user@example.com",
-        techGroupName: "Support Team",
-        categoryName: "Hardware",
-      });
-
-      expect(mockClient.mutate).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            description: "Detailed description",
-            priority: "HIGH",
-            requester: { email: "user@example.com" },
-            techGroup: { name: "Support Team" },
-            category: { name: "Hardware" },
-          }),
-        })
-      );
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_create", {
+      subject: "New Issue",
+      clientId: "client-123",
+      description: "Detailed description",
+      priority: "High",
+      requesterEmail: "user@example.com",
+      techGroupName: "Support Team",
+      categoryName: "Hardware",
     });
 
-    it("converts priority to uppercase", async () => {
-      const mockResponse = {
-        createTicket: { ticketId: "new-ticket" },
-      };
-      mockClient.mutate.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_create", {
-        subject: "Issue",
-        clientId: "client-123",
-        priority: "critical",
-      });
-
-      expect(mockClient.mutate).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            priority: "CRITICAL",
-          }),
-        })
-      );
-    });
-  });
-
-  describe("superops_tickets_update tool", () => {
-    it("has correct definition", () => {
-      const domain = getTicketsTools();
-      const tool = domain.tools.find((t) => t.name === "superops_tickets_update");
-
-      expect(tool).toBeDefined();
-      expect(tool?.inputSchema.properties).toHaveProperty("ticketId");
-      expect(tool?.inputSchema.properties).toHaveProperty("status");
-      expect(tool?.inputSchema.properties).toHaveProperty("priority");
-      expect(tool?.inputSchema.properties).toHaveProperty("assigneeId");
-      expect(tool?.inputSchema.required).toContain("ticketId");
-    });
-
-    it("calls mutate with ticketId only", async () => {
-      const mockResponse = {
-        updateTicket: { ticketId: "ticket-123", status: "Open" },
-      };
-      mockClient.mutate.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_update", { ticketId: "ticket-123" });
-
-      expect(mockClient.mutate).toHaveBeenCalledWith(
-        expect.stringContaining("updateTicket"),
-        expect.objectContaining({
-          input: { ticketId: "ticket-123" },
-        })
-      );
-    });
-
-    it("includes update fields when provided", async () => {
-      const mockResponse = {
-        updateTicket: { ticketId: "ticket-123" },
-      };
-      mockClient.mutate.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_update", {
-        ticketId: "ticket-123",
-        status: "Resolved",
-        priority: "Low",
-        assigneeId: "tech-456",
-        resolution: "Fixed the issue",
-      });
-
-      expect(mockClient.mutate).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            ticketId: "ticket-123",
-            status: "Resolved",
-            priority: "LOW",
-            assignee: { id: "tech-456" },
-            resolution: "Fixed the issue",
-          }),
-        })
-      );
-    });
-  });
-
-  describe("superops_tickets_add_note tool", () => {
-    it("has correct definition", () => {
-      const domain = getTicketsTools();
-      const tool = domain.tools.find((t) => t.name === "superops_tickets_add_note");
-
-      expect(tool).toBeDefined();
-      expect(tool?.inputSchema.properties).toHaveProperty("ticketId");
-      expect(tool?.inputSchema.properties).toHaveProperty("content");
-      expect(tool?.inputSchema.properties).toHaveProperty("isPublic");
-      expect(tool?.inputSchema.required).toContain("ticketId");
-      expect(tool?.inputSchema.required).toContain("content");
-    });
-
-    it("adds internal note by default", async () => {
-      const mockResponse = {
-        addTicketNote: {
-          noteId: "note-123",
-          content: "Test note",
-          isPublic: false,
+    expect(mockClient.mutate).toHaveBeenCalledWith(
+      expect.stringContaining("createTicket"),
+      {
+        input: {
+          subject: "New Issue",
+          client: { accountId: "client-123" },
+          status: "New",
+          source: "FORM",
+          description: "Detailed description",
+          priority: "High",
+          category: "Hardware",
         },
-      };
-      mockClient.mutate.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_add_note", {
-        ticketId: "ticket-123",
-        content: "Test note",
-      });
-
-      expect(mockClient.mutate).toHaveBeenCalledWith(
-        expect.stringContaining("addTicketNote"),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            ticketId: "ticket-123",
-            content: "Test note",
-            isPublic: false,
-          }),
-        })
-      );
-    });
-
-    it("adds public note when specified", async () => {
-      const mockResponse = {
-        addTicketNote: {
-          noteId: "note-123",
-          content: "Public note",
-          isPublic: true,
-        },
-      };
-      mockClient.mutate.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_add_note", {
-        ticketId: "ticket-123",
-        content: "Public note",
-        isPublic: true,
-      });
-
-      expect(mockClient.mutate).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            isPublic: true,
-          }),
-        })
-      );
-    });
+      }
+    );
+    expect(mockClient.mutate.mock.calls[0][0]).toContain("displayId");
+    expect(result.content[0].text).toContain("new-ticket");
   });
 
-  describe("superops_tickets_log_time tool", () => {
-    it("has correct definition", () => {
-      const domain = getTicketsTools();
-      const tool = domain.tools.find((t) => t.name === "superops_tickets_log_time");
-
-      expect(tool).toBeDefined();
-      expect(tool?.inputSchema.properties).toHaveProperty("ticketId");
-      expect(tool?.inputSchema.properties).toHaveProperty("duration");
-      expect(tool?.inputSchema.properties).toHaveProperty("description");
-      expect(tool?.inputSchema.properties).toHaveProperty("workType");
-      expect(tool?.inputSchema.properties).toHaveProperty("billable");
-      expect(tool?.inputSchema.required).toContain("ticketId");
-      expect(tool?.inputSchema.required).toContain("duration");
+  it("updates tickets with technician assignment rather than assignee", async () => {
+    mockClient.mutate.mockResolvedValue({
+      updateTicket: { ticketId: "ticket-123", technician: { userId: "tech-456" } },
     });
 
-    it("logs time with required fields and default billable", async () => {
-      const mockResponse = {
-        addTicketTimeEntry: {
-          timeEntryId: "time-123",
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_update", {
+      ticketId: "ticket-123",
+      status: "Resolved",
+      priority: "Low",
+      assigneeId: "tech-456",
+      resolution: "Fixed the issue",
+    });
+
+    expect(mockClient.mutate).toHaveBeenCalledWith(
+      expect.stringContaining("updateTicket"),
+      {
+        input: {
           ticketId: "ticket-123",
-          duration: 30,
+          status: "Resolved",
+          priority: "Low",
+          technician: { userId: "tech-456" },
         },
-      };
-      mockClient.mutate.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_log_time", {
-        ticketId: "ticket-123",
-        duration: 30,
-      });
-
-      expect(mockClient.mutate).toHaveBeenCalledWith(
-        expect.stringContaining("addTicketTimeEntry"),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            ticketId: "ticket-123",
-            duration: 30,
-            billable: true,
-          }),
-        })
-      );
-    });
-
-    it("includes optional fields when provided", async () => {
-      const mockResponse = {
-        addTicketTimeEntry: {
-          timeEntryId: "time-123",
-          duration: 60,
-        },
-      };
-      mockClient.mutate.mockResolvedValue(mockResponse);
-
-      const domain = getTicketsTools();
-      await domain.handleCall("superops_tickets_log_time", {
-        ticketId: "ticket-123",
-        duration: 60,
-        description: "Troubleshooting network issue",
-        workType: "Remote Support",
-        billable: false,
-      });
-
-      expect(mockClient.mutate).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          input: expect.objectContaining({
-            description: "Troubleshooting network issue",
-            workType: "Remote Support",
-            billable: false,
-          }),
-        })
-      );
-    });
+      }
+    );
   });
 
-  describe("Error handling", () => {
-    it("returns error for unknown tool", async () => {
-      const domain = getTicketsTools();
-      const result = await domain.handleCall("unknown_tool", {});
-
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("Unknown tickets tool");
+  it("creates ticket notes using createTicketNote", async () => {
+    mockClient.mutate.mockResolvedValue({
+      createTicketNote: {
+        noteId: "note-123",
+        content: "Private note",
+        privacyType: "PRIVATE",
+      },
     });
 
-    it("handles API errors gracefully", async () => {
-      mockClient.query.mockRejectedValue(new Error("API rate limit exceeded"));
-
-      const domain = getTicketsTools();
-      const result = await domain.handleCall("superops_tickets_list", {});
-
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("Error: API rate limit exceeded");
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_add_note", {
+      ticketId: "ticket-123",
+      content: "Private note",
     });
 
-    it("handles mutation errors gracefully", async () => {
-      mockClient.mutate.mockRejectedValue(new Error("Validation failed"));
+    expect(mockClient.mutate).toHaveBeenCalledWith(
+      expect.stringContaining("createTicketNote"),
+      {
+        input: {
+          ticket: { ticketId: "ticket-123" },
+          content: "Private note",
+          privacyType: "PRIVATE",
+        },
+      }
+    );
+  });
 
-      const domain = getTicketsTools();
-      const result = await domain.handleCall("superops_tickets_create", {
-        subject: "Test",
-        clientId: "123",
-      });
-
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("Error: Validation failed");
+  it("logs time using createWorklogEntries", async () => {
+    mockClient.mutate.mockResolvedValue({
+      createWorklogEntries: [
+        {
+          itemId: "worklog-123",
+          qty: "0.5",
+          workItem: { workId: "ticket-123", module: "TICKET" },
+        },
+      ],
     });
+
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_log_time", {
+      ticketId: "ticket-123",
+      duration: 30,
+      description: "Troubleshooting",
+    });
+
+    expect(mockClient.mutate).toHaveBeenCalledWith(
+      expect.stringContaining("createWorklogEntries"),
+      {
+        input: [
+          expect.objectContaining({
+            workItem: { workId: "ticket-123", module: "TICKET" },
+            qty: "0.5",
+            billDateTime: expect.any(String),
+            notes: "Troubleshooting",
+            billable: true,
+            afterHours: false,
+          }),
+        ],
+      }
+    );
+  });
+
+  it("handles unknown tools and API errors", async () => {
+    const domain = getTicketsTools();
+    const unknown = await domain.handleCall("unknown_tool", {});
+    expect(unknown.isError).toBe(true);
+
+    mockClient.query.mockRejectedValue(new Error("API rate limit exceeded"));
+    const failed = await domain.handleCall("superops_tickets_list", { page: 1 });
+    expect(failed.isError).toBe(true);
+    expect(failed.content[0].text).toContain("API rate limit exceeded");
   });
 });

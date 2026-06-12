@@ -7,119 +7,119 @@
 import { getClient } from "../client.js";
 import type { DomainTools, Technician, ListInfo } from "../types.js";
 
+const DEFAULT_LIST_PAGE = 1;
+
 const LIST_TECHNICIANS_QUERY = `
   query getTechnicianList($input: ListInfoInput!) {
     getTechnicianList(input: $input) {
-      technicians {
-        id
+      userList {
+        userId
+        firstName
+        lastName
         name
         email
-        phone
-        isActive
+        contactNumber
+        emailSignature
+        designation
+        businessFunction
+        team
+        reportingManager
         role
-        department
-        teams {
-          id
-          name
-        }
-        ticketCount
-        lastLoginTime
+        groups
       }
       listInfo {
+        page
+        pageSize
+        hasMore
         totalCount
-        hasNextPage
-        endCursor
       }
     }
   }
 `;
 
 const GET_TECHNICIAN_QUERY = `
-  query getTechnician($input: TechnicianIdentifierInput!) {
-    getTechnician(input: $input) {
-      id
-      name
-      email
-      phone
-      isActive
-      role
-      department
-      teams {
-        id
-        name
-      }
-      manager {
-        id
+  query getTechnicianList($input: ListInfoInput!) {
+    getTechnicianList(input: $input) {
+      userList {
+        userId
+        firstName
+        lastName
         name
         email
+        contactNumber
+        emailSignature
+        designation
+        businessFunction
+        team
+        reportingManager
+        role
+        groups
       }
-      skills
-      ticketCount
-      averageResponseTime
-      lastLoginTime
-      createdTime
+      listInfo {
+        page
+        pageSize
+        hasMore
+        totalCount
+      }
     }
   }
 `;
 
 const LIST_TECH_GROUPS_QUERY = `
-  query getTechGroupList($input: ListInfoInput!) {
-    getTechGroupList(input: $input) {
-      techGroups {
-        id
-        name
-        description
-        memberCount
-        members {
-          id
-          name
-        }
-      }
-      listInfo {
-        totalCount
-        hasNextPage
-      }
+  query getTechnicianGroupList {
+    getTechnicianGroupList {
+      groupId
+      name
     }
   }
 `;
 
-interface ExtendedTechnician extends Technician {
-  isActive?: boolean;
-  role?: string;
-  department?: string;
-  teams?: { id: string; name: string }[];
-  manager?: { id: string; name: string; email: string };
-  skills?: string[];
-  ticketCount?: number;
-  averageResponseTime?: number;
-  lastLoginTime?: string;
-  createdTime?: string;
-}
-
 interface ListTechniciansResponse {
   getTechnicianList: {
-    technicians: ExtendedTechnician[];
+    userList: Technician[];
     listInfo: ListInfo;
   };
 }
 
 interface GetTechnicianResponse {
-  getTechnician: ExtendedTechnician;
+  getTechnicianList: {
+    userList: Technician[];
+    listInfo: ListInfo;
+  };
 }
 
 interface TechGroup {
-  id: string;
+  groupId: string;
   name: string;
-  description?: string;
-  memberCount?: number;
-  members?: { id: string; name: string }[];
 }
 
 interface ListTechGroupsResponse {
-  getTechGroupList: {
-    techGroups: TechGroup[];
-    listInfo: ListInfo;
+  getTechnicianGroupList: TechGroup[];
+}
+
+function pageInput(max: number | undefined, page?: number) {
+  return {
+    page: page ?? DEFAULT_LIST_PAGE,
+    pageSize: Math.min(max ?? 50, 500),
   };
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
+}
+
+function applyTechnicianFilters(
+  technicians: Technician[],
+  filters: { teamId?: string }
+): Technician[] {
+  return technicians.filter((technician) => {
+    const team = jsonRecord(technician.team);
+    if (filters.teamId && team?.teamId !== filters.teamId) return false;
+    return true;
+  });
 }
 
 export function getTechniciansTools(): DomainTools {
@@ -146,9 +146,10 @@ export function getTechniciansTools(): DomainTools {
               description: "Maximum number of results (default: 50, max: 500)",
               default: 50,
             },
-            cursor: {
-              type: "string",
-              description: "Pagination cursor for fetching next page",
+            page: {
+              type: "number",
+              description: "Page number to fetch (default: 1)",
+              default: 1,
             },
           },
         },
@@ -193,23 +194,20 @@ export function getTechniciansTools(): DomainTools {
               activeOnly?: boolean;
               teamId?: string;
               max?: number;
-              cursor?: string;
+              page?: number;
             };
-
-            const filter: Record<string, unknown> = {};
-            if (params.activeOnly !== false) filter.isActive = true;
-            if (params.teamId) filter.teams = { id: params.teamId };
 
             const response = await client.query<ListTechniciansResponse>(
               LIST_TECHNICIANS_QUERY,
               {
-                input: {
-                  first: Math.min(params.max ?? 50, 500),
-                  ...(params.cursor && { after: params.cursor }),
-                  ...(Object.keys(filter).length > 0 && { filter }),
-                  orderBy: { field: "name", direction: "ASC" },
-                },
+                // TODO: Replace local filtering with ListInfoInput.condition after
+                // SuperOps documents condition syntax for technician fields.
+                input: pageInput(params.max, params.page),
               }
+            );
+            response.getTechnicianList.userList = applyTechnicianFilters(
+              response.getTechnicianList.userList,
+              { teamId: params.teamId }
             );
 
             return {
@@ -226,14 +224,29 @@ export function getTechniciansTools(): DomainTools {
             const { technicianId } = args as { technicianId: string };
 
             const response = await client.query<GetTechnicianResponse>(GET_TECHNICIAN_QUERY, {
-              input: { id: technicianId },
+              input: pageInput(500),
             });
+            const technician = response.getTechnicianList.userList.find(
+              (item) => item.userId === technicianId
+            );
+
+            if (!technician) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Error: Technician not found in first returned page: ${technicianId}`,
+                  },
+                ],
+                isError: true,
+              };
+            }
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getTechnician, null, 2),
+                  text: JSON.stringify(technician, null, 2),
                 },
               ],
             };
@@ -242,17 +255,17 @@ export function getTechniciansTools(): DomainTools {
           case "superops_technicians_groups": {
             const params = args as { max?: number };
 
-            const response = await client.query<ListTechGroupsResponse>(LIST_TECH_GROUPS_QUERY, {
-              input: {
-                first: Math.min(params.max ?? 50, 500),
-              },
-            });
+            const response = await client.query<ListTechGroupsResponse>(LIST_TECH_GROUPS_QUERY);
+            const groups = response.getTechnicianGroupList.slice(
+              0,
+              Math.min(params.max ?? 50, 500)
+            );
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getTechGroupList, null, 2),
+                  text: JSON.stringify(groups, null, 2),
                 },
               ],
             };

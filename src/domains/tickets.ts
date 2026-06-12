@@ -5,38 +5,37 @@
  */
 
 import { getClient } from "../client.js";
-import type { DomainTools, Ticket, ListInfo } from "../types.js";
+import type { DomainTools, Ticket, TicketNote, TimeEntry, ListInfo } from "../types.js";
 import { elicitText } from "../utils/elicitation.js";
+
+const DEFAULT_LIST_PAGE = 1;
 
 const LIST_TICKETS_QUERY = `
   query getTicketList($input: ListInfoInput!) {
     getTicketList(input: $input) {
       tickets {
         ticketId
-        ticketNumber
+        displayId
         subject
+        requestType
+        source
+        client
+        requester
+        techGroup
+        technician
         status
         priority
+        impact
+        urgency
+        category
         createdTime
-        lastUpdatedTime
-        client {
-          accountId
-          name
-        }
-        assignee {
-          id
-          name
-        }
-        requester {
-          id
-          name
-          email
-        }
+        updatedTime
       }
       listInfo {
+        page
+        pageSize
+        hasMore
         totalCount
-        hasNextPage
-        endCursor
       }
     }
   }
@@ -46,46 +45,38 @@ const GET_TICKET_QUERY = `
   query getTicket($input: TicketIdentifierInput!) {
     getTicket(input: $input) {
       ticketId
-      ticketNumber
+      displayId
       subject
-      description
+      ticketType
+      requestType
+      source
+      client
+      site
+      requester
+      additionalRequester
+      followers
+      techGroup
+      technician
       status
       priority
       impact
       urgency
+      category
+      subcategory
+      cause
+      subcause
+      resolutionCode
+      sla
       createdTime
-      lastUpdatedTime
-      client {
-        accountId
-        name
-      }
-      site {
-        id
-        name
-      }
-      requester {
-        id
-        name
-        email
-        phone
-      }
-      assignee {
-        id
-        name
-        email
-      }
-      techGroup {
-        id
-        name
-      }
-      category {
-        id
-        name
-      }
-      customFields {
-        name
-        value
-      }
+      updatedTime
+      firstResponseDueTime
+      firstResponseTime
+      firstResponseViolated
+      resolutionDueTime
+      resolutionTime
+      resolutionViolated
+      customFields
+      worklogTimespent
     }
   }
 `;
@@ -94,19 +85,17 @@ const CREATE_TICKET_MUTATION = `
   mutation createTicket($input: CreateTicketInput!) {
     createTicket(input: $input) {
       ticketId
-      ticketNumber
+      displayId
       subject
+      client
+      requester
+      techGroup
+      technician
       status
       priority
+      category
       createdTime
-      client {
-        accountId
-        name
-      }
-      assignee {
-        id
-        name
-      }
+      updatedTime
     }
   }
 `;
@@ -115,45 +104,42 @@ const UPDATE_TICKET_MUTATION = `
   mutation updateTicket($input: UpdateTicketInput!) {
     updateTicket(input: $input) {
       ticketId
-      ticketNumber
+      displayId
       status
       priority
-      assignee {
-        id
-        name
-      }
-      lastUpdatedTime
+      techGroup
+      technician
+      updatedTime
     }
   }
 `;
 
 const ADD_TICKET_NOTE_MUTATION = `
-  mutation addTicketNote($input: AddTicketNoteInput!) {
-    addTicketNote(input: $input) {
+  mutation createTicketNote($input: CreateTicketNoteInput!) {
+    createTicketNote(input: $input) {
       noteId
+      addedBy
+      addedOn
       content
-      createdTime
-      isPublic
-      createdBy {
-        id
-        name
-      }
+      privacyType
     }
   }
 `;
 
 const ADD_TIME_ENTRY_MUTATION = `
-  mutation addTicketTimeEntry($input: AddTimeEntryInput!) {
-    addTicketTimeEntry(input: $input) {
-      timeEntryId
-      ticketId
-      duration
-      description
-      technician {
-        id
-        name
-      }
-      createdTime
+  mutation createWorklogEntries($input: [CreateWorklogEntryInput!]!) {
+    createWorklogEntries(input: $input) {
+      itemId
+      status
+      serviceItem
+      billable
+      afterHours
+      qty
+      unitPrice
+      billDateTime
+      technician
+      notes
+      workItem
     }
   }
 `;
@@ -178,24 +164,57 @@ interface UpdateTicketResponse {
 }
 
 interface AddNoteResponse {
-  addTicketNote: {
-    noteId: string;
-    content: string;
-    createdTime: string;
-    isPublic: boolean;
-    createdBy?: { id: string; name: string };
-  };
+  createTicketNote: TicketNote;
 }
 
 interface AddTimeEntryResponse {
-  addTicketTimeEntry: {
-    timeEntryId: string;
-    ticketId: string;
-    duration: number;
-    description?: string;
-    technician?: { id: string; name: string };
-    createdTime: string;
+  createWorklogEntries: TimeEntry[];
+}
+
+function pageInput(max: number | undefined, page?: number) {
+  return {
+    page: page ?? DEFAULT_LIST_PAGE,
+    pageSize: Math.min(max ?? 50, 500),
   };
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
+}
+
+function applyTicketFilters(
+  tickets: Ticket[],
+  filters: {
+    status?: string[];
+    priority?: string[];
+    clientId?: string;
+    assigneeId?: string;
+    unassigned?: boolean;
+  }
+): Ticket[] {
+  return tickets.filter((ticket) => {
+    if (filters.status && (!ticket.status || !filters.status.includes(ticket.status))) {
+      return false;
+    }
+    if (
+      filters.priority &&
+      (!ticket.priority || !filters.priority.includes(ticket.priority))
+    ) {
+      return false;
+    }
+
+    const clientInfo = jsonRecord(ticket.client);
+    if (filters.clientId && clientInfo?.accountId !== filters.clientId) return false;
+
+    const technicianInfo = jsonRecord(ticket.technician);
+    if (filters.assigneeId && technicianInfo?.userId !== filters.assigneeId) return false;
+    if (filters.unassigned && technicianInfo) return false;
+
+    return true;
+  });
 }
 
 export function getTicketsTools(): DomainTools {
@@ -236,9 +255,10 @@ export function getTicketsTools(): DomainTools {
               description: "Maximum number of results (default: 50, max: 500)",
               default: 50,
             },
-            cursor: {
-              type: "string",
-              description: "Pagination cursor for fetching next page",
+            page: {
+              type: "number",
+              description: "Page number to fetch (default: 1)",
+              default: 1,
             },
           },
         },
@@ -402,7 +422,7 @@ export function getTicketsTools(): DomainTools {
               assigneeId?: string;
               unassigned?: boolean;
               max?: number;
-              cursor?: string;
+              page?: number;
             };
 
             // If no filters provided, elicit a date range from the user
@@ -413,7 +433,7 @@ export function getTicketsTools(): DomainTools {
               params.assigneeId ||
               params.unassigned;
 
-            if (!hasFilters && !params.cursor) {
+            if (!hasFilters && !params.page) {
               const statusChoice = await elicitText(
                 "No filters specified. Would you like to narrow by ticket status?",
                 "status",
@@ -424,21 +444,15 @@ export function getTicketsTools(): DomainTools {
               }
             }
 
-            const filter: Record<string, unknown> = {};
-            if (params.status) filter.status = params.status;
-            if (params.priority) filter.priority = params.priority;
-            if (params.clientId) filter.client = { accountId: params.clientId };
-            if (params.assigneeId) filter.assignee = { id: params.assigneeId };
-            if (params.unassigned) filter.assignee = null;
-
             const response = await client.query<ListTicketsResponse>(LIST_TICKETS_QUERY, {
-              input: {
-                first: Math.min(params.max ?? 50, 500),
-                ...(params.cursor && { after: params.cursor }),
-                ...(Object.keys(filter).length > 0 && { filter }),
-                orderBy: { field: "createdTime", direction: "DESC" },
-              },
+              // TODO: Replace local filtering with ListInfoInput.condition after
+              // SuperOps documents per-list condition operators and attributes.
+              input: pageInput(params.max, params.page),
             });
+            response.getTicketList.tickets = applyTicketFilters(
+              response.getTicketList.tickets,
+              params
+            );
 
             return {
               content: [
@@ -481,12 +495,14 @@ export function getTicketsTools(): DomainTools {
             const input: Record<string, unknown> = {
               subject: params.subject,
               client: { accountId: params.clientId },
+              status: "New",
+              source: "FORM",
             };
             if (params.description) input.description = params.description;
-            if (params.priority) input.priority = params.priority.toUpperCase();
-            if (params.requesterEmail) input.requester = { email: params.requesterEmail };
-            if (params.techGroupName) input.techGroup = { name: params.techGroupName };
-            if (params.categoryName) input.category = { name: params.categoryName };
+            if (params.priority) input.priority = params.priority;
+            if (params.categoryName) input.category = params.categoryName;
+            // TODO: Map requesterEmail and techGroupName only after IDs can be
+            // resolved safely to ClientUserIdentifierInput and TechnicianGroupIdentifierInput.
 
             const response = await client.mutate<CreateTicketResponse>(
               CREATE_TICKET_MUTATION,
@@ -515,10 +531,10 @@ export function getTicketsTools(): DomainTools {
 
             const input: Record<string, unknown> = { ticketId: params.ticketId };
             if (params.status) input.status = params.status;
-            if (params.priority) input.priority = params.priority.toUpperCase();
-            if (params.assigneeId) input.assignee = { id: params.assigneeId };
-            if (params.techGroupName) input.techGroup = { name: params.techGroupName };
-            if (params.resolution) input.resolution = params.resolution;
+            if (params.priority) input.priority = params.priority;
+            if (params.assigneeId) input.technician = { userId: params.assigneeId };
+            // TODO: Map techGroupName and resolution only after a documented
+            // name-to-ID lookup or resolution-code workflow is available.
 
             const response = await client.mutate<UpdateTicketResponse>(
               UPDATE_TICKET_MUTATION,
@@ -544,9 +560,9 @@ export function getTicketsTools(): DomainTools {
 
             const response = await client.mutate<AddNoteResponse>(ADD_TICKET_NOTE_MUTATION, {
               input: {
-                ticketId: params.ticketId,
+                ticket: { ticketId: params.ticketId },
                 content: params.content,
-                isPublic: params.isPublic ?? false,
+                privacyType: params.isPublic ? "PUBLIC" : "PRIVATE",
               },
             });
 
@@ -554,7 +570,7 @@ export function getTicketsTools(): DomainTools {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.addTicketNote, null, 2),
+                  text: JSON.stringify(response.createTicketNote, null, 2),
                 },
               ],
             };
@@ -572,13 +588,18 @@ export function getTicketsTools(): DomainTools {
             const response = await client.mutate<AddTimeEntryResponse>(
               ADD_TIME_ENTRY_MUTATION,
               {
-                input: {
-                  ticketId: params.ticketId,
-                  duration: params.duration,
-                  description: params.description,
-                  workType: params.workType,
-                  billable: params.billable ?? true,
-                },
+                input: [
+                  {
+                    workItem: { workId: params.ticketId, module: "TICKET" },
+                    qty: String(params.duration / 60),
+                    billDateTime: new Date().toISOString(),
+                    notes: params.description,
+                    billable: params.billable ?? true,
+                    afterHours: false,
+                    // TODO: Map workType to ServiceItemIdentifierInput only after
+                    // a documented service-item lookup is added.
+                  },
+                ],
               }
             );
 
@@ -586,7 +607,7 @@ export function getTicketsTools(): DomainTools {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.addTicketTimeEntry, null, 2),
+                  text: JSON.stringify(response.createWorklogEntries, null, 2),
                 },
               ],
             };

@@ -8,6 +8,8 @@ import { getClient } from "../client.js";
 import type { DomainTools, Client, ListInfo } from "../types.js";
 import { elicitText } from "../utils/elicitation.js";
 
+const DEFAULT_LIST_PAGE = 1;
+
 const LIST_CLIENTS_QUERY = `
   query getClientList($input: ListInfoInput!) {
     getClientList(input: $input) {
@@ -81,6 +83,35 @@ interface GetClientResponse {
   getClient: Client;
 }
 
+function pageInput(max: number | undefined, defaultPageSize: number, page?: number) {
+  return {
+    page: page ?? DEFAULT_LIST_PAGE,
+    pageSize: Math.min(max ?? defaultPageSize, 500),
+  };
+}
+
+function applyClientFilters(
+  clients: Client[],
+  filters: { status?: string; stage?: string; query?: string }
+): Client[] {
+  return clients.filter((client) => {
+    if (filters.status && client.status !== filters.status) return false;
+    if (filters.stage && client.stage !== filters.stage) return false;
+
+    if (filters.query) {
+      const query = filters.query.toLowerCase();
+      const nameMatches = client.name.toLowerCase().includes(query);
+      const domainMatches = client.emailDomains?.some((domain) =>
+        domain.toLowerCase().includes(query)
+      );
+
+      if (!nameMatches && !domainMatches) return false;
+    }
+
+    return true;
+  });
+}
+
 export function getClientsTools(): DomainTools {
   return {
     tools: [
@@ -106,9 +137,10 @@ export function getClientsTools(): DomainTools {
               description: "Maximum number of results (default: 50, max: 500)",
               default: 50,
             },
-            cursor: {
-              type: "string",
-              description: "Pagination cursor for fetching next page",
+            page: {
+              type: "number",
+              description: "Page number to fetch (default: 1)",
+              default: 1,
             },
           },
         },
@@ -159,12 +191,12 @@ export function getClientsTools(): DomainTools {
               status?: string;
               stage?: string;
               max?: number;
-              cursor?: string;
+              page?: number;
             };
 
             // If no filters provided, elicit a search term from the user
             const hasFilters = params.status || params.stage;
-            if (!hasFilters && !params.cursor) {
+            if (!hasFilters && !params.page) {
               const searchTerm = await elicitText(
                 "No filters specified. Would you like to search for a specific client?",
                 "search",
@@ -175,16 +207,12 @@ export function getClientsTools(): DomainTools {
                 const searchResponse = await client.query<ListClientsResponse>(
                   SEARCH_CLIENTS_QUERY,
                   {
-                    input: {
-                      first: Math.min(params.max ?? 50, 500),
-                      filter: {
-                        or: [
-                          { name: { contains: searchTerm } },
-                          { emailDomains: { contains: searchTerm } },
-                        ],
-                      },
-                    },
+                    input: pageInput(params.max, 50, params.page),
                   }
+                );
+                searchResponse.getClientList.clients = applyClientFilters(
+                  searchResponse.getClientList.clients,
+                  { query: searchTerm }
                 );
                 return {
                   content: [
@@ -197,18 +225,15 @@ export function getClientsTools(): DomainTools {
               }
             }
 
-            const filter: Record<string, unknown> = {};
-            if (params.status) filter.status = params.status;
-            if (params.stage) filter.stage = params.stage;
-
             const response = await client.query<ListClientsResponse>(LIST_CLIENTS_QUERY, {
-              input: {
-                first: Math.min(params.max ?? 50, 500),
-                ...(params.cursor && { after: params.cursor }),
-                ...(Object.keys(filter).length > 0 && { filter }),
-                orderBy: { field: "name", direction: "ASC" },
-              },
+              // TODO: Replace local filtering with ListInfoInput.condition after
+              // SuperOps documents per-list condition operators and attributes.
+              input: pageInput(params.max, 50, params.page),
             });
+            response.getClientList.clients = applyClientFilters(
+              response.getClientList.clients,
+              { status: params.status, stage: params.stage }
+            );
 
             return {
               content: [
@@ -241,16 +266,17 @@ export function getClientsTools(): DomainTools {
             const params = args as { query: string; max?: number };
 
             const response = await client.query<ListClientsResponse>(SEARCH_CLIENTS_QUERY, {
+              // TODO: Replace local search with ListInfoInput.condition after
+              // SuperOps documents reliable condition syntax for Client fields.
               input: {
-                first: Math.min(params.max ?? 20, 100),
-                filter: {
-                  or: [
-                    { name: { contains: params.query } },
-                    { emailDomains: { contains: params.query } },
-                  ],
-                },
+                page: DEFAULT_LIST_PAGE,
+                pageSize: Math.min(params.max ?? 20, 100),
               },
             });
+            response.getClientList.clients = applyClientFilters(
+              response.getClientList.clients,
+              { query: params.query }
+            );
 
             return {
               content: [
