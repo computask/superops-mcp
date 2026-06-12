@@ -31,14 +31,14 @@ const VALID_TICKET_STATUSES = [
 ] as const;
 
 const VALID_TICKET_CATEGORIES = [
-  "Support request",
-  "Change request",
-  "Security Incident",
-  "New setup",
-  "Non-technical query",
-  "New enquiry",
-  "Sales call",
-  "Rewst",
+  "1. Support request",
+  "2. Change request",
+  "3. Security Incident",
+  "4. New setup",
+  "5. Non-technical query",
+  "6. New enquiry",
+  "7. Sales call",
+  "8. Rewst",
 ] as const;
 
 const DEFAULT_CREATE_TICKET_STATUS = "New Calls";

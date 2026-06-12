@@ -37,14 +37,14 @@ const VALID_TICKET_STATUSES = [
 ];
 
 const VALID_TICKET_CATEGORIES = [
-  "Support request",
-  "Change request",
-  "Security Incident",
-  "New setup",
-  "Non-technical query",
-  "New enquiry",
-  "Sales call",
-  "Rewst",
+  "1. Support request",
+  "2. Change request",
+  "3. Security Incident",
+  "4. New setup",
+  "5. Non-technical query",
+  "6. New enquiry",
+  "7. Sales call",
+  "8. Rewst",
 ];
 
 describe("Tickets Domain", () => {
@@ -192,7 +192,7 @@ describe("Tickets Domain", () => {
       description: "Detailed description",
       requesterEmail: "user@example.com",
       techGroupName: "Support Team",
-      categoryName: "Support request",
+      categoryName: "1. Support request",
     });
 
     expect(mockClient.mutate).toHaveBeenCalledWith(
@@ -205,7 +205,7 @@ describe("Tickets Domain", () => {
           requestType: "Incident",
           source: "FORM",
           description: "Detailed description",
-          category: "Support request",
+          category: "1. Support request",
         },
       }
     );
