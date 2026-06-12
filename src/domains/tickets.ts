@@ -10,6 +10,39 @@ import { elicitText } from "../utils/elicitation.js";
 
 const DEFAULT_LIST_PAGE = 1;
 
+const VALID_TICKET_STATUSES = [
+  "Worked on",
+  "Awaiting Customer Reply",
+  "Awaiting Engineer",
+  "Escalated Tickets",
+  "Resolved",
+  "Awaiting 2nd Line Engineer",
+  "Setup Info",
+  "Worked on Setups",
+  "Awaiting Quote",
+  "Waiting on third party",
+  "Ticket on Hold",
+  "Closed",
+  "Awaiting Approval",
+  "For Sam's Attention",
+  "Adhoc",
+  "New Calls",
+  "Rewst",
+] as const;
+
+const VALID_TICKET_CATEGORIES = [
+  "Support request",
+  "Change request",
+  "Security Incident",
+  "New setup",
+  "Non-technical query",
+  "New enquiry",
+  "Sales call",
+  "Rewst",
+] as const;
+
+const DEFAULT_CREATE_TICKET_STATUS = "New Calls";
+
 const LIST_TICKETS_QUERY = `
   query getTicketList($input: ListInfoInput!) {
     getTicketList(input: $input) {
@@ -217,6 +250,17 @@ function applyTicketFilters(
   });
 }
 
+function invalidValues(values: string[], validValues: readonly string[]): string[] {
+  return values.filter((value) => !validValues.includes(value));
+}
+
+function errorResult(message: string) {
+  return {
+    content: [{ type: "text", text: `Error: ${message}` }],
+    isError: true,
+  };
+}
+
 export function getTicketsTools(): DomainTools {
   return {
     tools: [
@@ -229,14 +273,17 @@ export function getTicketsTools(): DomainTools {
           properties: {
             status: {
               type: "array",
-              items: { type: "string" },
+              items: {
+                type: "string",
+                enum: [...VALID_TICKET_STATUSES],
+              },
               description:
-                "Filter by status(es): Open, In Progress, Pending, Resolved, Closed",
+                `Filter by configured ticket status(es): ${VALID_TICKET_STATUSES.join(", ")}`,
             },
             priority: {
               type: "array",
               items: { type: "string" },
-              description: "Filter by priority(ies): Low, Medium, High, Critical",
+              description: "Filter by priority value returned by SuperOps.",
             },
             clientId: {
               type: "string",
@@ -297,8 +344,8 @@ export function getTicketsTools(): DomainTools {
             },
             priority: {
               type: "string",
-              description: "Ticket priority: Low, Medium, High, or Critical",
-              enum: ["Low", "Medium", "High", "Critical"],
+              description:
+                "Currently not sent by this tool. Requires confirmed SuperOps priority ID mapping.",
             },
             requesterEmail: {
               type: "string",
@@ -310,8 +357,12 @@ export function getTicketsTools(): DomainTools {
             },
             categoryName: {
               type: "string",
-              description: "Service category name",
+              description:
+                `Configured top-level ticket category: ${VALID_TICKET_CATEGORIES.join(", ")}`,
+              enum: [...VALID_TICKET_CATEGORIES],
             },
+            // TODO: Add subcategoryName after the SuperOps ticket input shape for
+            // configured subcategory references is confirmed.
           },
           required: ["subject", "clientId"],
         },
@@ -329,13 +380,14 @@ export function getTicketsTools(): DomainTools {
             },
             status: {
               type: "string",
-              description: "New status: Open, In Progress, Pending, Resolved, Closed",
-              enum: ["Open", "In Progress", "Pending", "Resolved", "Closed"],
+              description:
+                "New status. Must match one of the configured SuperOps ticket statuses for this tenant.",
+              enum: [...VALID_TICKET_STATUSES],
             },
             priority: {
               type: "string",
-              description: "New priority: Low, Medium, High, Critical",
-              enum: ["Low", "Medium", "High", "Critical"],
+              description:
+                "Currently not sent by this tool. Requires confirmed SuperOps priority ID mapping.",
             },
             assigneeId: {
               type: "string",
@@ -437,10 +489,19 @@ export function getTicketsTools(): DomainTools {
               const statusChoice = await elicitText(
                 "No filters specified. Would you like to narrow by ticket status?",
                 "status",
-                "Enter status (Open, In Progress, Pending, Resolved, Closed) or leave blank for all"
+                `Enter status (${VALID_TICKET_STATUSES.join(", ")}) or leave blank for all`
               );
               if (statusChoice) {
                 params.status = statusChoice.split(",").map((s) => s.trim());
+              }
+            }
+
+            if (params.status) {
+              const invalidStatuses = invalidValues(params.status, VALID_TICKET_STATUSES);
+              if (invalidStatuses.length > 0) {
+                return errorResult(
+                  `Invalid ticket status(es): ${invalidStatuses.join(", ")}`
+                );
               }
             }
 
@@ -492,17 +553,24 @@ export function getTicketsTools(): DomainTools {
               categoryName?: string;
             };
 
-			const input: Record<string, unknown> = {
-			  subject: params.subject,
-			  client: { accountId: params.clientId },
-			  status: "New Calls",
-			  requestType: "Incident",
-			  source: "FORM",
-			};
-			if (params.description) input.description = params.description;
-			// Priority appears to require a SuperOps priority ID, not a friendly label like "Low".
-			// Leave it unset until priority ID mapping is implemented.
-			if (params.categoryName) input.category = params.categoryName;
+            if (
+              params.categoryName &&
+              invalidValues([params.categoryName], VALID_TICKET_CATEGORIES).length > 0
+            ) {
+              return errorResult(`Invalid ticket category: ${params.categoryName}`);
+            }
+
+            const input: Record<string, unknown> = {
+              subject: params.subject,
+              client: { accountId: params.clientId },
+              status: DEFAULT_CREATE_TICKET_STATUS,
+              requestType: "Incident",
+              source: "FORM",
+            };
+            if (params.description) input.description = params.description;
+            // Priority appears to require a SuperOps priority ID, not a friendly label.
+            // Leave it unset until priority ID mapping is implemented.
+            if (params.categoryName) input.category = params.categoryName;
             // TODO: Map requesterEmail and techGroupName only after IDs can be
             // resolved safely to ClientUserIdentifierInput and TechnicianGroupIdentifierInput.
 
@@ -532,8 +600,15 @@ export function getTicketsTools(): DomainTools {
             };
 
             const input: Record<string, unknown> = { ticketId: params.ticketId };
+            if (
+              params.status &&
+              invalidValues([params.status], VALID_TICKET_STATUSES).length > 0
+            ) {
+              return errorResult(`Invalid ticket status: ${params.status}`);
+            }
             if (params.status) input.status = params.status;
-            if (params.priority) input.priority = params.priority;
+            // Priority appears to require a SuperOps priority ID, not a friendly label.
+            // Leave it unset until priority ID mapping is implemented.
             if (params.assigneeId) input.technician = { userId: params.assigneeId };
             // TODO: Map techGroupName and resolution only after a documented
             // name-to-ID lookup or resolution-code workflow is available.

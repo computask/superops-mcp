@@ -16,6 +16,37 @@ vi.mock("../client.js", () => ({
 import { getClient } from "../client.js";
 import { getTicketsTools } from "./tickets.js";
 
+const VALID_TICKET_STATUSES = [
+  "Worked on",
+  "Awaiting Customer Reply",
+  "Awaiting Engineer",
+  "Escalated Tickets",
+  "Resolved",
+  "Awaiting 2nd Line Engineer",
+  "Setup Info",
+  "Worked on Setups",
+  "Awaiting Quote",
+  "Waiting on third party",
+  "Ticket on Hold",
+  "Closed",
+  "Awaiting Approval",
+  "For Sam's Attention",
+  "Adhoc",
+  "New Calls",
+  "Rewst",
+];
+
+const VALID_TICKET_CATEGORIES = [
+  "Support request",
+  "Change request",
+  "Security Incident",
+  "New setup",
+  "Non-technical query",
+  "New enquiry",
+  "Sales call",
+  "Rewst",
+];
+
 describe("Tickets Domain", () => {
   let mockClient: { query: ReturnType<typeof vi.fn>; mutate: ReturnType<typeof vi.fn> };
 
@@ -48,7 +79,12 @@ describe("Tickets Domain", () => {
     mockClient.query.mockResolvedValue({
       getTicketList: {
         tickets: [
-          { ticketId: "1", displayId: "062822-0001", subject: "Open", status: "Open" },
+          {
+            ticketId: "1",
+            displayId: "062822-0001",
+            subject: "Worked ticket",
+            status: "Worked on",
+          },
           { ticketId: "2", displayId: "062822-0002", subject: "Closed", status: "Closed" },
         ],
         listInfo: { page: 1, pageSize: 50, hasMore: false, totalCount: 2 },
@@ -57,7 +93,7 @@ describe("Tickets Domain", () => {
 
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_list", {
-      status: ["Open"],
+      status: ["Worked on"],
       max: 75,
       page: 2,
     });
@@ -68,8 +104,29 @@ describe("Tickets Domain", () => {
     );
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("first");
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
-    expect(result.content[0].text).toContain("Open");
+    expect(result.content[0].text).toContain("Worked ticket");
     expect(result.content[0].text).not.toContain("Closed");
+  });
+
+  it("exposes tenant-specific status and category enums", () => {
+    const domain = getTicketsTools();
+    const listTool = domain.tools.find((tool) => tool.name === "superops_tickets_list");
+    const createTool = domain.tools.find((tool) => tool.name === "superops_tickets_create");
+    const updateTool = domain.tools.find((tool) => tool.name === "superops_tickets_update");
+
+    const listStatus = listTool?.inputSchema.properties.status as {
+      items?: { enum?: string[] };
+    };
+    const createCategory = createTool?.inputSchema.properties.categoryName as {
+      enum?: string[];
+    };
+    const updateStatus = updateTool?.inputSchema.properties.status as {
+      enum?: string[];
+    };
+
+    expect(listStatus.items?.enum).toEqual(VALID_TICKET_STATUSES);
+    expect(updateStatus.enum).toEqual(VALID_TICKET_STATUSES);
+    expect(createCategory.enum).toEqual(VALID_TICKET_CATEGORIES);
   });
 
   it("uses documented ticket fields in list and get queries", async () => {
@@ -119,42 +176,42 @@ describe("Tickets Domain", () => {
     expect(result.content[0].text).toContain("Test Issue");
   });
 
-  it("creates tickets with documented input names and response fields", async () => {
+  it("creates tickets with tenant default status and configured category", async () => {
     mockClient.mutate.mockResolvedValue({
       createTicket: {
-        ticketId: "new-ticket",
+        ticketId: "created-ticket",
         displayId: "062822-0005",
-        subject: "New Issue",
+        subject: "Tenant Issue",
       },
     });
 
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_create", {
-      subject: "New Issue",
+      subject: "Tenant Issue",
       clientId: "client-123",
       description: "Detailed description",
-      priority: "High",
       requesterEmail: "user@example.com",
       techGroupName: "Support Team",
-      categoryName: "Hardware",
+      categoryName: "Support request",
     });
 
     expect(mockClient.mutate).toHaveBeenCalledWith(
       expect.stringContaining("createTicket"),
       {
-		input: {
-		  subject: "New Issue",
-		  client: { accountId: "client-123" },
-		  status: "New",
-		  requestType: "Incident",
-		  source: "FORM",
-		  description: "Detailed description",
-		  category: "Hardware",
-		},
+        input: {
+          subject: "Tenant Issue",
+          client: { accountId: "client-123" },
+          status: "New Calls",
+          requestType: "Incident",
+          source: "FORM",
+          description: "Detailed description",
+          category: "Support request",
+        },
       }
     );
     expect(mockClient.mutate.mock.calls[0][0]).toContain("displayId");
-    expect(result.content[0].text).toContain("new-ticket");
+    expect(result.content[0].text).toContain("created-ticket");
+    expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
   });
 
   it("updates tickets with technician assignment rather than assignee", async () => {
@@ -166,7 +223,6 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_update", {
       ticketId: "ticket-123",
       status: "Resolved",
-      priority: "Low",
       assigneeId: "tech-456",
       resolution: "Fixed the issue",
     });
@@ -177,11 +233,11 @@ describe("Tickets Domain", () => {
         input: {
           ticketId: "ticket-123",
           status: "Resolved",
-          priority: "Low",
           technician: { userId: "tech-456" },
         },
       }
     );
+    expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
   });
 
   it("creates ticket notes using createTicketNote", async () => {
