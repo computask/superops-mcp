@@ -495,7 +495,7 @@ export function getTicketsTools(): DomainTools {
 			const input: Record<string, unknown> = {
 			  subject: params.subject,
 			  client: { accountId: params.clientId },
-			  status: "New",
+			  status: "New Calls",
 			  requestType: "Incident",
 			  source: "FORM",
 			};
