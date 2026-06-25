@@ -12,6 +12,7 @@ import type {
   TicketNote,
   TimeEntry,
   ListInfo,
+  ListInfoInput,
 } from "../types.js";
 import { elicitText } from "../utils/elicitation.js";
 
@@ -49,6 +50,11 @@ const VALID_TICKET_CATEGORIES = [
 ] as const;
 
 const DEFAULT_CREATE_TICKET_STATUS = "New Calls";
+const DEFAULT_RECENT_TICKETS_COUNT = 10;
+const MIN_RECENT_TICKETS_COUNT = 1;
+const MAX_RECENT_TICKETS_COUNT = 50;
+const MAX_RECENT_TICKETS_WITH_CONTENT = 10;
+const DISPLAY_ID_EQUALS_OPERATOR = "is";
 
 const LIST_TICKETS_QUERY = `
   query getTicketList($input: ListInfoInput!) {
@@ -262,11 +268,110 @@ interface AddTimeEntryResponse {
   createWorklogEntries: TimeEntry[];
 }
 
+type SuperOpsClientInstance = ReturnType<typeof getClient>;
+
 function pageInput(max: number | undefined, page?: number) {
   return {
     page: page ?? DEFAULT_LIST_PAGE,
     pageSize: Math.min(max ?? 50, 500),
   };
+}
+
+function clampRecentTicketCount(count: unknown): number {
+  if (typeof count !== "number" || !Number.isFinite(count)) {
+    return DEFAULT_RECENT_TICKETS_COUNT;
+  }
+
+  return Math.min(
+    MAX_RECENT_TICKETS_COUNT,
+    Math.max(MIN_RECENT_TICKETS_COUNT, Math.trunc(count))
+  );
+}
+
+function buildRecentTicketsInput(count: number): ListInfoInput {
+  return {
+    page: 1,
+    pageSize: count,
+    sort: [{ attribute: "createdTime", order: "DESC" }],
+  };
+}
+
+function normaliseTicketNumber(ticketNumber: unknown): string {
+  if (typeof ticketNumber !== "string" && typeof ticketNumber !== "number") {
+    return "";
+  }
+
+  return String(ticketNumber).trim().replace(/^#/, "").trim();
+}
+
+function buildDisplayIdLookupInput(displayId: string): ListInfoInput {
+  return {
+    page: 1,
+    pageSize: 5,
+    condition: {
+      attribute: "displayId",
+      operator: DISPLAY_ID_EQUALS_OPERATOR,
+      value: displayId,
+    },
+  };
+}
+
+async function getTicketByInternalId(
+  client: SuperOpsClientInstance,
+  ticketId: string
+): Promise<Ticket> {
+  const response = await client.query<GetTicketResponse>(GET_TICKET_QUERY, {
+    input: { ticketId },
+  });
+
+  return response.getTicket;
+}
+
+async function getTicketConversations(
+  client: SuperOpsClientInstance,
+  ticketId: string
+): Promise<TicketConversation[]> {
+  const response = await client.query<GetTicketConversationListResponse>(
+    GET_TICKET_CONVERSATION_LIST_QUERY,
+    { input: { ticketId } }
+  );
+
+  return response.getTicketConversationList;
+}
+
+async function getTicketNotes(
+  client: SuperOpsClientInstance,
+  ticketId: string
+): Promise<TicketNote[]> {
+  const response = await client.query<GetTicketNoteListResponse>(
+    GET_TICKET_NOTE_LIST_QUERY,
+    { input: { ticketId } }
+  );
+
+  return response.getTicketNoteList;
+}
+
+async function resolveTicketIdByDisplayId(
+  client: SuperOpsClientInstance,
+  displayId: string
+): Promise<Ticket[]> {
+  const response = await client.query<ListTicketsResponse>(LIST_TICKETS_QUERY, {
+    input: buildDisplayIdLookupInput(displayId),
+  });
+
+  return response.getTicketList.tickets;
+}
+
+async function withTicketContent<T extends Ticket>(
+  client: SuperOpsClientInstance,
+  ticket: T
+): Promise<T & { conversations: TicketConversation[]; notes: TicketNote[] }> {
+  const [conversations, notes] = await Promise.all([
+    getTicketConversations(client, ticket.ticketId),
+    getTicketNotes(client, ticket.ticketId),
+  ]);
+
+  return { ...ticket, conversations, notes };
 }
 
 function jsonRecord(value: unknown): Record<string, unknown> | undefined {
@@ -369,6 +474,27 @@ export function getTicketsTools(): DomainTools {
         },
       },
       {
+        name: "superops_tickets_recent",
+        description:
+          "List the most recently created tickets, sorted by createdTime descending.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            count: {
+              type: "number",
+              description: "Number of recent tickets to return (default: 10, max: 50)",
+              default: DEFAULT_RECENT_TICKETS_COUNT,
+            },
+            includeContent: {
+              type: "boolean",
+              description:
+                "Include ticket conversations and notes. Limited to 10 tickets.",
+              default: false,
+            },
+          },
+        },
+      },
+      {
         name: "superops_tickets_get",
         description: "Get detailed information for a specific ticket by its ID.",
         inputSchema: {
@@ -380,6 +506,26 @@ export function getTicketsTools(): DomainTools {
             },
           },
           required: ["ticketId"],
+        },
+      },
+      {
+        name: "superops_tickets_get_by_number",
+        description:
+          "Get detailed ticket information by visible SuperOps display number, such as 57072 or #57072.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ticketNumber: {
+              oneOf: [{ type: "string" }, { type: "number" }],
+              description: "The visible SuperOps ticket number or display ID",
+            },
+            includeContent: {
+              type: "boolean",
+              description: "Include ticket conversations and notes",
+              default: false,
+            },
+          },
+          required: ["ticketNumber"],
         },
       },
       {
@@ -613,18 +759,103 @@ export function getTicketsTools(): DomainTools {
             };
           }
 
-          case "superops_tickets_get": {
-            const { ticketId } = args as { ticketId: string };
+          case "superops_tickets_recent": {
+            const params = args as { count?: number; includeContent?: boolean };
+            const count = clampRecentTicketCount(params.count);
 
-            const response = await client.query<GetTicketResponse>(GET_TICKET_QUERY, {
-              input: { ticketId },
-            });
+            if (params.includeContent && count > MAX_RECENT_TICKETS_WITH_CONTENT) {
+              return errorResult(
+                `includeContent is limited to ${MAX_RECENT_TICKETS_WITH_CONTENT} tickets. Reduce count before requesting ticket conversations and notes.`
+              );
+            }
+
+            let response: ListTicketsResponse;
+            try {
+              response = await client.query<ListTicketsResponse>(LIST_TICKETS_QUERY, {
+                input: buildRecentTicketsInput(count),
+              });
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              return errorResult(
+                `createdTime sort was rejected by SuperOps while fetching recent tickets: ${message}`
+              );
+            }
+
+            const tickets = params.includeContent
+              ? await Promise.all(
+                  response.getTicketList.tickets.map((ticket) =>
+                    withTicketContent(client, ticket)
+                  )
+                )
+              : response.getTicketList.tickets;
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getTicket, null, 2),
+                  text: JSON.stringify(
+                    { tickets, listInfo: response.getTicketList.listInfo },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+
+          case "superops_tickets_get": {
+            const { ticketId } = args as { ticketId: string };
+
+            const ticket = await getTicketByInternalId(client, ticketId);
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(ticket, null, 2),
+                },
+              ],
+            };
+          }
+
+          case "superops_tickets_get_by_number": {
+            const params = args as {
+              ticketNumber?: string | number;
+              includeContent?: boolean;
+            };
+            const displayId = normaliseTicketNumber(params.ticketNumber);
+
+            if (!displayId) {
+              return errorResult("ticketNumber is required and cannot be empty.");
+            }
+
+            const matches = await resolveTicketIdByDisplayId(client, displayId);
+
+            if (matches.length === 0) {
+              return errorResult(`No ticket was found for display number ${displayId}.`);
+            }
+
+            if (matches.length > 1) {
+              const matchSummary = matches.map((ticket) => ({
+                ticketId: ticket.ticketId,
+                displayId: ticket.displayId,
+                subject: ticket.subject,
+              }));
+              return errorResult(
+                `Display number ${displayId} was not unique. Matching tickets: ${JSON.stringify(matchSummary)}`
+              );
+            }
+
+            const ticket = await getTicketByInternalId(client, matches[0].ticketId);
+            const result = params.includeContent
+              ? await withTicketContent(client, ticket)
+              : ticket;
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(result, null, 2),
                 },
               ],
             };
@@ -633,16 +864,13 @@ export function getTicketsTools(): DomainTools {
           case "superops_tickets_conversation_list": {
             const { ticketId } = args as { ticketId: string };
 
-            const response = await client.query<GetTicketConversationListResponse>(
-              GET_TICKET_CONVERSATION_LIST_QUERY,
-              { input: { ticketId } }
-            );
+            const conversations = await getTicketConversations(client, ticketId);
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getTicketConversationList, null, 2),
+                  text: JSON.stringify(conversations, null, 2),
                 },
               ],
             };
@@ -651,16 +879,13 @@ export function getTicketsTools(): DomainTools {
           case "superops_tickets_notes_list": {
             const { ticketId } = args as { ticketId: string };
 
-            const response = await client.query<GetTicketNoteListResponse>(
-              GET_TICKET_NOTE_LIST_QUERY,
-              { input: { ticketId } }
-            );
+            const notes = await getTicketNotes(client, ticketId);
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getTicketNoteList, null, 2),
+                  text: JSON.stringify(notes, null, 2),
                 },
               ],
             };

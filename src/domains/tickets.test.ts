@@ -67,7 +67,9 @@ describe("Tickets Domain", () => {
 
     expect(domain.tools.map((tool) => tool.name)).toEqual([
       "superops_tickets_list",
+      "superops_tickets_recent",
       "superops_tickets_get",
+      "superops_tickets_get_by_number",
       "superops_tickets_conversation_list",
       "superops_tickets_notes_list",
       "superops_tickets_create",
@@ -108,6 +110,77 @@ describe("Tickets Domain", () => {
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
     expect(result.content[0].text).toContain("Worked ticket");
     expect(result.content[0].text).not.toContain("Closed");
+  });
+
+  it("lists recent tickets with default count and createdTime descending sort", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketList: {
+        tickets: [
+          {
+            ticketId: "ticket-2",
+            displayId: "57072",
+            subject: "Most recent",
+            createdTime: "2026-06-25T10:00:00",
+          },
+        ],
+        listInfo: { page: 1, pageSize: 10, hasMore: false, totalCount: 1 },
+      },
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_recent", {});
+
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining("getTicketList"),
+      {
+        input: {
+          page: 1,
+          pageSize: 10,
+          sort: [{ attribute: "createdTime", order: "DESC" }],
+        },
+      }
+    );
+    expect(result.content[0].text).toContain("Most recent");
+    expect(result.content[0].text).toContain("listInfo");
+  });
+
+  it("clamps recent ticket count to 1..50", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketList: {
+        tickets: [],
+        listInfo: { page: 1, pageSize: 1, hasMore: false, totalCount: 0 },
+      },
+    });
+
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_recent", { count: 0 });
+    expect(mockClient.query.mock.calls[0][1].input.pageSize).toBe(1);
+
+    await domain.handleCall("superops_tickets_recent", { count: 500 });
+    expect(mockClient.query.mock.calls[1][1].input.pageSize).toBe(50);
+  });
+
+  it("returns an error if SuperOps rejects recent createdTime sorting", async () => {
+    mockClient.query.mockRejectedValue(new Error("Cannot sort by createdTime"));
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_recent", { count: 5 });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("createdTime sort was rejected");
+    expect(result.content[0].text).toContain("Cannot sort by createdTime");
+  });
+
+  it("rejects recent ticket content fetches above 10 tickets", async () => {
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_recent", {
+      count: 11,
+      includeContent: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("includeContent is limited to 10 tickets");
+    expect(mockClient.query).not.toHaveBeenCalled();
   });
 
   it("exposes tenant-specific status and category enums", () => {
@@ -176,6 +249,159 @@ describe("Tickets Domain", () => {
       { input: { ticketId: "ticket-123" } }
     );
     expect(result.content[0].text).toContain("Test Issue");
+  });
+
+  it("gets tickets by number after normalising number, string, and hash-prefixed input", async () => {
+    const inputs: Array<string | number> = [57072, "57072", "#57072"];
+    const domain = getTicketsTools();
+
+    for (const ticketNumber of inputs) {
+      mockClient.query
+        .mockResolvedValueOnce({
+          getTicketList: {
+            tickets: [
+              {
+                ticketId: "ticket-57072",
+                displayId: "57072",
+                subject: "Lookup ticket",
+              },
+            ],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        })
+        .mockResolvedValueOnce({
+          getTicket: {
+            ticketId: "ticket-57072",
+            displayId: "57072",
+            subject: "Lookup ticket detail",
+          },
+        });
+
+      const result = await domain.handleCall("superops_tickets_get_by_number", {
+        ticketNumber,
+      });
+
+      expect(mockClient.query.mock.calls[0][0]).toContain("getTicketList");
+      expect(mockClient.query.mock.calls[0][1]).toEqual({
+        input: {
+          page: 1,
+          pageSize: 5,
+          condition: {
+            attribute: "displayId",
+            operator: "is",
+            value: "57072",
+          },
+        },
+      });
+      expect(mockClient.query.mock.calls[1][0]).toContain("getTicket");
+      expect(mockClient.query.mock.calls[1][1]).toEqual({
+        input: { ticketId: "ticket-57072" },
+      });
+      expect(result.content[0].text).toContain("Lookup ticket detail");
+
+      mockClient.query.mockClear();
+    }
+  });
+
+  it("returns an error when ticket number lookup finds no match", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketList: {
+        tickets: [],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 0 },
+      },
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_get_by_number", {
+      ticketNumber: "#57072",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("No ticket was found");
+    expect(result.content[0].text).toContain("57072");
+  });
+
+  it("returns an error when ticket number lookup is not unique", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketList: {
+        tickets: [
+          { ticketId: "ticket-1", displayId: "57072", subject: "First match" },
+          { ticketId: "ticket-2", displayId: "57072", subject: "Second match" },
+        ],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 2 },
+      },
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_get_by_number", {
+      ticketNumber: "57072",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("not unique");
+    expect(result.content[0].text).toContain("ticket-1");
+    expect(result.content[0].text).toContain("ticket-2");
+  });
+
+  it("includes conversations and notes when getting a ticket by number with content", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [
+            {
+              ticketId: "ticket-57072",
+              displayId: "57072",
+              subject: "Lookup ticket",
+            },
+          ],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57072",
+          displayId: "57072",
+          subject: "Lookup ticket detail",
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicketConversationList: [
+          {
+            conversationId: "conversation-1",
+            content: "Customer message",
+            time: "2026-06-25T10:00:00",
+            type: "REQ_REPLY",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        getTicketNoteList: [
+          {
+            noteId: "note-1",
+            addedOn: "2026-06-25T10:05:00",
+            content: "Internal note",
+          },
+        ],
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_get_by_number", {
+      ticketNumber: "#57072",
+      includeContent: true,
+    });
+
+    expect(mockClient.query.mock.calls[2][0]).toContain("getTicketConversationList");
+    expect(mockClient.query.mock.calls[2][1]).toEqual({
+      input: { ticketId: "ticket-57072" },
+    });
+    expect(mockClient.query.mock.calls[3][0]).toContain("getTicketNoteList");
+    expect(mockClient.query.mock.calls[3][1]).toEqual({
+      input: { ticketId: "ticket-57072" },
+    });
+    expect(result.content[0].text).toContain("conversations");
+    expect(result.content[0].text).toContain("notes");
+    expect(result.content[0].text).toContain("Customer message");
+    expect(result.content[0].text).toContain("Internal note");
   });
 
   it("lists ticket conversations using documented TicketIdentifierInput", async () => {

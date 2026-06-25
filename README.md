@@ -89,7 +89,9 @@ Add to your `claude_desktop_config.json`:
 ### Tickets Domain
 
 - `superops_tickets_list` - List tickets with filters
+- `superops_tickets_recent` - List the most recently created tickets, optionally with conversations and notes
 - `superops_tickets_get` - Get ticket details
+- `superops_tickets_get_by_number` - Get ticket details by visible SuperOps ticket number/display ID
 - `superops_tickets_conversation_list` - Read customer ticket conversations/replies, including attachment metadata where returned by SuperOps
 - `superops_tickets_notes_list` - Read public/internal ticket notes, including attachment metadata where returned by SuperOps
 - `superops_tickets_create` - Create a new ticket
