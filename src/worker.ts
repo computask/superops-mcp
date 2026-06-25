@@ -32,6 +32,13 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { runWithCredentials } from "./client.js";
 import { createMcpServer, resolveGatewayCredentials } from "./mcp-server.js";
 import type { SuperOpsCredentials } from "./types.js";
+import {
+  auditToolCall,
+  customGraphqlAuditMetadata,
+  requestIdFromHeaders,
+  runWithAuditContext,
+  runtimeFlagsFromEnv,
+} from "./audit.js";
 
 export interface Env {
   SUPEROPS_API_TOKEN?: string;
@@ -39,6 +46,9 @@ export interface Env {
   SUPEROPS_REGION?: string;
   AUTH_MODE?: string;
   LOG_LEVEL?: string;
+  MCP_ENABLED?: string;
+  ENABLE_WRITE_TOOLS?: string;
+  ENABLE_CUSTOM_MUTATION?: string;
   OAUTH_KV?: unknown;
   OAUTH_PROVIDER?: unknown;
   CHATGPT_MCP_HOST?: string;
@@ -145,6 +155,31 @@ function ensureExecutionContext(
   );
 }
 
+function userFromOAuthProps(props: unknown): string | undefined {
+  if (typeof props !== "object" || props === null || Array.isArray(props)) {
+    return undefined;
+  }
+
+  const email = (props as { email?: unknown }).email;
+  return typeof email === "string" && email.trim() ? email.trim() : undefined;
+}
+
+function runWithWorkerAuditContext<T>(
+  request: Request,
+  env: Env,
+  props: unknown,
+  fn: () => T
+): T {
+  return runWithAuditContext(
+    {
+      requestId: requestIdFromHeaders(request.headers),
+      user: userFromOAuthProps(props),
+      ...runtimeFlagsFromEnv(env),
+    },
+    fn
+  );
+}
+
 function parseScopes(
   value: string | undefined,
   fallback: string[]
@@ -233,6 +268,17 @@ async function rejectBlockedChatGptToolCall(
     return undefined;
   }
 
+  const toolArgs = ((params as { arguments?: unknown }).arguments ??
+    {}) as Record<string, unknown>;
+  const message = `${toolName} is disabled on the ChatGPT direct route until write and broad-query tools are reviewed.`;
+  auditToolCall({
+    toolName,
+    success: false,
+    durationMs: 0,
+    errorSummary: message,
+    metadata: customGraphqlAuditMetadata(toolName, toolArgs),
+  });
+
   const id = (body as { id?: unknown }).id ?? null;
   return json({
     jsonrpc: "2.0",
@@ -241,7 +287,7 @@ async function rejectBlockedChatGptToolCall(
       content: [
         {
           type: "text",
-          text: `${toolName} is disabled on the ChatGPT direct route until write and broad-query tools are reviewed.`,
+          text: message,
         },
       ],
       isError: true,
@@ -435,7 +481,9 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
 
 async function handleBaseWorkerFetch(
   request: Request,
-  env: Env
+  env: Env,
+  props?: unknown,
+  auditContextApplied = false
 ): Promise<Response> {
   const url = new URL(request.url);
 
@@ -455,6 +503,7 @@ async function handleBaseWorkerFetch(
   }
 
   if (url.pathname === "/mcp") {
+    const runMcpRequest = async (): Promise<Response> => {
     const isGatewayMode = (env.AUTH_MODE ?? "env") === "gateway";
 
     let creds: SuperOpsCredentials | undefined;
@@ -488,30 +537,47 @@ async function handleBaseWorkerFetch(
       return runWithCredentials(creds, () => handleMcp(request));
     }
     return handleMcp(request);
+    };
+
+    if (auditContextApplied) {
+      return runMcpRequest();
+    }
+
+    return runWithWorkerAuditContext(request, env, props, runMcpRequest);
   }
 
   return json({ error: "Not found", endpoints: ["/mcp", "/health"] }, 404);
 }
 
 const chatGptMcpApiHandler = {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const blockedToolCall = await rejectBlockedChatGptToolCall(request, env);
-    if (blockedToolCall) {
-      return blockedToolCall;
-    }
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx?: WorkerExecutionContext
+  ): Promise<Response> {
+    return runWithWorkerAuditContext(request, env, ctx?.props, async () => {
+      const blockedToolCall = await rejectBlockedChatGptToolCall(request, env);
+      if (blockedToolCall) {
+        return blockedToolCall;
+      }
 
-    return handleBaseWorkerFetch(request, env);
+      return handleBaseWorkerFetch(request, env, ctx?.props, true);
+    });
   },
 };
 
 const chatGptDefaultHandler = {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx?: WorkerExecutionContext
+  ): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/authorize") {
       return handleAuthorize(request, env);
     }
 
-    return handleBaseWorkerFetch(request, env);
+    return handleBaseWorkerFetch(request, env, ctx?.props);
   },
 };
 
@@ -561,6 +627,6 @@ export default {
       );
     }
 
-    return handleBaseWorkerFetch(request, env);
+    return handleBaseWorkerFetch(request, env, ctx?.props);
   },
 };

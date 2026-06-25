@@ -245,7 +245,7 @@ describe("Tool Discovery and Management", () => {
         content: [
           {
             type: "text",
-            text: "Error: No API credentials configured. Please set SUPEROPS_API_TOKEN and SUPEROPS_SUBDOMAIN environment variables.",
+            text: "Error: SuperOps API credentials are not configured.",
           },
         ],
         isError: true,
@@ -253,7 +253,7 @@ describe("Tool Discovery and Management", () => {
 
       expect(errorResponse.isError).toBe(true);
       expect(errorResponse.content[0].type).toBe("text");
-      expect(errorResponse.content[0].text).toContain("SUPEROPS_API_TOKEN");
+      expect(errorResponse.content[0].text).toContain("credentials");
     });
 
     it("formats invalid domain error correctly", () => {

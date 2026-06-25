@@ -141,7 +141,7 @@ export function getClient(): SuperOpsClient {
     const creds = getCredentials();
     if (!creds) {
       throw new Error(
-        "SuperOps credentials not configured. Set SUPEROPS_API_TOKEN and SUPEROPS_SUBDOMAIN environment variables."
+        "SuperOps credentials not configured. Set the required SuperOps API token and subdomain configuration."
       );
     }
     _client = new SuperOpsClient(creds);

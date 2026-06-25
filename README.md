@@ -39,10 +39,12 @@ npm install @wyre-technology/superops-mcp
 Set the following environment variables:
 
 ```bash
-export SUPEROPS_API_TOKEN="your-api-token"
 export SUPEROPS_SUBDOMAIN="yourcompany"
 export SUPEROPS_REGION="us"  # or "eu" for EU region
 ```
+
+Configure the SuperOps API token as a secret in your runtime or Worker platform.
+Never commit token values or put them in examples, logs, headers, or responses.
 
 ### Getting Your API Token
 
@@ -63,7 +65,6 @@ Add to your `claude_desktop_config.json`:
       "command": "npx",
       "args": ["@wyre-technology/superops-mcp"],
       "env": {
-        "SUPEROPS_API_TOKEN": "your-api-token",
         "SUPEROPS_SUBDOMAIN": "yourcompany",
         "SUPEROPS_REGION": "us"
       }
@@ -71,6 +72,69 @@ Add to your `claude_desktop_config.json`:
   }
 }
 ```
+
+Provide the SuperOps API token through your MCP client's secure secret/env
+mechanism rather than committing it to this file.
+
+## Cloudflare Worker Deployment Notes
+
+- Worker name: `superops-mcp`
+- MCP endpoint: `https://<your-mcp-host>/mcp`
+- Health endpoint: `https://<your-mcp-host>/health`
+- Required non-secret vars: `AUTH_MODE=env`, `SUPEROPS_SUBDOMAIN=computaskltd`, `SUPEROPS_REGION=us`, `LOG_LEVEL=warn`
+- Optional non-secret safety vars: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=true`, `ENABLE_CUSTOM_MUTATION=true`
+- Required secrets: the SuperOps API token Worker secret, plus any OAuth/session secrets required by the deployed auth provider
+- Never commit: API token values, OAuth access/refresh tokens, bearer tokens, Cloudflare service token values, client secrets, private keys, or full request headers
+
+Safe local validation:
+
+```bash
+npm test
+npm run build
+```
+
+Safe deployed smoke tools:
+
+- `superops_status`
+- `superops_test_connection`
+- `superops_clients_list`
+- `superops_tickets_list`
+- `superops_assets_list`
+- `superops_technicians_list`
+
+Write-capable tools remain enabled by default:
+
+- `superops_tickets_create`
+- `superops_tickets_update`
+- `superops_tickets_add_note`
+- `superops_tickets_log_time`
+- `superops_custom_mutation`
+
+`superops_custom_mutation` is the highest-risk tool because it accepts custom
+GraphQL mutation text. Audit logs record only safe metadata for custom GraphQL:
+operation type, operation name when parseable, and variable key names. Full
+GraphQL bodies and variable values are not logged by default.
+
+Audit logs are structured JSON records emitted for MCP tool calls. They include
+timestamp, request/correlation ID, tool name, user identity when available from
+the auth layer, tool category, high-risk marker, success/failure, duration, and
+a sanitised error summary on failure.
+
+Emergency disable process:
+
+- Set `MCP_ENABLED=false` to stop MCP tool execution.
+- Set `ENABLE_WRITE_TOOLS=false` to block ticket write tools.
+- Set `ENABLE_CUSTOM_MUTATION=false` to block custom GraphQL mutations.
+- Re-run the deployment pipeline after changing Worker vars, then verify `/health` and `superops_status`.
+
+Token rotation plan:
+
+1. Generate a replacement SuperOps API token in SuperOps.
+2. Update the existing Cloudflare Worker secret value.
+3. Redeploy or restart using the normal deployment process.
+4. Run safe smoke tests.
+5. Revoke the old SuperOps token.
+6. Review audit logs for unexpected failed calls after rotation.
 
 ## Available Domains & Tools
 

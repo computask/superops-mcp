@@ -19,6 +19,15 @@ import {
 import type { Domain, DomainTools, ToolDefinition } from "./types.js";
 import { getCredentials } from "./client.js";
 import { setServerRef } from "./utils/server-ref.js";
+import {
+  auditToolCall,
+  blockedToolReason,
+  customGraphqlAuditMetadata,
+  errorSummaryFromResult,
+  sanitizeError,
+  sanitizeToolResult,
+  type ToolResult,
+} from "./audit.js";
 
 // Lazy-loaded domain modules
 const domainCache = new Map<Domain, DomainTools>();
@@ -180,6 +189,155 @@ export function resolveGatewayCredentials(
   return { creds: { apiToken, subdomain } };
 }
 
+function errorResult(message: string): ToolResult {
+  return {
+    content: [{ type: "text", text: `Error: ${message}` }],
+    isError: true,
+  };
+}
+
+async function executeToolCall(
+  name: string,
+  args: Record<string, unknown>
+): Promise<ToolResult> {
+  const blockedReason = blockedToolReason(name);
+  if (blockedReason) {
+    return errorResult(blockedReason);
+  }
+
+  // Handle test connection
+  if (name === "superops_test_connection") {
+    const creds = getCredentials();
+    if (!creds) {
+      return errorResult("SuperOps API credentials are not configured.");
+    }
+
+    try {
+      const clientsTools = await loadDomain("clients");
+      const result = await clientsTools.handleCall("superops_clients_list", {
+        max: 1,
+      });
+
+      if (result.isError) {
+        return result;
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Connection successful!\n\nCredentials configured for:\n- Subdomain: ${creds.subdomain}\n- Region: ${creds.region ?? "us"}\n\nAPI is responding correctly.`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Connection test failed: ${sanitizeError(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  // Handle navigation / discovery helper
+  if (name === "superops_navigate") {
+    const { domain } = args as { domain?: string };
+    const validDomains: Domain[] = [
+      "clients",
+      "tickets",
+      "assets",
+      "technicians",
+      "custom",
+    ];
+
+    if (!domain || !validDomains.includes(domain as Domain)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Invalid domain. Please choose from: ${validDomains.join(", ")}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const domainTools = await loadDomain(domain as Domain);
+    const toolSummary = domainTools.tools
+      .map((t) => `- ${t.name}: ${t.description}`)
+      .join("\n");
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${domainDescriptions[domain as Domain]}\n\nAvailable tools:\n${toolSummary}\n\nYou can call any of these tools directly.`,
+        },
+      ],
+    };
+  }
+
+  // Handle status
+  if (name === "superops_status") {
+    const creds = getCredentials();
+    const credStatus = creds
+      ? `Configured (subdomain: ${creds.subdomain}, region: ${creds.region ?? "us"})`
+      : "NOT CONFIGURED - SuperOps API credentials are required";
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `SuperOps.ai MCP Server Status\n\nCredentials: ${credStatus}\nAvailable domains: ${Object.keys(domainDescriptions).join(", ")}\n\nAll tools are available at all times. Use superops_navigate to discover tools by domain.`,
+        },
+      ],
+    };
+  }
+
+  // Check for credential issues before domain calls
+  const creds = getCredentials();
+  if (!creds) {
+    return errorResult("SuperOps API credentials are not configured.");
+  }
+
+  // Route to appropriate domain handler based on tool name prefix
+  if (name.startsWith("superops_clients_")) {
+    const domainTools = await loadDomain("clients");
+    return domainTools.handleCall(name, args);
+  }
+  if (name.startsWith("superops_tickets_")) {
+    const domainTools = await loadDomain("tickets");
+    return domainTools.handleCall(name, args);
+  }
+  if (name.startsWith("superops_assets_")) {
+    const domainTools = await loadDomain("assets");
+    return domainTools.handleCall(name, args);
+  }
+  if (name.startsWith("superops_technicians_")) {
+    const domainTools = await loadDomain("technicians");
+    return domainTools.handleCall(name, args);
+  }
+  if (name.startsWith("superops_custom_")) {
+    const domainTools = await loadDomain("custom");
+    return domainTools.handleCall(name, args);
+  }
+
+  // Unknown tool
+  return {
+    content: [
+      {
+        type: "text",
+        text: `Unknown tool: ${name}. Use superops_navigate to discover available tools by domain.`,
+      },
+    ],
+    isError: true,
+  };
+}
+
 /**
  * Create and configure an MCP Server instance with all request handlers.
  * Called once for stdio, or per-request for HTTP / Workers transports.
@@ -208,158 +366,32 @@ export function createMcpServer(): Server {
 
   // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
+    const { name } = request.params;
+    const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+    const started = Date.now();
+    const metadata = customGraphqlAuditMetadata(name, args);
 
-    // Handle test connection
-    if (name === "superops_test_connection") {
-      const creds = getCredentials();
-      if (!creds) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: No API credentials configured. Please set SUPEROPS_API_TOKEN and SUPEROPS_SUBDOMAIN environment variables.",
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      try {
-        const clientsTools = await loadDomain("clients");
-        const result = await clientsTools.handleCall("superops_clients_list", {
-          max: 1,
-        });
-
-        if (result.isError) {
-          return result;
-        }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Connection successful!\n\nCredentials configured for:\n- Subdomain: ${creds.subdomain}\n- Region: ${creds.region ?? "us"}\n\nAPI is responding correctly.`,
-            },
-          ],
-        };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Connection test failed: ${message}`,
-            },
-          ],
-          isError: true,
-        };
-      }
+    try {
+      const result = sanitizeToolResult(await executeToolCall(name, args));
+      auditToolCall({
+        toolName: name,
+        success: !result.isError,
+        durationMs: Date.now() - started,
+        errorSummary: errorSummaryFromResult(result),
+        metadata,
+      });
+      return result as never;
+    } catch (error) {
+      const result = errorResult(sanitizeError(error));
+      auditToolCall({
+        toolName: name,
+        success: false,
+        durationMs: Date.now() - started,
+        errorSummary: errorSummaryFromResult(result),
+        metadata,
+      });
+      return result as never;
     }
-
-    // Handle navigation / discovery helper
-    if (name === "superops_navigate") {
-      const { domain } = (args ?? {}) as { domain?: string };
-      const validDomains: Domain[] = [
-        "clients",
-        "tickets",
-        "assets",
-        "technicians",
-        "custom",
-      ];
-
-      if (!domain || !validDomains.includes(domain as Domain)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Invalid domain. Please choose from: ${validDomains.join(", ")}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      const domainTools = await loadDomain(domain as Domain);
-      const toolSummary = domainTools.tools
-        .map((t) => `- ${t.name}: ${t.description}`)
-        .join("\n");
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `${domainDescriptions[domain as Domain]}\n\nAvailable tools:\n${toolSummary}\n\nYou can call any of these tools directly.`,
-          },
-        ],
-      };
-    }
-
-    // Handle status
-    if (name === "superops_status") {
-      const creds = getCredentials();
-      const credStatus = creds
-        ? `Configured (subdomain: ${creds.subdomain}, region: ${creds.region ?? "us"})`
-        : "NOT CONFIGURED - Please set SUPEROPS_API_TOKEN and SUPEROPS_SUBDOMAIN environment variables";
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `SuperOps.ai MCP Server Status\n\nCredentials: ${credStatus}\nAvailable domains: ${Object.keys(domainDescriptions).join(", ")}\n\nAll tools are available at all times. Use superops_navigate to discover tools by domain.`,
-          },
-        ],
-      };
-    }
-
-    // Check for credential issues before domain calls
-    const creds = getCredentials();
-    if (!creds) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Error: No API credentials configured. Please set SUPEROPS_API_TOKEN and SUPEROPS_SUBDOMAIN environment variables.",
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    // Route to appropriate domain handler based on tool name prefix
-    const toolArgs = (args ?? {}) as Record<string, unknown>;
-
-    if (name.startsWith("superops_clients_")) {
-      const domainTools = await loadDomain("clients");
-      return domainTools.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("superops_tickets_")) {
-      const domainTools = await loadDomain("tickets");
-      return domainTools.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("superops_assets_")) {
-      const domainTools = await loadDomain("assets");
-      return domainTools.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("superops_technicians_")) {
-      const domainTools = await loadDomain("technicians");
-      return domainTools.handleCall(name, toolArgs);
-    }
-    if (name.startsWith("superops_custom_")) {
-      const domainTools = await loadDomain("custom");
-      return domainTools.handleCall(name, toolArgs);
-    }
-
-    // Unknown tool
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Unknown tool: ${name}. Use superops_navigate to discover available tools by domain.`,
-        },
-      ],
-      isError: true,
-    };
   });
 
   return server;

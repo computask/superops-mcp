@@ -20,12 +20,15 @@
 		"SUPEROPS_SUBDOMAIN": "computaskltd",
 		"SUPEROPS_REGION": "us",
 		"LOG_LEVEL": "warn",
+		"MCP_ENABLED": "true",
+		"ENABLE_WRITE_TOOLS": "true",
+		"ENABLE_CUSTOM_MUTATION": "true",
 		"CHATGPT_MCP_HOST": "superops-mcp-chatgpt-direct.taskgroup.co.uk",
 		"CHATGPT_MCP_RESOURCE": "https://superops-mcp-chatgpt-direct.taskgroup.co.uk/mcp",
 		"CHATGPT_OAUTH_SCOPES": "superops.read",
 		"CHATGPT_AUTH_ALLOWED_EMAIL": "sam@computask.co.uk",
 		"CHATGPT_AUTH_ACCESS_ISSUER": "https://super-bar-5ae4.cloudflareaccess.com",
 		"CHATGPT_AUTH_ACCESS_AUD": "9e9e3c95cfb18bbfacfd7e8cc0ceb1a971fc61a382d4c839780f32f18cde1bf2",
-		"CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS": "false"
+		"CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS": "true"
 	}
 }

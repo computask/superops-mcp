@@ -163,6 +163,21 @@ async function mcp(
   );
 }
 
+function auditRecords(spy: { mock: { calls: unknown[][] } }) {
+  return spy.mock.calls
+    .map(([line]) => {
+      try {
+        return JSON.parse(String(line)) as Record<string, unknown>;
+      } catch {
+        return undefined;
+      }
+    })
+    .filter(
+      (record): record is Record<string, unknown> =>
+        record?.event === "mcp.tool_call"
+    );
+}
+
 async function cloudflareAccessJwt(email = ALLOWED_EMAIL): Promise<string> {
   return new SignJWT({ email })
     .setProtectedHeader({ alg: "RS256", kid: "access-test-key" })
@@ -390,6 +405,188 @@ describe("Cloudflare Worker entrypoint", () => {
     };
     expect(body.result?.isError).toBe(true);
     expect(body.result?.content?.[0]?.text).toMatch(/credential/i);
+  });
+
+  it("emits a safe structured audit log for a successful tool call", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 31,
+          method: "tools/call",
+          params: { name: "superops_status", arguments: {} },
+        },
+        {
+          SUPEROPS_API_TOKEN: "test-token",
+          SUPEROPS_SUBDOMAIN: "computaskltd",
+          SUPEROPS_REGION: "us",
+        },
+        { "X-Request-Id": "audit-success-1" }
+      );
+
+      expect(res.status).toBe(200);
+      const records = auditRecords(logSpy);
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        event: "mcp.tool_call",
+        requestId: "audit-success-1",
+        toolName: "superops_status",
+        toolCategory: "read",
+        highRisk: false,
+        success: true,
+      });
+      expect(records[0].timestamp).toEqual(expect.any(String));
+      expect(records[0].durationMs).toEqual(expect.any(Number));
+      expect(JSON.stringify(records[0])).not.toContain("test-token");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("emits a safe audit log and sanitized response for a failed tool call", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 32,
+          method: "tools/call",
+          params: { name: "superops_tickets_list", arguments: {} },
+        },
+        {},
+        { "X-Request-Id": "audit-failure-1" }
+      );
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: { text?: string }[] };
+      };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toContain("credentials");
+      expect(body.result?.content?.[0]?.text).not.toContain("SUPEROPS_API_TOKEN");
+      expect(body.result?.content?.[0]?.text).not.toContain(" at ");
+
+      const records = auditRecords(logSpy);
+      expect(records[0]).toMatchObject({
+        requestId: "audit-failure-1",
+        toolName: "superops_tickets_list",
+        success: false,
+      });
+      expect(String(records[0].errorSummary)).toContain("credentials");
+      expect(JSON.stringify(records[0])).not.toContain("SUPEROPS_API_TOKEN");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("marks write-capable tools as high-risk when they are blocked by flag", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 33,
+          method: "tools/call",
+          params: {
+            name: "superops_tickets_create",
+            arguments: { subject: "Test", clientId: "client-1" },
+          },
+        },
+        { ENABLE_WRITE_TOOLS: "false" },
+        { "X-Request-Id": "audit-write-blocked-1" }
+      );
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: { text?: string }[] };
+      };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toContain("ENABLE_WRITE_TOOLS=false");
+
+      const records = auditRecords(logSpy);
+      expect(records[0]).toMatchObject({
+        toolName: "superops_tickets_create",
+        toolCategory: "write",
+        highRisk: true,
+        success: false,
+      });
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("does not audit full custom mutation bodies or variable values", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 34,
+          method: "tools/call",
+          params: {
+            name: "superops_custom_mutation",
+            arguments: {
+              mutation:
+                "mutation RotateToken($secretValue: String!) { rotateToken(secretValue: $secretValue) { id } }",
+              variables: {
+                secretValue: "do-not-log-this-value",
+                ticketId: "ticket-1",
+              },
+            },
+          },
+        },
+        { ENABLE_CUSTOM_MUTATION: "false" },
+        { "X-Request-Id": "audit-custom-blocked-1" }
+      );
+
+      expect(res.status).toBe(200);
+      const records = auditRecords(logSpy);
+      const serialized = JSON.stringify(records[0]);
+      expect(records[0]).toMatchObject({
+        toolName: "superops_custom_mutation",
+        toolCategory: "custom_mutation",
+        highRisk: true,
+        success: false,
+        customGraphql: {
+          operationType: "mutation",
+          operationName: "RotateToken",
+          variableKeys: ["secretValue", "ticketId"],
+        },
+      });
+      expect(serialized).not.toContain("rotateToken(secretValue");
+      expect(serialized).not.toContain("do-not-log-this-value");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("preserves tool execution by default but blocks it when MCP_ENABLED is false", async () => {
+    const defaultRes = await mcp({
+      jsonrpc: "2.0",
+      id: 35,
+      method: "tools/call",
+      params: { name: "superops_status", arguments: {} },
+    });
+    const defaultBody = (await defaultRes.json()) as {
+      result?: { isError?: boolean; content?: { text?: string }[] };
+    };
+    expect(defaultBody.result?.isError).toBeUndefined();
+
+    const disabledRes = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 36,
+        method: "tools/call",
+        params: { name: "superops_status", arguments: {} },
+      },
+      { MCP_ENABLED: "false" }
+    );
+    const disabledBody = (await disabledRes.json()) as {
+      result?: { isError?: boolean; content?: { text?: string }[] };
+    };
+    expect(disabledBody.result?.isError).toBe(true);
+    expect(disabledBody.result?.content?.[0]?.text).toContain("MCP_ENABLED=false");
   });
 
   it("rejects /mcp in gateway mode without credential headers", async () => {

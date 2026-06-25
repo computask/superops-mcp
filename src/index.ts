@@ -23,13 +23,16 @@
  *   - Header: X-SuperOps-Subdomain
  *
  * Environment Variables:
- * - SUPEROPS_API_TOKEN: Your SuperOps.ai API token
+ * - SuperOps API token secret: Your SuperOps.ai API token
  * - SUPEROPS_SUBDOMAIN: Your SuperOps.ai subdomain
  * - SUPEROPS_REGION: API region (us or eu, default: us)
  * - MCP_TRANSPORT: Transport mode (stdio or http, default: stdio)
  * - MCP_HTTP_PORT: HTTP port (default: 8080)
  * - MCP_HTTP_HOST: HTTP host (default: 0.0.0.0)
  * - AUTH_MODE: Authentication mode (env or gateway, default: env)
+ * - MCP_ENABLED: Set false to disable MCP tool execution
+ * - ENABLE_WRITE_TOOLS: Set false to block write-capable ticket tools
+ * - ENABLE_CUSTOM_MUTATION: Set false to block custom GraphQL mutations
  */
 
 import {
@@ -43,6 +46,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 import { getCredentials, runWithCredentials } from "./client.js";
 import { createMcpServer } from "./mcp-server.js";
+import { runWithAuditContext, runtimeFlagsFromEnv } from "./audit.js";
 
 /**
  * Start the server with stdio transport (default).
@@ -65,6 +69,13 @@ async function startHttpTransport(): Promise<void> {
   const port = parseInt(process.env.MCP_HTTP_PORT || "8080", 10);
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
   const isGatewayMode = process.env.AUTH_MODE === "gateway";
+  const requestId = (req: IncomingMessage): string => {
+    const value = req.headers["x-request-id"];
+    if (Array.isArray(value)) {
+      return value[0] || randomUUID();
+    }
+    return value || randomUUID();
+  };
 
   const httpServer = createHttpServer(
     async (req: IncomingMessage, res: ServerResponse) => {
@@ -96,33 +107,56 @@ async function startHttpTransport(): Promise<void> {
 
       // MCP endpoint - each request gets a fresh server + transport
       if (url.pathname === "/mcp") {
-        // Gateway mode: extract credentials from headers
-        if (isGatewayMode) {
-          const apiToken = req.headers["x-superops-api-token"] as
-            | string
-            | undefined;
-          const subdomain = req.headers["x-superops-subdomain"] as
-            | string
-            | undefined;
+        await runWithAuditContext(
+          {
+            requestId: requestId(req),
+            ...runtimeFlagsFromEnv({
+              MCP_ENABLED: process.env.MCP_ENABLED,
+              ENABLE_WRITE_TOOLS: process.env.ENABLE_WRITE_TOOLS,
+              ENABLE_CUSTOM_MUTATION: process.env.ENABLE_CUSTOM_MUTATION,
+            }),
+          },
+          async () => {
+            // Gateway mode: extract credentials from headers
+            if (isGatewayMode) {
+              const apiToken = req.headers["x-superops-api-token"] as
+                | string
+                | undefined;
+              const subdomain = req.headers["x-superops-subdomain"] as
+                | string
+                | undefined;
 
-          if (!apiToken || !subdomain) {
-            res.writeHead(401, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({
-                error: "Missing credentials",
-                message:
-                  "Gateway mode requires X-SuperOps-API-Token and X-SuperOps-Subdomain headers",
-                required: ["X-SuperOps-API-Token", "X-SuperOps-Subdomain"],
-              })
-            );
-            return;
-          }
+              if (!apiToken || !subdomain) {
+                res.writeHead(401, { "Content-Type": "application/json" });
+                res.end(
+                  JSON.stringify({
+                    error: "Missing credentials",
+                    message:
+                      "Gateway mode requires X-SuperOps-API-Token and X-SuperOps-Subdomain headers",
+                    required: ["X-SuperOps-API-Token", "X-SuperOps-Subdomain"],
+                  })
+                );
+                return;
+              }
 
-          const creds = { apiToken, subdomain };
+              const creds = { apiToken, subdomain };
 
-          // Run the entire MCP request inside AsyncLocalStorage context
-          // so getCredentials()/getClient() pick up per-request creds
-          await runWithCredentials(creds, async () => {
+              // Run the entire MCP request inside AsyncLocalStorage context
+              // so getCredentials()/getClient() pick up per-request creds
+              await runWithCredentials(creds, async () => {
+                const perRequestServer = createMcpServer();
+                const transport = new StreamableHTTPServerTransport({
+                  sessionIdGenerator: () => randomUUID(),
+                  enableJsonResponse: true,
+                });
+                await perRequestServer.connect(transport);
+                await transport.handleRequest(req, res);
+                await perRequestServer.close();
+              });
+              return;
+            }
+
+            // Non-gateway mode: single server, env-var credentials
             const perRequestServer = createMcpServer();
             const transport = new StreamableHTTPServerTransport({
               sessionIdGenerator: () => randomUUID(),
@@ -131,19 +165,8 @@ async function startHttpTransport(): Promise<void> {
             await perRequestServer.connect(transport);
             await transport.handleRequest(req, res);
             await perRequestServer.close();
-          });
-          return;
-        }
-
-        // Non-gateway mode: single server, env-var credentials
-        const perRequestServer = createMcpServer();
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          enableJsonResponse: true,
-        });
-        await perRequestServer.connect(transport);
-        await transport.handleRequest(req, res);
-        await perRequestServer.close();
+          }
+        );
         return;
       }
 
@@ -167,7 +190,7 @@ async function startHttpTransport(): Promise<void> {
         `Health check available at http://${host}:${port}/health`
       );
       console.error(
-        `Authentication mode: ${isGatewayMode ? "gateway (X-SuperOps-API-Token + X-SuperOps-Subdomain headers)" : "env (SUPEROPS_API_TOKEN + SUPEROPS_SUBDOMAIN environment variables)"}`
+        `Authentication mode: ${isGatewayMode ? "gateway credentials from request headers" : "env credentials from configured runtime"}`
       );
       resolve();
     });
