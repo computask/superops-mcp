@@ -6,7 +6,8 @@
  * transport the Worker uses in production.
  */
 
-import { describe, it, expect } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import worker, { type Env } from "./worker.js";
 
 const MCP_HEADERS = {
@@ -14,13 +15,146 @@ const MCP_HEADERS = {
   "Content-Type": "application/json",
 };
 
+const DIRECT_HOST = "superops-mcp-chatgpt-direct.taskgroup.co.uk";
+const INTERNAL_HOST = "superops-mcp-tg110626.taskgroup.co.uk";
+const MCP_RESOURCE = `https://${DIRECT_HOST}/mcp`;
+const AUTH_SERVER = `https://${DIRECT_HOST}`;
+const ACCESS_ISSUER = "https://computask.cloudflareaccess.test";
+const ACCESS_AUD = "test-access-aud";
+const ALLOWED_EMAIL = "sam@computask.co.uk";
+const CHATGPT_REDIRECT_URI = "https://chatgpt.com/connector/oauth/callback";
+
+type MemoryKvEntry = {
+  value: string;
+  expiresAt?: number;
+};
+
+type MemoryKvGetOptions = {
+  type?: "text" | "json" | "arrayBuffer";
+};
+
+type MemoryKvPutOptions = {
+  expiration?: number;
+  expirationTtl?: number;
+};
+
+type MemoryKvListOptions = {
+  prefix?: string;
+  limit?: number;
+  cursor?: string;
+};
+
+function createMemoryKv() {
+  const store = new Map<string, MemoryKvEntry>();
+  const now = () => Math.floor(Date.now() / 1000);
+
+  function getLiveEntry(key: string): MemoryKvEntry | undefined {
+    const entry = store.get(key);
+    if (!entry) {
+      return undefined;
+    }
+
+    if (entry.expiresAt !== undefined && entry.expiresAt <= now()) {
+      store.delete(key);
+      return undefined;
+    }
+
+    return entry;
+  }
+
+  return {
+    async get(key: string, options?: MemoryKvGetOptions): Promise<unknown> {
+      const entry = getLiveEntry(key);
+      if (!entry) {
+        return null;
+      }
+
+      if (options?.type === "json") {
+        return JSON.parse(entry.value);
+      }
+      if (options?.type === "arrayBuffer") {
+        return new TextEncoder().encode(entry.value).buffer;
+      }
+      return entry.value;
+    },
+
+    async put(
+      key: string,
+      value: string | ArrayBuffer,
+      options?: MemoryKvPutOptions
+    ): Promise<void> {
+      const text =
+        typeof value === "string"
+          ? value
+          : new TextDecoder().decode(new Uint8Array(value));
+
+      const expiresAt =
+        typeof options?.expiration === "number"
+          ? options.expiration
+          : typeof options?.expirationTtl === "number"
+            ? now() + options.expirationTtl
+            : undefined;
+
+      store.set(key, { value: text, expiresAt });
+    },
+
+    async delete(key: string): Promise<void> {
+      store.delete(key);
+    },
+
+    async list(options?: MemoryKvListOptions): Promise<{
+      keys: { name: string }[];
+      list_complete: boolean;
+      cursor?: string;
+    }> {
+      for (const key of [...store.keys()]) {
+        getLiveEntry(key);
+      }
+
+      const prefix = options?.prefix ?? "";
+      const limit = options?.limit ?? 1000;
+      const start = options?.cursor ? Number(options.cursor) : 0;
+      const names = [...store.keys()]
+        .filter((key) => key.startsWith(prefix))
+        .sort();
+      const page = names.slice(start, start + limit);
+      const next = start + limit < names.length ? String(start + limit) : "";
+
+      return {
+        keys: page.map((name) => ({ name })),
+        list_complete: !next,
+        ...(next ? { cursor: next } : {}),
+      };
+    },
+  };
+}
+
+function chatGptEnv(overrides: Partial<Env> = {}): Env {
+  return {
+    AUTH_MODE: "env",
+    CHATGPT_MCP_HOST: DIRECT_HOST,
+    CHATGPT_MCP_RESOURCE: MCP_RESOURCE,
+    CHATGPT_OAUTH_SCOPES: "superops.read",
+    CHATGPT_AUTH_ALLOWED_EMAIL: ALLOWED_EMAIL,
+    CHATGPT_AUTH_ACCESS_ISSUER: ACCESS_ISSUER,
+    CHATGPT_AUTH_ACCESS_AUD: ACCESS_AUD,
+    CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS: "false",
+    OAUTH_KV: createMemoryKv(),
+    ...overrides,
+  };
+}
+
+let accessKeyPair: Awaited<ReturnType<typeof generateKeyPair>>;
+let originalFetch: typeof globalThis.fetch;
+
 async function mcp(
   body: unknown,
   env: Env = {},
-  extraHeaders: Record<string, string> = {}
+  extraHeaders: Record<string, string> = {},
+  url = "http://worker.local/mcp"
 ): Promise<Response> {
   return worker.fetch(
-    new Request("http://worker.local/mcp", {
+    new Request(url, {
       method: "POST",
       headers: { ...MCP_HEADERS, ...extraHeaders },
       body: JSON.stringify(body),
@@ -29,7 +163,160 @@ async function mcp(
   );
 }
 
+async function cloudflareAccessJwt(email = ALLOWED_EMAIL): Promise<string> {
+  return new SignJWT({ email })
+    .setProtectedHeader({ alg: "RS256", kid: "access-test-key" })
+    .setIssuer(ACCESS_ISSUER)
+    .setAudience(ACCESS_AUD)
+    .setSubject(email)
+    .setIssuedAt()
+    .setExpirationTime("5m")
+    .sign(accessKeyPair.privateKey);
+}
+
+function base64Url(buffer: ArrayBuffer): string {
+  return Buffer.from(buffer)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+async function pkceChallenge(verifier: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier)
+  );
+  return base64Url(digest);
+}
+
+async function registerChatGptClient(env: Env): Promise<string> {
+  const res = await worker.fetch(
+    new Request(`${AUTH_SERVER}/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "ChatGPT",
+        redirect_uris: [CHATGPT_REDIRECT_URI],
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+      }),
+    }),
+    env
+  );
+
+  expect(res.status).toBe(201);
+  const body = (await res.json()) as {
+    client_id?: string;
+    client_secret?: string;
+    token_endpoint_auth_method?: string;
+  };
+  expect(body.client_id).toBeTruthy();
+  expect(body.client_secret).toBeUndefined();
+  expect(body.token_endpoint_auth_method).toBe("none");
+  return body.client_id!;
+}
+
+async function getOAuthAccessToken(env: Env): Promise<string> {
+  const clientId = await registerChatGptClient(env);
+  const verifier = "test-verifier-abcdefghijklmnopqrstuvwxyz0123456789";
+  const challenge = await pkceChallenge(verifier);
+
+  const authorizeUrl = new URL(`${AUTH_SERVER}/authorize`);
+  authorizeUrl.searchParams.set("response_type", "code");
+  authorizeUrl.searchParams.set("client_id", clientId);
+  authorizeUrl.searchParams.set("redirect_uri", CHATGPT_REDIRECT_URI);
+  authorizeUrl.searchParams.set("scope", "superops.read");
+  authorizeUrl.searchParams.set("state", "test-state");
+  authorizeUrl.searchParams.set("code_challenge", challenge);
+  authorizeUrl.searchParams.set("code_challenge_method", "S256");
+  authorizeUrl.searchParams.set("resource", MCP_RESOURCE);
+
+  const authorizeRes = await worker.fetch(
+    new Request(authorizeUrl, {
+      headers: {
+        "CF-Access-Jwt-Assertion": await cloudflareAccessJwt(),
+      },
+      redirect: "manual",
+    }),
+    env
+  );
+
+  expect(authorizeRes.status).toBe(302);
+  const location = authorizeRes.headers.get("Location");
+  expect(location).toBeTruthy();
+
+  const callbackUrl = new URL(location!);
+  const code = callbackUrl.searchParams.get("code");
+  expect(callbackUrl.searchParams.get("state")).toBe("test-state");
+  expect(code).toBeTruthy();
+
+  const tokenBody = new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: clientId,
+    code: code!,
+    redirect_uri: CHATGPT_REDIRECT_URI,
+    code_verifier: verifier,
+    resource: MCP_RESOURCE,
+  });
+
+  const tokenRes = await worker.fetch(
+    new Request(`${AUTH_SERVER}/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: tokenBody.toString(),
+    }),
+    env
+  );
+
+  expect(tokenRes.status).toBe(200);
+  const tokenJson = (await tokenRes.json()) as {
+    access_token?: string;
+    token_type?: string;
+    scope?: string;
+    resource?: string;
+  };
+  expect(tokenJson.access_token).toBeTruthy();
+  expect(tokenJson.token_type).toBe("bearer");
+  expect(tokenJson.scope).toBe("superops.read");
+  expect(tokenJson.resource).toBe(MCP_RESOURCE);
+  return tokenJson.access_token!;
+}
+
 describe("Cloudflare Worker entrypoint", () => {
+  beforeAll(async () => {
+    accessKeyPair = await generateKeyPair("RS256", { extractable: true });
+    const publicJwk = await exportJWK(accessKeyPair.publicKey);
+    publicJwk.kid = "access-test-key";
+    publicJwk.alg = "RS256";
+
+    originalFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+
+        if (url === `${ACCESS_ISSUER}/cdn-cgi/access/certs`) {
+          return new Response(JSON.stringify({ keys: [publicJwk] }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        return originalFetch(input, init);
+      }
+    );
+  });
+
+  afterAll(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("serves a shallow health probe", async () => {
     const res = await worker.fetch(
       new Request("http://worker.local/health"),
@@ -72,7 +359,7 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(body.result?.serverInfo?.name).toBe("superops-mcp");
   });
 
-  it("lists all tools without credentials", async () => {
+  it("lists all tools without credentials on the existing path", async () => {
     const res = await mcp({
       jsonrpc: "2.0",
       id: 2,
@@ -137,5 +424,182 @@ describe("Cloudflare Worker entrypoint", () => {
       result?: { tools?: { name: string }[] };
     };
     expect((body.result?.tools ?? []).length).toBeGreaterThan(10);
+  });
+
+  it("serves OAuth discovery metadata on the ChatGPT direct hostname", async () => {
+    const env = chatGptEnv();
+    const protectedResourceRes = await worker.fetch(
+      new Request(`${AUTH_SERVER}/.well-known/oauth-protected-resource`),
+      env
+    );
+    expect(protectedResourceRes.status).toBe(200);
+    const protectedResource = (await protectedResourceRes.json()) as {
+      resource?: string;
+      authorization_servers?: string[];
+      scopes_supported?: string[];
+    };
+    expect(protectedResource.resource).toBe(MCP_RESOURCE);
+    expect(protectedResource.authorization_servers).toEqual([AUTH_SERVER]);
+    expect(protectedResource.scopes_supported).toEqual(["superops.read"]);
+
+    const authServerRes = await worker.fetch(
+      new Request(`${AUTH_SERVER}/.well-known/oauth-authorization-server`),
+      env
+    );
+    expect(authServerRes.status).toBe(200);
+    const authServerMetadata = (await authServerRes.json()) as {
+      authorization_endpoint?: string;
+      token_endpoint?: string;
+      registration_endpoint?: string;
+      code_challenge_methods_supported?: string[];
+    };
+    expect(authServerMetadata.authorization_endpoint).toBe(
+      `${AUTH_SERVER}/authorize`
+    );
+    expect(authServerMetadata.token_endpoint).toBe(`${AUTH_SERVER}/token`);
+    expect(authServerMetadata.registration_endpoint).toBe(
+      `${AUTH_SERVER}/register`
+    );
+    expect(authServerMetadata.code_challenge_methods_supported).toEqual([
+      "S256",
+    ]);
+  });
+
+  it("rejects the ChatGPT direct /mcp route without an OAuth access token", async () => {
+    const res = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 6,
+        method: "tools/list",
+        params: {},
+      },
+      chatGptEnv(),
+      {},
+      `${AUTH_SERVER}/mcp`
+    );
+
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toContain(
+      "/.well-known/oauth-protected-resource/mcp"
+    );
+  });
+
+  it("rejects /authorize without Cloudflare Access identity", async () => {
+    const env = chatGptEnv();
+    const clientId = await registerChatGptClient(env);
+    const authorizeUrl = new URL(`${AUTH_SERVER}/authorize`);
+    authorizeUrl.searchParams.set("response_type", "code");
+    authorizeUrl.searchParams.set("client_id", clientId);
+    authorizeUrl.searchParams.set("redirect_uri", CHATGPT_REDIRECT_URI);
+    authorizeUrl.searchParams.set("code_challenge", "test-challenge");
+    authorizeUrl.searchParams.set("code_challenge_method", "S256");
+
+    const res = await worker.fetch(new Request(authorizeUrl), env);
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects /authorize for a non-allowed Access user", async () => {
+    const env = chatGptEnv();
+    const clientId = await registerChatGptClient(env);
+    const authorizeUrl = new URL(`${AUTH_SERVER}/authorize`);
+    authorizeUrl.searchParams.set("response_type", "code");
+    authorizeUrl.searchParams.set("client_id", clientId);
+    authorizeUrl.searchParams.set("redirect_uri", CHATGPT_REDIRECT_URI);
+    authorizeUrl.searchParams.set("code_challenge", "test-challenge");
+    authorizeUrl.searchParams.set("code_challenge_method", "S256");
+
+    const res = await worker.fetch(
+      new Request(authorizeUrl, {
+        headers: {
+          "CF-Access-Jwt-Assertion": await cloudflareAccessJwt(
+            "not-sam@example.com"
+          ),
+        },
+      }),
+      env
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects dynamic client registration for non-ChatGPT redirect URIs", async () => {
+    const res = await worker.fetch(
+      new Request(`${AUTH_SERVER}/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_name: "Untrusted",
+          redirect_uris: ["https://example.test/oauth/callback"],
+          grant_types: ["authorization_code"],
+          response_types: ["code"],
+          token_endpoint_auth_method: "none",
+        }),
+      }),
+      chatGptEnv()
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("completes the ChatGPT direct OAuth flow and lists tools", async () => {
+    const env = chatGptEnv();
+    const token = await getOAuthAccessToken(env);
+
+    const res = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 7,
+        method: "tools/list",
+        params: {},
+      },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result?: { tools?: { name: string }[] };
+    };
+    const names = (body.result?.tools ?? []).map((t) => t.name);
+    expect(names).toContain("superops_navigate");
+    expect(names).toContain("superops_tickets_create");
+  });
+
+  it("blocks write and broad-query tools on the ChatGPT direct route by default", async () => {
+    const env = chatGptEnv();
+    const token = await getOAuthAccessToken(env);
+    const res = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 8,
+        method: "tools/call",
+        params: { name: "superops_custom_query", arguments: {} },
+      },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result?: { isError?: boolean; content?: { text?: string }[] };
+    };
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.content?.[0]?.text).toMatch(/disabled/i);
+  });
+
+  it("keeps the internal hostname on the existing /mcp behavior", async () => {
+    const res = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/list",
+        params: {},
+      },
+      chatGptEnv(),
+      {},
+      `https://${INTERNAL_HOST}/mcp`
+    );
+
+    expect(res.status).toBe(200);
   });
 });
