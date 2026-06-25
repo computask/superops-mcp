@@ -5,7 +5,14 @@
  */
 
 import { getClient } from "../client.js";
-import type { DomainTools, Ticket, TicketNote, TimeEntry, ListInfo } from "../types.js";
+import type {
+  DomainTools,
+  Ticket,
+  TicketConversation,
+  TicketNote,
+  TimeEntry,
+  ListInfo,
+} from "../types.js";
 import { elicitText } from "../utils/elicitation.js";
 
 const DEFAULT_LIST_PAGE = 1;
@@ -114,6 +121,49 @@ const GET_TICKET_QUERY = `
   }
 `;
 
+const GET_TICKET_CONVERSATION_LIST_QUERY = `
+  query getTicketConversationList($input: TicketIdentifierInput!) {
+    getTicketConversationList(input: $input) {
+      conversationId
+      content
+      time
+      user
+      toUsers {
+        user
+      }
+      ccUsers {
+        user
+      }
+      bccUsers {
+        user
+      }
+      attachments {
+        fileName
+        originalFileName
+        fileSize
+      }
+      type
+    }
+  }
+`;
+
+const GET_TICKET_NOTE_LIST_QUERY = `
+  query getTicketNoteList($input: TicketIdentifierInput!) {
+    getTicketNoteList(input: $input) {
+      noteId
+      addedBy
+      addedOn
+      content
+      attachments {
+        fileName
+        originalFileName
+        fileSize
+      }
+      privacyType
+    }
+  }
+`;
+
 const CREATE_TICKET_MUTATION = `
   mutation createTicket($input: CreateTicketInput!) {
     createTicket(input: $input) {
@@ -186,6 +236,14 @@ interface ListTicketsResponse {
 
 interface GetTicketResponse {
   getTicket: Ticket;
+}
+
+interface GetTicketConversationListResponse {
+  getTicketConversationList: TicketConversation[];
+}
+
+interface GetTicketNoteListResponse {
+  getTicketNoteList: TicketNote[];
 }
 
 interface CreateTicketResponse {
@@ -313,6 +371,36 @@ export function getTicketsTools(): DomainTools {
       {
         name: "superops_tickets_get",
         description: "Get detailed information for a specific ticket by its ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ticketId: {
+              type: "string",
+              description: "The unique ticket ID",
+            },
+          },
+          required: ["ticketId"],
+        },
+      },
+      {
+        name: "superops_tickets_conversation_list",
+        description:
+          "List customer ticket conversations and replies, including attachment metadata where returned.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ticketId: {
+              type: "string",
+              description: "The unique ticket ID",
+            },
+          },
+          required: ["ticketId"],
+        },
+      },
+      {
+        name: "superops_tickets_notes_list",
+        description:
+          "List public and internal ticket notes, including attachment metadata where returned.",
         inputSchema: {
           type: "object",
           properties: {
@@ -537,6 +625,42 @@ export function getTicketsTools(): DomainTools {
                 {
                   type: "text",
                   text: JSON.stringify(response.getTicket, null, 2),
+                },
+              ],
+            };
+          }
+
+          case "superops_tickets_conversation_list": {
+            const { ticketId } = args as { ticketId: string };
+
+            const response = await client.query<GetTicketConversationListResponse>(
+              GET_TICKET_CONVERSATION_LIST_QUERY,
+              { input: { ticketId } }
+            );
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(response.getTicketConversationList, null, 2),
+                },
+              ],
+            };
+          }
+
+          case "superops_tickets_notes_list": {
+            const { ticketId } = args as { ticketId: string };
+
+            const response = await client.query<GetTicketNoteListResponse>(
+              GET_TICKET_NOTE_LIST_QUERY,
+              { input: { ticketId } }
+            );
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(response.getTicketNoteList, null, 2),
                 },
               ],
             };

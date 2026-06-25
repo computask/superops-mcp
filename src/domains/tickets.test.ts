@@ -68,6 +68,8 @@ describe("Tickets Domain", () => {
     expect(domain.tools.map((tool) => tool.name)).toEqual([
       "superops_tickets_list",
       "superops_tickets_get",
+      "superops_tickets_conversation_list",
+      "superops_tickets_notes_list",
       "superops_tickets_create",
       "superops_tickets_update",
       "superops_tickets_add_note",
@@ -174,6 +176,83 @@ describe("Tickets Domain", () => {
       { input: { ticketId: "ticket-123" } }
     );
     expect(result.content[0].text).toContain("Test Issue");
+  });
+
+  it("lists ticket conversations using documented TicketIdentifierInput", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketConversationList: [
+        {
+          conversationId: "conversation-123",
+          content: "Customer reply",
+          time: "2026-06-25T10:00:00",
+          user: { userId: "requester-1", name: "Requester" },
+          toUsers: [{ user: { email: "support@example.com" } }],
+          ccUsers: [],
+          bccUsers: [],
+          attachments: [
+            {
+              fileName: "log.txt",
+              originalFileName: "log.txt",
+              fileSize: "128",
+            },
+          ],
+          type: "REQ_REPLY",
+        },
+      ],
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_conversation_list", {
+      ticketId: "ticket-123",
+    });
+
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining("getTicketConversationList"),
+      { input: { ticketId: "ticket-123" } }
+    );
+    expect(mockClient.query.mock.calls[0][0]).toContain("TicketIdentifierInput");
+    expect(mockClient.query.mock.calls[0][0]).toContain("conversationId");
+    expect(mockClient.query.mock.calls[0][0]).toContain("toUsers");
+    expect(mockClient.query.mock.calls[0][0]).toContain("fileName");
+    expect(result.content[0].text).toContain("Customer reply");
+    expect(result.content[0].text).toContain("log.txt");
+  });
+
+  it("lists ticket notes using documented TicketIdentifierInput", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketNoteList: [
+        {
+          noteId: "note-123",
+          addedBy: { userId: "tech-1", name: "Technician" },
+          addedOn: "2026-06-25T10:05:00",
+          content: "Internal update",
+          attachments: [
+            {
+              fileName: "screenshot.png",
+              originalFileName: "screenshot.png",
+              fileSize: "2048",
+            },
+          ],
+          privacyType: "PRIVATE",
+        },
+      ],
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_notes_list", {
+      ticketId: "ticket-123",
+    });
+
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining("getTicketNoteList"),
+      { input: { ticketId: "ticket-123" } }
+    );
+    expect(mockClient.query.mock.calls[0][0]).toContain("TicketIdentifierInput");
+    expect(mockClient.query.mock.calls[0][0]).toContain("noteId");
+    expect(mockClient.query.mock.calls[0][0]).toContain("privacyType");
+    expect(mockClient.query.mock.calls[0][0]).toContain("fileName");
+    expect(result.content[0].text).toContain("Internal update");
+    expect(result.content[0].text).toContain("screenshot.png");
   });
 
   it("creates tickets with tenant default status and configured category", async () => {
@@ -311,5 +390,24 @@ describe("Tickets Domain", () => {
     const failed = await domain.handleCall("superops_tickets_list", { page: 1 });
     expect(failed.isError).toBe(true);
     expect(failed.content[0].text).toContain("API rate limit exceeded");
+  });
+
+  it("returns API errors for ticket conversation and note reads", async () => {
+    const domain = getTicketsTools();
+
+    mockClient.query.mockRejectedValueOnce(new Error("conversation read failed"));
+    const conversationResult = await domain.handleCall(
+      "superops_tickets_conversation_list",
+      { ticketId: "ticket-123" }
+    );
+    expect(conversationResult.isError).toBe(true);
+    expect(conversationResult.content[0].text).toContain("conversation read failed");
+
+    mockClient.query.mockRejectedValueOnce(new Error("notes read failed"));
+    const notesResult = await domain.handleCall("superops_tickets_notes_list", {
+      ticketId: "ticket-123",
+    });
+    expect(notesResult.isError).toBe(true);
+    expect(notesResult.content[0].text).toContain("notes read failed");
   });
 });

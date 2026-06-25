@@ -156,7 +156,30 @@ export interface TicketNote {
   addedBy?: SuperOpsJson;
   addedOn: string;
   content: string;
+  attachments?: TicketAttachment[];
   privacyType?: "PUBLIC" | "PRIVATE";
+}
+
+export interface TicketAttachment {
+  fileName: string;
+  originalFileName: string;
+  fileSize: string;
+}
+
+export interface TicketRecipientInfo {
+  user?: SuperOpsJson;
+}
+
+export interface TicketConversation {
+  conversationId: string;
+  content?: string;
+  time: string;
+  user?: SuperOpsJson;
+  toUsers?: TicketRecipientInfo[];
+  ccUsers?: TicketRecipientInfo[];
+  bccUsers?: TicketRecipientInfo[];
+  attachments?: TicketAttachment[];
+  type: string;
 }
 
 export interface TimeEntry {

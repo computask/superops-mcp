@@ -90,6 +90,8 @@ Add to your `claude_desktop_config.json`:
 
 - `superops_tickets_list` - List tickets with filters
 - `superops_tickets_get` - Get ticket details
+- `superops_tickets_conversation_list` - Read customer ticket conversations/replies, including attachment metadata where returned by SuperOps
+- `superops_tickets_notes_list` - Read public/internal ticket notes, including attachment metadata where returned by SuperOps
 - `superops_tickets_create` - Create a new ticket
 - `superops_tickets_update` - Update ticket status/assignment
 - `superops_tickets_add_note` - Add note to ticket
