@@ -547,6 +547,34 @@ describe("Cloudflare Worker entrypoint", () => {
     }
   });
 
+  it("audits resolve_full note presence without logging note content", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 332,
+          method: "tools/call",
+          params: {
+            name: "superops_tickets_resolve_full",
+            arguments: {
+              ticketId: "ticket-57100",
+              note: "Sensitive internal note body",
+            },
+          },
+        },
+        { ENABLE_WRITE_TOOLS: "false" },
+        { "X-Request-Id": "audit-resolve-note-blocked-1" }
+      );
+
+      const recordText = JSON.stringify(auditRecords(logSpy)[0]);
+      expect(recordText).toContain('"note"');
+      expect(recordText).not.toContain("Sensitive internal note body");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it("does not audit full custom mutation bodies or variable values", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {

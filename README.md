@@ -165,11 +165,16 @@ Token rotation plan:
 - `superops_tickets_add_note` - Add note to ticket
 - `superops_tickets_log_time` - Log time on ticket
 
-Ticket urgency is writable. Priority can still be supplied manually and will be
-validated against live SuperOps options, but the preferred workflow is to set
-impact and urgency and let SuperOps calculate priority from its business rules.
-When priority is omitted from update or resolve calls, it is not sent to
-`updateTicket`.
+Ticket urgency and impact are writable. Priority can still be supplied manually
+and will be validated against live SuperOps options. Prefer impact plus urgency
+where SuperOps can calculate priority, but some SuperOps resolve/update
+workflows require priority. For resolved-ticket workflows, provide priority or
+ensure the ticket already has a valid priority; otherwise the tool returns a
+structured validation failure before adding notes or mutating the ticket.
+
+If a response reports `partialFailure`, a note was already created but the later
+ticket update failed unexpectedly. Do not retry with the same note unless you
+intentionally want a duplicate note.
 
 ### Assets Domain
 
@@ -207,6 +212,7 @@ User: Resolve spam ticket 57100
 Claude: [calls superops_tickets_resolve_full with {
   "ticketNumber": "57100",
   "clientName": "Task Group",
+  "priority": "Very Low",
   "impact": "Low",
   "urgency": "Low",
   "category": "7. Sales call",

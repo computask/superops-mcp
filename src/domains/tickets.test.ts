@@ -590,7 +590,60 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
   });
 
-  it("resolves a ticket by ticket number with impact and urgency, without default priority", async () => {
+  it("returns structured validation and does not add a note or update when resolve priority is missing", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [
+            {
+              ticketId: "ticket-57100",
+              displayId: "57100",
+              subject: "Sales email",
+            },
+          ],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57100",
+          displayId: "57100",
+          subject: "Sales email",
+          status: "New Calls",
+        },
+      })
+      .mockResolvedValueOnce({
+        getFields: [
+          ticketField("priority", ["Very Low", "Low", "Medium", "High"]),
+          ticketField("impact", ["Low"]),
+          ticketField("urgency", ["Low"]),
+        ],
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketNumber: "57100",
+      impact: "Low",
+      urgency: "Low",
+      note: "Internal note that must not be added",
+      verify: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed).toEqual({
+      ok: false,
+      message: "Ticket was not updated because validation failed.",
+      missingFields: ["priority"],
+      invalidFields: {},
+      validOptions: {
+        priority: ["Very Low", "Low", "Medium", "High"],
+      },
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("resolves a ticket by ticket number with validated priority, impact, and urgency", async () => {
     mockClient.query
       .mockResolvedValueOnce({
         getTicketList: {
@@ -606,6 +659,7 @@ describe("Tickets Domain", () => {
       })
       .mockResolvedValueOnce({
         getFields: [
+          ticketField("priority", ["Very Low"]),
           ticketField("impact", ["Low"]),
           ticketField("urgency", ["Low"]),
           ticketField("resolutionCode", ["Permanent Fix"]),
@@ -628,6 +682,7 @@ describe("Tickets Domain", () => {
     const result = await domain.handleCall("superops_tickets_resolve_full", {
       ticketNumber: "57100",
       clientId: "2993553194649526272",
+      priority: "Very Low",
       impact: "Low",
       urgency: "Low",
       category: "7. Sales call",
@@ -658,6 +713,7 @@ describe("Tickets Domain", () => {
           status: "Resolved",
           suppressCloseNotification: true,
           client: { accountId: "2993553194649526272" },
+          priority: "Very Low",
           impact: "Low",
           urgency: "Low",
           category: "7. Sales call",
@@ -667,7 +723,6 @@ describe("Tickets Domain", () => {
         },
       }
     );
-    expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
     expect(result.content[0].text).toContain("ticket-57100");
   });
 
@@ -725,7 +780,14 @@ describe("Tickets Domain", () => {
         },
       })
       .mockResolvedValueOnce({
-        getFields: [],
+        getTicket: {
+          ticketId: "ticket-57100",
+          status: "New Calls",
+          priority: "Very Low",
+        },
+      })
+      .mockResolvedValueOnce({
+        getFields: [ticketField("priority", ["Very Low"])],
       });
     mockClient.mutate.mockResolvedValue({
       updateTicket: { ticketId: "ticket-57100", status: "Resolved" },
@@ -746,15 +808,16 @@ describe("Tickets Domain", () => {
           ticketId: "ticket-57100",
           status: "Resolved",
           suppressCloseNotification: true,
+          priority: "Very Low",
           client: { accountId: "2993553194649526272" },
         },
       }
     );
   });
 
-  it("adds a note before resolving a ticket", async () => {
+  it("adds a note only after resolve validation succeeds", async () => {
     mockClient.query.mockResolvedValue({
-      getFields: [],
+      getFields: [ticketField("priority", ["Very Low"])],
     });
     mockClient.mutate
       .mockResolvedValueOnce({
@@ -772,6 +835,7 @@ describe("Tickets Domain", () => {
     const domain = getTicketsTools();
     await domain.handleCall("superops_tickets_resolve_full", {
       ticketId: "ticket-57100",
+      priority: "Very Low",
       note: "Internal note",
       verify: false,
     });
@@ -785,6 +849,67 @@ describe("Tickets Domain", () => {
         privacyType: "PRIVATE",
       },
     });
+  });
+
+  it("keeps partialFailure for unexpected update errors after note creation", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: [ticketField("priority", ["Very Low"])],
+    });
+    mockClient.mutate
+      .mockResolvedValueOnce({
+        createTicketNote: {
+          noteId: "note-123",
+          addedOn: "2026-06-26T08:00:00",
+          content: "Internal note",
+          privacyType: "PRIVATE",
+        },
+      })
+      .mockRejectedValueOnce(new Error("update failed after validation"));
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      priority: "Very Low",
+      note: "Internal note",
+      verify: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed.partialFailure).toBe(true);
+    expect(parsed.noteAdded.noteId).toBe("note-123");
+    expect(parsed.updateError).toBe("update failed after validation");
+  });
+
+  it("returns a clearer partialFailure message for unexpected mandatory priority errors after note creation", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: [ticketField("priority", ["Very Low"])],
+    });
+    mockClient.mutate
+      .mockResolvedValueOnce({
+        createTicketNote: {
+          noteId: "note-123",
+          addedOn: "2026-06-26T08:00:00",
+          content: "Internal note",
+          privacyType: "PRIVATE",
+        },
+      })
+      .mockRejectedValueOnce(new Error("mandatory_validation_failed: priority"));
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      priority: "Very Low",
+      note: "Internal note",
+      verify: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed.partialFailure).toBe(true);
+    expect(parsed.updateError).toContain("priority is required");
+    expect(parsed.updateError).toContain("No further note should be added");
+    expect(parsed.updateError).not.toContain("mandatory_validation_failed");
   });
 
   it("rejects invalid resolve_full option names before mutation", async () => {

@@ -416,6 +416,14 @@ interface ResolveFullParams extends TicketClassificationParams {
   verify?: boolean;
 }
 
+interface StructuredValidationFailure {
+  ok: false;
+  message: string;
+  missingFields: string[];
+  invalidFields: Record<string, string>;
+  validOptions: Record<string, string[]>;
+}
+
 function pageInput(max: number | undefined, page?: number) {
   return {
     page: page ?? DEFAULT_LIST_PAGE,
@@ -593,6 +601,42 @@ function formatValidOptionValues(values: string[]): string {
   return `${visible.join(", ")}${suffix}`;
 }
 
+function structuredValidationResult(
+  failure: StructuredValidationFailure
+): {
+  content: { type: "text"; text: string }[];
+  isError: true;
+} {
+  return {
+    content: [{ type: "text", text: JSON.stringify(failure, null, 2) }],
+    isError: true,
+  };
+}
+
+function validationFailure(params?: {
+  message?: string;
+  missingFields?: string[];
+  invalidFields?: Record<string, string>;
+  validOptions?: Record<string, string[]>;
+}): StructuredValidationFailure {
+  return {
+    ok: false,
+    message: params?.message ?? "Ticket was not updated because validation failed.",
+    missingFields: params?.missingFields ?? [],
+    invalidFields: params?.invalidFields ?? {},
+    validOptions: params?.validOptions ?? {},
+  };
+}
+
+function isPriorityMandatoryValidation(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /mandatory_validation_failed\s*:\s*priority/i.test(message);
+}
+
+function priorityMandatoryRuntimeMessage(): string {
+  return "SuperOps rejected the update because priority is required for this update path. No further note should be added on retry unless you intentionally want a duplicate note.";
+}
+
 function resolveOptionValue(
   fieldName: ValidatedTicketOptionField,
   field: SuperOpsField,
@@ -712,6 +756,39 @@ async function addValidatedTicketOptionUpdates(
   }
 
   const fields = await getTicketOptionFields(client, fieldsToValidate);
+
+  for (const fieldName of fieldsToValidate) {
+    const field = fields.get(fieldName);
+    if (!field) {
+      return `SuperOps did not return field metadata for ${TICKET_OPTION_FIELD_LABELS[fieldName]} via getFields; cannot safely update ${fieldName}.`;
+    }
+
+    const resolved = resolveOptionValue(fieldName, field, params[fieldName]);
+    if ("error" in resolved) {
+      return resolved.error;
+    }
+
+    const dependencyError = validateOptionDependency(
+      params,
+      fieldName,
+      field,
+      resolved.option
+    );
+    if (dependencyError) {
+      return dependencyError;
+    }
+
+    input[fieldName] = resolved.value;
+  }
+}
+
+function addValidatedTicketOptionUpdatesFromFields(
+  fields: Map<ValidatedTicketOptionField, SuperOpsField>,
+  params: TicketClassificationParams,
+  input: Record<string, unknown>,
+  allowedFields: readonly ValidatedTicketOptionField[] = VALIDATED_TICKET_OPTION_FIELDS
+): string | undefined {
+  const fieldsToValidate = requestedValidatedOptionFields(params, allowedFields);
 
   for (const fieldName of fieldsToValidate) {
     const field = fields.get(fieldName);
@@ -1622,6 +1699,9 @@ export function getTicketsTools(): DomainTools {
               return errorResult(`Invalid ticket category: ${params.category}`);
             }
 
+            const finalStatus = params.status ?? DEFAULT_RESOLVE_TICKET_STATUS;
+            let currentTicket: Ticket | undefined;
+
             const resolvedClient = await resolveClientAccountId(client, {
               clientId: params.clientId,
               clientName: params.clientName,
@@ -1640,7 +1720,7 @@ export function getTicketsTools(): DomainTools {
 
             const updateInput: Record<string, unknown> = {
               ticketId: resolvedTicket.ticketId,
-              status: params.status ?? DEFAULT_RESOLVE_TICKET_STATUS,
+              status: finalStatus,
               suppressCloseNotification: params.suppressCloseNotification ?? true,
             };
 
@@ -1656,22 +1736,62 @@ export function getTicketsTools(): DomainTools {
               updateInput.category = params.category;
             }
 
-            const optionValidationError = await addValidatedTicketOptionUpdates(
-              client,
-              {
-                priority: params.priority,
-                impact: params.impact,
-                urgency: params.urgency,
-                category: params.category,
-                subcategory: params.subcategory,
-                cause: params.cause,
-                resolutionCode: params.resolutionCode,
-                status: params.status,
-              },
+            const optionParams: TicketClassificationParams = {
+              priority: params.priority,
+              impact: params.impact,
+              urgency: params.urgency,
+              category: params.category,
+              subcategory: params.subcategory,
+              cause: params.cause,
+              resolutionCode: params.resolutionCode,
+              status: params.status,
+            };
+            const optionFieldsToFetch = new Set<ValidatedTicketOptionField>(
+              requestedValidatedOptionFields(optionParams)
+            );
+            const requiresPriority = finalStatus === DEFAULT_RESOLVE_TICKET_STATUS;
+            if (requiresPriority) {
+              optionFieldsToFetch.add("priority");
+            }
+
+            if (requiresPriority && !optionParams.priority) {
+              currentTicket = await getTicketByInternalId(
+                client,
+                resolvedTicket.ticketId
+              );
+              if (currentTicket.priority) {
+                optionParams.priority = currentTicket.priority;
+              }
+            }
+
+            const optionFields =
+              optionFieldsToFetch.size > 0
+                ? await getTicketOptionFields(client, [...optionFieldsToFetch])
+                : new Map<ValidatedTicketOptionField, SuperOpsField>();
+
+            if (requiresPriority && !optionParams.priority) {
+              const priorityField = optionFields.get("priority");
+              return structuredValidationResult(
+                validationFailure({
+                  missingFields: ["priority"],
+                  validOptions: {
+                    priority: priorityField ? optionValues(priorityField) : [],
+                  },
+                })
+              );
+            }
+
+            const optionValidationError = addValidatedTicketOptionUpdatesFromFields(
+              optionFields,
+              optionParams,
               updateInput
             );
             if (optionValidationError) {
-              return errorResult(optionValidationError);
+              return structuredValidationResult(
+                validationFailure({
+                  invalidFields: { classification: optionValidationError },
+                })
+              );
             }
 
             if (resolvedClient.accountId) {
@@ -1699,7 +1819,11 @@ export function getTicketsTools(): DomainTools {
                 { input: updateInput }
               );
             } catch (error) {
-              const message = error instanceof Error ? error.message : String(error);
+              const message = isPriorityMandatoryValidation(error)
+                ? priorityMandatoryRuntimeMessage()
+                : error instanceof Error
+                  ? error.message
+                  : String(error);
               if (createdNote) {
                 return {
                   content: [
@@ -1723,6 +1847,20 @@ export function getTicketsTools(): DomainTools {
                   ],
                   isError: true,
                 };
+              }
+
+              if (isPriorityMandatoryValidation(error)) {
+                return structuredValidationResult(
+                  validationFailure({
+                    message: priorityMandatoryRuntimeMessage(),
+                    missingFields: ["priority"],
+                    validOptions: {
+                      priority: optionFields.get("priority")
+                        ? optionValues(optionFields.get("priority") as SuperOpsField)
+                        : [],
+                    },
+                  })
+                );
               }
 
               throw error;
