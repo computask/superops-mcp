@@ -516,6 +516,37 @@ describe("Cloudflare Worker entrypoint", () => {
     }
   });
 
+  it("marks superops_tickets_resolve_full as a high-risk write tool", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 331,
+          method: "tools/call",
+          params: {
+            name: "superops_tickets_resolve_full",
+            arguments: { ticketId: "ticket-57100" },
+          },
+        },
+        { ENABLE_WRITE_TOOLS: "false" },
+        { "X-Request-Id": "audit-resolve-blocked-1" }
+      );
+
+      expect(res.status).toBe(200);
+      const records = auditRecords(logSpy);
+      expect(records[0]).toMatchObject({
+        toolName: "superops_tickets_resolve_full",
+        toolCategory: "write",
+        highRisk: true,
+        success: false,
+      });
+      expect(records[0].changedFields).toEqual(["ticketId"]);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it("does not audit full custom mutation bodies or variable values", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {

@@ -96,6 +96,7 @@ describe("Tickets Domain", () => {
       "superops_tickets_conversation_list",
       "superops_tickets_notes_list",
       "superops_tickets_create",
+      "superops_tickets_resolve_full",
       "superops_tickets_update",
       "superops_tickets_add_note",
       "superops_tickets_log_time",
@@ -548,6 +549,219 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate.mock.calls[0][0]).toContain("displayId");
     expect(result.content[0].text).toContain("created-ticket");
     expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
+  });
+
+  it("resolves a ticket by ticket number with validated display-name classifications", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [
+            {
+              ticketId: "ticket-57100",
+              displayId: "57100",
+              subject: "Sales email",
+            },
+          ],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getFields: [
+          ticketField("priority", ["Very Low"]),
+          ticketField("impact", ["Low"]),
+          ticketField("resolutionCode", ["Permanent Fix"]),
+          ticketField("cause", ["No Fault Found"]),
+          ticketField("subcategory", ["No Action Needed"], {
+            columnName: "category",
+            value: "7. Sales call",
+          }),
+        ],
+      });
+    mockClient.mutate.mockResolvedValue({
+      updateTicket: {
+        ticketId: "ticket-57100",
+        displayId: "57100",
+        status: "Resolved",
+      },
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketNumber: "57100",
+      clientId: "2993553194649526272",
+      priority: "Very Low",
+      impact: "Low",
+      category: "7. Sales call",
+      subcategory: "No Action Needed",
+      cause: "No Fault Found",
+      resolutionCode: "Permanent Fix",
+      verify: false,
+    });
+
+    expect(mockClient.query.mock.calls[0][0]).toContain("getTicketList");
+    expect(mockClient.query.mock.calls[0][1]).toEqual({
+      input: {
+        page: 1,
+        pageSize: 5,
+        condition: {
+          attribute: "displayId",
+          operator: "is",
+          value: "57100",
+        },
+      },
+    });
+    expect(mockClient.query.mock.calls[1][0]).toContain("getFields");
+    expect(mockClient.mutate).toHaveBeenCalledWith(
+      expect.stringContaining("updateTicket"),
+      {
+        input: {
+          ticketId: "ticket-57100",
+          status: "Resolved",
+          suppressCloseNotification: true,
+          client: { accountId: "2993553194649526272" },
+          priority: "Very Low",
+          impact: "Low",
+          category: "7. Sales call",
+          subcategory: "No Action Needed",
+          cause: "No Fault Found",
+          resolutionCode: "Permanent Fix",
+        },
+      }
+    );
+    expect(result.content[0].text).toContain("ticket-57100");
+  });
+
+  it("resolves a ticket directly by ticketId and verifies the final state", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getFields: [
+          ticketField("priority", ["Very Low"]),
+          ticketField("impact", ["Low"]),
+        ],
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57100",
+          displayId: "57100",
+          subject: "Sales email",
+          status: "Resolved",
+          priority: "Very Low",
+          impact: "Low",
+        },
+      });
+    mockClient.mutate.mockResolvedValue({
+      updateTicket: { ticketId: "ticket-57100", status: "Resolved" },
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      priority: "Very Low",
+      impact: "Low",
+    });
+
+    expect(mockClient.mutate).toHaveBeenCalledWith(
+      expect.stringContaining("updateTicket"),
+      {
+        input: {
+          ticketId: "ticket-57100",
+          status: "Resolved",
+          suppressCloseNotification: true,
+          priority: "Very Low",
+          impact: "Low",
+        },
+      }
+    );
+    expect(mockClient.query.mock.calls[1][0]).toContain("getTicket");
+    expect(result.content[0].text).toContain('"displayId": "57100"');
+  });
+
+  it("resolves client aliases for resolve_full via client lookup", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getClientList: {
+          clients: [{ accountId: "2993553194649526272", name: "TaskGroup" }],
+          listInfo: { page: 1, pageSize: 200, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getFields: [],
+      });
+    mockClient.mutate.mockResolvedValue({
+      updateTicket: { ticketId: "ticket-57100", status: "Resolved" },
+    });
+
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      clientName: "Task Group",
+      verify: false,
+    });
+
+    expect(mockClient.query.mock.calls[0][0]).toContain("getClientList");
+    expect(mockClient.mutate).toHaveBeenCalledWith(
+      expect.stringContaining("updateTicket"),
+      {
+        input: {
+          ticketId: "ticket-57100",
+          status: "Resolved",
+          suppressCloseNotification: true,
+          client: { accountId: "2993553194649526272" },
+        },
+      }
+    );
+  });
+
+  it("adds a note before resolving a ticket", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: [],
+    });
+    mockClient.mutate
+      .mockResolvedValueOnce({
+        createTicketNote: {
+          noteId: "note-123",
+          addedOn: "2026-06-26T08:00:00",
+          content: "Internal note",
+          privacyType: "PRIVATE",
+        },
+      })
+      .mockResolvedValueOnce({
+        updateTicket: { ticketId: "ticket-57100", status: "Resolved" },
+      });
+
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      note: "Internal note",
+      verify: false,
+    });
+
+    expect(mockClient.mutate.mock.calls[0][0]).toContain("createTicketNote");
+    expect(mockClient.mutate.mock.calls[1][0]).toContain("updateTicket");
+    expect(mockClient.mutate.mock.calls[0][1]).toEqual({
+      input: {
+        ticket: { ticketId: "ticket-57100" },
+        content: "Internal note",
+        privacyType: "PRIVATE",
+      },
+    });
+  });
+
+  it("rejects invalid resolve_full option names before mutation", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: [ticketField("priority", ["Very Low"])],
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      priority: "Not a priority",
+      verify: false,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Invalid priority");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
   it("updates tickets with technician assignment rather than assignee", async () => {

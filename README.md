@@ -159,6 +159,7 @@ Token rotation plan:
 - `superops_tickets_conversation_list` - Read customer ticket conversations/replies, including attachment metadata where returned by SuperOps
 - `superops_tickets_notes_list` - Read public/internal ticket notes, including attachment metadata where returned by SuperOps
 - `superops_tickets_create` - Create a new ticket
+- `superops_tickets_resolve_full` - Resolve or fully classify a ticket by ticket number or internal ID, with client lookup, technician group lookup, validated display-name classification fields, optional note creation, and optional final verification
 - `superops_tickets_update` - Update ticket status, assignment, impact, category, cause, subcategory, and resolution code. Tenant category values use the configured enum; other option values are resolved and validated from SuperOps ticket field metadata before mutation.
 - `superops_tickets_add_note` - Add note to ticket
 - `superops_tickets_log_time` - Log time on ticket
@@ -194,6 +195,21 @@ Now in tickets domain. Available tools: superops_tickets_list, superops_tickets_
 User: Show open high priority tickets
 Claude: [calls superops_tickets_list with status: ["Open"], priority: ["High"]]
 Here are the open high priority tickets...
+
+User: Resolve spam ticket 57100
+Claude: [calls superops_tickets_resolve_full with {
+  "ticketNumber": "57100",
+  "clientName": "Task Group",
+  "priority": "Very Low",
+  "impact": "Low",
+  "category": "7. Sales call",
+  "subcategory": "No Action Needed",
+  "cause": "No Fault Found",
+  "resolutionCode": "Permanent Fix",
+  "note": "Resolving as unsolicited marketing/sales email rather than a genuine support request.",
+  "suppressCloseNotification": true
+}]
+The ticket has been classified and resolved.
 ```
 
 ## Rate Limits

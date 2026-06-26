@@ -34,10 +34,10 @@ import { createMcpServer, resolveGatewayCredentials } from "./mcp-server.js";
 import type { SuperOpsCredentials } from "./types.js";
 import {
   auditToolCall,
-  customGraphqlAuditMetadata,
   requestIdFromHeaders,
   runWithAuditContext,
   runtimeFlagsFromEnv,
+  toolAuditMetadata,
 } from "./audit.js";
 
 export interface Env {
@@ -86,6 +86,7 @@ const CHATGPT_REDIRECT_HOSTS = new Set(["chatgpt.com", "chat.openai.com"]);
 const DEFAULT_CHATGPT_BLOCKED_TOOLS = new Set([
   "superops_tickets_create",
   "superops_tickets_update",
+  "superops_tickets_resolve_full",
   "superops_tickets_add_note",
   "superops_tickets_log_time",
   "superops_custom_mutation",
@@ -276,7 +277,7 @@ async function rejectBlockedChatGptToolCall(
     success: false,
     durationMs: 0,
     errorSummary: message,
-    metadata: customGraphqlAuditMetadata(toolName, toolArgs),
+    metadata: toolAuditMetadata(toolName, toolArgs),
   });
 
   const id = (body as { id?: unknown }).id ?? null;

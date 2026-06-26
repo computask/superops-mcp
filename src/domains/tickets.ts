@@ -7,9 +7,11 @@
 import { getClient } from "../client.js";
 import type {
   DomainTools,
+  Client,
   Ticket,
   TicketConversation,
   TicketNote,
+  TechGroup,
   TimeEntry,
   ListInfo,
   ListInfoInput,
@@ -51,23 +53,34 @@ const VALID_TICKET_CATEGORIES = [
 ] as const;
 
 const DEFAULT_CREATE_TICKET_STATUS = "New Calls";
+const DEFAULT_RESOLVE_TICKET_STATUS = "Resolved";
 const DEFAULT_RECENT_TICKETS_COUNT = 10;
 const MIN_RECENT_TICKETS_COUNT = 1;
 const MAX_RECENT_TICKETS_COUNT = 50;
 const MAX_RECENT_TICKETS_WITH_CONTENT = 10;
 const DISPLAY_ID_EQUALS_OPERATOR = "is";
 const TICKET_FIELD_MODULE = "TICKET";
+const CLIENT_LOOKUP_PAGE_SIZE = 200;
 
-const DYNAMIC_TICKET_OPTION_FIELDS = [
+const CLIENT_NAME_ALIASES: Record<string, string> = {
+  "task group": "TaskGroup",
+  taskgroup: "TaskGroup",
+  computask: "TaskGroup",
+};
+
+const VALIDATED_TICKET_OPTION_FIELDS = [
+  "priority",
   "impact",
   "resolutionCode",
   "cause",
   "subcategory",
 ] as const;
 
-type DynamicTicketOptionField = (typeof DYNAMIC_TICKET_OPTION_FIELDS)[number];
+type ValidatedTicketOptionField =
+  (typeof VALIDATED_TICKET_OPTION_FIELDS)[number];
 
-const TICKET_OPTION_FIELD_LABELS: Record<DynamicTicketOptionField, string> = {
+const TICKET_OPTION_FIELD_LABELS: Record<ValidatedTicketOptionField, string> = {
+  priority: "priority",
   impact: "impact",
   resolutionCode: "resolution code",
   cause: "cause",
@@ -75,7 +88,7 @@ const TICKET_OPTION_FIELD_LABELS: Record<DynamicTicketOptionField, string> = {
 };
 
 const FALLBACK_PARENT_FIELDS: Partial<
-  Record<DynamicTicketOptionField, keyof UpdateTicketParams>
+  Record<ValidatedTicketOptionField, keyof TicketClassificationParams>
 > = {
   subcategory: "category",
 };
@@ -220,6 +233,35 @@ const GET_TICKET_FIELDS_QUERY = `
   }
 `;
 
+const LIST_CLIENTS_QUERY = `
+  query getClientList($input: ListInfoInput!) {
+    getClientList(input: $input) {
+      clients {
+        accountId
+        name
+        status
+        stage
+        emailDomains
+      }
+      listInfo {
+        page
+        pageSize
+        hasMore
+        totalCount
+      }
+    }
+  }
+`;
+
+const LIST_TECH_GROUPS_QUERY = `
+  query getTechnicianGroupList {
+    getTechnicianGroupList {
+      groupId
+      name
+    }
+  }
+`;
+
 const CREATE_TICKET_MUTATION = `
   mutation createTicket($input: CreateTicketInput!) {
     createTicket(input: $input) {
@@ -312,6 +354,17 @@ interface GetTicketFieldsResponse {
   getFields: SuperOpsField[] | SuperOpsField;
 }
 
+interface ListClientsResponse {
+  getClientList: {
+    clients: Client[];
+    listInfo: ListInfo;
+  };
+}
+
+interface ListTechGroupsResponse {
+  getTechnicianGroupList: TechGroup[];
+}
+
 interface CreateTicketResponse {
   createTicket: Ticket;
 }
@@ -330,18 +383,33 @@ interface AddTimeEntryResponse {
 
 type SuperOpsClientInstance = ReturnType<typeof getClient>;
 
-interface UpdateTicketParams {
-  ticketId: string;
+interface TicketClassificationParams {
   status?: string;
   priority?: string;
-  assigneeId?: string;
-  techGroupName?: string;
-  resolution?: string;
   impact?: string;
   resolutionCode?: string;
   category?: string;
   cause?: string;
   subcategory?: string;
+}
+
+interface UpdateTicketParams extends TicketClassificationParams {
+  ticketId: string;
+  assigneeId?: string;
+  techGroupName?: string;
+  resolution?: string;
+}
+
+interface ResolveFullParams extends TicketClassificationParams {
+  ticketNumber?: string;
+  ticketId?: string;
+  clientName?: string;
+  clientId?: string;
+  note?: string;
+  isPublicNote?: boolean;
+  techGroupName?: string;
+  suppressCloseNotification?: boolean;
+  verify?: boolean;
 }
 
 function pageInput(max: number | undefined, page?: number) {
@@ -491,10 +559,20 @@ function invalidValues(values: string[], validValues: readonly string[]): string
   return values.filter((value) => !validValues.includes(value));
 }
 
-function requestedDynamicOptionFields(
-  params: UpdateTicketParams
-): DynamicTicketOptionField[] {
-  return DYNAMIC_TICKET_OPTION_FIELDS.filter(
+function normalizeClientName(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function canonicalClientName(value: string): string {
+  const normalized = normalizeClientName(value);
+  return CLIENT_NAME_ALIASES[normalized] ?? value.trim();
+}
+
+function requestedValidatedOptionFields(
+  params: TicketClassificationParams,
+  allowedFields: readonly ValidatedTicketOptionField[] = VALIDATED_TICKET_OPTION_FIELDS
+): ValidatedTicketOptionField[] {
+  return allowedFields.filter(
     (field) => params[field] !== undefined
   );
 }
@@ -512,7 +590,7 @@ function formatValidOptionValues(values: string[]): string {
 }
 
 function resolveOptionValue(
-  fieldName: DynamicTicketOptionField,
+  fieldName: ValidatedTicketOptionField,
   field: SuperOpsField,
   rawValue: unknown
 ):
@@ -561,8 +639,8 @@ function resolveOptionValue(
 }
 
 function validateOptionDependency(
-  params: UpdateTicketParams,
-  fieldName: DynamicTicketOptionField,
+  params: TicketClassificationParams,
+  fieldName: ValidatedTicketOptionField,
   field: SuperOpsField,
   resolvedOption: NonNullable<SuperOpsField["options"]>[number]
 ): string | undefined {
@@ -589,8 +667,8 @@ function validateOptionDependency(
 
 async function getTicketOptionFields(
   client: SuperOpsClientInstance,
-  fieldNames: DynamicTicketOptionField[]
-): Promise<Map<DynamicTicketOptionField, SuperOpsField>> {
+  fieldNames: ValidatedTicketOptionField[]
+): Promise<Map<ValidatedTicketOptionField, SuperOpsField>> {
   const response = await client.query<GetTicketFieldsResponse>(
     GET_TICKET_FIELDS_QUERY,
     {
@@ -607,11 +685,11 @@ async function getTicketOptionFields(
       ? [response.getFields]
       : [];
   const requested = new Set<string>(fieldNames);
-  const byName = new Map<DynamicTicketOptionField, SuperOpsField>();
+  const byName = new Map<ValidatedTicketOptionField, SuperOpsField>();
 
   for (const field of returnedFields) {
     if (field.columnName && requested.has(field.columnName)) {
-      byName.set(field.columnName as DynamicTicketOptionField, field);
+      byName.set(field.columnName as ValidatedTicketOptionField, field);
     }
   }
 
@@ -620,10 +698,11 @@ async function getTicketOptionFields(
 
 async function addValidatedTicketOptionUpdates(
   client: SuperOpsClientInstance,
-  params: UpdateTicketParams,
-  input: Record<string, unknown>
+  params: TicketClassificationParams,
+  input: Record<string, unknown>,
+  allowedFields: readonly ValidatedTicketOptionField[] = VALIDATED_TICKET_OPTION_FIELDS
 ): Promise<string | undefined> {
-  const fieldsToValidate = requestedDynamicOptionFields(params);
+  const fieldsToValidate = requestedValidatedOptionFields(params, allowedFields);
   if (fieldsToValidate.length === 0) {
     return undefined;
   }
@@ -653,6 +732,162 @@ async function addValidatedTicketOptionUpdates(
 
     input[fieldName] = resolved.value;
   }
+}
+
+async function resolveTicketId(
+  client: SuperOpsClientInstance,
+  params: { ticketId?: string; ticketNumber?: string }
+): Promise<{ ticketId?: string; error?: string }> {
+  if (typeof params.ticketId === "string" && params.ticketId.trim().length > 0) {
+    return { ticketId: params.ticketId.trim() };
+  }
+
+  const displayId = normaliseTicketNumber(params.ticketNumber);
+  if (!displayId) {
+    return { error: "Either ticketId or ticketNumber is required." };
+  }
+
+  const matches = await resolveTicketIdByDisplayId(client, displayId);
+  if (matches.length === 0) {
+    return { error: `No ticket was found for display number ${displayId}.` };
+  }
+
+  if (matches.length > 1) {
+    const matchSummary = matches.map((ticket) => ({
+      ticketId: ticket.ticketId,
+      displayId: ticket.displayId,
+      subject: ticket.subject,
+    }));
+    return {
+      error: `Display number ${displayId} was not unique. Matching tickets: ${JSON.stringify(matchSummary)}`,
+    };
+  }
+
+  return { ticketId: matches[0].ticketId };
+}
+
+async function resolveClientAccountId(
+  client: SuperOpsClientInstance,
+  params: { clientId?: string; clientName?: string }
+): Promise<{ accountId?: string; name?: string; error?: string }> {
+  if (typeof params.clientId === "string" && params.clientId.trim().length > 0) {
+    return { accountId: params.clientId.trim() };
+  }
+
+  if (typeof params.clientName !== "string" || params.clientName.trim().length === 0) {
+    return {};
+  }
+
+  const canonicalName = canonicalClientName(params.clientName);
+  const normalizedTarget = normalizeClientName(canonicalName);
+  const response = await client.query<ListClientsResponse>(LIST_CLIENTS_QUERY, {
+    input: {
+      page: 1,
+      pageSize: CLIENT_LOOKUP_PAGE_SIZE,
+    },
+  });
+
+  const exactMatches = response.getClientList.clients.filter(
+    (candidate) => normalizeClientName(candidate.name) === normalizedTarget
+  );
+
+  if (exactMatches.length === 1) {
+    return {
+      accountId: exactMatches[0].accountId,
+      name: exactMatches[0].name,
+    };
+  }
+
+  if (exactMatches.length > 1) {
+    return {
+      error: `Multiple clients matched "${canonicalName}": ${JSON.stringify(
+        exactMatches.map((candidate) => ({
+          accountId: candidate.accountId,
+          name: candidate.name,
+        }))
+      )}`,
+    };
+  }
+
+  return { error: `No client matched "${canonicalName}".` };
+}
+
+async function resolveTechGroup(
+  client: SuperOpsClientInstance,
+  techGroupName: string | undefined
+): Promise<{ groupId?: string; name?: string; error?: string }> {
+  if (typeof techGroupName !== "string" || techGroupName.trim().length === 0) {
+    return {};
+  }
+
+  const requested = techGroupName.trim().toLowerCase();
+  const response = await client.query<ListTechGroupsResponse>(LIST_TECH_GROUPS_QUERY);
+  const matches = response.getTechnicianGroupList.filter(
+    (group) => group.name.trim().toLowerCase() === requested
+  );
+
+  if (matches.length === 1) {
+    return {
+      groupId: matches[0].groupId,
+      name: matches[0].name,
+    };
+  }
+
+  if (matches.length > 1) {
+    return {
+      error: `Multiple technician groups matched "${techGroupName.trim()}": ${JSON.stringify(
+        matches.map((group) => ({
+          groupId: group.groupId,
+          name: group.name,
+        }))
+      )}`,
+    };
+  }
+
+  return { error: `No technician group matched "${techGroupName.trim()}".` };
+}
+
+async function createTicketNote(
+  client: SuperOpsClientInstance,
+  ticketId: string,
+  content: string,
+  isPublic = false
+): Promise<TicketNote> {
+  const response = await client.mutate<AddNoteResponse>(ADD_TICKET_NOTE_MUTATION, {
+    input: {
+      ticket: { ticketId },
+      content,
+      privacyType: isPublic ? "PUBLIC" : "PRIVATE",
+    },
+  });
+
+  return response.createTicketNote;
+}
+
+function ticketSummary(ticket: Ticket, latestNote?: TicketNote) {
+  return {
+    ticketId: ticket.ticketId,
+    displayId: ticket.displayId,
+    subject: ticket.subject,
+    client: ticket.client,
+    status: ticket.status,
+    priority: ticket.priority,
+    impact: ticket.impact,
+    category: ticket.category,
+    subcategory: ticket.subcategory,
+    cause: ticket.cause,
+    resolutionCode: ticket.resolutionCode,
+    techGroup: ticket.techGroup,
+    technician: ticket.technician,
+    latestNoteSummary: latestNote
+      ? {
+          noteId: latestNote.noteId,
+          addedOn: latestNote.addedOn,
+          privacyType: latestNote.privacyType,
+          contentPreview: latestNote.content.slice(0, 160),
+        }
+      : undefined,
+  };
 }
 
 function errorResult(message: string) {
@@ -837,6 +1072,92 @@ export function getTicketsTools(): DomainTools {
             // configured subcategory references is confirmed.
           },
           required: ["subject", "clientId"],
+        },
+      },
+      {
+        name: "superops_tickets_resolve_full",
+        description:
+          "Resolve or fully classify a ticket by ticket number or internal ticket ID, optionally adding a note, client, technician group, and final classification values before verifying the final state.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ticketNumber: {
+              type: "string",
+              description: "Visible SuperOps ticket number or display ID, such as 57100 or #57100",
+            },
+            ticketId: {
+              type: "string",
+              description: "Internal SuperOps ticket ID. Preferred over ticketNumber when both are supplied.",
+            },
+            clientName: {
+              type: "string",
+              description:
+                "Client display name. Aliases supported: Task Group, taskgroup, computask.",
+            },
+            clientId: {
+              type: "string",
+              description: "Client account ID. Used directly when supplied.",
+            },
+            status: {
+              type: "string",
+              description: "Final ticket status. Defaults to Resolved.",
+              default: DEFAULT_RESOLVE_TICKET_STATUS,
+            },
+            priority: {
+              type: "string",
+              description:
+                "Priority display name. Validated against SuperOps ticket field options before update.",
+            },
+            impact: {
+              type: "string",
+              description:
+                "Impact display name. Validated against SuperOps ticket field options before update.",
+            },
+            category: {
+              type: "string",
+              description:
+                `Configured top-level ticket category: ${VALID_TICKET_CATEGORIES.join(", ")}`,
+              enum: [...VALID_TICKET_CATEGORIES],
+            },
+            subcategory: {
+              type: "string",
+              description:
+                "Subcategory display name. Include category when SuperOps marks the subcategory as dependent on a parent category.",
+            },
+            cause: {
+              type: "string",
+              description:
+                "Cause display name. Validated against SuperOps ticket field options before update.",
+            },
+            resolutionCode: {
+              type: "string",
+              description:
+                "Resolution code display name. Validated against SuperOps ticket field options before update.",
+            },
+            note: {
+              type: "string",
+              description: "Optional note to add before resolving the ticket.",
+            },
+            isPublicNote: {
+              type: "boolean",
+              description: "Whether the optional note is client-visible. Defaults to false.",
+              default: false,
+            },
+            techGroupName: {
+              type: "string",
+              description: "Technician group name to resolve and assign before closing.",
+            },
+            suppressCloseNotification: {
+              type: "boolean",
+              description: "Suppress the close notification email. Defaults to true.",
+              default: true,
+            },
+            verify: {
+              type: "boolean",
+              description: "Re-read the ticket after update and return the final state. Defaults to true.",
+              default: true,
+            },
+          },
         },
       },
       {
@@ -1202,6 +1523,177 @@ export function getTicketsTools(): DomainTools {
             };
           }
 
+          case "superops_tickets_resolve_full": {
+            const params = args as ResolveFullParams;
+
+            const resolvedTicket = await resolveTicketId(client, {
+              ticketId: params.ticketId,
+              ticketNumber: params.ticketNumber,
+            });
+            if (resolvedTicket.error || !resolvedTicket.ticketId) {
+              return errorResult(
+                resolvedTicket.error ?? "Either ticketId or ticketNumber is required."
+              );
+            }
+
+            if (
+              params.category &&
+              invalidValues([params.category], VALID_TICKET_CATEGORIES).length > 0
+            ) {
+              return errorResult(`Invalid ticket category: ${params.category}`);
+            }
+
+            const resolvedClient = await resolveClientAccountId(client, {
+              clientId: params.clientId,
+              clientName: params.clientName,
+            });
+            if (resolvedClient.error) {
+              return errorResult(resolvedClient.error);
+            }
+
+            const resolvedTechGroup = await resolveTechGroup(
+              client,
+              params.techGroupName
+            );
+            if (resolvedTechGroup.error) {
+              return errorResult(resolvedTechGroup.error);
+            }
+
+            const updateInput: Record<string, unknown> = {
+              ticketId: resolvedTicket.ticketId,
+              status: params.status ?? DEFAULT_RESOLVE_TICKET_STATUS,
+              suppressCloseNotification: params.suppressCloseNotification ?? true,
+            };
+
+            if (
+              updateInput.status &&
+              typeof updateInput.status === "string" &&
+              invalidValues([updateInput.status], VALID_TICKET_STATUSES).length > 0
+            ) {
+              return errorResult(`Invalid ticket status: ${updateInput.status}`);
+            }
+
+            if (params.category) {
+              updateInput.category = params.category;
+            }
+
+            const optionValidationError = await addValidatedTicketOptionUpdates(
+              client,
+              {
+                priority: params.priority,
+                impact: params.impact,
+                category: params.category,
+                subcategory: params.subcategory,
+                cause: params.cause,
+                resolutionCode: params.resolutionCode,
+                status: params.status,
+              },
+              updateInput
+            );
+            if (optionValidationError) {
+              return errorResult(optionValidationError);
+            }
+
+            if (resolvedClient.accountId) {
+              updateInput.client = { accountId: resolvedClient.accountId };
+            }
+
+            if (resolvedTechGroup.groupId) {
+              updateInput.techGroup = { groupId: resolvedTechGroup.groupId };
+            }
+
+            let createdNote: TicketNote | undefined;
+            if (typeof params.note === "string" && params.note.trim().length > 0) {
+              createdNote = await createTicketNote(
+                client,
+                resolvedTicket.ticketId,
+                params.note,
+                params.isPublicNote ?? false
+              );
+            }
+
+            let updateResponse: UpdateTicketResponse;
+            try {
+              updateResponse = await client.mutate<UpdateTicketResponse>(
+                UPDATE_TICKET_MUTATION,
+                { input: updateInput }
+              );
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              if (createdNote) {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify(
+                        {
+                          partialFailure: true,
+                          ticketId: resolvedTicket.ticketId,
+                          noteAdded: {
+                            noteId: createdNote.noteId,
+                            addedOn: createdNote.addedOn,
+                            privacyType: createdNote.privacyType,
+                          },
+                          updateError: message,
+                        },
+                        null,
+                        2
+                      ),
+                    },
+                  ],
+                  isError: true,
+                };
+              }
+
+              throw error;
+            }
+
+            if (params.verify === false) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(
+                      createdNote
+                        ? {
+                            noteAdded: {
+                              noteId: createdNote.noteId,
+                              addedOn: createdNote.addedOn,
+                              privacyType: createdNote.privacyType,
+                            },
+                            update: updateResponse.updateTicket,
+                          }
+                        : updateResponse.updateTicket,
+                      null,
+                      2
+                    ),
+                  },
+                ],
+              };
+            }
+
+            const verifiedTicket = await getTicketByInternalId(
+              client,
+              resolvedTicket.ticketId
+            );
+            const latestNotes = createdNote
+              ? await getTicketNotes(client, resolvedTicket.ticketId)
+              : [];
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    ticketSummary(verifiedTicket, latestNotes[0] ?? createdNote),
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+
           case "superops_tickets_update": {
             const rawParams = args as Record<string, unknown>;
 
@@ -1233,7 +1725,13 @@ export function getTicketsTools(): DomainTools {
             const optionValidationError = await addValidatedTicketOptionUpdates(
               client,
               params,
-              input
+              input,
+              [
+                "impact",
+                "resolutionCode",
+                "cause",
+                "subcategory",
+              ] as ValidatedTicketOptionField[]
             );
             if (optionValidationError) {
               return errorResult(optionValidationError);

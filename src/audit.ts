@@ -19,11 +19,13 @@ export interface AuditMetadata {
   operationType?: string;
   operationName?: string;
   variableKeys?: string[];
+  changedFields?: string[];
 }
 
 const HIGH_RISK_WRITE_TOOLS = new Set([
   "superops_tickets_create",
   "superops_tickets_update",
+  "superops_tickets_resolve_full",
   "superops_tickets_add_note",
   "superops_tickets_log_time",
   "superops_custom_mutation",
@@ -186,12 +188,61 @@ function variableKeys(variables: unknown): string[] | undefined {
   return Object.keys(variables as Record<string, unknown>).slice(0, 25);
 }
 
-export function customGraphqlAuditMetadata(
+const WRITE_FIELD_KEYS: Partial<Record<string, string[]>> = {
+  superops_tickets_update: [
+    "ticketId",
+    "status",
+    "priority",
+    "impact",
+    "resolutionCode",
+    "category",
+    "cause",
+    "subcategory",
+    "assigneeId",
+    "techGroupName",
+    "resolution",
+  ],
+  superops_tickets_resolve_full: [
+    "ticketId",
+    "ticketNumber",
+    "clientName",
+    "clientId",
+    "status",
+    "priority",
+    "impact",
+    "category",
+    "subcategory",
+    "cause",
+    "resolutionCode",
+    "note",
+    "isPublicNote",
+    "techGroupName",
+    "suppressCloseNotification",
+    "verify",
+  ],
+};
+
+function changedFieldKeys(
+  toolName: string,
+  args: Record<string, unknown>
+): string[] | undefined {
+  const allowed = WRITE_FIELD_KEYS[toolName];
+  if (!allowed) {
+    return undefined;
+  }
+
+  const fields = allowed.filter((key) => key in args);
+  return fields.length > 0 ? fields : undefined;
+}
+
+export function toolAuditMetadata(
   name: string,
   args: Record<string, unknown>
 ): AuditMetadata | undefined {
+  const changedFields = changedFieldKeys(name, args);
+
   if (name !== "superops_custom_query" && name !== "superops_custom_mutation") {
-    return undefined;
+    return changedFields ? { changedFields } : undefined;
   }
 
   const source =
@@ -200,6 +251,7 @@ export function customGraphqlAuditMetadata(
   return {
     ...parseGraphQLOperation(source),
     variableKeys: variableKeys(args.variables),
+    changedFields,
   };
 }
 
@@ -275,6 +327,7 @@ export function auditToolCall(args: {
     success: args.success,
     durationMs: args.durationMs,
     errorSummary: args.errorSummary ? sanitizeText(args.errorSummary) : undefined,
+    changedFields: args.metadata?.changedFields,
     customGraphql: args.metadata,
   };
 

@@ -22,10 +22,10 @@ import { setServerRef } from "./utils/server-ref.js";
 import {
   auditToolCall,
   blockedToolReason,
-  customGraphqlAuditMetadata,
   errorSummaryFromResult,
   sanitizeError,
   sanitizeToolResult,
+  toolAuditMetadata,
   type ToolResult,
 } from "./audit.js";
 
@@ -369,7 +369,7 @@ export function createMcpServer(): Server {
     const { name } = request.params;
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
     const started = Date.now();
-    const metadata = customGraphqlAuditMetadata(name, args);
+    const metadata = toolAuditMetadata(name, args);
 
     try {
       const result = sanitizeToolResult(await executeToolCall(name, args));
