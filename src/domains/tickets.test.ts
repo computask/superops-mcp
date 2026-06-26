@@ -95,6 +95,7 @@ describe("Tickets Domain", () => {
       "superops_tickets_get_by_number",
       "superops_tickets_conversation_list",
       "superops_tickets_notes_list",
+      "superops_tickets_field_options",
       "superops_tickets_create",
       "superops_tickets_resolve_full",
       "superops_tickets_update",
@@ -211,7 +212,13 @@ describe("Tickets Domain", () => {
     const domain = getTicketsTools();
     const listTool = domain.tools.find((tool) => tool.name === "superops_tickets_list");
     const createTool = domain.tools.find((tool) => tool.name === "superops_tickets_create");
+    const resolveTool = domain.tools.find(
+      (tool) => tool.name === "superops_tickets_resolve_full"
+    );
     const updateTool = domain.tools.find((tool) => tool.name === "superops_tickets_update");
+    const fieldOptionsTool = domain.tools.find(
+      (tool) => tool.name === "superops_tickets_field_options"
+    );
 
     const listStatus = listTool?.inputSchema.properties.status as {
       items?: { enum?: string[] };
@@ -225,15 +232,47 @@ describe("Tickets Domain", () => {
     const updateCategory = updateTool?.inputSchema.properties.category as {
       enum?: string[];
     };
+    const fieldOptionsFields = fieldOptionsTool?.inputSchema.properties.fields as {
+      items: { enum: string[] };
+    };
 
     expect(listStatus.items?.enum).toEqual(VALID_TICKET_STATUSES);
     expect(updateStatus.enum).toEqual(VALID_TICKET_STATUSES);
     expect(createCategory.enum).toEqual(VALID_TICKET_CATEGORIES);
     expect(updateCategory.enum).toEqual(VALID_TICKET_CATEGORIES);
+    expect(resolveTool?.inputSchema.properties.urgency).toBeDefined();
     expect(updateTool?.inputSchema.properties.impact).toBeDefined();
+    expect(updateTool?.inputSchema.properties.urgency).toBeDefined();
     expect(updateTool?.inputSchema.properties.resolutionCode).toBeDefined();
     expect(updateTool?.inputSchema.properties.cause).toBeDefined();
     expect(updateTool?.inputSchema.properties.subcategory).toBeDefined();
+    expect(fieldOptionsFields.items.enum).toContain("urgency");
+  });
+
+  it("returns urgency in ticket field option discovery", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: [
+        ticketField("priority", ["Very Low"]),
+        ticketField("impact", ["Low"]),
+        ticketField("urgency", ["Low"]),
+      ],
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_field_options", {});
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.query).toHaveBeenCalledWith(expect.stringContaining("getFields"), {
+      input: [
+        { module: "TICKET", columnName: "priority" },
+        { module: "TICKET", columnName: "impact" },
+        { module: "TICKET", columnName: "urgency" },
+        { module: "TICKET", columnName: "resolutionCode" },
+        { module: "TICKET", columnName: "cause" },
+        { module: "TICKET", columnName: "subcategory" },
+      ],
+    });
+    expect(parsed.urgency.options[0].value).toBe("Low");
   });
 
   it("uses documented ticket fields in list and get queries", async () => {
@@ -551,7 +590,7 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
   });
 
-  it("resolves a ticket by ticket number with validated display-name classifications", async () => {
+  it("resolves a ticket by ticket number with impact and urgency, without default priority", async () => {
     mockClient.query
       .mockResolvedValueOnce({
         getTicketList: {
@@ -567,8 +606,8 @@ describe("Tickets Domain", () => {
       })
       .mockResolvedValueOnce({
         getFields: [
-          ticketField("priority", ["Very Low"]),
           ticketField("impact", ["Low"]),
+          ticketField("urgency", ["Low"]),
           ticketField("resolutionCode", ["Permanent Fix"]),
           ticketField("cause", ["No Fault Found"]),
           ticketField("subcategory", ["No Action Needed"], {
@@ -589,8 +628,8 @@ describe("Tickets Domain", () => {
     const result = await domain.handleCall("superops_tickets_resolve_full", {
       ticketNumber: "57100",
       clientId: "2993553194649526272",
-      priority: "Very Low",
       impact: "Low",
+      urgency: "Low",
       category: "7. Sales call",
       subcategory: "No Action Needed",
       cause: "No Fault Found",
@@ -619,8 +658,8 @@ describe("Tickets Domain", () => {
           status: "Resolved",
           suppressCloseNotification: true,
           client: { accountId: "2993553194649526272" },
-          priority: "Very Low",
           impact: "Low",
+          urgency: "Low",
           category: "7. Sales call",
           subcategory: "No Action Needed",
           cause: "No Fault Found",
@@ -628,6 +667,7 @@ describe("Tickets Domain", () => {
         },
       }
     );
+    expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
     expect(result.content[0].text).toContain("ticket-57100");
   });
 
@@ -791,7 +831,9 @@ describe("Tickets Domain", () => {
   });
 
   it.each([
+    ["priority", "Very Low"],
     ["impact", "High"],
+    ["urgency", "High"],
     ["resolutionCode", "Fixed"],
     ["cause", "Component issue"],
     ["subcategory", "Wireless"],
@@ -870,6 +912,24 @@ describe("Tickets Domain", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("Invalid impact");
+    expect(result.content[0].text).toContain('"Low"');
+    expect(result.content[0].text).toContain('"Medium"');
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid urgency before mutation", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: [ticketField("urgency", ["Low", "Medium"])],
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_update", {
+      ticketId: "ticket-123",
+      urgency: "Not an urgency",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Invalid urgency");
     expect(result.content[0].text).toContain('"Low"');
     expect(result.content[0].text).toContain('"Medium"');
     expect(mockClient.mutate).not.toHaveBeenCalled();

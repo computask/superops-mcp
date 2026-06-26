@@ -71,6 +71,7 @@ const CLIENT_NAME_ALIASES: Record<string, string> = {
 const VALIDATED_TICKET_OPTION_FIELDS = [
   "priority",
   "impact",
+  "urgency",
   "resolutionCode",
   "cause",
   "subcategory",
@@ -82,6 +83,7 @@ type ValidatedTicketOptionField =
 const TICKET_OPTION_FIELD_LABELS: Record<ValidatedTicketOptionField, string> = {
   priority: "priority",
   impact: "impact",
+  urgency: "urgency",
   resolutionCode: "resolution code",
   cause: "cause",
   subcategory: "subcategory",
@@ -289,6 +291,7 @@ const UPDATE_TICKET_MUTATION = `
       status
       priority
       impact
+      urgency
       category
       subcategory
       cause
@@ -387,6 +390,7 @@ interface TicketClassificationParams {
   status?: string;
   priority?: string;
   impact?: string;
+  urgency?: string;
   resolutionCode?: string;
   category?: string;
   cause?: string;
@@ -873,6 +877,7 @@ function ticketSummary(ticket: Ticket, latestNote?: TicketNote) {
     status: ticket.status,
     priority: ticket.priority,
     impact: ticket.impact,
+    urgency: ticket.urgency,
     category: ticket.category,
     subcategory: ticket.subcategory,
     cause: ticket.cause,
@@ -1032,6 +1037,25 @@ export function getTicketsTools(): DomainTools {
         },
       },
       {
+        name: "superops_tickets_field_options",
+        description:
+          "Discover writable ticket classification field options from SuperOps for validation before updates.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            fields: {
+              type: "array",
+              items: {
+                type: "string",
+                enum: [...VALIDATED_TICKET_OPTION_FIELDS],
+              },
+              description:
+                "Optional subset of fields to fetch. Defaults to priority, impact, urgency, resolutionCode, cause, and subcategory.",
+            },
+          },
+        },
+      },
+      {
         name: "superops_tickets_create",
         description: "Create a new ticket in SuperOps.ai.",
         inputSchema: {
@@ -1106,12 +1130,17 @@ export function getTicketsTools(): DomainTools {
             priority: {
               type: "string",
               description:
-                "Priority display name. Validated against SuperOps ticket field options before update.",
+                "Manual priority override display name. Validated against SuperOps ticket field options before update. Prefer impact plus urgency so SuperOps can calculate priority.",
             },
             impact: {
               type: "string",
               description:
                 "Impact display name. Validated against SuperOps ticket field options before update.",
+            },
+            urgency: {
+              type: "string",
+              description:
+                "Urgency display name. Validated against SuperOps ticket field options before update.",
             },
             category: {
               type: "string",
@@ -1163,7 +1192,7 @@ export function getTicketsTools(): DomainTools {
       {
         name: "superops_tickets_update",
         description:
-          "Update an existing ticket - change status, assignment, impact, category, cause, subcategory, or resolution code.",
+          "Update an existing ticket - change status, assignment, impact, urgency, category, cause, subcategory, resolution code, or an explicit manual priority override.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1180,12 +1209,17 @@ export function getTicketsTools(): DomainTools {
             priority: {
               type: "string",
               description:
-                "Currently not sent by this tool. Requires confirmed SuperOps priority ID mapping.",
+                "Manual priority override name. Validated against SuperOps ticket field options before update. Omitted unless explicitly supplied.",
             },
             impact: {
               type: "string",
               description:
                 "Impact name. Validated against SuperOps ticket field options before update.",
+            },
+            urgency: {
+              type: "string",
+              description:
+                "Urgency name. Validated against SuperOps ticket field options before update.",
             },
             resolutionCode: {
               type: "string",
@@ -1403,6 +1437,51 @@ export function getTicketsTools(): DomainTools {
             };
           }
 
+          case "superops_tickets_field_options": {
+            const params = args as { fields?: ValidatedTicketOptionField[] };
+            const requestedFields =
+              params.fields && params.fields.length > 0
+                ? params.fields
+                : [...VALIDATED_TICKET_OPTION_FIELDS];
+            const invalidFields = requestedFields.filter(
+              (field) =>
+                !VALIDATED_TICKET_OPTION_FIELDS.includes(
+                  field as ValidatedTicketOptionField
+                )
+            );
+
+            if (invalidFields.length > 0) {
+              return errorResult(
+                `Invalid field option field(s): ${invalidFields.join(", ")}`
+              );
+            }
+
+            const fields = await getTicketOptionFields(client, requestedFields);
+            const result = Object.fromEntries(
+              requestedFields.map((fieldName) => {
+                const field = fields.get(fieldName);
+                return [
+                  fieldName,
+                  {
+                    label: field?.label,
+                    columnName: field?.columnName ?? fieldName,
+                    options: field?.options ?? [],
+                    parentField: field?.parentField,
+                  },
+                ];
+              })
+            );
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
+          }
+
           case "superops_tickets_get_by_number": {
             const params = args as {
               ticketNumber?: string | number;
@@ -1582,6 +1661,7 @@ export function getTicketsTools(): DomainTools {
               {
                 priority: params.priority,
                 impact: params.impact,
+                urgency: params.urgency,
                 category: params.category,
                 subcategory: params.subcategory,
                 cause: params.cause,
@@ -1727,7 +1807,9 @@ export function getTicketsTools(): DomainTools {
               params,
               input,
               [
+                "priority",
                 "impact",
+                "urgency",
                 "resolutionCode",
                 "cause",
                 "subcategory",
@@ -1736,8 +1818,6 @@ export function getTicketsTools(): DomainTools {
             if (optionValidationError) {
               return errorResult(optionValidationError);
             }
-            // Priority appears to require a SuperOps priority ID, not a friendly label.
-            // Leave it unset until priority ID mapping is implemented.
             if (params.assigneeId) input.technician = { userId: params.assigneeId };
             // TODO: Map techGroupName and resolution only after a documented
             // name-to-ID lookup or resolution-code workflow is available.

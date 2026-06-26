@@ -158,11 +158,18 @@ Token rotation plan:
 - `superops_tickets_get_by_number` - Get ticket details by visible SuperOps ticket number/display ID
 - `superops_tickets_conversation_list` - Read customer ticket conversations/replies, including attachment metadata where returned by SuperOps
 - `superops_tickets_notes_list` - Read public/internal ticket notes, including attachment metadata where returned by SuperOps
+- `superops_tickets_field_options` - Discover live SuperOps ticket option values for priority, impact, urgency, resolution code, cause, and subcategory
 - `superops_tickets_create` - Create a new ticket
 - `superops_tickets_resolve_full` - Resolve or fully classify a ticket by ticket number or internal ID, with client lookup, technician group lookup, validated display-name classification fields, optional note creation, and optional final verification
-- `superops_tickets_update` - Update ticket status, assignment, impact, category, cause, subcategory, and resolution code. Tenant category values use the configured enum; other option values are resolved and validated from SuperOps ticket field metadata before mutation.
+- `superops_tickets_update` - Update ticket status, assignment, impact, urgency, category, cause, subcategory, resolution code, or an explicit manual priority override. Tenant category values use the configured enum; other option values are resolved and validated from SuperOps ticket field metadata before mutation.
 - `superops_tickets_add_note` - Add note to ticket
 - `superops_tickets_log_time` - Log time on ticket
+
+Ticket urgency is writable. Priority can still be supplied manually and will be
+validated against live SuperOps options, but the preferred workflow is to set
+impact and urgency and let SuperOps calculate priority from its business rules.
+When priority is omitted from update or resolve calls, it is not sent to
+`updateTicket`.
 
 ### Assets Domain
 
@@ -200,8 +207,8 @@ User: Resolve spam ticket 57100
 Claude: [calls superops_tickets_resolve_full with {
   "ticketNumber": "57100",
   "clientName": "Task Group",
-  "priority": "Very Low",
   "impact": "Low",
+  "urgency": "Low",
   "category": "7. Sales call",
   "subcategory": "No Action Needed",
   "cause": "No Fault Found",
@@ -210,6 +217,13 @@ Claude: [calls superops_tickets_resolve_full with {
   "suppressCloseNotification": true
 }]
 The ticket has been classified and resolved.
+
+User: Manually override ticket 57101 priority
+Claude: [calls superops_tickets_update with {
+  "ticketId": "ticket-57101",
+  "priority": "High"
+}]
+The priority override has been validated and applied.
 ```
 
 ## Rate Limits
