@@ -151,6 +151,26 @@ export interface Category {
   name: string;
 }
 
+export interface FieldOption {
+  id?: string;
+  value?: string;
+  description?: string;
+  parentOption?: FieldOption;
+}
+
+export interface SuperOpsField {
+  id?: string;
+  module?: string;
+  columnName?: string;
+  label?: string;
+  options?: FieldOption[];
+  parentField?: {
+    id?: string;
+    columnName?: string;
+    label?: string;
+  };
+}
+
 export interface TicketNote {
   noteId: string;
   addedBy?: SuperOpsJson;

@@ -13,6 +13,7 @@ import type {
   TimeEntry,
   ListInfo,
   ListInfoInput,
+  SuperOpsField,
 } from "../types.js";
 import { elicitText } from "../utils/elicitation.js";
 
@@ -55,6 +56,29 @@ const MIN_RECENT_TICKETS_COUNT = 1;
 const MAX_RECENT_TICKETS_COUNT = 50;
 const MAX_RECENT_TICKETS_WITH_CONTENT = 10;
 const DISPLAY_ID_EQUALS_OPERATOR = "is";
+const TICKET_FIELD_MODULE = "TICKET";
+
+const DYNAMIC_TICKET_OPTION_FIELDS = [
+  "impact",
+  "resolutionCode",
+  "cause",
+  "subcategory",
+] as const;
+
+type DynamicTicketOptionField = (typeof DYNAMIC_TICKET_OPTION_FIELDS)[number];
+
+const TICKET_OPTION_FIELD_LABELS: Record<DynamicTicketOptionField, string> = {
+  impact: "impact",
+  resolutionCode: "resolution code",
+  cause: "cause",
+  subcategory: "subcategory",
+};
+
+const FALLBACK_PARENT_FIELDS: Partial<
+  Record<DynamicTicketOptionField, keyof UpdateTicketParams>
+> = {
+  subcategory: "category",
+};
 
 const LIST_TICKETS_QUERY = `
   query getTicketList($input: ListInfoInput!) {
@@ -170,6 +194,32 @@ const GET_TICKET_NOTE_LIST_QUERY = `
   }
 `;
 
+const GET_TICKET_FIELDS_QUERY = `
+  query getFields($input: [FieldIdentifierInput!]!) {
+    getFields(input: $input) {
+      id
+      module
+      columnName
+      label
+      options {
+        id
+        value
+        description
+        parentOption {
+          id
+          value
+          description
+        }
+      }
+      parentField {
+        id
+        columnName
+        label
+      }
+    }
+  }
+`;
+
 const CREATE_TICKET_MUTATION = `
   mutation createTicket($input: CreateTicketInput!) {
     createTicket(input: $input) {
@@ -196,6 +246,12 @@ const UPDATE_TICKET_MUTATION = `
       displayId
       status
       priority
+      impact
+      category
+      subcategory
+      cause
+      subcause
+      resolutionCode
       techGroup
       technician
       updatedTime
@@ -252,6 +308,10 @@ interface GetTicketNoteListResponse {
   getTicketNoteList: TicketNote[];
 }
 
+interface GetTicketFieldsResponse {
+  getFields: SuperOpsField[] | SuperOpsField;
+}
+
 interface CreateTicketResponse {
   createTicket: Ticket;
 }
@@ -269,6 +329,20 @@ interface AddTimeEntryResponse {
 }
 
 type SuperOpsClientInstance = ReturnType<typeof getClient>;
+
+interface UpdateTicketParams {
+  ticketId: string;
+  status?: string;
+  priority?: string;
+  assigneeId?: string;
+  techGroupName?: string;
+  resolution?: string;
+  impact?: string;
+  resolutionCode?: string;
+  category?: string;
+  cause?: string;
+  subcategory?: string;
+}
 
 function pageInput(max: number | undefined, page?: number) {
   return {
@@ -415,6 +489,170 @@ function applyTicketFilters(
 
 function invalidValues(values: string[], validValues: readonly string[]): string[] {
   return values.filter((value) => !validValues.includes(value));
+}
+
+function requestedDynamicOptionFields(
+  params: UpdateTicketParams
+): DynamicTicketOptionField[] {
+  return DYNAMIC_TICKET_OPTION_FIELDS.filter(
+    (field) => params[field] !== undefined
+  );
+}
+
+function optionValues(field: SuperOpsField): string[] {
+  return (field.options ?? [])
+    .map((option) => option.value?.trim())
+    .filter((value): value is string => Boolean(value));
+}
+
+function formatValidOptionValues(values: string[]): string {
+  const visible = values.slice(0, 30).map((value) => `"${value}"`);
+  const suffix = values.length > visible.length ? `, and ${values.length - visible.length} more` : "";
+  return `${visible.join(", ")}${suffix}`;
+}
+
+function resolveOptionValue(
+  fieldName: DynamicTicketOptionField,
+  field: SuperOpsField,
+  rawValue: unknown
+):
+  | { value: string; option: NonNullable<SuperOpsField["options"]>[number] }
+  | { error: string } {
+  const label = TICKET_OPTION_FIELD_LABELS[fieldName];
+  if (typeof rawValue !== "string" || rawValue.trim().length === 0) {
+    return { error: `${label} must be a non-empty string.` };
+  }
+
+  const options = (field.options ?? []).filter(
+    (option) => typeof option.value === "string" && option.value.trim().length > 0
+  );
+  const values = optionValues(field);
+
+  if (options.length === 0) {
+    return {
+      error: `SuperOps did not return valid ${label} options; cannot safely update ${fieldName}.`,
+    };
+  }
+
+  const requested = rawValue.trim();
+  const exact = options.find((option) => option.value?.trim() === requested);
+  if (exact?.value) {
+    return { value: exact.value.trim(), option: exact };
+  }
+
+  const lowered = requested.toLowerCase();
+  const matches = options.filter(
+    (option) => option.value?.trim().toLowerCase() === lowered
+  );
+
+  if (matches.length === 1 && matches[0].value) {
+    return { value: matches[0].value.trim(), option: matches[0] };
+  }
+
+  if (matches.length > 1) {
+    return {
+      error: `The ${label} value "${requested}" is ambiguous. Valid values: ${formatValidOptionValues(values)}`,
+    };
+  }
+
+  return {
+    error: `Invalid ${label}: "${requested}". Valid values: ${formatValidOptionValues(values)}`,
+  };
+}
+
+function validateOptionDependency(
+  params: UpdateTicketParams,
+  fieldName: DynamicTicketOptionField,
+  field: SuperOpsField,
+  resolvedOption: NonNullable<SuperOpsField["options"]>[number]
+): string | undefined {
+  const parentValue = resolvedOption.parentOption?.value?.trim();
+  if (!parentValue) {
+    return undefined;
+  }
+
+  const parentFieldName =
+    field.parentField?.columnName ?? FALLBACK_PARENT_FIELDS[fieldName];
+  if (!parentFieldName) {
+    return `SuperOps returned a parent option for ${TICKET_OPTION_FIELD_LABELS[fieldName]} but did not identify the parent field; cannot safely update ${fieldName}.`;
+  }
+
+  const rawParent = (params as unknown as Record<string, unknown>)[parentFieldName];
+  if (typeof rawParent !== "string" || rawParent.trim().length === 0) {
+    return `${TICKET_OPTION_FIELD_LABELS[fieldName]} "${resolvedOption.value}" depends on ${parentFieldName} "${parentValue}". Include ${parentFieldName} in the same update so the option dependency can be validated.`;
+  }
+
+  if (rawParent.trim().toLowerCase() !== parentValue.toLowerCase()) {
+    return `${TICKET_OPTION_FIELD_LABELS[fieldName]} "${resolvedOption.value}" belongs under ${parentFieldName} "${parentValue}", not "${rawParent.trim()}".`;
+  }
+}
+
+async function getTicketOptionFields(
+  client: SuperOpsClientInstance,
+  fieldNames: DynamicTicketOptionField[]
+): Promise<Map<DynamicTicketOptionField, SuperOpsField>> {
+  const response = await client.query<GetTicketFieldsResponse>(
+    GET_TICKET_FIELDS_QUERY,
+    {
+      input: fieldNames.map((columnName) => ({
+        module: TICKET_FIELD_MODULE,
+        columnName,
+      })),
+    }
+  );
+
+  const returnedFields = Array.isArray(response.getFields)
+    ? response.getFields
+    : response.getFields
+      ? [response.getFields]
+      : [];
+  const requested = new Set<string>(fieldNames);
+  const byName = new Map<DynamicTicketOptionField, SuperOpsField>();
+
+  for (const field of returnedFields) {
+    if (field.columnName && requested.has(field.columnName)) {
+      byName.set(field.columnName as DynamicTicketOptionField, field);
+    }
+  }
+
+  return byName;
+}
+
+async function addValidatedTicketOptionUpdates(
+  client: SuperOpsClientInstance,
+  params: UpdateTicketParams,
+  input: Record<string, unknown>
+): Promise<string | undefined> {
+  const fieldsToValidate = requestedDynamicOptionFields(params);
+  if (fieldsToValidate.length === 0) {
+    return undefined;
+  }
+
+  const fields = await getTicketOptionFields(client, fieldsToValidate);
+
+  for (const fieldName of fieldsToValidate) {
+    const field = fields.get(fieldName);
+    if (!field) {
+      return `SuperOps did not return field metadata for ${TICKET_OPTION_FIELD_LABELS[fieldName]} via getFields; cannot safely update ${fieldName}.`;
+    }
+
+    const resolved = resolveOptionValue(fieldName, field, params[fieldName]);
+    if ("error" in resolved) {
+      return resolved.error;
+    }
+
+    const dependencyError = validateOptionDependency(
+      params,
+      fieldName,
+      field,
+      resolved.option
+    );
+    if (dependencyError) {
+      return dependencyError;
+    }
+
+    input[fieldName] = resolved.value;
+  }
 }
 
 function errorResult(message: string) {
@@ -604,7 +842,7 @@ export function getTicketsTools(): DomainTools {
       {
         name: "superops_tickets_update",
         description:
-          "Update an existing ticket - change status, priority, assignment, or add resolution.",
+          "Update an existing ticket - change status, assignment, impact, category, cause, subcategory, or resolution code.",
         inputSchema: {
           type: "object",
           properties: {
@@ -622,6 +860,32 @@ export function getTicketsTools(): DomainTools {
               type: "string",
               description:
                 "Currently not sent by this tool. Requires confirmed SuperOps priority ID mapping.",
+            },
+            impact: {
+              type: "string",
+              description:
+                "Impact name. Validated against SuperOps ticket field options before update.",
+            },
+            resolutionCode: {
+              type: "string",
+              description:
+                "Resolution code name. Validated against SuperOps ticket field options before update.",
+            },
+            category: {
+              type: "string",
+              description:
+                `Configured top-level ticket category: ${VALID_TICKET_CATEGORIES.join(", ")}`,
+              enum: [...VALID_TICKET_CATEGORIES],
+            },
+            cause: {
+              type: "string",
+              description:
+                "Cause name. Validated against SuperOps ticket field options before update.",
+            },
+            subcategory: {
+              type: "string",
+              description:
+                "Subcategory name. Validated against SuperOps ticket field options before update. Include category when SuperOps marks the subcategory as dependent on a parent category.",
             },
             assigneeId: {
               type: "string",
@@ -939,14 +1203,16 @@ export function getTicketsTools(): DomainTools {
           }
 
           case "superops_tickets_update": {
-            const params = args as {
-              ticketId: string;
-              status?: string;
-              priority?: string;
-              assigneeId?: string;
-              techGroupName?: string;
-              resolution?: string;
-            };
+            const rawParams = args as Record<string, unknown>;
+
+            if (
+              typeof rawParams.ticketId !== "string" ||
+              rawParams.ticketId.length === 0
+            ) {
+              return errorResult("ticketId is required.");
+            }
+
+            const params = rawParams as unknown as UpdateTicketParams;
 
             const input: Record<string, unknown> = { ticketId: params.ticketId };
             if (
@@ -956,6 +1222,22 @@ export function getTicketsTools(): DomainTools {
               return errorResult(`Invalid ticket status: ${params.status}`);
             }
             if (params.status) input.status = params.status;
+            if (
+              params.category &&
+              invalidValues([params.category], VALID_TICKET_CATEGORIES).length > 0
+            ) {
+              return errorResult(`Invalid ticket category: ${params.category}`);
+            }
+            if (params.category) input.category = params.category;
+
+            const optionValidationError = await addValidatedTicketOptionUpdates(
+              client,
+              params,
+              input
+            );
+            if (optionValidationError) {
+              return errorResult(optionValidationError);
+            }
             // Priority appears to require a SuperOps priority ID, not a friendly label.
             // Leave it unset until priority ID mapping is implemented.
             if (params.assigneeId) input.technician = { userId: params.assigneeId };

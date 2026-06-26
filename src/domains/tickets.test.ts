@@ -47,6 +47,29 @@ const VALID_TICKET_CATEGORIES = [
   "8. Rewst",
 ];
 
+function ticketField(
+  columnName: string,
+  values: string[],
+  parentField?: { columnName: string; value: string }
+) {
+  return {
+    id: `${columnName}-field`,
+    module: "TICKET",
+    columnName,
+    label: columnName,
+    options: values.map((value) => ({
+      id: `${columnName}-${value}`,
+      value,
+      parentOption: parentField
+        ? { id: `${parentField.columnName}-${parentField.value}`, value: parentField.value }
+        : undefined,
+    })),
+    parentField: parentField
+      ? { id: `${parentField.columnName}-field`, columnName: parentField.columnName }
+      : undefined,
+  };
+}
+
 describe("Tickets Domain", () => {
   let mockClient: { query: ReturnType<typeof vi.fn>; mutate: ReturnType<typeof vi.fn> };
 
@@ -198,10 +221,18 @@ describe("Tickets Domain", () => {
     const updateStatus = updateTool?.inputSchema.properties.status as {
       enum?: string[];
     };
+    const updateCategory = updateTool?.inputSchema.properties.category as {
+      enum?: string[];
+    };
 
     expect(listStatus.items?.enum).toEqual(VALID_TICKET_STATUSES);
     expect(updateStatus.enum).toEqual(VALID_TICKET_STATUSES);
     expect(createCategory.enum).toEqual(VALID_TICKET_CATEGORIES);
+    expect(updateCategory.enum).toEqual(VALID_TICKET_CATEGORIES);
+    expect(updateTool?.inputSchema.properties.impact).toBeDefined();
+    expect(updateTool?.inputSchema.properties.resolutionCode).toBeDefined();
+    expect(updateTool?.inputSchema.properties.cause).toBeDefined();
+    expect(updateTool?.inputSchema.properties.subcategory).toBeDefined();
   });
 
   it("uses documented ticket fields in list and get queries", async () => {
@@ -543,6 +574,161 @@ describe("Tickets Domain", () => {
       }
     );
     expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
+  });
+
+  it.each([
+    ["impact", "High"],
+    ["resolutionCode", "Fixed"],
+    ["cause", "Component issue"],
+    ["subcategory", "Wireless"],
+  ] as const)(
+    "updates tickets with validated %s option values",
+    async (fieldName, optionValue) => {
+      mockClient.query.mockResolvedValue({
+        getFields: [ticketField(fieldName, [optionValue])],
+      });
+      mockClient.mutate.mockResolvedValue({
+        updateTicket: { ticketId: "ticket-123", [fieldName]: optionValue },
+      });
+
+      const domain = getTicketsTools();
+      const result = await domain.handleCall("superops_tickets_update", {
+        ticketId: "ticket-123",
+        [fieldName]: optionValue,
+      });
+
+      expect(mockClient.query).toHaveBeenCalledWith(
+        expect.stringContaining("getFields"),
+        {
+          input: [{ module: "TICKET", columnName: fieldName }],
+        }
+      );
+      expect(mockClient.mutate).toHaveBeenCalledWith(
+        expect.stringContaining("updateTicket"),
+        {
+          input: {
+            ticketId: "ticket-123",
+            [fieldName]: optionValue,
+          },
+        }
+      );
+      expect(mockClient.mutate.mock.calls[0][0]).toContain(fieldName);
+      expect(result.content[0].text).toContain(optionValue);
+    }
+  );
+
+  it("updates tickets with configured category names", async () => {
+    mockClient.mutate.mockResolvedValue({
+      updateTicket: {
+        ticketId: "ticket-123",
+        category: "1. Support request",
+      },
+    });
+
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_update", {
+      ticketId: "ticket-123",
+      category: "1. Support request",
+    });
+
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).toHaveBeenCalledWith(
+      expect.stringContaining("updateTicket"),
+      {
+        input: {
+          ticketId: "ticket-123",
+          category: "1. Support request",
+        },
+      }
+    );
+  });
+
+  it("rejects invalid dynamic ticket option names before mutation", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: [ticketField("impact", ["Low", "Medium"])],
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_update", {
+      ticketId: "ticket-123",
+      impact: "Not an impact",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Invalid impact");
+    expect(result.content[0].text).toContain('"Low"');
+    expect(result.content[0].text).toContain('"Medium"');
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid configured category names before mutation", async () => {
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_update", {
+      ticketId: "ticket-123",
+      category: "Unsupported category",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Invalid ticket category");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("validates dependent subcategory options against the supplied category", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: [
+        ticketField("subcategory", ["Wireless"], {
+          columnName: "category",
+          value: "1. Support request",
+        }),
+      ],
+    });
+    mockClient.mutate.mockResolvedValue({
+      updateTicket: {
+        ticketId: "ticket-123",
+        category: "1. Support request",
+        subcategory: "Wireless",
+      },
+    });
+
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_update", {
+      ticketId: "ticket-123",
+      category: "1. Support request",
+      subcategory: "Wireless",
+    });
+
+    expect(mockClient.mutate).toHaveBeenCalledWith(
+      expect.stringContaining("updateTicket"),
+      {
+        input: {
+          ticketId: "ticket-123",
+          category: "1. Support request",
+          subcategory: "Wireless",
+        },
+      }
+    );
+  });
+
+  it("rejects dependent subcategory options when the required category is missing", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: [
+        ticketField("subcategory", ["Wireless"], {
+          columnName: "category",
+          value: "1. Support request",
+        }),
+      ],
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_update", {
+      ticketId: "ticket-123",
+      subcategory: "Wireless",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Include category");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
   it("creates ticket notes using createTicketNote", async () => {

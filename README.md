@@ -159,7 +159,7 @@ Token rotation plan:
 - `superops_tickets_conversation_list` - Read customer ticket conversations/replies, including attachment metadata where returned by SuperOps
 - `superops_tickets_notes_list` - Read public/internal ticket notes, including attachment metadata where returned by SuperOps
 - `superops_tickets_create` - Create a new ticket
-- `superops_tickets_update` - Update ticket status/assignment
+- `superops_tickets_update` - Update ticket status, assignment, impact, category, cause, subcategory, and resolution code. Tenant category values use the configured enum; other option values are resolved and validated from SuperOps ticket field metadata before mutation.
 - `superops_tickets_add_note` - Add note to ticket
 - `superops_tickets_log_time` - Log time on ticket
 
