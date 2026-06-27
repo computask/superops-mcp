@@ -165,12 +165,24 @@ Token rotation plan:
 - `superops_tickets_add_note` - Add note to ticket
 - `superops_tickets_log_time` - Log time on ticket
 
+`superops_tickets_list` supports configured status display names such as
+`New Calls`. Status filters are sent to SuperOps as a ticket-list condition so
+queue listing is not limited to the first unfiltered page. `max` controls the
+requested page size up to 500, with `page` selecting the page number. If extra
+client, priority, or assignee filters are applied locally after the SuperOps
+query, `totalCount` and `hasMore` are omitted rather than reporting unrelated
+unfiltered counts.
+
 Ticket urgency and impact are writable. Priority can still be supplied manually
 and will be validated against live SuperOps options. Prefer impact plus urgency
-where SuperOps can calculate priority, but some SuperOps resolve/update
-workflows require priority. For resolved-ticket workflows, provide priority or
-ensure the ticket already has a valid priority; otherwise the tool returns a
-structured validation failure before adding notes or mutating the ticket.
+where SuperOps can calculate priority, but resolved-ticket workflows may require
+the full classification set: priority, impact, category, subcategory, cause, and
+resolutionCode. `superops_tickets_resolve_full` validates those fields before
+adding notes or mutating the ticket, and can reuse existing ticket values only
+when they are present and valid against live SuperOps options.
+
+`No Action Needed` is a subcategory, not a resolutionCode. Use a valid
+resolutionCode returned by SuperOps, such as `Permanent Fix` when available.
 
 If a response reports `partialFailure`, a note was already created but the later
 ticket update failed unexpectedly. Do not retry with the same note unless you
@@ -208,10 +220,22 @@ User: Show open high priority tickets
 Claude: [calls superops_tickets_list with status: ["Open"], priority: ["High"]]
 Here are the open high priority tickets...
 
+User: Show tickets currently in New Calls
+Claude: [calls superops_tickets_list with {
+  "status": ["New Calls"],
+  "max": 50,
+  "page": 1
+}]
+Here are the current New Calls tickets...
+
+Note: superops_tickets_recent is only a recent-ticket view. Do not use it as a
+complete queue listing for statuses such as New Calls.
+
 User: Resolve spam ticket 57100
 Claude: [calls superops_tickets_resolve_full with {
   "ticketNumber": "57100",
   "clientName": "Task Group",
+  "status": "Resolved",
   "priority": "Very Low",
   "impact": "Low",
   "urgency": "Low",
@@ -219,8 +243,10 @@ Claude: [calls superops_tickets_resolve_full with {
   "subcategory": "No Action Needed",
   "cause": "No Fault Found",
   "resolutionCode": "Permanent Fix",
+  "techGroupName": "Level 1 Support",
   "note": "Resolving as unsolicited marketing/sales email rather than a genuine support request.",
-  "suppressCloseNotification": true
+  "suppressCloseNotification": true,
+  "verify": true
 }]
 The ticket has been classified and resolved.
 

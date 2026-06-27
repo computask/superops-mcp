@@ -59,6 +59,8 @@ const MIN_RECENT_TICKETS_COUNT = 1;
 const MAX_RECENT_TICKETS_COUNT = 50;
 const MAX_RECENT_TICKETS_WITH_CONTENT = 10;
 const DISPLAY_ID_EQUALS_OPERATOR = "is";
+const STATUS_EQUALS_OPERATOR = "is";
+const STATUS_IN_OPERATOR = "in";
 const TICKET_FIELD_MODULE = "TICKET";
 const CLIENT_LOOKUP_PAGE_SIZE = 200;
 
@@ -79,6 +81,19 @@ const VALIDATED_TICKET_OPTION_FIELDS = [
 
 type ValidatedTicketOptionField =
   (typeof VALIDATED_TICKET_OPTION_FIELDS)[number];
+
+const RESOLVED_REQUIRED_OPTION_FIELDS = [
+  "priority",
+  "impact",
+  "subcategory",
+  "cause",
+  "resolutionCode",
+] as const satisfies readonly ValidatedTicketOptionField[];
+
+const RESOLVED_REQUIRED_FIELDS = [
+  ...RESOLVED_REQUIRED_OPTION_FIELDS,
+  "category",
+] as const;
 
 const TICKET_OPTION_FIELD_LABELS: Record<ValidatedTicketOptionField, string> = {
   priority: "priority",
@@ -431,6 +446,34 @@ function pageInput(max: number | undefined, page?: number) {
   };
 }
 
+function buildStatusCondition(statuses: string[]): ListInfoInput["condition"] {
+  if (statuses.length === 1) {
+    return {
+      attribute: "status",
+      operator: STATUS_EQUALS_OPERATOR,
+      value: statuses[0],
+    };
+  }
+
+  return {
+    attribute: "status",
+    operator: STATUS_IN_OPERATOR,
+    value: statuses,
+  };
+}
+
+function buildTicketListInput(params: {
+  max?: number;
+  page?: number;
+  status?: string[];
+}): ListInfoInput {
+  const input: ListInfoInput = pageInput(params.max, params.page);
+  if (params.status && params.status.length > 0) {
+    input.condition = buildStatusCondition(params.status);
+  }
+  return input;
+}
+
 function clampRecentTicketCount(count: unknown): number {
   if (typeof count !== "number" || !Number.isFinite(count)) {
     return DEFAULT_RECENT_TICKETS_COUNT;
@@ -538,7 +581,6 @@ function jsonRecord(value: unknown): Record<string, unknown> | undefined {
 function applyTicketFilters(
   tickets: Ticket[],
   filters: {
-    status?: string[];
     priority?: string[];
     clientId?: string;
     assigneeId?: string;
@@ -546,9 +588,6 @@ function applyTicketFilters(
   }
 ): Ticket[] {
   return tickets.filter((ticket) => {
-    if (filters.status && (!ticket.status || !filters.status.includes(ticket.status))) {
-      return false;
-    }
     if (
       filters.priority &&
       (!ticket.priority || !filters.priority.includes(ticket.priority))
@@ -633,8 +672,29 @@ function isPriorityMandatoryValidation(error: unknown): boolean {
   return /mandatory_validation_failed\s*:\s*priority/i.test(message);
 }
 
-function priorityMandatoryRuntimeMessage(): string {
-  return "SuperOps rejected the update because priority is required for this update path. No further note should be added on retry unless you intentionally want a duplicate note.";
+function mandatoryValidationFields(error: unknown): string[] {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/mandatory_validation_failed\s*:\s*([A-Za-z0-9_,\s-]+)/i);
+  if (!match?.[1]) {
+    return [];
+  }
+
+  return match[1]
+    .split(/[,\s]+/)
+    .map((field) => field.trim())
+    .filter(Boolean);
+}
+
+function mandatoryValidationRuntimeMessage(
+  fields: string[],
+  noteAdded: boolean
+): string {
+  const fieldList = fields.length > 0 ? fields.join(", ") : "one or more fields";
+  const verb = fields.length === 1 ? "is" : "are";
+  const noteContext = noteAdded
+    ? "A note was already added before this unexpected runtime failure. No further note should be added on retry unless you intentionally want a duplicate note."
+    : "No note was added.";
+  return `SuperOps rejected the update because ${fieldList} ${verb} required for this update path. ${noteContext}`;
 }
 
 function resolveOptionValue(
@@ -812,6 +872,92 @@ function addValidatedTicketOptionUpdatesFromFields(
     }
 
     input[fieldName] = resolved.value;
+  }
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : undefined;
+}
+
+function ticketClassificationValue(
+  ticket: Ticket,
+  fieldName: (typeof RESOLVED_REQUIRED_FIELDS)[number]
+): string | undefined {
+  return stringValue((ticket as unknown as Record<string, unknown>)[fieldName]);
+}
+
+function validOptionsForFields(
+  fields: Map<ValidatedTicketOptionField, SuperOpsField>,
+  fieldNames: readonly ValidatedTicketOptionField[]
+): Record<string, string[]> {
+  return Object.fromEntries(
+    fieldNames.map((fieldName) => [
+      fieldName,
+      fields.get(fieldName) ? optionValues(fields.get(fieldName) as SuperOpsField) : [],
+    ])
+  );
+}
+
+function validateResolvedTicketFields(params: {
+  optionParams: TicketClassificationParams;
+  optionFields: Map<ValidatedTicketOptionField, SuperOpsField>;
+  input: Record<string, unknown>;
+}): StructuredValidationFailure | undefined {
+  const missingFields: string[] = [];
+  const invalidFields: Record<string, string> = {};
+  const validOptions = validOptionsForFields(
+    params.optionFields,
+    RESOLVED_REQUIRED_OPTION_FIELDS
+  );
+  validOptions.category = [...VALID_TICKET_CATEGORIES];
+
+  const category = stringValue(params.optionParams.category);
+  if (!category) {
+    missingFields.push("category");
+  } else if (invalidValues([category], VALID_TICKET_CATEGORIES).length > 0) {
+    invalidFields.category = `Invalid ticket category: ${category}`;
+  } else {
+    params.input.category = category;
+  }
+
+  for (const fieldName of RESOLVED_REQUIRED_OPTION_FIELDS) {
+    const value = stringValue(params.optionParams[fieldName]);
+    if (!value) {
+      missingFields.push(fieldName);
+      continue;
+    }
+
+    const field = params.optionFields.get(fieldName);
+    if (!field) {
+      invalidFields[fieldName] =
+        `SuperOps did not return field metadata for ${TICKET_OPTION_FIELD_LABELS[fieldName]} via getFields; cannot safely update ${fieldName}.`;
+      continue;
+    }
+
+    const resolved = resolveOptionValue(fieldName, field, value);
+    if ("error" in resolved) {
+      invalidFields[fieldName] = resolved.error;
+      continue;
+    }
+
+    const dependencyError = validateOptionDependency(
+      params.optionParams,
+      fieldName,
+      field,
+      resolved.option
+    );
+    if (dependencyError) {
+      invalidFields[fieldName] = dependencyError;
+      continue;
+    }
+
+    params.input[fieldName] = resolved.value;
+  }
+
+  if (missingFields.length > 0 || Object.keys(invalidFields).length > 0) {
+    return validationFailure({ missingFields, invalidFields, validOptions });
   }
 }
 
@@ -1429,27 +1575,47 @@ export function getTicketsTools(): DomainTools {
             if (params.status) {
               const invalidStatuses = invalidValues(params.status, VALID_TICKET_STATUSES);
               if (invalidStatuses.length > 0) {
-                return errorResult(
-                  `Invalid ticket status(es): ${invalidStatuses.join(", ")}`
+                return structuredValidationResult(
+                  validationFailure({
+                    message: "Tickets were not queried because validation failed.",
+                    invalidFields: {
+                      status: `Invalid ticket status(es): ${invalidStatuses.join(", ")}`,
+                    },
+                    validOptions: { status: [...VALID_TICKET_STATUSES] },
+                  })
                 );
               }
             }
 
             const response = await client.query<ListTicketsResponse>(LIST_TICKETS_QUERY, {
-              // TODO: Replace local filtering with ListInfoInput.condition after
-              // SuperOps documents per-list condition operators and attributes.
-              input: pageInput(params.max, params.page),
+              input: buildTicketListInput(params),
             });
-            response.getTicketList.tickets = applyTicketFilters(
+            const tickets = applyTicketFilters(
               response.getTicketList.tickets,
               params
             );
+            const localFiltersApplied = Boolean(
+              params.priority ||
+                params.clientId ||
+                params.assigneeId ||
+                params.unassigned
+            );
+            const listInfo = localFiltersApplied
+              ? {
+                  page: response.getTicketList.listInfo.page ?? params.page ?? DEFAULT_LIST_PAGE,
+                  pageSize:
+                    response.getTicketList.listInfo.pageSize ??
+                    Math.min(params.max ?? 50, 500),
+                  totalCount: undefined,
+                  hasMore: undefined,
+                }
+              : response.getTicketList.listInfo;
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getTicketList, null, 2),
+                  text: JSON.stringify({ tickets, listInfo }, null, 2),
                 },
               ],
             };
@@ -1692,15 +1858,18 @@ export function getTicketsTools(): DomainTools {
               );
             }
 
+            const finalStatus = params.status ?? DEFAULT_RESOLVE_TICKET_STATUS;
+            let currentTicket: Ticket | undefined;
+            const requiresResolvedPreflight =
+              finalStatus === DEFAULT_RESOLVE_TICKET_STATUS;
+
             if (
+              !requiresResolvedPreflight &&
               params.category &&
               invalidValues([params.category], VALID_TICKET_CATEGORIES).length > 0
             ) {
               return errorResult(`Invalid ticket category: ${params.category}`);
             }
-
-            const finalStatus = params.status ?? DEFAULT_RESOLVE_TICKET_STATUS;
-            let currentTicket: Ticket | undefined;
 
             const resolvedClient = await resolveClientAccountId(client, {
               clientId: params.clientId,
@@ -1749,18 +1918,27 @@ export function getTicketsTools(): DomainTools {
             const optionFieldsToFetch = new Set<ValidatedTicketOptionField>(
               requestedValidatedOptionFields(optionParams)
             );
-            const requiresPriority = finalStatus === DEFAULT_RESOLVE_TICKET_STATUS;
-            if (requiresPriority) {
-              optionFieldsToFetch.add("priority");
+            if (requiresResolvedPreflight) {
+              for (const fieldName of RESOLVED_REQUIRED_OPTION_FIELDS) {
+                optionFieldsToFetch.add(fieldName);
+              }
             }
 
-            if (requiresPriority && !optionParams.priority) {
+            if (
+              requiresResolvedPreflight &&
+              RESOLVED_REQUIRED_FIELDS.some((fieldName) => !optionParams[fieldName])
+            ) {
               currentTicket = await getTicketByInternalId(
                 client,
                 resolvedTicket.ticketId
               );
-              if (currentTicket.priority) {
-                optionParams.priority = currentTicket.priority;
+              for (const fieldName of RESOLVED_REQUIRED_FIELDS) {
+                if (!optionParams[fieldName]) {
+                  optionParams[fieldName] = ticketClassificationValue(
+                    currentTicket,
+                    fieldName
+                  );
+                }
               }
             }
 
@@ -1769,29 +1947,49 @@ export function getTicketsTools(): DomainTools {
                 ? await getTicketOptionFields(client, [...optionFieldsToFetch])
                 : new Map<ValidatedTicketOptionField, SuperOpsField>();
 
-            if (requiresPriority && !optionParams.priority) {
-              const priorityField = optionFields.get("priority");
-              return structuredValidationResult(
-                validationFailure({
-                  missingFields: ["priority"],
-                  validOptions: {
-                    priority: priorityField ? optionValues(priorityField) : [],
-                  },
-                })
+            if (requiresResolvedPreflight) {
+              const validationError = validateResolvedTicketFields({
+                optionParams,
+                optionFields,
+                input: updateInput,
+              });
+              if (validationError) {
+                return structuredValidationResult(validationError);
+              }
+              const optionalOptionFields = requestedValidatedOptionFields(
+                optionParams
+              ).filter(
+                (fieldName) =>
+                  !RESOLVED_REQUIRED_OPTION_FIELDS.includes(
+                    fieldName as (typeof RESOLVED_REQUIRED_OPTION_FIELDS)[number]
+                  )
               );
-            }
-
-            const optionValidationError = addValidatedTicketOptionUpdatesFromFields(
-              optionFields,
-              optionParams,
-              updateInput
-            );
-            if (optionValidationError) {
-              return structuredValidationResult(
-                validationFailure({
-                  invalidFields: { classification: optionValidationError },
-                })
+              const optionalValidationError = addValidatedTicketOptionUpdatesFromFields(
+                optionFields,
+                optionParams,
+                updateInput,
+                optionalOptionFields
               );
+              if (optionalValidationError) {
+                return structuredValidationResult(
+                  validationFailure({
+                    invalidFields: { classification: optionalValidationError },
+                  })
+                );
+              }
+            } else {
+              const optionValidationError = addValidatedTicketOptionUpdatesFromFields(
+                optionFields,
+                optionParams,
+                updateInput
+              );
+              if (optionValidationError) {
+                return structuredValidationResult(
+                  validationFailure({
+                    invalidFields: { classification: optionValidationError },
+                  })
+                );
+              }
             }
 
             if (resolvedClient.accountId) {
@@ -1819,8 +2017,9 @@ export function getTicketsTools(): DomainTools {
                 { input: updateInput }
               );
             } catch (error) {
-              const message = isPriorityMandatoryValidation(error)
-                ? priorityMandatoryRuntimeMessage()
+              const requiredFields = mandatoryValidationFields(error);
+              const message = requiredFields.length > 0
+                ? mandatoryValidationRuntimeMessage(requiredFields, Boolean(createdNote))
                 : error instanceof Error
                   ? error.message
                   : String(error);
@@ -1849,16 +2048,15 @@ export function getTicketsTools(): DomainTools {
                 };
               }
 
-              if (isPriorityMandatoryValidation(error)) {
+              if (requiredFields.length > 0) {
                 return structuredValidationResult(
                   validationFailure({
-                    message: priorityMandatoryRuntimeMessage(),
-                    missingFields: ["priority"],
-                    validOptions: {
-                      priority: optionFields.get("priority")
-                        ? optionValues(optionFields.get("priority") as SuperOpsField)
-                        : [],
-                    },
+                    message,
+                    missingFields: requiredFields,
+                    validOptions: validOptionsForFields(
+                      optionFields,
+                      RESOLVED_REQUIRED_OPTION_FIELDS
+                    ),
                   })
                 );
               }

@@ -47,6 +47,33 @@ const VALID_TICKET_CATEGORIES = [
   "8. Rewst",
 ];
 
+const RESOLVED_OPTION_FIELDS = [
+  ticketField("priority", ["Very Low", "Low", "Medium", "High"]),
+  ticketField("impact", ["Low", "Medium", "High"]),
+  ticketField("urgency", ["Low", "Medium", "High"]),
+  ticketField("resolutionCode", [
+    "Exception",
+    "Permanent Fix",
+    "Resolved by Requester",
+    "Workaround",
+  ]),
+  ticketField("cause", ["No Fault Found", "User Request", "Unknown"]),
+  ticketField("subcategory", ["No Action Needed", "To Escalate", "Quote Wanted"], {
+    columnName: "category",
+    value: "7. Sales call",
+  }),
+];
+
+const RESOLVED_CLASSIFICATION = {
+  priority: "Very Low",
+  impact: "Low",
+  urgency: "Low",
+  category: "7. Sales call",
+  subcategory: "No Action Needed",
+  cause: "No Fault Found",
+  resolutionCode: "Permanent Fix",
+};
+
 function ticketField(
   columnName: string,
   values: string[],
@@ -104,25 +131,160 @@ describe("Tickets Domain", () => {
     ]);
   });
 
-  it("uses page/pageSize list variables and local status filtering", async () => {
+  it("uses server-side status condition and returns New Calls tickets", async () => {
     mockClient.query.mockResolvedValue({
       getTicketList: {
         tickets: [
           {
             ticketId: "1",
             displayId: "062822-0001",
-            subject: "Worked ticket",
-            status: "Worked on",
+            subject: "New ticket",
+            status: "New Calls",
           },
-          { ticketId: "2", displayId: "062822-0002", subject: "Closed", status: "Closed" },
         ],
-        listInfo: { page: 1, pageSize: 50, hasMore: false, totalCount: 2 },
+        listInfo: { page: 1, pageSize: 50, hasMore: true, totalCount: 15 },
       },
     });
 
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_list", {
-      status: ["Worked on"],
+      status: ["New Calls"],
+      max: 50,
+      page: 1,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining("getTicketList"),
+      {
+        input: {
+          page: 1,
+          pageSize: 50,
+          condition: {
+            attribute: "status",
+            operator: "is",
+            value: "New Calls",
+          },
+        },
+      }
+    );
+    expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("first");
+    expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
+    expect(parsed.tickets).toEqual([
+      expect.objectContaining({ ticketId: "1", status: "New Calls" }),
+    ]);
+    expect(parsed.listInfo).toEqual({
+      page: 1,
+      pageSize: 50,
+      hasMore: true,
+      totalCount: 15,
+    });
+  });
+
+  it("uses an in condition for multiple status display names", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketList: {
+        tickets: [],
+        listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 0 },
+      },
+    });
+
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_list", {
+      status: ["New Calls", "Worked on"],
+      max: 100,
+      page: 1,
+    });
+
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining("getTicketList"),
+      {
+        input: {
+          page: 1,
+          pageSize: 100,
+          condition: {
+            attribute: "status",
+            operator: "in",
+            value: ["New Calls", "Worked on"],
+          },
+        },
+      }
+    );
+  });
+
+  it("does not return unrelated unfiltered totalCount after local post-filtering", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketList: {
+        tickets: [
+          {
+            ticketId: "1",
+            displayId: "062822-0001",
+            subject: "High priority",
+            status: "New Calls",
+            priority: "High",
+          },
+          {
+            ticketId: "2",
+            displayId: "062822-0002",
+            subject: "Low priority",
+            status: "New Calls",
+            priority: "Low",
+          },
+        ],
+        listInfo: { page: 1, pageSize: 50, hasMore: true, totalCount: 28604 },
+      },
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_list", {
+      status: ["New Calls"],
+      priority: ["High"],
+      max: 50,
+      page: 1,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.tickets).toEqual([
+      expect.objectContaining({ ticketId: "1", priority: "High" }),
+    ]);
+    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 50 });
+    expect(parsed.listInfo.totalCount).toBeUndefined();
+    expect(parsed.listInfo.hasMore).toBeUndefined();
+  });
+
+  it("returns structured validation for invalid status names", async () => {
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_list", {
+      status: ["Not a status"],
+      max: 50,
+      page: 1,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed).toMatchObject({
+      ok: false,
+      message: "Tickets were not queried because validation failed.",
+      invalidFields: {
+        status: "Invalid ticket status(es): Not a status",
+      },
+    });
+    expect(parsed.validOptions.status).toContain("New Calls");
+    expect(mockClient.query).not.toHaveBeenCalled();
+  });
+
+  it("lists tickets without status using page/pageSize only", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketList: {
+        tickets: [
+          { ticketId: "1", displayId: "062822-0001", subject: "Any ticket" },
+        ],
+        listInfo: { page: 2, pageSize: 75, hasMore: false, totalCount: 1 },
+      },
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_list", {
       max: 75,
       page: 2,
     });
@@ -131,10 +293,7 @@ describe("Tickets Domain", () => {
       expect.stringContaining("getTicketList"),
       { input: { page: 2, pageSize: 75 } }
     );
-    expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("first");
-    expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
-    expect(result.content[0].text).toContain("Worked ticket");
-    expect(result.content[0].text).not.toContain("Closed");
+    expect(result.content[0].text).toContain("Any ticket");
   });
 
   it("lists recent tickets with default count and createdTime descending sort", async () => {
@@ -613,11 +772,7 @@ describe("Tickets Domain", () => {
         },
       })
       .mockResolvedValueOnce({
-        getFields: [
-          ticketField("priority", ["Very Low", "Low", "Medium", "High"]),
-          ticketField("impact", ["Low"]),
-          ticketField("urgency", ["Low"]),
-        ],
+        getFields: RESOLVED_OPTION_FIELDS,
       });
 
     const domain = getTicketsTools();
@@ -634,12 +789,156 @@ describe("Tickets Domain", () => {
     expect(parsed).toEqual({
       ok: false,
       message: "Ticket was not updated because validation failed.",
-      missingFields: ["priority"],
+      missingFields: [
+        "category",
+        "priority",
+        "subcategory",
+        "cause",
+        "resolutionCode",
+      ],
       invalidFields: {},
       validOptions: {
         priority: ["Very Low", "Low", "Medium", "High"],
+        impact: ["Low", "Medium", "High"],
+        subcategory: ["No Action Needed", "To Escalate", "Quote Wanted"],
+        cause: ["No Fault Found", "User Request", "Unknown"],
+        resolutionCode: [
+          "Exception",
+          "Permanent Fix",
+          "Resolved by Requester",
+          "Workaround",
+        ],
+        category: VALID_TICKET_CATEGORIES,
       },
     });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("returns all missing required resolved-ticket fields with useful options", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57100",
+          displayId: "57100",
+          subject: "Sales email",
+        },
+      })
+      .mockResolvedValueOnce({
+        getFields: RESOLVED_OPTION_FIELDS,
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      note: "Internal note that must not be added",
+      verify: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed.missingFields).toEqual([
+      "category",
+      "priority",
+      "impact",
+      "subcategory",
+      "cause",
+      "resolutionCode",
+    ]);
+    expect(parsed.validOptions.priority).toEqual([
+      "Very Low",
+      "Low",
+      "Medium",
+      "High",
+    ]);
+    expect(parsed.validOptions.impact).toEqual(["Low", "Medium", "High"]);
+    expect(parsed.validOptions.subcategory).toEqual([
+      "No Action Needed",
+      "To Escalate",
+      "Quote Wanted",
+    ]);
+    expect(parsed.validOptions.cause).toEqual([
+      "No Fault Found",
+      "User Request",
+      "Unknown",
+    ]);
+    expect(parsed.validOptions.resolutionCode).toContain("Permanent Fix");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "impact",
+    "subcategory",
+    "cause",
+  ] as const)(
+    "does not add a note when resolved-ticket %s is missing",
+    async (missingField) => {
+      mockClient.query
+        .mockResolvedValueOnce({
+          getTicket: {
+            ticketId: "ticket-57100",
+            displayId: "57100",
+            subject: "Sales email",
+          },
+        })
+        .mockResolvedValueOnce({
+          getFields: RESOLVED_OPTION_FIELDS,
+        });
+
+      const args = {
+        ticketId: "ticket-57100",
+        ...RESOLVED_CLASSIFICATION,
+        note: "Internal note that must not be added",
+        verify: false,
+      };
+      delete (args as Record<string, unknown>)[missingField];
+
+      const domain = getTicketsTools();
+      const result = await domain.handleCall("superops_tickets_resolve_full", args);
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(result.isError).toBe(true);
+      expect(parsed.missingFields).toContain(missingField);
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+    }
+  );
+
+  it("does not add a note when resolved-ticket resolutionCode is invalid", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: RESOLVED_OPTION_FIELDS,
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      ...RESOLVED_CLASSIFICATION,
+      resolutionCode: "No action needed",
+      note: "Internal note that must not be added",
+      verify: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed.invalidFields.resolutionCode).toContain("Invalid resolution code");
+    expect(parsed.invalidFields.resolutionCode).toContain('"Permanent Fix"');
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("does not add a note when techGroupName is invalid", async () => {
+    mockClient.query.mockResolvedValue({
+      getTechnicianGroupList: [{ groupId: "level-1", name: "Level 1 Support" }],
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      ...RESOLVED_CLASSIFICATION,
+      techGroupName: "Unknown Team",
+      note: "Internal note that must not be added",
+      verify: false,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("No technician group matched");
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
@@ -658,17 +957,7 @@ describe("Tickets Domain", () => {
         },
       })
       .mockResolvedValueOnce({
-        getFields: [
-          ticketField("priority", ["Very Low"]),
-          ticketField("impact", ["Low"]),
-          ticketField("urgency", ["Low"]),
-          ticketField("resolutionCode", ["Permanent Fix"]),
-          ticketField("cause", ["No Fault Found"]),
-          ticketField("subcategory", ["No Action Needed"], {
-            columnName: "category",
-            value: "7. Sales call",
-          }),
-        ],
+        getFields: RESOLVED_OPTION_FIELDS,
       });
     mockClient.mutate.mockResolvedValue({
       updateTicket: {
@@ -682,13 +971,7 @@ describe("Tickets Domain", () => {
     const result = await domain.handleCall("superops_tickets_resolve_full", {
       ticketNumber: "57100",
       clientId: "2993553194649526272",
-      priority: "Very Low",
-      impact: "Low",
-      urgency: "Low",
-      category: "7. Sales call",
-      subcategory: "No Action Needed",
-      cause: "No Fault Found",
-      resolutionCode: "Permanent Fix",
+      ...RESOLVED_CLASSIFICATION,
       verify: false,
     });
 
@@ -729,10 +1012,7 @@ describe("Tickets Domain", () => {
   it("resolves a ticket directly by ticketId and verifies the final state", async () => {
     mockClient.query
       .mockResolvedValueOnce({
-        getFields: [
-          ticketField("priority", ["Very Low"]),
-          ticketField("impact", ["Low"]),
-        ],
+        getFields: RESOLVED_OPTION_FIELDS,
       })
       .mockResolvedValueOnce({
         getTicket: {
@@ -742,6 +1022,11 @@ describe("Tickets Domain", () => {
           status: "Resolved",
           priority: "Very Low",
           impact: "Low",
+          urgency: "Low",
+          category: "7. Sales call",
+          subcategory: "No Action Needed",
+          cause: "No Fault Found",
+          resolutionCode: "Permanent Fix",
         },
       });
     mockClient.mutate.mockResolvedValue({
@@ -751,8 +1036,7 @@ describe("Tickets Domain", () => {
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_resolve_full", {
       ticketId: "ticket-57100",
-      priority: "Very Low",
-      impact: "Low",
+      ...RESOLVED_CLASSIFICATION,
     });
 
     expect(mockClient.mutate).toHaveBeenCalledWith(
@@ -762,13 +1046,98 @@ describe("Tickets Domain", () => {
           ticketId: "ticket-57100",
           status: "Resolved",
           suppressCloseNotification: true,
-          priority: "Very Low",
-          impact: "Low",
+          ...RESOLVED_CLASSIFICATION,
         },
       }
     );
     expect(mockClient.query.mock.calls[1][0]).toContain("getTicket");
     expect(result.content[0].text).toContain('"displayId": "57100"');
+  });
+
+  it("can reuse valid existing resolved-ticket classification values when omitted", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57100",
+          displayId: "57100",
+          subject: "Sales email",
+          ...RESOLVED_CLASSIFICATION,
+        },
+      })
+      .mockResolvedValueOnce({
+        getFields: RESOLVED_OPTION_FIELDS,
+      });
+    mockClient.mutate.mockResolvedValue({
+      updateTicket: { ticketId: "ticket-57100", status: "Resolved" },
+    });
+
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      verify: false,
+    });
+
+    const { urgency: _urgency, ...requiredClassification } =
+      RESOLVED_CLASSIFICATION;
+    expect(mockClient.mutate).toHaveBeenCalledWith(
+      expect.stringContaining("updateTicket"),
+      {
+        input: {
+          ticketId: "ticket-57100",
+          status: "Resolved",
+          suppressCloseNotification: true,
+          ...requiredClassification,
+        },
+      }
+    );
+  });
+
+  it("does not reuse invalid existing resolved-ticket values", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57100",
+          displayId: "57100",
+          subject: "Sales email",
+          ...RESOLVED_CLASSIFICATION,
+          cause: "Unsupported Cause",
+        },
+      })
+      .mockResolvedValueOnce({
+        getFields: RESOLVED_OPTION_FIELDS,
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      note: "Internal note that must not be added",
+      verify: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed.invalidFields.cause).toContain("Invalid cause");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("validates subcategory against the selected category", async () => {
+    mockClient.query.mockResolvedValue({
+      getFields: RESOLVED_OPTION_FIELDS,
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      ...RESOLVED_CLASSIFICATION,
+      category: "1. Support request",
+      note: "Internal note that must not be added",
+      verify: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed.invalidFields.subcategory).toContain("belongs under category");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
   it("resolves client aliases for resolve_full via client lookup", async () => {
@@ -783,11 +1152,11 @@ describe("Tickets Domain", () => {
         getTicket: {
           ticketId: "ticket-57100",
           status: "New Calls",
-          priority: "Very Low",
+          ...RESOLVED_CLASSIFICATION,
         },
       })
       .mockResolvedValueOnce({
-        getFields: [ticketField("priority", ["Very Low"])],
+        getFields: RESOLVED_OPTION_FIELDS,
       });
     mockClient.mutate.mockResolvedValue({
       updateTicket: { ticketId: "ticket-57100", status: "Resolved" },
@@ -800,6 +1169,8 @@ describe("Tickets Domain", () => {
       verify: false,
     });
 
+    const { urgency: _urgency, ...requiredClassification } =
+      RESOLVED_CLASSIFICATION;
     expect(mockClient.query.mock.calls[0][0]).toContain("getClientList");
     expect(mockClient.mutate).toHaveBeenCalledWith(
       expect.stringContaining("updateTicket"),
@@ -808,7 +1179,7 @@ describe("Tickets Domain", () => {
           ticketId: "ticket-57100",
           status: "Resolved",
           suppressCloseNotification: true,
-          priority: "Very Low",
+          ...requiredClassification,
           client: { accountId: "2993553194649526272" },
         },
       }
@@ -817,7 +1188,7 @@ describe("Tickets Domain", () => {
 
   it("adds a note only after resolve validation succeeds", async () => {
     mockClient.query.mockResolvedValue({
-      getFields: [ticketField("priority", ["Very Low"])],
+      getFields: RESOLVED_OPTION_FIELDS,
     });
     mockClient.mutate
       .mockResolvedValueOnce({
@@ -835,7 +1206,7 @@ describe("Tickets Domain", () => {
     const domain = getTicketsTools();
     await domain.handleCall("superops_tickets_resolve_full", {
       ticketId: "ticket-57100",
-      priority: "Very Low",
+      ...RESOLVED_CLASSIFICATION,
       note: "Internal note",
       verify: false,
     });
@@ -853,7 +1224,7 @@ describe("Tickets Domain", () => {
 
   it("keeps partialFailure for unexpected update errors after note creation", async () => {
     mockClient.query.mockResolvedValue({
-      getFields: [ticketField("priority", ["Very Low"])],
+      getFields: RESOLVED_OPTION_FIELDS,
     });
     mockClient.mutate
       .mockResolvedValueOnce({
@@ -869,7 +1240,7 @@ describe("Tickets Domain", () => {
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_resolve_full", {
       ticketId: "ticket-57100",
-      priority: "Very Low",
+      ...RESOLVED_CLASSIFICATION,
       note: "Internal note",
       verify: false,
     });
@@ -883,7 +1254,7 @@ describe("Tickets Domain", () => {
 
   it("returns a clearer partialFailure message for unexpected mandatory priority errors after note creation", async () => {
     mockClient.query.mockResolvedValue({
-      getFields: [ticketField("priority", ["Very Low"])],
+      getFields: RESOLVED_OPTION_FIELDS,
     });
     mockClient.mutate
       .mockResolvedValueOnce({
@@ -899,7 +1270,7 @@ describe("Tickets Domain", () => {
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_resolve_full", {
       ticketId: "ticket-57100",
-      priority: "Very Low",
+      ...RESOLVED_CLASSIFICATION,
       note: "Internal note",
       verify: false,
     });
@@ -914,12 +1285,13 @@ describe("Tickets Domain", () => {
 
   it("rejects invalid resolve_full option names before mutation", async () => {
     mockClient.query.mockResolvedValue({
-      getFields: [ticketField("priority", ["Very Low"])],
+      getFields: RESOLVED_OPTION_FIELDS,
     });
 
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_resolve_full", {
       ticketId: "ticket-57100",
+      ...RESOLVED_CLASSIFICATION,
       priority: "Not a priority",
       verify: false,
     });
