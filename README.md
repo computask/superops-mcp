@@ -99,6 +99,7 @@ Safe deployed smoke tools:
 - `superops_test_connection`
 - `superops_clients_list`
 - `superops_tickets_list`
+- `superops_alerts_list`
 - `superops_assets_list`
 - `superops_technicians_list`
 
@@ -108,6 +109,8 @@ Write-capable tools remain enabled by default:
 - `superops_tickets_update`
 - `superops_tickets_add_note`
 - `superops_tickets_log_time`
+- `superops_alerts_create`
+- `superops_alerts_resolve`
 - `superops_custom_mutation`
 
 `superops_custom_mutation` is the highest-risk tool because it accepts custom
@@ -225,6 +228,115 @@ Example safe retrieval call:
 - `superops_assets_get` - Get asset details
 - `superops_assets_software` - Get software inventory
 - `superops_assets_patches` - Get patch status
+
+### Alerts Domain
+
+- `superops_alerts_list` - List alerts with safe status filtering, pagination, sorting, and optional severity or asset filtering
+- `superops_alerts_get` - Retrieve one alert by exact alert ID
+- `superops_alerts_for_asset` - List alerts for a specific asset
+- `superops_alerts_resolve` - Write action: resolve one or more alerts, with `dryRun` and optional verification
+- `superops_alerts_create` - Write action: create a new alert for an asset, with `dryRun` and optional verification
+- `superops_alerts_summary` - Summarise alerts by severity, client, policy, and policy type
+
+Alert status filtering uses the SuperOps-safe condition form:
+
+```json
+{
+  "attribute": "status",
+  "operator": "is",
+  "value": "Open"
+}
+```
+
+Avoid raw custom GraphQL for standard alert work. The alert tools use the
+dedicated SuperOps alert schema and deliberately avoid known-bad status
+operators such as `EQUALS`, `IN`, and `IS_EMPTY`.
+
+Example: list active alerts:
+
+```json
+{
+  "activeOnly": true,
+  "page": 1,
+  "pageSize": 25,
+  "sortBy": "createdTime",
+  "sortOrder": "DESC"
+}
+```
+
+Example: get an alert by ID:
+
+```json
+{
+  "alertId": "ALERT_ID_HERE"
+}
+```
+
+Example: list alerts for an asset:
+
+```json
+{
+  "assetId": "ASSET_ID_HERE",
+  "activeOnly": true,
+  "page": 1,
+  "pageSize": 25
+}
+```
+
+Example: resolve alert dry run:
+
+```json
+{
+  "alertIds": ["ALERT_ID_HERE"],
+  "dryRun": true,
+  "verify": false
+}
+```
+
+Example: resolve alert for real:
+
+```json
+{
+  "alertIds": ["ALERT_ID_HERE"],
+  "dryRun": false,
+  "verify": true
+}
+```
+
+Example: create alert dry run:
+
+```json
+{
+  "assetId": "ASSET_ID_HERE",
+  "message": "Test alert message",
+  "description": "Optional description",
+  "severity": "High",
+  "dryRun": true,
+  "verify": false
+}
+```
+
+Example: create alert for real:
+
+```json
+{
+  "assetId": "ASSET_ID_HERE",
+  "message": "Test alert message",
+  "description": "Optional description",
+  "severity": "High",
+  "dryRun": false,
+  "verify": true
+}
+```
+
+Example: summarise active alerts:
+
+```json
+{
+  "status": "Open",
+  "pageSize": 100
+}
+```
 
 ### Technicians Domain
 

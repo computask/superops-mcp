@@ -202,6 +202,30 @@ export interface TicketConversation {
   type: string;
 }
 
+export interface Alert {
+  id: string;
+  message?: string;
+  createdTime?: string;
+  status?: string;
+  severity?: string;
+  description?: string;
+  asset?: SuperOpsJson;
+  policy?: SuperOpsJson;
+  resolvedTime?: string;
+  occurrenceCount?: number;
+}
+
+export interface NormalizedAlert extends Alert {
+  clientName?: string;
+  siteName?: string;
+  assetName?: string;
+  assetId?: string;
+  policyName?: string;
+  policyType?: string;
+  ownerName?: string;
+  ownerEmail?: string;
+}
+
 export interface TimeEntry {
   itemId: string;
   status?: string;
@@ -286,7 +310,13 @@ export interface ToolDefinition {
   };
 }
 
-export type Domain = "clients" | "tickets" | "assets" | "technicians" | "custom";
+export type Domain =
+  | "clients"
+  | "tickets"
+  | "assets"
+  | "alerts"
+  | "technicians"
+  | "custom";
 
 export interface DomainTools {
   tools: ToolDefinition[];

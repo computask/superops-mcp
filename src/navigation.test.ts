@@ -54,6 +54,19 @@ vi.mock("./domains/assets.js", () => ({
   })),
 }));
 
+vi.mock("./domains/alerts.js", () => ({
+  getAlertsTools: vi.fn(() => ({
+    tools: [
+      {
+        name: "superops_alerts_list",
+        description: "List alerts",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ],
+    handleCall: vi.fn(),
+  })),
+}));
+
 vi.mock("./domains/technicians.js", () => ({
   getTechniciansTools: vi.fn(() => ({
     tools: [
@@ -94,32 +107,37 @@ describe("Tool Discovery and Management", () => {
 
   describe("Domain validation", () => {
     it("validates clients domain", () => {
-      const validDomains = ["clients", "tickets", "assets", "technicians", "custom"];
+      const validDomains = ["clients", "tickets", "assets", "alerts", "technicians", "custom"];
       expect(validDomains).toContain("clients");
     });
 
     it("validates tickets domain", () => {
-      const validDomains = ["clients", "tickets", "assets", "technicians", "custom"];
+      const validDomains = ["clients", "tickets", "assets", "alerts", "technicians", "custom"];
       expect(validDomains).toContain("tickets");
     });
 
     it("validates assets domain", () => {
-      const validDomains = ["clients", "tickets", "assets", "technicians", "custom"];
+      const validDomains = ["clients", "tickets", "assets", "alerts", "technicians", "custom"];
       expect(validDomains).toContain("assets");
     });
 
+    it("validates alerts domain", () => {
+      const validDomains = ["clients", "tickets", "assets", "alerts", "technicians", "custom"];
+      expect(validDomains).toContain("alerts");
+    });
+
     it("validates technicians domain", () => {
-      const validDomains = ["clients", "tickets", "assets", "technicians", "custom"];
+      const validDomains = ["clients", "tickets", "assets", "alerts", "technicians", "custom"];
       expect(validDomains).toContain("technicians");
     });
 
     it("validates custom domain", () => {
-      const validDomains = ["clients", "tickets", "assets", "technicians", "custom"];
+      const validDomains = ["clients", "tickets", "assets", "alerts", "technicians", "custom"];
       expect(validDomains).toContain("custom");
     });
 
     it("rejects invalid domain", () => {
-      const validDomains = ["clients", "tickets", "assets", "technicians", "custom"];
+      const validDomains = ["clients", "tickets", "assets", "alerts", "technicians", "custom"];
       expect(validDomains).not.toContain("invalid");
     });
   });
@@ -154,6 +172,7 @@ describe("Tool Discovery and Management", () => {
         "getClientsTools",
         "getTicketsTools",
         "getAssetsTools",
+        "getAlertsTools",
         "getTechniciansTools",
         "getCustomTools",
       ];
@@ -199,7 +218,7 @@ describe("Tool Discovery and Management", () => {
             domain: {
               type: "string",
               description: "The domain to explore",
-              enum: ["clients", "tickets", "assets", "technicians", "custom"],
+              enum: ["clients", "tickets", "assets", "alerts", "technicians", "custom"],
             },
           },
           required: ["domain"],
@@ -207,7 +226,7 @@ describe("Tool Discovery and Management", () => {
       };
 
       expect(navigationTool.name).toBe("superops_navigate");
-      expect(navigationTool.inputSchema.properties.domain.enum).toHaveLength(5);
+      expect(navigationTool.inputSchema.properties.domain.enum).toHaveLength(6);
     });
 
     it("status tool has correct structure", () => {
@@ -257,7 +276,7 @@ describe("Tool Discovery and Management", () => {
     });
 
     it("formats invalid domain error correctly", () => {
-      const validDomains = ["clients", "tickets", "assets", "technicians", "custom"];
+      const validDomains = ["clients", "tickets", "assets", "alerts", "technicians", "custom"];
       const errorResponse = {
         content: [
           {
@@ -311,14 +330,14 @@ describe("Tool Discovery and Management", () => {
         content: [
           {
             type: "text",
-            text: "SuperOps.ai MCP Server Status\n\nCredentials: Configured (subdomain: test-company, region: us)\nAvailable domains: clients, tickets, assets, technicians, custom\n\nAll tools are available at all times. Use superops_navigate to discover tools by domain.",
+            text: "SuperOps.ai MCP Server Status\n\nCredentials: Configured (subdomain: test-company, region: us)\nAvailable domains: clients, tickets, assets, alerts, technicians, custom\n\nAll tools are available at all times. Use superops_navigate to discover tools by domain.",
           },
         ],
       };
 
       expect(statusResponse.content[0].text).toContain("SuperOps.ai MCP Server Status");
       expect(statusResponse.content[0].text).toContain("All tools are available at all times");
-      expect(statusResponse.content[0].text).toContain("clients, tickets, assets, technicians, custom");
+      expect(statusResponse.content[0].text).toContain("clients, tickets, assets, alerts, technicians, custom");
     });
   });
 });

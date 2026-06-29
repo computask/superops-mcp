@@ -389,6 +389,8 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(names).toContain("superops_navigate");
     expect(names).toContain("superops_status");
     expect(names).toContain("superops_tickets_list");
+    expect(names).toContain("superops_alerts_list");
+    expect(names).toContain("superops_alerts_create");
     expect(names.length).toBeGreaterThan(10);
   });
 
@@ -542,6 +544,66 @@ describe("Cloudflare Worker entrypoint", () => {
         success: false,
       });
       expect(records[0].changedFields).toEqual(["ticketId"]);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("marks alert create and resolve tools as high-risk write tools", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 334,
+          method: "tools/call",
+          params: {
+            name: "superops_alerts_create",
+            arguments: {
+              assetId: "asset-1",
+              message: "Disk alert",
+              description: "Raw alert description that must not be logged",
+              dryRun: false,
+            },
+          },
+        },
+        { ENABLE_WRITE_TOOLS: "false" },
+        { "X-Request-Id": "audit-alert-create-blocked-1" }
+      );
+
+      await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 335,
+          method: "tools/call",
+          params: {
+            name: "superops_alerts_resolve",
+            arguments: { alertIds: ["alert-1"], dryRun: false },
+          },
+        },
+        { ENABLE_WRITE_TOOLS: "false" },
+        { "X-Request-Id": "audit-alert-resolve-blocked-1" }
+      );
+
+      const records = auditRecords(logSpy);
+      expect(records[0]).toMatchObject({
+        toolName: "superops_alerts_create",
+        toolCategory: "write",
+        highRisk: true,
+        success: false,
+        changedFields: ["assetId", "message", "dryRun"],
+      });
+      expect(records[1]).toMatchObject({
+        toolName: "superops_alerts_resolve",
+        toolCategory: "write",
+        highRisk: true,
+        success: false,
+        changedFields: ["alertIds", "dryRun"],
+      });
+      const serialized = JSON.stringify(records);
+      expect(serialized).not.toContain("Raw alert description");
+      expect(serialized).not.toContain("Disk alert");
+      expect(serialized).not.toContain("alert-1");
     } finally {
       logSpy.mockRestore();
     }

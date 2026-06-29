@@ -28,6 +28,8 @@ const HIGH_RISK_WRITE_TOOLS = new Set([
   "superops_tickets_resolve_full",
   "superops_tickets_add_note",
   "superops_tickets_log_time",
+  "superops_alerts_create",
+  "superops_alerts_resolve",
   "superops_custom_mutation",
 ]);
 
@@ -221,6 +223,19 @@ const WRITE_FIELD_KEYS: Partial<Record<string, string[]>> = {
     "techGroupName",
     "suppressCloseNotification",
     "verify",
+  ],
+  superops_alerts_create: [
+    "assetId",
+    "message",
+    "severity",
+    "verify",
+    "dryRun",
+  ],
+  superops_alerts_resolve: [
+    "alertId",
+    "alertIds",
+    "verify",
+    "dryRun",
   ],
 };
 

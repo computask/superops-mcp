@@ -62,6 +62,11 @@ export async function loadDomain(domain: Domain): Promise<DomainTools> {
       tools = getAssetsTools();
       break;
     }
+    case "alerts": {
+      const { getAlertsTools } = await import("./domains/alerts.js");
+      tools = getAlertsTools();
+      break;
+    }
     case "technicians": {
       const { getTechniciansTools } = await import("./domains/technicians.js");
       tools = getTechniciansTools();
@@ -90,6 +95,8 @@ const domainDescriptions: Record<Domain, string> = {
     "Ticket management - list, get, create tickets and manage support workflow",
   assets:
     "Asset management - list and get hardware/software assets, endpoint inventory",
+  alerts:
+    "Alert management - list, retrieve, create, resolve, and summarise SuperOps alerts",
   technicians:
     "Technician management - list and get support staff and technician information",
   custom: "Custom queries - execute advanced GraphQL queries with full API access",
@@ -107,6 +114,7 @@ async function getAllDomainTools(): Promise<ToolDefinition[]> {
     "clients",
     "tickets",
     "assets",
+    "alerts",
     "technicians",
     "custom",
   ];
@@ -135,9 +143,10 @@ const navigationTool: ToolDefinition = {
 - clients: ${domainDescriptions.clients}
 - tickets: ${domainDescriptions.tickets}
 - assets: ${domainDescriptions.assets}
+- alerts: ${domainDescriptions.alerts}
 - technicians: ${domainDescriptions.technicians}
 - custom: ${domainDescriptions.custom}`,
-        enum: ["clients", "tickets", "assets", "technicians", "custom"],
+        enum: ["clients", "tickets", "assets", "alerts", "technicians", "custom"],
       },
     },
     required: ["domain"],
@@ -250,6 +259,7 @@ async function executeToolCall(
       "clients",
       "tickets",
       "assets",
+      "alerts",
       "technicians",
       "custom",
     ];
@@ -315,6 +325,10 @@ async function executeToolCall(
   }
   if (name.startsWith("superops_assets_")) {
     const domainTools = await loadDomain("assets");
+    return domainTools.handleCall(name, args);
+  }
+  if (name.startsWith("superops_alerts_")) {
+    const domainTools = await loadDomain("alerts");
     return domainTools.handleCall(name, args);
   }
   if (name.startsWith("superops_technicians_")) {

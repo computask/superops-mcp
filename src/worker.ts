@@ -89,6 +89,8 @@ const DEFAULT_CHATGPT_BLOCKED_TOOLS = new Set([
   "superops_tickets_resolve_full",
   "superops_tickets_add_note",
   "superops_tickets_log_time",
+  "superops_alerts_create",
+  "superops_alerts_resolve",
   "superops_custom_mutation",
   "superops_custom_query",
 ]);
