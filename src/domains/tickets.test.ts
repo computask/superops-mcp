@@ -666,8 +666,6 @@ describe("Tickets Domain", () => {
           resolutionCode: "Permanent Fix",
           createdTime: "2026-06-25T09:00:00",
           updatedTime: "2026-06-25T10:00:00",
-          description:
-            "<p>Visible description</p><script>alert('x')</script><style>.x{}</style><iframe src='x'></iframe>",
         },
       })
       .mockResolvedValueOnce({
@@ -675,7 +673,7 @@ describe("Tickets Domain", () => {
           {
             conversationId: "conversation-1",
             content:
-              "Received: by mx.example\r\nDKIM-Signature: abc\r\n MIME-Version: 1.0\r\n<p>Hello <b>team</b><img src=\"cid:image001\"></p> password=secret123 data:image/png;base64,AAAA " +
+              "<html><body><p>User reports VMware internal inconsistency errors when opening the VM.</p><script>alert('bad')</script>Authorization: Bearer abc.def.ghi<img src=\"cid:trackingimage\"></body></html>\r\nReceived: by mx.example\r\nDKIM-Signature: abc\r\n MIME-Version: 1.0\r\n<p>Hello <b>team</b><img src=\"cid:image001\"></p> password=secret123 data:image/png;base64,AAAA " +
               base64Blob,
             time: "2026-06-25T10:00:00",
             type: "REQ_REPLY",
@@ -738,17 +736,33 @@ describe("Tickets Domain", () => {
       requesterName: "Alex Requester",
       requesterEmail: "alex@example.test",
       status: "New Calls",
-      safeContent: {
-        description: {
-          plainText: "Visible description",
-          truncated: false,
-        },
-      },
     });
+    expect(mockClient.query.mock.calls[1][0]).toContain("getTicket");
+    expect(mockClient.query.mock.calls[1][0]).not.toContain("description");
+    expect(parsed.safeContent.items.length).toBeGreaterThan(0);
+    expect(parsed.contentAvailability).toMatchObject({
+      ticketBody: {
+        requested: true,
+        available: false,
+        source: "notAvailableInLiveSchema",
+      },
+      conversations: { requested: true, available: true, count: 2 },
+      notes: { requested: true, available: true, count: 1 },
+      degraded: false,
+    });
+    expect(serialized).toContain(
+      "User reports VMware internal inconsistency errors when opening the VM."
+    );
     expect(serialized).toContain("Hello team");
     expect(serialized).toContain("[removed embedded image]");
     expect(serialized).toContain("[removed base64 content]");
     expect(serialized).toContain("[redacted credential/token]");
+    expect(serialized).not.toContain("alert('bad')");
+    expect(serialized).not.toContain("Authorization:");
+    expect(serialized).not.toContain("abc.def.ghi");
+    expect(serialized).not.toContain("cid:trackingimage");
+    expect(serialized).not.toContain("<html");
+    expect(serialized).not.toContain("<body");
     expect(serialized).not.toContain("<script");
     expect(serialized).not.toContain("<style");
     expect(serialized).not.toContain("<iframe");
@@ -777,7 +791,7 @@ describe("Tickets Domain", () => {
       credentialsRedacted: true,
       base64Removed: true,
       attachmentsMetadataOnly: true,
-      itemsReturned: 4,
+      itemsReturned: 3,
     });
   });
 
@@ -864,7 +878,16 @@ describe("Tickets Domain", () => {
       .mockRejectedValueOnce(
         new Error("Received: bad\r\nAuthorization: Bearer secret-token raw failure")
       )
-      .mockResolvedValueOnce({ getTicketNoteList: [] });
+      .mockResolvedValueOnce({
+        getTicketNoteList: [
+          {
+            noteId: "note-available",
+            addedOn: "2026-06-25T10:05:00",
+            content: "<p>Technician found useful diagnostic details.</p>",
+            privacyType: "PRIVATE",
+          },
+        ],
+      });
 
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_get_safe_by_number", {
@@ -873,11 +896,22 @@ describe("Tickets Domain", () => {
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.ticketId).toBe("ticket-55841");
-    expect(parsed.safeContent.contentErrors[0]).toContain(
+    expect(parsed.safeContent.contentWarnings[0]).toContain(
       "Conversations could not be fetched safely"
     );
-    expect(parsed.safeContent.contentErrors[0]).not.toContain("secret-token");
-    expect(parsed.safeContent.contentErrors[0]).not.toContain("Received:");
+    expect(parsed.safeContent.contentWarnings[0]).not.toContain("secret-token");
+    expect(parsed.safeContent.contentWarnings[0]).not.toContain("Received:");
+    expect(parsed.safeContent.items).toEqual([
+      expect.objectContaining({
+        id: "note-available",
+        plainText: "Technician found useful diagnostic details.",
+      }),
+    ]);
+    expect(parsed.contentAvailability).toMatchObject({
+      conversations: { requested: true, available: false, count: 0 },
+      notes: { requested: true, available: true, count: 1 },
+      degraded: false,
+    });
   });
 
   it("keeps normal get_by_number content behaviour unchanged", async () => {

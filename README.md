@@ -199,12 +199,14 @@ checks, or if you only need safe plain-text triage context, use
 `superops_tickets_get_safe_by_number` instead.
 
 Safe retrieval returns ticket metadata, requester/sender fields, sanitized
-visible text, timestamps, author names, public/internal flags, convenience
-latest-message fields, and attachment metadata only. It strips HTML, removes raw
-email headers and MIME-like payloads, removes base64/data/cid embedded content,
-redacts credentials, tokens, private keys, long hashes, passwords, passcodes and
-secrets, and truncates long content. Attachment bodies are never returned by the
-safe tool; `attachments` currently supports only `metadataOnly` and `none`.
+visible text from the existing conversation and note content paths, timestamps,
+author names, public/internal flags, convenience latest-message fields, content
+availability diagnostics, and attachment metadata only. It does not query
+unsupported ticket description fields. It strips HTML, removes raw email headers
+and MIME-like payloads, removes base64/data/cid embedded content, redacts
+credentials, tokens, private keys, long hashes, passwords, passcodes and secrets,
+and truncates long content. Attachment bodies are never returned by the safe
+tool; `attachments` currently supports only `metadataOnly` and `none`.
 
 Example safe retrieval call:
 

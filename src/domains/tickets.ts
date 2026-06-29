@@ -181,38 +181,6 @@ const GET_TICKET_QUERY = `
   }
 `;
 
-const GET_SAFE_TICKET_QUERY = `
-  query getTicket($input: TicketIdentifierInput!) {
-    getTicket(input: $input) {
-      ticketId
-      displayId
-      subject
-      ticketType
-      requestType
-      source
-      client
-      site
-      requester
-      additionalRequester
-      followers
-      techGroup
-      technician
-      status
-      priority
-      impact
-      urgency
-      category
-      subcategory
-      cause
-      subcause
-      resolutionCode
-      createdTime
-      updatedTime
-      description
-    }
-  }
-`;
-
 const GET_TICKET_CONVERSATION_LIST_QUERY = `
   query getTicketConversationList($input: TicketIdentifierInput!) {
     getTicketConversationList(input: $input) {
@@ -433,10 +401,6 @@ interface AddTimeEntryResponse {
 
 type SuperOpsClientInstance = ReturnType<typeof getClient>;
 
-interface SafeTicket extends Ticket {
-  description?: string;
-}
-
 interface SafeTicketParams {
   ticketNumber?: string | number;
   includeDescription?: boolean;
@@ -651,18 +615,6 @@ async function withTicketContent<T extends Ticket>(
   ]);
 
   return { ...ticket, conversations, notes };
-}
-
-async function getSafeTicketByInternalId(
-  client: SuperOpsClientInstance,
-  ticketId: string
-): Promise<SafeTicket> {
-  const response = await client.query<{ getTicket: SafeTicket }>(
-    GET_SAFE_TICKET_QUERY,
-    { input: { ticketId } }
-  );
-
-  return response.getTicket;
 }
 
 function jsonRecord(value: unknown): Record<string, unknown> | undefined {
@@ -1002,7 +954,7 @@ function safeErrorMessage(error: unknown): string {
 }
 
 function buildSafeTicketResult(params: {
-  ticket: SafeTicket;
+  ticket: Ticket;
   safeParams: Required<SafeTicketParams>;
   conversations?: TicketConversation[];
   notes?: TicketNote[];
@@ -1029,24 +981,16 @@ function buildSafeTicketResult(params: {
       ]
     : [];
 
-  const description = safeParams.includeDescription
-    ? sanitizeTicketText(ticket.description, safeParams)
-    : undefined;
-  if (description) {
-    mergeDiagnostics(sanitization, description.diagnostics);
-  }
+  const sectionWarnings: string[] = [...(params.contentErrors ?? [])];
+  const ticketBodyAvailable = false;
+  const conversationCount = params.conversations?.length ?? 0;
+  const noteCount = params.notes?.length ?? 0;
 
   const items: SafeContentItem[] = [];
-  if (safeParams.includeDescription && description?.plainText) {
-    items.push({
-      id: `${ticket.ticketId}:description`,
-      type: "description",
-      direction: "unknown",
-      createdTime: ticket.createdTime,
-      isInternal: false,
-      plainText: description.plainText,
-      truncated: description.truncated,
-    });
+  if (safeParams.includeDescription) {
+    sectionWarnings.push(
+      "Ticket body/description is not queried because Ticket.description is not available in the live SuperOps schema. Safe retrieval uses the proven conversation and note content paths."
+    );
   }
 
   if (safeParams.includeConversations) {
@@ -1088,7 +1032,7 @@ function buildSafeTicketResult(params: {
     return safeParams.latestFirst ? -comparison : comparison;
   });
 
-  let usedChars = description?.plainText.length ?? 0;
+  let usedChars = 0;
   const limitedItems: SafeContentItem[] = [];
   for (const item of orderedItems) {
     if (limitedItems.length >= safeParams.maxItems) {
@@ -1105,6 +1049,11 @@ function buildSafeTicketResult(params: {
   }
 
   sanitization.itemsReturned = limitedItems.length;
+  if (limitedItems.length === 0 && (conversationCount > 0 || noteCount > 0)) {
+    sectionWarnings.push(
+      "Content sources were available, but all sanitized items were omitted by item or total character limits."
+    );
+  }
 
   const latestCustomerMessage = limitedItems.find(
     (item) => item.type === "conversation" && item.direction === "customer"
@@ -1137,14 +1086,27 @@ function buildSafeTicketResult(params: {
     createdTime: ticket.createdTime,
     updatedTime: ticket.updatedTime,
     safeContent: {
-      description: description
-        ? {
-            plainText: description.plainText,
-            truncated: description.truncated,
-          }
-        : undefined,
+      description: undefined,
       items: limitedItems,
-      contentErrors: params.contentErrors,
+      contentWarnings: sectionWarnings.length > 0 ? sectionWarnings : undefined,
+    },
+    contentAvailability: {
+      ticketBody: {
+        requested: safeParams.includeDescription,
+        available: ticketBodyAvailable,
+        source: "notAvailableInLiveSchema",
+      },
+      conversations: {
+        requested: safeParams.includeConversations,
+        available: conversationCount > 0,
+        count: conversationCount,
+      },
+      notes: {
+        requested: safeParams.includeNotes,
+        available: noteCount > 0,
+        count: noteCount,
+      },
+      degraded: limitedItems.length === 0 && (conversationCount > 0 || noteCount > 0),
     },
     latestCustomerMessage,
     latestInternalNote,
@@ -1820,7 +1782,8 @@ export function getTicketsTools(): DomainTools {
             includeDescription: {
               type: "boolean",
               default: true,
-              description: "Include the ticket description as sanitized plain text",
+              description:
+                "Request ticket body content when available through a proven SuperOps content path. Conversations and notes are retrieved separately.",
             },
             includeNotes: {
               type: "boolean",
@@ -2442,28 +2405,7 @@ export function getTicketsTools(): DomainTools {
             }
 
             const ticketId = matches[0].ticketId;
-            let ticket: SafeTicket;
-            try {
-              ticket = await getSafeTicketByInternalId(client, ticketId);
-            } catch (error) {
-              const fallbackTicket = await getTicketByInternalId(client, ticketId);
-              const result = buildSafeTicketResult({
-                ticket: fallbackTicket,
-                safeParams,
-                contentErrors: [
-                  `Ticket content metadata was returned, but the safe description fetch failed: ${safeErrorMessage(error)}`,
-                ],
-              });
-
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: JSON.stringify(result, null, 2),
-                  },
-                ],
-              };
-            }
+            const ticket = await getTicketByInternalId(client, ticketId);
 
             const contentErrors: string[] = [];
             let conversations: TicketConversation[] = [];
