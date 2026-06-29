@@ -181,6 +181,38 @@ const GET_TICKET_QUERY = `
   }
 `;
 
+const GET_SAFE_TICKET_QUERY = `
+  query getTicket($input: TicketIdentifierInput!) {
+    getTicket(input: $input) {
+      ticketId
+      displayId
+      subject
+      ticketType
+      requestType
+      source
+      client
+      site
+      requester
+      additionalRequester
+      followers
+      techGroup
+      technician
+      status
+      priority
+      impact
+      urgency
+      category
+      subcategory
+      cause
+      subcause
+      resolutionCode
+      createdTime
+      updatedTime
+      description
+    }
+  }
+`;
+
 const GET_TICKET_CONVERSATION_LIST_QUERY = `
   query getTicketConversationList($input: TicketIdentifierInput!) {
     getTicketConversationList(input: $input) {
@@ -401,6 +433,56 @@ interface AddTimeEntryResponse {
 
 type SuperOpsClientInstance = ReturnType<typeof getClient>;
 
+interface SafeTicket extends Ticket {
+  description?: string;
+}
+
+interface SafeTicketParams {
+  ticketNumber?: string | number;
+  includeDescription?: boolean;
+  includeNotes?: boolean;
+  includeConversations?: boolean;
+  latestFirst?: boolean;
+  maxItems?: number;
+  maxCharsPerItem?: number;
+  maxTotalChars?: number;
+  redactCredentials?: boolean;
+  stripHtml?: boolean;
+  stripHeaders?: boolean;
+  attachments?: "metadataOnly" | "none";
+}
+
+interface SanitizationDiagnostics {
+  htmlStripped: boolean;
+  headersRemoved: boolean;
+  credentialsRedacted: boolean;
+  base64Removed: boolean;
+  attachmentsMetadataOnly: boolean;
+  truncated: boolean;
+  itemsReturned: number;
+  itemsOmittedByLimit: number;
+}
+
+interface SafeTextResult {
+  plainText: string;
+  truncated: boolean;
+  diagnostics: Partial<SanitizationDiagnostics> & {
+    embeddedImageRemoved?: boolean;
+    binaryRemoved?: boolean;
+  };
+}
+
+interface SafeContentItem {
+  id: string;
+  type: "conversation" | "note" | "description";
+  direction: "customer" | "technician" | "internal" | "unknown";
+  createdTime?: string;
+  author?: string;
+  isInternal: boolean;
+  plainText: string;
+  truncated: boolean;
+}
+
 interface TicketClassificationParams {
   status?: string;
   priority?: string;
@@ -571,12 +653,507 @@ async function withTicketContent<T extends Ticket>(
   return { ...ticket, conversations, notes };
 }
 
+async function getSafeTicketByInternalId(
+  client: SuperOpsClientInstance,
+  ticketId: string
+): Promise<SafeTicket> {
+  const response = await client.query<{ getTicket: SafeTicket }>(
+    GET_SAFE_TICKET_QUERY,
+    { input: { ticketId } }
+  );
+
+  return response.getTicket;
+}
+
 function jsonRecord(value: unknown): Record<string, unknown> | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return undefined;
   }
   return value as Record<string, unknown>;
 }
+
+function readableString(value: unknown, keys: string[]): string | undefined {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value.trim();
+  }
+
+  const record = jsonRecord(value);
+  if (!record) {
+    return undefined;
+  }
+
+  for (const key of keys) {
+    const candidate = record[key];
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+
+  const first = typeof record.firstName === "string" ? record.firstName.trim() : "";
+  const last = typeof record.lastName === "string" ? record.lastName.trim() : "";
+  const fullName = `${first} ${last}`.trim();
+  return fullName || undefined;
+}
+
+function safeTicketParams(args: SafeTicketParams): Required<SafeTicketParams> {
+  const attachments =
+    args.attachments === "none" || args.attachments === "metadataOnly"
+      ? args.attachments
+      : "metadataOnly";
+
+  return {
+    ticketNumber: args.ticketNumber ?? "",
+    includeDescription: args.includeDescription ?? true,
+    includeNotes: args.includeNotes ?? true,
+    includeConversations: args.includeConversations ?? true,
+    latestFirst: args.latestFirst ?? true,
+    maxItems: Math.min(Math.max(Math.trunc(args.maxItems ?? 20), 0), 50),
+    maxCharsPerItem: Math.min(
+      Math.max(Math.trunc(args.maxCharsPerItem ?? 4000), 1),
+      10000
+    ),
+    maxTotalChars: Math.min(
+      Math.max(Math.trunc(args.maxTotalChars ?? 20000), 0),
+      50000
+    ),
+    redactCredentials: args.redactCredentials ?? true,
+    stripHtml: args.stripHtml ?? true,
+    stripHeaders: args.stripHeaders ?? true,
+    attachments,
+  };
+}
+
+function decodeHtmlEntities(value: string): string {
+  const named: Record<string, string> = {
+    amp: "&",
+    apos: "'",
+    gt: ">",
+    lt: "<",
+    nbsp: " ",
+    quot: '"',
+  };
+
+  return value.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (entity, body: string) => {
+    const lower = body.toLowerCase();
+    if (lower[0] === "#") {
+      const codePoint = lower[1] === "x"
+        ? Number.parseInt(lower.slice(2), 16)
+        : Number.parseInt(lower.slice(1), 10);
+      return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : entity;
+    }
+    return named[lower] ?? entity;
+  });
+}
+
+function htmlToPlainText(value: string): { text: string; stripped: boolean } {
+  const hadHtml = /<[^>]+>/.test(value);
+  let text = value
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(
+      /<(script|style|iframe|object|embed|svg|form|input|button)\b[\s\S]*?<\/\1>/gi,
+      " "
+    )
+    .replace(
+      /<(script|style|iframe|object|embed|svg|form|input|button|img)\b[^>]*\/?>/gi,
+      " "
+    )
+    .replace(/<[^>]+\b(?:hidden|display\s*:\s*none|visibility\s*:\s*hidden)[^>]*>[\s\S]*?<\/[^>]+>/gi, " ")
+    .replace(/<(br|p|div|li|tr|h[1-6])\b[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+
+  return { text: decodeHtmlEntities(text), stripped: hadHtml };
+}
+
+function stripRawEmailHeaders(value: string): { text: string; removed: boolean } {
+  const headerLine =
+    /^(?:Received|DKIM-Signature|Authentication-Results|SPF|Return-Path|Message-ID|MIME-Version|Content-Type|Content-Transfer-Encoding|ARC-[A-Za-z-]+|X-[A-Za-z0-9-]+)\s*:/i;
+  const lines = value.replace(/\r\n/g, "\n").split("\n");
+  const kept: string[] = [];
+  let removed = false;
+  let inHeaderBlock = false;
+
+  for (const line of lines) {
+    if (headerLine.test(line)) {
+      removed = true;
+      inHeaderBlock = true;
+      continue;
+    }
+    if (inHeaderBlock && /^[ \t]+/.test(line)) {
+      removed = true;
+      continue;
+    }
+    inHeaderBlock = false;
+    kept.push(line);
+  }
+
+  return { text: kept.join("\n"), removed };
+}
+
+function redactRiskyText(
+  value: string,
+  redactCredentials: boolean
+): {
+  text: string;
+  credentialsRedacted: boolean;
+  base64Removed: boolean;
+  embeddedImageRemoved: boolean;
+  binaryRemoved: boolean;
+} {
+  let text = value;
+  let credentialsRedacted = false;
+  let base64Removed = false;
+  let embeddedImageRemoved = false;
+  let binaryRemoved = false;
+
+  text = text
+    .replace(/data:[^"'\s>)]+/gi, () => {
+      embeddedImageRemoved = true;
+      return "[removed embedded image]";
+    })
+    .replace(/\bcid:[^\s"'<>]+/gi, () => {
+      embeddedImageRemoved = true;
+      return "[removed embedded image]";
+    })
+    .replace(/--[A-Za-z0-9'()+_,./:=?-]{12,}[\s\S]*?(?=\n--|\n\n|$)/g, () => {
+      base64Removed = true;
+      return "[removed attachment body]";
+    })
+    .replace(/BEGIN:VCALENDAR[\s\S]*?END:VCALENDAR/gi, "[removed attachment body]")
+    .replace(/BEGIN:VCARD[\s\S]*?END:VCARD/gi, "[removed attachment body]")
+    .replace(/<\?xml[\s\S]*?(?:<\/[A-Za-z][^>]*>|$)/gi, "[removed attachment body]");
+
+  text = text.replace(/\b[A-Za-z0-9+/]{120,}={0,2}\b/g, () => {
+    base64Removed = true;
+    return "[removed base64 content]";
+  });
+
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(text)) {
+    binaryRemoved = true;
+    text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]+/g, "[removed binary-like content]");
+  }
+
+  if (redactCredentials) {
+    const patterns: RegExp[] = [
+      /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+      /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi,
+      /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+      /\b(?:password|passwd|pwd|passcode|secret|client_secret|api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|authorization)\b\s*[:=]\s*["']?[^"'\s,;]+/gi,
+      /\b[A-Fa-f0-9]{48,}\b/g,
+    ];
+
+    for (const pattern of patterns) {
+      text = text.replace(pattern, () => {
+        credentialsRedacted = true;
+        return "[redacted credential/token]";
+      });
+    }
+  }
+
+  return {
+    text,
+    credentialsRedacted,
+    base64Removed,
+    embeddedImageRemoved,
+    binaryRemoved,
+  };
+}
+
+function normalizePlainText(value: string): string {
+  return value
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function truncateSafeText(value: string, maxChars: number): {
+  text: string;
+  truncated: boolean;
+} {
+  if (value.length <= maxChars) {
+    return { text: value, truncated: false };
+  }
+
+  const marker = "\n\n[... content truncated by safe retrieval ...]\n\n";
+  const available = Math.max(0, maxChars - marker.length);
+  const firstLength = Math.floor(available * 0.75);
+  const lastLength = available - firstLength;
+  return {
+    text: `${value.slice(0, firstLength)}${marker}${value.slice(value.length - lastLength)}`,
+    truncated: true,
+  };
+}
+
+function sanitizeTicketText(
+  value: unknown,
+  params: Required<SafeTicketParams>
+): SafeTextResult {
+  let text = typeof value === "string" ? value : "";
+  let htmlStripped = false;
+  let headersRemoved = false;
+
+  if (params.stripHtml) {
+    const html = htmlToPlainText(text);
+    text = html.text;
+    htmlStripped = html.stripped;
+  }
+
+  if (params.stripHeaders) {
+    const headers = stripRawEmailHeaders(text);
+    text = headers.text;
+    headersRemoved = headers.removed;
+  }
+
+  const redacted = redactRiskyText(text, params.redactCredentials);
+  const truncated = truncateSafeText(
+    normalizePlainText(redacted.text),
+    params.maxCharsPerItem
+  );
+
+  return {
+    plainText: truncated.text,
+    truncated: truncated.truncated,
+    diagnostics: {
+      htmlStripped,
+      headersRemoved,
+      credentialsRedacted: redacted.credentialsRedacted,
+      base64Removed: redacted.base64Removed,
+      embeddedImageRemoved: redacted.embeddedImageRemoved,
+      binaryRemoved: redacted.binaryRemoved,
+      truncated: truncated.truncated,
+    },
+  };
+}
+
+function safeAttachmentMetadata(attachments: unknown): {
+  filename?: string;
+  contentType?: string;
+  size?: number | string;
+}[] {
+  if (!Array.isArray(attachments)) {
+    return [];
+  }
+
+  return attachments
+    .map((attachment): {
+      filename?: string;
+      contentType?: string;
+      size?: number | string;
+    } | undefined => {
+      const record = jsonRecord(attachment);
+      if (!record) {
+        return undefined;
+      }
+      const filename = readableString(record.originalFileName, []) ??
+        readableString(record.fileName, []) ??
+        readableString(record.filename, []) ??
+        readableString(record.name, []);
+      const contentType = readableString(record.contentType, []) ??
+        readableString(record.mimeType, []);
+      const size = record.fileSize ?? record.size;
+      return {
+        filename,
+        contentType,
+        size: typeof size === "number" || typeof size === "string" ? size : undefined,
+      };
+    })
+    .filter((attachment): attachment is {
+      filename?: string;
+      contentType?: string;
+      size?: number | string;
+    } => Boolean(attachment?.filename || attachment?.contentType || attachment?.size));
+}
+
+function conversationDirection(
+  conversation: TicketConversation
+): SafeContentItem["direction"] {
+  const type = conversation.type?.toLowerCase() ?? "";
+  if (type.includes("req") || type.includes("customer")) return "customer";
+  if (type.includes("tech") || type.includes("reply")) return "technician";
+  return "unknown";
+}
+
+function noteDirection(note: TicketNote): SafeContentItem["direction"] {
+  return note.privacyType === "PRIVATE" ? "internal" : "technician";
+}
+
+function timestampOf(item: SafeContentItem): string {
+  return item.createdTime ?? "";
+}
+
+function mergeDiagnostics(
+  target: SanitizationDiagnostics,
+  source: SafeTextResult["diagnostics"]
+): void {
+  target.htmlStripped ||= Boolean(source.htmlStripped);
+  target.headersRemoved ||= Boolean(source.headersRemoved);
+  target.credentialsRedacted ||= Boolean(source.credentialsRedacted);
+  target.base64Removed ||= Boolean(source.base64Removed);
+  target.truncated ||= Boolean(source.truncated);
+  if (source.embeddedImageRemoved || source.binaryRemoved) {
+    target.base64Removed ||= Boolean(source.embeddedImageRemoved);
+  }
+}
+
+function safeErrorMessage(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  return normalizePlainText(
+    redactRiskyText(stripRawEmailHeaders(raw).text, true).text
+  ).slice(0, 500);
+}
+
+function buildSafeTicketResult(params: {
+  ticket: SafeTicket;
+  safeParams: Required<SafeTicketParams>;
+  conversations?: TicketConversation[];
+  notes?: TicketNote[];
+  contentErrors?: string[];
+}) {
+  const { ticket, safeParams } = params;
+  const sanitization: SanitizationDiagnostics = {
+    htmlStripped: false,
+    headersRemoved: false,
+    credentialsRedacted: false,
+    base64Removed: false,
+    attachmentsMetadataOnly: safeParams.attachments === "metadataOnly",
+    truncated: false,
+    itemsReturned: 0,
+    itemsOmittedByLimit: 0,
+  };
+
+  const attachments = safeParams.attachments === "metadataOnly"
+    ? [
+        ...(params.conversations ?? []).flatMap((item) =>
+          safeAttachmentMetadata(item.attachments)
+        ),
+        ...(params.notes ?? []).flatMap((item) => safeAttachmentMetadata(item.attachments)),
+      ]
+    : [];
+
+  const description = safeParams.includeDescription
+    ? sanitizeTicketText(ticket.description, safeParams)
+    : undefined;
+  if (description) {
+    mergeDiagnostics(sanitization, description.diagnostics);
+  }
+
+  const items: SafeContentItem[] = [];
+  if (safeParams.includeDescription && description?.plainText) {
+    items.push({
+      id: `${ticket.ticketId}:description`,
+      type: "description",
+      direction: "unknown",
+      createdTime: ticket.createdTime,
+      isInternal: false,
+      plainText: description.plainText,
+      truncated: description.truncated,
+    });
+  }
+
+  if (safeParams.includeConversations) {
+    for (const conversation of params.conversations ?? []) {
+      const safeText = sanitizeTicketText(conversation.content, safeParams);
+      mergeDiagnostics(sanitization, safeText.diagnostics);
+      items.push({
+        id: conversation.conversationId,
+        type: "conversation",
+        direction: conversationDirection(conversation),
+        createdTime: conversation.time,
+        author: readableString(conversation.user, ["name", "email"]),
+        isInternal: false,
+        plainText: safeText.plainText,
+        truncated: safeText.truncated,
+      });
+    }
+  }
+
+  if (safeParams.includeNotes) {
+    for (const note of params.notes ?? []) {
+      const safeText = sanitizeTicketText(note.content, safeParams);
+      mergeDiagnostics(sanitization, safeText.diagnostics);
+      items.push({
+        id: note.noteId,
+        type: "note",
+        direction: noteDirection(note),
+        createdTime: note.addedOn,
+        author: readableString(note.addedBy, ["name", "email"]),
+        isInternal: note.privacyType === "PRIVATE",
+        plainText: safeText.plainText,
+        truncated: safeText.truncated,
+      });
+    }
+  }
+
+  const orderedItems = [...items].sort((a, b) => {
+    const comparison = timestampOf(a).localeCompare(timestampOf(b));
+    return safeParams.latestFirst ? -comparison : comparison;
+  });
+
+  let usedChars = description?.plainText.length ?? 0;
+  const limitedItems: SafeContentItem[] = [];
+  for (const item of orderedItems) {
+    if (limitedItems.length >= safeParams.maxItems) {
+      sanitization.itemsOmittedByLimit += 1;
+      continue;
+    }
+    if (usedChars + item.plainText.length > safeParams.maxTotalChars) {
+      sanitization.itemsOmittedByLimit += 1;
+      sanitization.truncated = true;
+      continue;
+    }
+    usedChars += item.plainText.length;
+    limitedItems.push(item);
+  }
+
+  sanitization.itemsReturned = limitedItems.length;
+
+  const latestCustomerMessage = limitedItems.find(
+    (item) => item.type === "conversation" && item.direction === "customer"
+  );
+  const latestInternalNote = limitedItems.find(
+    (item) => item.type === "note" && item.isInternal
+  );
+  const latestTechnicianReply = limitedItems.find(
+    (item) =>
+      (item.type === "conversation" && item.direction === "technician") ||
+      (item.type === "note" && !item.isInternal)
+  );
+
+  return {
+    ticketNumber: ticket.displayId,
+    ticketId: ticket.ticketId,
+    subject: ticket.subject,
+    client: readableString(ticket.client, ["name", "accountName"]),
+    site: readableString(ticket.site, ["name"]),
+    status: ticket.status,
+    priority: ticket.priority,
+    impact: ticket.impact,
+    urgency: ticket.urgency,
+    category: ticket.category,
+    subcategory: ticket.subcategory,
+    cause: ticket.cause,
+    resolutionCode: ticket.resolutionCode,
+    requesterName: readableString(ticket.requester, ["name", "firstName", "lastName"]),
+    requesterEmail: readableString(ticket.requester, ["email"]),
+    createdTime: ticket.createdTime,
+    updatedTime: ticket.updatedTime,
+    safeContent: {
+      description: description
+        ? {
+            plainText: description.plainText,
+            truncated: description.truncated,
+          }
+        : undefined,
+      items: limitedItems,
+      contentErrors: params.contentErrors,
+    },
+    latestCustomerMessage,
+    latestInternalNote,
+    latestTechnicianReply,
+    attachments,
+    sanitization,
+  };
+}
+
 
 function applyTicketFilters(
   tickets: Ticket[],
@@ -1230,6 +1807,77 @@ export function getTicketsTools(): DomainTools {
         },
       },
       {
+        name: "superops_tickets_get_safe_by_number",
+        description:
+          "Safely retrieve a SuperOps ticket by visible ticket number with HTML stripped, risky embedded content removed, credentials redacted, attachments returned as metadata only, and long content truncated. Use this when normal ticket content retrieval is blocked or when safe plain-text triage is preferred.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ticketNumber: {
+              oneOf: [{ type: "string" }, { type: "number" }],
+              description: "The visible SuperOps ticket number or display ID",
+            },
+            includeDescription: {
+              type: "boolean",
+              default: true,
+              description: "Include the ticket description as sanitized plain text",
+            },
+            includeNotes: {
+              type: "boolean",
+              default: true,
+              description: "Include sanitized ticket notes",
+            },
+            includeConversations: {
+              type: "boolean",
+              default: true,
+              description: "Include sanitized ticket conversations",
+            },
+            latestFirst: {
+              type: "boolean",
+              default: true,
+              description: "Return notes and conversations newest first when timestamps are available",
+            },
+            maxItems: {
+              type: "number",
+              default: 20,
+              description: "Maximum content items to return (max: 50)",
+            },
+            maxCharsPerItem: {
+              type: "number",
+              default: 4000,
+              description: "Maximum characters per sanitized item (max: 10000)",
+            },
+            maxTotalChars: {
+              type: "number",
+              default: 20000,
+              description: "Maximum total sanitized content characters (max: 50000)",
+            },
+            redactCredentials: {
+              type: "boolean",
+              default: true,
+              description: "Redact credentials, secrets, tokens, private keys, and long hashes",
+            },
+            stripHtml: {
+              type: "boolean",
+              default: true,
+              description: "Strip HTML and convert visible text to plain text",
+            },
+            stripHeaders: {
+              type: "boolean",
+              default: true,
+              description: "Remove raw email source and security header lines",
+            },
+            attachments: {
+              type: "string",
+              enum: ["metadataOnly", "none"],
+              default: "metadataOnly",
+              description: "Return attachment metadata only, or omit attachments",
+            },
+          },
+          required: ["ticketNumber"],
+        },
+      },
+      {
         name: "superops_tickets_conversation_list",
         description:
           "List customer ticket conversations and replies, including attachment metadata where returned.",
@@ -1757,6 +2405,97 @@ export function getTicketsTools(): DomainTools {
             const result = params.includeContent
               ? await withTicketContent(client, ticket)
               : ticket;
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
+          }
+
+          case "superops_tickets_get_safe_by_number": {
+            const safeParams = safeTicketParams(args as SafeTicketParams);
+            const displayId = normaliseTicketNumber(safeParams.ticketNumber);
+
+            if (!displayId) {
+              return errorResult("ticketNumber is required and cannot be empty.");
+            }
+
+            const matches = await resolveTicketIdByDisplayId(client, displayId);
+
+            if (matches.length === 0) {
+              return errorResult(`No ticket was found for display number ${displayId}.`);
+            }
+
+            if (matches.length > 1) {
+              const matchSummary = matches.map((ticket) => ({
+                ticketId: ticket.ticketId,
+                displayId: ticket.displayId,
+                subject: ticket.subject,
+              }));
+              return errorResult(
+                `Display number ${displayId} was not unique. Matching tickets: ${JSON.stringify(matchSummary)}`
+              );
+            }
+
+            const ticketId = matches[0].ticketId;
+            let ticket: SafeTicket;
+            try {
+              ticket = await getSafeTicketByInternalId(client, ticketId);
+            } catch (error) {
+              const fallbackTicket = await getTicketByInternalId(client, ticketId);
+              const result = buildSafeTicketResult({
+                ticket: fallbackTicket,
+                safeParams,
+                contentErrors: [
+                  `Ticket content metadata was returned, but the safe description fetch failed: ${safeErrorMessage(error)}`,
+                ],
+              });
+
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(result, null, 2),
+                  },
+                ],
+              };
+            }
+
+            const contentErrors: string[] = [];
+            let conversations: TicketConversation[] = [];
+            let notes: TicketNote[] = [];
+
+            if (safeParams.includeConversations) {
+              try {
+                conversations = await getTicketConversations(client, ticket.ticketId);
+              } catch (error) {
+                contentErrors.push(
+                  `Conversations could not be fetched safely: ${safeErrorMessage(error)}`
+                );
+              }
+            }
+
+            if (safeParams.includeNotes) {
+              try {
+                notes = await getTicketNotes(client, ticket.ticketId);
+              } catch (error) {
+                contentErrors.push(
+                  `Notes could not be fetched safely: ${safeErrorMessage(error)}`
+                );
+              }
+            }
+
+            const result = buildSafeTicketResult({
+              ticket,
+              safeParams,
+              conversations,
+              notes,
+              contentErrors: contentErrors.length > 0 ? contentErrors : undefined,
+            });
 
             return {
               content: [

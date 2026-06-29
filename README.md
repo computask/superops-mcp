@@ -156,6 +156,7 @@ Token rotation plan:
 - `superops_tickets_recent` - List the most recently created tickets, optionally with conversations and notes
 - `superops_tickets_get` - Get ticket details
 - `superops_tickets_get_by_number` - Get ticket details by visible SuperOps ticket number/display ID
+- `superops_tickets_get_safe_by_number` - Safely get ticket metadata and sanitized plain-text context by visible SuperOps ticket number/display ID
 - `superops_tickets_conversation_list` - Read customer ticket conversations/replies, including attachment metadata where returned by SuperOps
 - `superops_tickets_notes_list` - Read public/internal ticket notes, including attachment metadata where returned by SuperOps
 - `superops_tickets_field_options` - Discover live SuperOps ticket option values for priority, impact, urgency, resolution code, cause, and subcategory
@@ -187,6 +188,36 @@ resolutionCode returned by SuperOps, such as `Permanent Fix` when available.
 If a response reports `partialFailure`, a note was already created but the later
 ticket update failed unexpectedly. Do not retry with the same note unless you
 intentionally want a duplicate note.
+
+Use `superops_tickets_get_by_number` for normal ticket lookup when raw ticket
+content is acceptable, or when you explicitly need the unmodified SuperOps
+conversation/note payloads. If `includeContent=true` is blocked by OpenAI safety
+checks, or if you only need safe plain-text triage context, use
+`superops_tickets_get_safe_by_number` instead.
+
+Safe retrieval returns ticket metadata, requester/sender fields, sanitized
+visible text, timestamps, author names, public/internal flags, convenience
+latest-message fields, and attachment metadata only. It strips HTML, removes raw
+email headers and MIME-like payloads, removes base64/data/cid embedded content,
+redacts credentials, tokens, private keys, long hashes, passwords, passcodes and
+secrets, and truncates long content. Attachment bodies are never returned by the
+safe tool; `attachments` currently supports only `metadataOnly` and `none`.
+
+Example safe retrieval call:
+
+```json
+{
+  "ticketNumber": "55841",
+  "includeDescription": true,
+  "includeNotes": true,
+  "includeConversations": true,
+  "latestFirst": true,
+  "maxItems": 20,
+  "maxCharsPerItem": 4000,
+  "maxTotalChars": 20000,
+  "attachments": "metadataOnly"
+}
+```
 
 ### Assets Domain
 

@@ -120,6 +120,7 @@ describe("Tickets Domain", () => {
       "superops_tickets_recent",
       "superops_tickets_get",
       "superops_tickets_get_by_number",
+      "superops_tickets_get_safe_by_number",
       "superops_tickets_conversation_list",
       "superops_tickets_notes_list",
       "superops_tickets_field_options",
@@ -632,6 +633,283 @@ describe("Tickets Domain", () => {
     expect(result.content[0].text).toContain("notes");
     expect(result.content[0].text).toContain("Customer message");
     expect(result.content[0].text).toContain("Internal note");
+  });
+
+  it("safely gets a ticket by number with metadata and sanitized plain text", async () => {
+    const base64Blob = "QUJD".repeat(40);
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXVzZXIifQ.signaturevalue123";
+
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [
+            { ticketId: "ticket-55841", displayId: "55841", subject: "Unsafe" },
+          ],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-55841",
+          displayId: "55841",
+          subject: "Unsafe",
+          client: { name: "TaskGroup" },
+          site: { name: "HQ" },
+          requester: { name: "Alex Requester", email: "alex@example.test" },
+          status: "New Calls",
+          priority: "High",
+          impact: "High",
+          urgency: "High",
+          category: "1. Support request",
+          subcategory: "Wireless",
+          cause: "Unknown",
+          resolutionCode: "Permanent Fix",
+          createdTime: "2026-06-25T09:00:00",
+          updatedTime: "2026-06-25T10:00:00",
+          description:
+            "<p>Visible description</p><script>alert('x')</script><style>.x{}</style><iframe src='x'></iframe>",
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicketConversationList: [
+          {
+            conversationId: "conversation-1",
+            content:
+              "Received: by mx.example\r\nDKIM-Signature: abc\r\n MIME-Version: 1.0\r\n<p>Hello <b>team</b><img src=\"cid:image001\"></p> password=secret123 data:image/png;base64,AAAA " +
+              base64Blob,
+            time: "2026-06-25T10:00:00",
+            type: "REQ_REPLY",
+            user: { name: "Alex Requester", email: "alex@example.test" },
+            attachments: [
+              {
+                fileName: "stored-1",
+                originalFileName: "invoice.html",
+                fileSize: "34821",
+                content: "<html>raw attachment body</html>",
+              },
+            ],
+          },
+          {
+            conversationId: "conversation-2",
+            content:
+              "<object>bad</object><embed src='bad'><svg>bad</svg><form><input value='secret'><button>bad</button></form> Technician reply " +
+              jwt,
+            time: "2026-06-25T10:05:00",
+            type: "TECH_REPLY",
+            user: { name: "Tech User" },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        getTicketNoteList: [
+          {
+            noteId: "note-1",
+            addedBy: { name: "Internal Tech" },
+            addedOn: "2026-06-25T10:10:00",
+            content:
+              "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\nInternal note",
+            privacyType: "PRIVATE",
+            attachments: [
+              {
+                fileName: "debug.log",
+                originalFileName: "debug.log",
+                fileSize: "100",
+                body: "raw attachment body",
+              },
+            ],
+          },
+        ],
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_get_safe_by_number", {
+      ticketNumber: "55841",
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    const serialized = JSON.stringify(parsed);
+
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+    expect(parsed).toMatchObject({
+      ticketNumber: "55841",
+      ticketId: "ticket-55841",
+      subject: "Unsafe",
+      client: "TaskGroup",
+      site: "HQ",
+      requesterName: "Alex Requester",
+      requesterEmail: "alex@example.test",
+      status: "New Calls",
+      safeContent: {
+        description: {
+          plainText: "Visible description",
+          truncated: false,
+        },
+      },
+    });
+    expect(serialized).toContain("Hello team");
+    expect(serialized).toContain("[removed embedded image]");
+    expect(serialized).toContain("[removed base64 content]");
+    expect(serialized).toContain("[redacted credential/token]");
+    expect(serialized).not.toContain("<script");
+    expect(serialized).not.toContain("<style");
+    expect(serialized).not.toContain("<iframe");
+    expect(serialized).not.toContain("<object");
+    expect(serialized).not.toContain("<embed");
+    expect(serialized).not.toContain("<svg");
+    expect(serialized).not.toContain("<form");
+    expect(serialized).not.toContain("<input");
+    expect(serialized).not.toContain("<button");
+    expect(serialized).not.toContain("Received:");
+    expect(serialized).not.toContain("DKIM-Signature");
+    expect(serialized).not.toContain("secret123");
+    expect(serialized).not.toContain(jwt);
+    expect(serialized).not.toContain("PRIVATE KEY");
+    expect(serialized).not.toContain("raw attachment body");
+    expect(parsed.attachments).toEqual([
+      { filename: "invoice.html", size: "34821" },
+      { filename: "debug.log", size: "100" },
+    ]);
+    expect(parsed.latestCustomerMessage.id).toBe("conversation-1");
+    expect(parsed.latestInternalNote.id).toBe("note-1");
+    expect(parsed.latestTechnicianReply.id).toBe("conversation-2");
+    expect(parsed.sanitization).toMatchObject({
+      htmlStripped: true,
+      headersRemoved: true,
+      credentialsRedacted: true,
+      base64Removed: true,
+      attachmentsMetadataOnly: true,
+      itemsReturned: 4,
+    });
+  });
+
+  it("truncates safe ticket items, respects total limits, and orders oldest first when requested", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-55841", displayId: "55841", subject: "Long" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-55841", displayId: "55841", subject: "Long" },
+      })
+      .mockResolvedValueOnce({
+        getTicketConversationList: [
+          {
+            conversationId: "conversation-old",
+            content: "Old " + Array(80).fill("visible").join(" "),
+            time: "2026-06-25T09:00:00",
+            type: "REQ_REPLY",
+          },
+          {
+            conversationId: "conversation-new",
+            content: "New " + Array(80).fill("visible").join(" "),
+            time: "2026-06-25T10:00:00",
+            type: "REQ_REPLY",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        getTicketNoteList: [
+          {
+            noteId: "note-newer",
+            addedOn: "2026-06-25T11:00:00",
+            content: "Note " + Array(80).fill("visible").join(" "),
+            privacyType: "PRIVATE",
+          },
+        ],
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_get_safe_by_number", {
+      ticketNumber: 55841,
+      latestFirst: false,
+      maxItems: 50,
+      maxCharsPerItem: 120,
+      maxTotalChars: 150,
+      attachments: "none",
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.safeContent.items[0].id).toBe("conversation-old");
+    expect(parsed.safeContent.items[0].plainText).toContain(
+      "[... content truncated by safe retrieval ...]"
+    );
+    expect(
+      parsed.safeContent.items.reduce(
+        (total: number, item: { plainText: string }) => total + item.plainText.length,
+        0
+      )
+    ).toBeLessThanOrEqual(150);
+    expect(parsed.safeContent.items.length).toBeLessThan(3);
+    expect(parsed.attachments).toEqual([]);
+    expect(parsed.sanitization.truncated).toBe(true);
+    expect(parsed.sanitization.itemsOmittedByLimit).toBeGreaterThan(0);
+  });
+
+  it("returns safe metadata with content errors if note or conversation fetches fail", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-55841", displayId: "55841", subject: "Partial" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-55841",
+          displayId: "55841",
+          subject: "Partial",
+        },
+      })
+      .mockRejectedValueOnce(
+        new Error("Received: bad\r\nAuthorization: Bearer secret-token raw failure")
+      )
+      .mockResolvedValueOnce({ getTicketNoteList: [] });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_get_safe_by_number", {
+      ticketNumber: "55841",
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.ticketId).toBe("ticket-55841");
+    expect(parsed.safeContent.contentErrors[0]).toContain(
+      "Conversations could not be fetched safely"
+    );
+    expect(parsed.safeContent.contentErrors[0]).not.toContain("secret-token");
+    expect(parsed.safeContent.contentErrors[0]).not.toContain("Received:");
+  });
+
+  it("keeps normal get_by_number content behaviour unchanged", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57072", displayId: "57072", subject: "Raw" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57072", displayId: "57072", subject: "Raw" },
+      })
+      .mockResolvedValueOnce({
+        getTicketConversationList: [
+          {
+            conversationId: "conversation-raw",
+            content: "<script>alert('still raw')</script>",
+            time: "2026-06-25T10:00:00",
+            type: "REQ_REPLY",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ getTicketNoteList: [] });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_get_by_number", {
+      ticketNumber: "57072",
+      includeContent: true,
+    });
+
+    expect(result.content[0].text).toContain("<script>alert('still raw')</script>");
   });
 
   it("lists ticket conversations using documented TicketIdentifierInput", async () => {

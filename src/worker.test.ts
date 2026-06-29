@@ -575,6 +575,44 @@ describe("Cloudflare Worker entrypoint", () => {
     }
   });
 
+  it("audits safe ticket retrieval as read-only without logging raw arguments", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 333,
+          method: "tools/call",
+          params: {
+            name: "superops_tickets_get_safe_by_number",
+            arguments: {
+              ticketNumber: "55841",
+              includeConversations: true,
+              maxTotalChars: 20000,
+            },
+          },
+        },
+        {},
+        { "X-Request-Id": "audit-safe-ticket-1" }
+      );
+
+      expect(res.status).toBe(200);
+      const records = auditRecords(logSpy);
+      expect(records[0]).toMatchObject({
+        requestId: "audit-safe-ticket-1",
+        toolName: "superops_tickets_get_safe_by_number",
+        toolCategory: "read",
+        highRisk: false,
+        success: false,
+      });
+      const serialized = JSON.stringify(records[0]);
+      expect(serialized).not.toContain("55841");
+      expect(serialized).not.toContain("maxTotalChars");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it("does not audit full custom mutation bodies or variable values", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
