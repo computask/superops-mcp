@@ -675,6 +675,53 @@ describe("Cloudflare Worker entrypoint", () => {
     }
   });
 
+  it("audits triage snapshot as read-only with safe metadata only", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 334,
+          method: "tools/call",
+          params: {
+            name: "superops_tickets_triage_snapshot",
+            arguments: {
+              status: ["New Calls"],
+              max: 50,
+              page: 1,
+              includeConversations: true,
+              includeNotes: true,
+              maxContentCharsPerTicket: 3000,
+            },
+          },
+        },
+        {},
+        { "X-Request-Id": "audit-triage-snapshot-1" }
+      );
+
+      expect(res.status).toBe(200);
+      const records = auditRecords(logSpy);
+      expect(records[0]).toMatchObject({
+        requestId: "audit-triage-snapshot-1",
+        toolName: "superops_tickets_triage_snapshot",
+        toolCategory: "read",
+        highRisk: false,
+        success: false,
+        triageSnapshot: {
+          status: ["New Calls"],
+          page: 1,
+          max: 50,
+          safeRead: true,
+        },
+      });
+      const serialized = JSON.stringify(records[0]);
+      expect(serialized).not.toContain("maxContentCharsPerTicket");
+      expect(serialized).not.toContain("plainText");
+      expect(serialized).not.toContain("safeSummary");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
   it("does not audit full custom mutation bodies or variable values", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {

@@ -36,6 +36,11 @@ vi.mock("./domains/tickets.js", () => ({
         description: "List tickets",
         inputSchema: { type: "object", properties: {} },
       },
+      {
+        name: "superops_tickets_triage_snapshot",
+        description: "Read-only triage snapshot",
+        inputSchema: { type: "object", properties: {} },
+      },
     ],
     handleCall: vi.fn(),
   })),
@@ -325,6 +330,32 @@ describe("Tool Discovery and Management", () => {
       expect(successResponse.content[0].text).toContain("You can call any of these tools directly");
     });
 
+    it("formats ticket navigation with triage snapshot", () => {
+      const tools = [
+        { name: "superops_tickets_list", description: "List tickets" },
+        {
+          name: "superops_tickets_triage_snapshot",
+          description: "Read-only triage snapshot",
+        },
+      ];
+      const successResponse = {
+        content: [
+          {
+            type: "text",
+            text: `Ticket management - list, get, create tickets and manage support workflow
+
+Available tools:
+${tools.map((t) => `- ${t.name}: ${t.description}`).join("\n")}
+
+You can call any of these tools directly.`,
+          },
+        ],
+      };
+
+      expect(successResponse.content[0].text).toContain(
+        "superops_tickets_triage_snapshot"
+      );
+    });
     it("formats status response correctly", () => {
       const statusResponse = {
         content: [

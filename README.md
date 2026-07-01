@@ -160,6 +160,7 @@ Token rotation plan:
 - `superops_tickets_get` - Get ticket details
 - `superops_tickets_get_by_number` - Get ticket details by visible SuperOps ticket number/display ID
 - `superops_tickets_get_safe_by_number` - Safely get ticket metadata and sanitized plain-text context by visible SuperOps ticket number/display ID
+- `superops_tickets_triage_snapshot` - Read-only queue triage snapshot that freezes the initial candidate list and returns safe compact evidence for ChatGPT assessment
 - `superops_tickets_conversation_list` - Read customer ticket conversations/replies, including attachment metadata where returned by SuperOps
 - `superops_tickets_notes_list` - Read public/internal ticket notes, including attachment metadata where returned by SuperOps
 - `superops_tickets_field_options` - Discover live SuperOps ticket option values for priority, impact, urgency, resolution code, cause, and subcategory
@@ -207,6 +208,19 @@ and MIME-like payloads, removes base64/data/cid embedded content, redacts
 credentials, tokens, private keys, long hashes, passwords, passcodes and secrets,
 and truncates long content. Attachment bodies are never returned by the safe
 tool; `attachments` currently supports only `metadataOnly` and `none`.
+
+`superops_tickets_triage_snapshot` is the preferred read-only starting point for
+New Calls triage. It lists the requested status/page once using the normal ticket
+list path, freezes the returned ticket numbers and internal IDs, and then reads
+safe compact evidence for each candidate. Phase 1 snapshots are stateless and are
+not persisted, even if `storeBatch` is supplied. The tool never writes, resolves,
+updates, notes, classifies, calls field options, or uses `superops_tickets_recent`.
+It returns every original candidate, including tickets where content is empty,
+blocked, unavailable, or metadata-only. Original ticket body content may come
+from SuperOps conversation items with type `DESCRIPTION`; the tool does not query
+`Ticket.description`, because that field is not available in the live schema.
+Prefer this tool over manually listing New Calls and then issuing many individual
+safe reads.
 
 Example safe retrieval call:
 
@@ -366,15 +380,22 @@ Claude: [calls superops_tickets_list with status: ["Open"], priority: ["High"]]
 Here are the open high priority tickets...
 
 User: Show tickets currently in New Calls
-Claude: [calls superops_tickets_list with {
+Claude: [calls superops_tickets_triage_snapshot with {
   "status": ["New Calls"],
   "max": 50,
-  "page": 1
+  "page": 1,
+  "safeRead": true,
+  "includeNotes": true,
+  "includeConversations": true,
+  "includeAttachments": "metadataOnly",
+  "maxContentCharsPerTicket": 3000,
+  "maxItemsPerTicket": 8,
+  "latestFirst": true
 }]
-Here are the current New Calls tickets...
+Here is the fixed safe New Calls snapshot for triage...
 
 Note: superops_tickets_recent is only a recent-ticket view. Do not use it as a
-complete queue listing for statuses such as New Calls.
+complete queue listing or triage source of truth for statuses such as New Calls.
 
 User: Resolve spam ticket 57100
 Claude: [calls superops_tickets_resolve_full with {

@@ -58,6 +58,12 @@ const DEFAULT_RECENT_TICKETS_COUNT = 10;
 const MIN_RECENT_TICKETS_COUNT = 1;
 const MAX_RECENT_TICKETS_COUNT = 50;
 const MAX_RECENT_TICKETS_WITH_CONTENT = 10;
+const DEFAULT_TRIAGE_SNAPSHOT_MAX = 50;
+const MAX_TRIAGE_SNAPSHOT_MAX = 500;
+const DEFAULT_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET = 3000;
+const MAX_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET = 10000;
+const DEFAULT_TRIAGE_MAX_ITEMS_PER_TICKET = 8;
+const MAX_TRIAGE_MAX_ITEMS_PER_TICKET = 20;
 const DISPLAY_ID_EQUALS_OPERATOR = "is";
 const STATUS_EQUALS_OPERATOR = "is";
 const STATUS_IN_OPERATOR = "in";
@@ -416,6 +422,20 @@ interface SafeTicketParams {
   attachments?: "metadataOnly" | "none";
 }
 
+interface TriageSnapshotParams {
+  status?: string[];
+  max?: number;
+  page?: number;
+  safeRead?: boolean;
+  includeNotes?: boolean;
+  includeConversations?: boolean;
+  includeAttachments?: "metadataOnly" | "none";
+  maxContentCharsPerTicket?: number;
+  maxItemsPerTicket?: number;
+  latestFirst?: boolean;
+  storeBatch?: boolean;
+}
+
 interface SanitizationDiagnostics {
   htmlStripped: boolean;
   headersRemoved: boolean;
@@ -445,6 +465,28 @@ interface SafeContentItem {
   isInternal: boolean;
   plainText: string;
   truncated: boolean;
+}
+
+type TriageProcessingState =
+  | "SnapshotRead"
+  | "MetadataOnly"
+  | "ContentUnavailable"
+  | "ContentBlocked"
+  | "NotFound"
+  | "Failed";
+
+interface NormalizedTriageSnapshotParams {
+  status: string[];
+  max: number;
+  page: number;
+  safeRead: true;
+  includeNotes: boolean;
+  includeConversations: boolean;
+  includeAttachments: "metadataOnly" | "none";
+  maxContentCharsPerTicket: number;
+  maxItemsPerTicket: number;
+  latestFirst: boolean;
+  storeBatch: boolean;
 }
 
 interface TicketClassificationParams {
@@ -675,6 +717,66 @@ function safeTicketParams(args: SafeTicketParams): Required<SafeTicketParams> {
   };
 }
 
+function triageSnapshotParams(
+  args: TriageSnapshotParams
+): NormalizedTriageSnapshotParams {
+  const max = typeof args.max === "number" && Number.isFinite(args.max)
+    ? Math.trunc(args.max)
+    : DEFAULT_TRIAGE_SNAPSHOT_MAX;
+  const page = typeof args.page === "number" && Number.isFinite(args.page)
+    ? Math.trunc(args.page)
+    : DEFAULT_LIST_PAGE;
+  const maxContentCharsPerTicket =
+    typeof args.maxContentCharsPerTicket === "number" &&
+    Number.isFinite(args.maxContentCharsPerTicket)
+      ? Math.trunc(args.maxContentCharsPerTicket)
+      : DEFAULT_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET;
+  const maxItemsPerTicket =
+    typeof args.maxItemsPerTicket === "number" && Number.isFinite(args.maxItemsPerTicket)
+      ? Math.trunc(args.maxItemsPerTicket)
+      : DEFAULT_TRIAGE_MAX_ITEMS_PER_TICKET;
+  const includeAttachments = args.includeAttachments === "none"
+    ? "none"
+    : "metadataOnly";
+
+  return {
+    status: args.status && args.status.length > 0 ? args.status : ["New Calls"],
+    max: Math.min(Math.max(max, 1), MAX_TRIAGE_SNAPSHOT_MAX),
+    page: Math.max(page, 1),
+    safeRead: true,
+    includeNotes: args.includeNotes ?? true,
+    includeConversations: args.includeConversations ?? true,
+    includeAttachments,
+    maxContentCharsPerTicket: Math.min(
+      Math.max(maxContentCharsPerTicket, 1),
+      MAX_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET
+    ),
+    maxItemsPerTicket: Math.min(
+      Math.max(maxItemsPerTicket, 0),
+      MAX_TRIAGE_MAX_ITEMS_PER_TICKET
+    ),
+    latestFirst: args.latestFirst ?? true,
+    storeBatch: false,
+  };
+}
+
+function safeParamsForTriageSnapshot(
+  params: NormalizedTriageSnapshotParams
+): Required<SafeTicketParams> {
+  return safeTicketParams({
+    includeDescription: false,
+    includeNotes: params.includeNotes,
+    includeConversations: params.includeConversations,
+    latestFirst: params.latestFirst,
+    maxItems: params.maxItemsPerTicket,
+    maxCharsPerItem: params.maxContentCharsPerTicket,
+    maxTotalChars: params.maxContentCharsPerTicket,
+    attachments: params.includeAttachments,
+    redactCredentials: true,
+    stripHtml: true,
+    stripHeaders: true,
+  });
+}
 function decodeHtmlEntities(value: string): string {
   const named: Record<string, string> = {
     amp: "&",
@@ -919,9 +1021,18 @@ function conversationDirection(
   conversation: TicketConversation
 ): SafeContentItem["direction"] {
   const type = conversation.type?.toLowerCase() ?? "";
+  if (type === "description") return "customer";
   if (type.includes("req") || type.includes("customer")) return "customer";
   if (type.includes("tech") || type.includes("reply")) return "technician";
   return "unknown";
+}
+
+function safeContentTypeForConversation(
+  conversation: TicketConversation
+): SafeContentItem["type"] {
+  return conversation.type?.toUpperCase() === "DESCRIPTION"
+    ? "description"
+    : "conversation";
 }
 
 function noteDirection(note: TicketNote): SafeContentItem["direction"] {
@@ -999,7 +1110,7 @@ function buildSafeTicketResult(params: {
       mergeDiagnostics(sanitization, safeText.diagnostics);
       items.push({
         id: conversation.conversationId,
-        type: "conversation",
+        type: safeContentTypeForConversation(conversation),
         direction: conversationDirection(conversation),
         createdTime: conversation.time,
         author: readableString(conversation.user, ["name", "email"]),
@@ -1117,6 +1228,161 @@ function buildSafeTicketResult(params: {
 }
 
 
+function triageItemType(item: SafeContentItem): string {
+  if (item.type === "description") return "description";
+  if (item.type === "note" && item.isInternal) return "internal_note";
+  if (item.type === "note") return "note";
+  if (item.direction === "customer") return "customer_reply";
+  if (item.direction === "technician") return "technician_reply";
+  return "conversation";
+}
+
+function triageProcessingState(params: {
+  metadataAvailable: boolean;
+  itemCount: number;
+  conversationCount: number;
+  noteCount: number;
+  contentErrors: string[];
+}): TriageProcessingState {
+  if (!params.metadataAvailable) return "Failed";
+  if (params.itemCount > 0) return "SnapshotRead";
+  if (params.contentErrors.length > 0) return "ContentBlocked";
+  if (params.conversationCount > 0 || params.noteCount > 0) return "ContentUnavailable";
+  return "MetadataOnly";
+}
+
+function buildTriageSnapshotTicket(params: {
+  candidate: Ticket;
+  ticket: Ticket;
+  safeResult: ReturnType<typeof buildSafeTicketResult>;
+  contentErrors: string[];
+  metadataAvailable: boolean;
+}) {
+  const { candidate, ticket, safeResult, contentErrors, metadataAvailable } = params;
+  const safeContentItems = safeResult.safeContent.items.map((item) => ({
+    type: triageItemType(item),
+    time: item.createdTime,
+    author: item.author,
+    isInternal: item.isInternal,
+    plainText: item.plainText,
+    truncated: item.truncated,
+  }));
+  const safeSummary = safeContentItems
+    .map((item) => item.plainText)
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, 800);
+  const conversationAvailability = safeResult.contentAvailability.conversations;
+  const noteAvailability = safeResult.contentAvailability.notes;
+
+  return {
+    ticketNumber: ticket.displayId ?? candidate.displayId,
+    ticketId: ticket.ticketId ?? candidate.ticketId,
+    subject: ticket.subject ?? candidate.subject,
+    client: readableString(ticket.client ?? candidate.client, ["name", "accountName"]),
+    site: readableString(ticket.site, ["name"]),
+    requesterName: readableString(
+      ticket.requester ?? candidate.requester,
+      ["name", "firstName", "lastName"]
+    ),
+    requesterEmail: readableString(ticket.requester ?? candidate.requester, ["email"]),
+    status: ticket.status ?? candidate.status,
+    priority: ticket.priority ?? candidate.priority,
+    impact: ticket.impact ?? candidate.impact,
+    urgency: ticket.urgency ?? candidate.urgency,
+    category: ticket.category ?? candidate.category,
+    subcategory: ticket.subcategory,
+    cause: ticket.cause,
+    resolutionCode: ticket.resolutionCode,
+    createdTime: ticket.createdTime ?? candidate.createdTime,
+    updatedTime: ticket.updatedTime ?? candidate.updatedTime,
+    processingState: triageProcessingState({
+      metadataAvailable,
+      itemCount: safeContentItems.length,
+      conversationCount: conversationAvailability.count,
+      noteCount: noteAvailability.count,
+      contentErrors,
+    }),
+    safeSummary,
+    safeContentItems,
+    attachments: safeResult.attachments,
+    contentAvailability: {
+      metadata: metadataAvailable ? "available" : "unavailable",
+      descriptionField: "notAvailableInSchema",
+      conversations: conversationAvailability.available
+        ? "available"
+        : conversationAvailability.requested
+          ? "unavailable"
+          : "notRequested",
+      notes: noteAvailability.available
+        ? "available"
+        : noteAvailability.requested
+          ? "unavailable"
+          : "notRequested",
+      attachments: safeResult.sanitization.attachmentsMetadataOnly
+        ? "metadataOnly"
+        : "none",
+    },
+    contentSourceNotes: [
+      "Ticket.description is not available in the live SuperOps schema. Original ticket body is retrieved from conversation items where SuperOps exposes it, including DESCRIPTION items.",
+    ],
+    warnings: contentErrors,
+  };
+}
+
+async function buildTriageSnapshotForCandidate(
+  client: SuperOpsClientInstance,
+  candidate: Ticket,
+  params: NormalizedTriageSnapshotParams
+) {
+  let ticket = candidate;
+  let metadataAvailable = true;
+  const contentErrors: string[] = [];
+
+  try {
+    ticket = await getTicketByInternalId(client, candidate.ticketId);
+  } catch (error) {
+    metadataAvailable = false;
+    contentErrors.push(`Metadata could not be fetched safely: ${safeErrorMessage(error)}`);
+  }
+
+  let conversations: TicketConversation[] = [];
+  let notes: TicketNote[] = [];
+
+  if (params.includeConversations) {
+    try {
+      conversations = await getTicketConversations(client, candidate.ticketId);
+    } catch (error) {
+      contentErrors.push(
+        `Conversations could not be fetched safely: ${safeErrorMessage(error)}`
+      );
+    }
+  }
+
+  if (params.includeNotes) {
+    try {
+      notes = await getTicketNotes(client, candidate.ticketId);
+    } catch (error) {
+      contentErrors.push(`Notes could not be fetched safely: ${safeErrorMessage(error)}`);
+    }
+  }
+
+  const safeResult = buildSafeTicketResult({
+    ticket,
+    safeParams: safeParamsForTriageSnapshot(params),
+    conversations,
+    notes,
+    contentErrors: undefined,
+  });
+
+  return buildTriageSnapshotTicket({
+    candidate,
+    ticket,
+    safeResult,
+    contentErrors,
+    metadataAvailable,
+  });
+}
 function applyTicketFilters(
   tickets: Ticket[],
   filters: {
@@ -1841,6 +2107,76 @@ export function getTicketsTools(): DomainTools {
         },
       },
       {
+        name: "superops_tickets_triage_snapshot",
+        description:
+          "Read-only New Calls triage snapshot. Lists a queue once, freezes the candidate ticket numbers and IDs, then returns safe compact metadata, sanitized conversation/note evidence, and attachment metadata only for ChatGPT assessment.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status: {
+              type: "array",
+              items: {
+                type: "string",
+                enum: [...VALID_TICKET_STATUSES],
+              },
+              default: ["New Calls"],
+              description:
+                `Queue status display names to snapshot. Defaults to New Calls. Valid values: ${VALID_TICKET_STATUSES.join(", ")}`,
+            },
+            max: {
+              type: "number",
+              default: DEFAULT_TRIAGE_SNAPSHOT_MAX,
+              description: "Maximum candidates to list before freezing the snapshot (default: 50, max: 500)",
+            },
+            page: {
+              type: "number",
+              default: 1,
+              description: "Ticket list page to snapshot (default: 1)",
+            },
+            safeRead: {
+              type: "boolean",
+              default: true,
+              description: "Accepted for compatibility; this Phase 1 tool always uses safe compact retrieval.",
+            },
+            includeNotes: {
+              type: "boolean",
+              default: true,
+              description: "Include sanitized ticket notes as evidence.",
+            },
+            includeConversations: {
+              type: "boolean",
+              default: true,
+              description: "Include sanitized ticket conversations as evidence, including DESCRIPTION items when SuperOps returns them.",
+            },
+            includeAttachments: {
+              type: "string",
+              enum: ["metadataOnly", "none"],
+              default: "metadataOnly",
+              description: "Return attachment metadata only, or omit attachments.",
+            },
+            maxContentCharsPerTicket: {
+              type: "number",
+              default: DEFAULT_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET,
+              description: "Maximum sanitized content characters per ticket (default: 3000, max: 10000).",
+            },
+            maxItemsPerTicket: {
+              type: "number",
+              default: DEFAULT_TRIAGE_MAX_ITEMS_PER_TICKET,
+              description: "Maximum safe content items per ticket (default: 8, max: 20).",
+            },
+            latestFirst: {
+              type: "boolean",
+              default: true,
+              description: "Return newest safe content items first when timestamps are available.",
+            },
+            storeBatch: {
+              type: "boolean",
+              default: false,
+              description: "Accepted for future compatibility; Phase 1 snapshots are stateless and are not persisted.",
+            },
+          },
+        },
+      },      {
         name: "superops_tickets_conversation_list",
         description:
           "List customer ticket conversations and replies, including attachment metadata where returned.",
@@ -2449,6 +2785,71 @@ export function getTicketsTools(): DomainTools {
             };
           }
 
+          case "superops_tickets_triage_snapshot": {
+            const snapshotParams = triageSnapshotParams(args as TriageSnapshotParams);
+            const invalidStatuses = invalidValues(
+              snapshotParams.status,
+              VALID_TICKET_STATUSES
+            );
+            if (invalidStatuses.length > 0) {
+              return structuredValidationResult(
+                validationFailure({
+                  message: "Triage snapshot was not queried because validation failed.",
+                  invalidFields: {
+                    status: `Invalid ticket status(es): ${invalidStatuses.join(", ")}`,
+                  },
+                  validOptions: { status: [...VALID_TICKET_STATUSES] },
+                })
+              );
+            }
+
+            const response = await client.query<ListTicketsResponse>(LIST_TICKETS_QUERY, {
+              input: buildTicketListInput({
+                status: snapshotParams.status,
+                max: snapshotParams.max,
+                page: snapshotParams.page,
+              }),
+            });
+            const candidates = response.getTicketList.tickets;
+            const candidateTicketNumbers = candidates.map(
+              (ticket) => ticket.displayId ?? ticket.ticketId
+            );
+            const tickets = [];
+            for (const ticket of candidates) {
+              tickets.push(
+                await buildTriageSnapshotForCandidate(client, ticket, snapshotParams)
+              );
+            }
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      batchId: undefined,
+                      source: {
+                        status: snapshotParams.status,
+                        page: snapshotParams.page,
+                        max: snapshotParams.max,
+                      },
+                      initialCandidateCount: candidates.length,
+                      candidateTicketNumbers,
+                      tickets,
+                      errors: [],
+                      safety: {
+                        safeReadUsed: true,
+                        rawHtmlReturned: false,
+                        attachmentBodiesReturned: false,
+                      },
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
           case "superops_tickets_conversation_list": {
             const { ticketId } = args as { ticketId: string };
 

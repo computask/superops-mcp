@@ -27,6 +27,7 @@ import {
   sanitizeToolResult,
   toolAuditMetadata,
   type ToolResult,
+  type AuditMetadata,
 } from "./audit.js";
 
 // Lazy-loaded domain modules
@@ -352,6 +353,42 @@ async function executeToolCall(
   };
 }
 
+function enrichAuditMetadataFromResult(
+  toolName: string,
+  result: ToolResult,
+  metadata: AuditMetadata | undefined
+): AuditMetadata | undefined {
+  if (toolName !== "superops_tickets_triage_snapshot" || result.isError) {
+    return metadata;
+  }
+
+  const text = result.content.find((item) => item.type === "text")?.text;
+  if (!text) {
+    return metadata;
+  }
+
+  try {
+    const parsed = JSON.parse(text) as {
+      source?: { status?: unknown; page?: unknown; max?: unknown };
+      initialCandidateCount?: unknown;
+      candidateTicketNumbers?: unknown;
+    };
+    return {
+      ...metadata,
+      triageSnapshot: {
+        status: parsed.source?.status,
+        page: parsed.source?.page,
+        max: parsed.source?.max,
+        candidateCount: parsed.initialCandidateCount,
+        ticketNumbers: parsed.candidateTicketNumbers,
+        safeRead: true,
+      },
+    };
+  } catch {
+    return metadata;
+  }
+}
+
 /**
  * Create and configure an MCP Server instance with all request handlers.
  * Called once for stdio, or per-request for HTTP / Workers transports.
@@ -383,10 +420,11 @@ export function createMcpServer(): Server {
     const { name } = request.params;
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
     const started = Date.now();
-    const metadata = toolAuditMetadata(name, args);
+    let metadata = toolAuditMetadata(name, args);
 
     try {
       const result = sanitizeToolResult(await executeToolCall(name, args));
+      metadata = enrichAuditMetadataFromResult(name, result, metadata);
       auditToolCall({
         toolName: name,
         success: !result.isError,

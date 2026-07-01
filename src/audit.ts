@@ -20,6 +20,14 @@ export interface AuditMetadata {
   operationName?: string;
   variableKeys?: string[];
   changedFields?: string[];
+  triageSnapshot?: {
+    status?: unknown;
+    page?: unknown;
+    max?: unknown;
+    candidateCount?: unknown;
+    ticketNumbers?: unknown;
+    safeRead?: unknown;
+  };
 }
 
 const HIGH_RISK_WRITE_TOOLS = new Set([
@@ -258,6 +266,17 @@ export function toolAuditMetadata(
 ): AuditMetadata | undefined {
   const changedFields = changedFieldKeys(name, args);
 
+  if (name === "superops_tickets_triage_snapshot") {
+    return {
+      triageSnapshot: {
+        status: args.status ?? ["New Calls"],
+        page: args.page ?? 1,
+        max: args.max ?? 50,
+        safeRead: true,
+      },
+    };
+  }
+
   if (name !== "superops_custom_query" && name !== "superops_custom_mutation") {
     return changedFields ? { changedFields } : undefined;
   }
@@ -345,6 +364,7 @@ export function auditToolCall(args: {
     durationMs: args.durationMs,
     errorSummary: args.errorSummary ? sanitizeText(args.errorSummary) : undefined,
     changedFields: args.metadata?.changedFields,
+    triageSnapshot: args.metadata?.triageSnapshot,
     customGraphql: args.metadata,
   };
 
