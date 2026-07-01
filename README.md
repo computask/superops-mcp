@@ -222,6 +222,45 @@ from SuperOps conversation items with type `DESCRIPTION`; the tool does not quer
 Prefer this tool over manually listing New Calls and then issuing many individual
 safe reads.
 
+### Recommended New Calls Triage Workflow
+
+For New Calls triage, start with `superops_tickets_triage_snapshot` and treat
+its `candidateTicketNumbers` list as fixed. ChatGPT should assess only the safe
+compact evidence returned by that snapshot when proposing a triage plan. Do not
+write changes while assessing the snapshot.
+
+Recommended flow:
+
+1. Call `superops_tickets_triage_snapshot` for `status: ["New Calls"]`.
+2. Analyse only the fixed snapshot returned by that call.
+3. Present a pre-write proposed action table for user approval.
+4. After approval, use the existing individual write tools such as
+   `superops_tickets_resolve_full`, `superops_tickets_update`, or
+   `superops_tickets_add_note`.
+5. Report the final outcome for every ticket from the snapshot.
+
+The pre-write approval table should include every proposed write or intentional
+non-write. Suggested columns: ticket number, subject, client, evidence summary,
+proposed action, fields or note to apply, and reason. Do not perform writes until
+the user approves the table.
+
+The final outcome table must include every ticket from the snapshot, even when no
+change was made. Each ticket must have one final outcome from: `Resolved`,
+`Moved`, `Updated`, `Left in New Calls`, `Skipped`, `Blocked`, `Failed`, or
+`Not Found`. Do not omit tickets because they were skipped, blocked, failed, not
+found, or left unchanged.
+
+When individual writes are used after approval, report failures explicitly with
+the ticket number, requested action, failure stage, and whether any partial write
+occurred. If a ticket changed or disappeared after the snapshot, keep it in the
+final table and mark it as `Blocked`, `Failed`, or `Not Found` as appropriate.
+
+Suggested Custom GPT instruction:
+
+```text
+For New Calls triage, use `superops_tickets_triage_snapshot` first. Treat the snapshot candidate list as fixed. Do not write changes until a proposed action table has been presented and approved. Every ticket from the snapshot must appear in the final report with a final outcome.
+```
+
 Example safe retrieval call:
 
 ```json
