@@ -41,6 +41,11 @@ vi.mock("./domains/tickets.js", () => ({
         description: "Read-only triage snapshot",
         inputSchema: { type: "object", properties: {} },
       },
+      {
+        name: "superops_tickets_apply_triage_plan",
+        description: "Apply approved triage plan",
+        inputSchema: { type: "object", properties: {} },
+      },
     ],
     handleCall: vi.fn(),
   })),
@@ -337,6 +342,10 @@ describe("Tool Discovery and Management", () => {
           name: "superops_tickets_triage_snapshot",
           description: "Read-only triage snapshot",
         },
+        {
+          name: "superops_tickets_apply_triage_plan",
+          description: "Apply approved triage plan",
+        },
       ];
       const successResponse = {
         content: [
@@ -354,6 +363,9 @@ You can call any of these tools directly.`,
 
       expect(successResponse.content[0].text).toContain(
         "superops_tickets_triage_snapshot"
+      );
+      expect(successResponse.content[0].text).toContain(
+        "superops_tickets_apply_triage_plan"
       );
     });
     it("formats status response correctly", () => {

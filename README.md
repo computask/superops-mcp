@@ -166,6 +166,7 @@ Token rotation plan:
 - `superops_tickets_field_options` - Discover live SuperOps ticket option values for priority, impact, urgency, resolution code, cause, and subcategory
 - `superops_tickets_create` - Create a new ticket
 - `superops_tickets_resolve_full` - Resolve or fully classify a ticket by ticket number or internal ID, with client lookup, technician group lookup, validated display-name classification fields, optional note creation, and optional final verification
+- `superops_tickets_apply_triage_plan` - Write/high-risk tool that applies an approved fixed-candidate triage plan with metadata validation, dry-run, note dedupe, controlled fallback, and verification
 - `superops_tickets_update` - Update ticket status, assignment, impact, urgency, category, cause, subcategory, resolution code, or an explicit manual priority override. Tenant category values use the configured enum; other option values are resolved and validated from SuperOps ticket field metadata before mutation.
 - `superops_tickets_add_note` - Add note to ticket
 - `superops_tickets_log_time` - Log time on ticket
@@ -261,6 +262,40 @@ Suggested Custom GPT instruction:
 For New Calls triage, use `superops_tickets_triage_snapshot` first. Treat the snapshot candidate list as fixed. Do not write changes until a proposed action table has been presented and approved. Every ticket from the snapshot must appear in the final report with a final outcome.
 ```
 
+### Approved Triage Plan Execution
+
+`superops_tickets_apply_triage_plan` is a write/high-risk Phase 3 tool for
+applying a user-approved plan to a fixed snapshot candidate set. Use it only
+after the Phase 2 pre-write table has been approved. The tool requires
+`expectedCandidateTicketNumbers` unless a safe stored batch mechanism is added in
+the future, and it returns a result for every expected ticket even when no action
+is supplied.
+
+Before writing each ticket, the tool re-reads metadata and validates the display
+number, internal ticket ID, subject, client, status, and `updatedTime` where the
+action supplied expected values. If `updatedTime` changed, the ticket is skipped
+as `SkippedChangedSinceSnapshot` unless `allowWriteIfUpdatedTimeChanged=true` is
+set. Mutating actions require `contentVerified=true` unless
+`allowWriteWithoutVerifiedContent=true` is supplied.
+
+Supported actions are `resolve`, `update`, `addNote`, `leave`, and `skip`.
+`dryRun=true` performs validation and returns intended outcomes without writing.
+When `dedupeNotes=true`, existing notes are checked before adding a note, and a
+matching note is not duplicated. Resolve actions use the controlled resolve path;
+if SuperOps returns an internal server error and fallback is explicitly allowed,
+the tool re-reads metadata and attempts one update fallback. It does not fallback
+for validation failures.
+
+When `verify=true`, each written ticket is read once after the write and the
+final state is returned. Verification failures are reported with
+`partialWrite: true`. Rate limits are reported with `failureStage: "rateLimit"`;
+the tool does not perform ad hoc repeated retries.
+
+Every expected ticket gets exactly one final outcome: `Resolved`, `Updated`,
+`Left`, `Skipped`, `Blocked`, `Failed`, `NoApprovedAction`, `NotFound`, or
+`SkippedChangedSinceSnapshot`. The audit record is high-risk write metadata only:
+batch ID, candidate count, ticket numbers, action types, dry-run/verify flags,
+and fallback allowance. It does not audit raw ticket content or full note bodies.
 Example safe retrieval call:
 
 ```json

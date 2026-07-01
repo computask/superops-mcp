@@ -122,6 +122,7 @@ describe("Tickets Domain", () => {
       "superops_tickets_get_by_number",
       "superops_tickets_get_safe_by_number",
       "superops_tickets_triage_snapshot",
+      "superops_tickets_apply_triage_plan",
       "superops_tickets_conversation_list",
       "superops_tickets_notes_list",
       "superops_tickets_field_options",
@@ -2038,6 +2039,298 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it("requires expected candidates for approved triage plan execution", async () => {
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      actions: [],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("expectedCandidateTicketNumbers");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("returns a result for every expected triage ticket and marks missing actions", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          subject: "Leave alone",
+          status: "New Calls",
+        },
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400", "57401"],
+      actions: [{ ticketNumber: "57400", action: "leave", expectedStatus: "New Calls" }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results).toEqual([
+      expect.objectContaining({ ticketNumber: "57400", finalOutcome: "Left" }),
+      expect.objectContaining({
+        ticketNumber: "57401",
+        finalOutcome: "NoApprovedAction",
+        writeAttempted: false,
+      }),
+    ]);
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("skips approved triage writes when updatedTime changed unless explicitly allowed", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          subject: "Changed",
+          status: "New Calls",
+          updatedTime: "2026-06-25T11:00:00",
+        },
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [
+        {
+          ticketNumber: "57400",
+          expectedUpdatedTime: "2026-06-25T10:00:00",
+          contentVerified: true,
+          action: "update",
+          target: { status: "Worked on" },
+        },
+      ],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "SkippedChangedSinceSnapshot",
+      failureStage: "validateUpdatedTime",
+      writeAttempted: false,
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("dry-runs approved triage updates without writing", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          subject: "Dry run",
+          status: "New Calls",
+        },
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [
+        {
+          ticketNumber: "57400",
+          contentVerified: true,
+          action: "update",
+          target: { status: "Worked on" },
+        },
+      ],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Updated",
+      writeAttempted: false,
+      writeMethod: "dryRun",
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("dedupes approved triage notes and does not duplicate existing note", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          subject: "Note",
+          status: "New Calls",
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicketNoteList: [
+          {
+            noteId: "note-existing",
+            addedOn: "2026-06-25T10:00:00",
+            content: "Already approved note",
+            privacyType: "PRIVATE",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          status: "New Calls",
+        },
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [
+        {
+          ticketNumber: "57400",
+          contentVerified: true,
+          action: "addNote",
+          note: "Already approved note",
+        },
+      ],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Updated",
+      noteAdded: false,
+      noteDeduped: true,
+      verified: true,
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("uses controlled update fallback for approved resolve internal server errors", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          subject: "Resolve",
+          status: "New Calls",
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          subject: "Resolve",
+          status: "New Calls",
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          status: "Resolved",
+        },
+      });
+    mockClient.mutate
+      .mockRejectedValueOnce(new Error("SuperOps internal server error"))
+      .mockResolvedValueOnce({
+        updateTicket: { ticketId: "ticket-57400", displayId: "57400", status: "Resolved" },
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      allowResolveFullFallbackToUpdate: true,
+      actions: [
+        {
+          ticketNumber: "57400",
+          expectedStatus: "New Calls",
+          contentVerified: true,
+          action: "resolve",
+          target: { status: "Resolved" },
+        },
+      ],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved",
+      writeAttempted: true,
+      writeMethod: "update_fallback",
+      fallbackAttempted: true,
+      fallbackResult: "Updated",
+      verified: true,
+    });
+  });
+
+  it("marks verification failure as partial write for approved triage updates", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          subject: "Verify fail",
+          status: "New Calls",
+        },
+      })
+      .mockRejectedValueOnce(new Error("verify failed"));
+    mockClient.mutate.mockResolvedValueOnce({
+      updateTicket: { ticketId: "ticket-57400", displayId: "57400", status: "Worked on" },
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [
+        {
+          ticketNumber: "57400",
+          contentVerified: true,
+          action: "update",
+          target: { status: "Worked on" },
+        },
+      ],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Updated",
+      writeAttempted: true,
+      verified: false,
+      partialWrite: true,
+      failureStage: "verify",
+    });
+  });
   it("creates ticket notes using createTicketNote", async () => {
     mockClient.mutate.mockResolvedValue({
       createTicketNote: {

@@ -519,6 +519,74 @@ interface ResolveFullParams extends TicketClassificationParams {
   verify?: boolean;
 }
 
+
+type TriagePlanActionType = "resolve" | "update" | "addNote" | "leave" | "skip";
+type TriageFinalOutcome =
+  | "Resolved"
+  | "Updated"
+  | "Left"
+  | "Skipped"
+  | "Blocked"
+  | "Failed"
+  | "NoApprovedAction"
+  | "NotFound"
+  | "SkippedChangedSinceSnapshot";
+
+interface TriagePlanAction {
+  ticketNumber: string;
+  expectedTicketId?: string;
+  expectedSubject?: string;
+  expectedClient?: string;
+  expectedStatus?: string;
+  expectedUpdatedTime?: string;
+  contentVerified?: boolean;
+  action: TriagePlanActionType;
+  reason?: string;
+  note?: string;
+  isPublicNote?: boolean;
+  target?: TicketClassificationParams & {
+    techGroupName?: string;
+    clientName?: string;
+    clientId?: string;
+    suppressCloseNotification?: boolean;
+  };
+  allowResolveFullFallbackToUpdate?: boolean;
+  allowWriteIfUpdatedTimeChanged?: boolean;
+  allowWriteWithoutVerifiedContent?: boolean;
+}
+
+interface ApplyTriagePlanParams {
+  batchId?: string;
+  expectedCandidateTicketNumbers?: string[];
+  actions?: TriagePlanAction[];
+  dryRun?: boolean;
+  verify?: boolean;
+  dedupeNotes?: boolean;
+  stopOnFirstFailure?: boolean;
+  allowResolveFullFallbackToUpdate?: boolean;
+  allowWriteIfUpdatedTimeChanged?: boolean;
+  allowWriteWithoutVerifiedContent?: boolean;
+}
+
+interface ApplyTriagePlanResult {
+  ticketNumber: string;
+  ticketId?: string;
+  subject?: string;
+  client?: string;
+  requestedAction?: TriagePlanActionType;
+  finalOutcome: TriageFinalOutcome;
+  writeAttempted: boolean;
+  writeMethod?: string | null;
+  noteAdded: boolean;
+  noteDeduped: boolean;
+  verified: boolean;
+  finalState?: Record<string, unknown> | null;
+  failureStage?: string | null;
+  failureReason?: string | null;
+  fallbackAttempted: boolean;
+  fallbackResult?: string | null;
+  partialWrite: boolean;
+}
 interface StructuredValidationFailure {
   ok: false;
   message: string;
@@ -1896,6 +1964,406 @@ async function createTicketNote(
   return response.createTicketNote;
 }
 
+function isSuperOpsInternalError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /internal server error|internal_error|server error|status\s*500/i.test(message);
+}
+
+function isRateLimitError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /rate limit|too many requests|status\s*429/i.test(message);
+}
+
+function ticketClientName(ticket: Ticket): string | undefined {
+  return readableString(ticket.client, ["name", "accountName"]);
+}
+
+function ticketFinalState(ticket: Ticket): Record<string, unknown> {
+  return {
+    status: ticket.status,
+    priority: ticket.priority,
+    impact: ticket.impact,
+    urgency: ticket.urgency,
+    category: ticket.category,
+    subcategory: ticket.subcategory,
+    cause: ticket.cause,
+    resolutionCode: ticket.resolutionCode,
+    techGroup: ticket.techGroup,
+  };
+}
+
+function baseApplyResult(
+  ticketNumber: string,
+  action?: TriagePlanAction,
+  ticket?: Ticket
+): ApplyTriagePlanResult {
+  return {
+    ticketNumber,
+    ticketId: ticket?.ticketId,
+    subject: ticket?.subject,
+    client: ticket ? ticketClientName(ticket) : undefined,
+    requestedAction: action?.action,
+    finalOutcome: "Failed",
+    writeAttempted: false,
+    writeMethod: null,
+    noteAdded: false,
+    noteDeduped: false,
+    verified: false,
+    finalState: ticket ? ticketFinalState(ticket) : null,
+    failureStage: null,
+    failureReason: null,
+    fallbackAttempted: false,
+    fallbackResult: null,
+    partialWrite: false,
+  };
+}
+
+function validateExpectedTicket(
+  ticketNumber: string,
+  action: TriagePlanAction,
+  ticket: Ticket,
+  allowChanged: boolean
+): { stage: string; reason: string; outcome?: TriageFinalOutcome } | undefined {
+  if (ticket.displayId && ticket.displayId !== ticketNumber) {
+    return {
+      stage: "validateTicketNumber",
+      reason: `Expected display number ${ticketNumber}, got ${ticket.displayId}.`,
+    };
+  }
+  if (action.expectedTicketId && ticket.ticketId !== action.expectedTicketId) {
+    return {
+      stage: "validateTicketId",
+      reason: `Expected ticketId ${action.expectedTicketId}, got ${ticket.ticketId}.`,
+    };
+  }
+  if (action.expectedSubject && ticket.subject !== action.expectedSubject) {
+    return {
+      stage: "validateSubject",
+      reason: `Expected subject ${JSON.stringify(action.expectedSubject)}, got ${JSON.stringify(ticket.subject)}.`,
+    };
+  }
+  if (action.expectedClient && ticketClientName(ticket) !== action.expectedClient) {
+    return {
+      stage: "validateClient",
+      reason: `Expected client ${JSON.stringify(action.expectedClient)}, got ${JSON.stringify(ticketClientName(ticket))}.`,
+    };
+  }
+  if (action.expectedStatus && ticket.status !== action.expectedStatus) {
+    return {
+      stage: "validateStatus",
+      reason: `Expected status ${JSON.stringify(action.expectedStatus)}, got ${JSON.stringify(ticket.status)}.`,
+    };
+  }
+  if (
+    action.expectedUpdatedTime &&
+    ticket.updatedTime !== action.expectedUpdatedTime &&
+    !allowChanged
+  ) {
+    return {
+      stage: "validateUpdatedTime",
+      reason: `Ticket changed since snapshot. Expected updatedTime ${action.expectedUpdatedTime}, got ${ticket.updatedTime}.`,
+      outcome: "SkippedChangedSinceSnapshot",
+    };
+  }
+}
+
+async function existingNoteMatches(
+  client: SuperOpsClientInstance,
+  ticketId: string,
+  note: string
+): Promise<boolean> {
+  const notes = await getTicketNotes(client, ticketId);
+  const normalized = normalizePlainText(note);
+  return notes.some((existing) => normalizePlainText(existing.content) === normalized);
+}
+
+async function addNoteForPlan(params: {
+  client: SuperOpsClientInstance;
+  ticketId: string;
+  note?: string;
+  isPublic?: boolean;
+  dedupe: boolean;
+  result: ApplyTriagePlanResult;
+}): Promise<void> {
+  if (typeof params.note !== "string" || params.note.trim().length === 0) {
+    return;
+  }
+  if (params.dedupe && await existingNoteMatches(params.client, params.ticketId, params.note)) {
+    params.result.noteDeduped = true;
+    return;
+  }
+  await createTicketNote(params.client, params.ticketId, params.note, params.isPublic ?? false);
+  params.result.noteAdded = true;
+}
+
+async function buildApprovedUpdateInput(
+  client: SuperOpsClientInstance,
+  ticketId: string,
+  action: TriagePlanAction,
+  defaultStatus?: string
+): Promise<Record<string, unknown> | { error: string }> {
+  const target = action.target ?? {};
+  const input: Record<string, unknown> = { ticketId };
+  const status = target.status ?? defaultStatus;
+  if (status) {
+    if (invalidValues([status], VALID_TICKET_STATUSES).length > 0) {
+      return { error: `Invalid ticket status: ${status}` };
+    }
+    input.status = status;
+  }
+  if (target.suppressCloseNotification !== undefined) {
+    input.suppressCloseNotification = target.suppressCloseNotification;
+  }
+  if (target.category) {
+    if (invalidValues([target.category], VALID_TICKET_CATEGORIES).length > 0) {
+      return { error: `Invalid ticket category: ${target.category}` };
+    }
+    input.category = target.category;
+  }
+
+  const optionValidationError = await addValidatedTicketOptionUpdates(
+    client,
+    target,
+    input,
+    ["priority", "impact", "urgency", "resolutionCode", "cause", "subcategory"]
+  );
+  if (optionValidationError) {
+    return { error: optionValidationError };
+  }
+
+  const resolvedClient = await resolveClientAccountId(client, {
+    clientId: target.clientId,
+    clientName: target.clientName,
+  });
+  if (resolvedClient.error) {
+    return { error: resolvedClient.error };
+  }
+  if (resolvedClient.accountId) {
+    input.client = { accountId: resolvedClient.accountId };
+  }
+
+  const resolvedTechGroup = await resolveTechGroup(client, target.techGroupName);
+  if (resolvedTechGroup.error) {
+    return { error: resolvedTechGroup.error };
+  }
+  if (resolvedTechGroup.groupId) {
+    input.techGroup = { groupId: resolvedTechGroup.groupId };
+  }
+
+  return input;
+}
+
+async function mutateTicketUpdate(
+  client: SuperOpsClientInstance,
+  input: Record<string, unknown>
+): Promise<Ticket> {
+  const response = await client.mutate<UpdateTicketResponse>(UPDATE_TICKET_MUTATION, {
+    input,
+  });
+  return response.updateTicket;
+}
+
+function summarizeApplyResults(results: ApplyTriagePlanResult[]) {
+  return {
+    resolved: results.filter((result) => result.finalOutcome === "Resolved").length,
+    updated: results.filter((result) => result.finalOutcome === "Updated").length,
+    left: results.filter((result) => result.finalOutcome === "Left").length,
+    skipped: results.filter((result) => result.finalOutcome === "Skipped" || result.finalOutcome === "NoApprovedAction" || result.finalOutcome === "SkippedChangedSinceSnapshot").length,
+    blocked: results.filter((result) => result.finalOutcome === "Blocked").length,
+    failed: results.filter((result) => result.finalOutcome === "Failed").length,
+    notFound: results.filter((result) => result.finalOutcome === "NotFound").length,
+    verified: results.filter((result) => result.verified).length,
+  };
+}
+
+async function applyApprovedTriageAction(params: {
+  client: SuperOpsClientInstance;
+  ticketNumber: string;
+  action?: TriagePlanAction;
+  dryRun: boolean;
+  verify: boolean;
+  dedupeNotes: boolean;
+  allowResolveFullFallbackToUpdate: boolean;
+  allowWriteIfUpdatedTimeChanged: boolean;
+  allowWriteWithoutVerifiedContent: boolean;
+}): Promise<ApplyTriagePlanResult> {
+  const { client, ticketNumber, action } = params;
+  if (!action) {
+    const result = baseApplyResult(ticketNumber);
+    result.finalOutcome = "NoApprovedAction";
+    result.failureStage = "approval";
+    result.failureReason = "No approved action was supplied for this expected candidate.";
+    return result;
+  }
+
+  const resolved = await resolveTicketId(client, { ticketNumber });
+  if (resolved.error || !resolved.ticketId) {
+    const result = baseApplyResult(ticketNumber, action);
+    result.finalOutcome = "NotFound";
+    result.failureStage = "readMetadata";
+    result.failureReason = resolved.error ?? "Ticket was not found.";
+    return result;
+  }
+
+  let ticket: Ticket;
+  try {
+    ticket = await getTicketByInternalId(client, resolved.ticketId);
+  } catch (error) {
+    const result = baseApplyResult(ticketNumber, action);
+    result.finalOutcome = "NotFound";
+    result.failureStage = "readMetadata";
+    result.failureReason = safeErrorMessage(error);
+    return result;
+  }
+
+  const result = baseApplyResult(ticketNumber, action, ticket);
+  const allowChanged = action.allowWriteIfUpdatedTimeChanged ?? params.allowWriteIfUpdatedTimeChanged;
+  const validationFailure = validateExpectedTicket(ticketNumber, action, ticket, allowChanged);
+  if (validationFailure) {
+    result.finalOutcome = validationFailure.outcome ?? "Blocked";
+    result.failureStage = validationFailure.stage;
+    result.failureReason = validationFailure.reason;
+    return result;
+  }
+
+  if (action.action === "skip") {
+    result.finalOutcome = "Skipped";
+    result.failureStage = "approval";
+    result.failureReason = action.reason ?? "Approved action was skip.";
+    return result;
+  }
+  if (action.action === "leave") {
+    result.finalOutcome = "Left";
+    return result;
+  }
+
+  const mutating = action.action === "resolve" || action.action === "update" || action.action === "addNote";
+  const allowUnverified = action.allowWriteWithoutVerifiedContent ?? params.allowWriteWithoutVerifiedContent;
+  if (mutating && action.contentVerified !== true && !allowUnverified) {
+    result.finalOutcome = "Blocked";
+    result.failureStage = "contentVerification";
+    result.failureReason = "Mutating action requires contentVerified=true or allowWriteWithoutVerifiedContent=true.";
+    return result;
+  }
+
+  if (params.dryRun) {
+    if (action.action === "resolve" || action.action === "update") {
+      const dryRunInput = await buildApprovedUpdateInput(
+        client,
+        ticket.ticketId,
+        action,
+        action.action === "resolve" ? DEFAULT_RESOLVE_TICKET_STATUS : undefined
+      );
+      const dryRunError = (dryRunInput as { error?: unknown }).error;
+      if (typeof dryRunError === "string") {
+        result.finalOutcome = "Blocked";
+        result.failureStage = "validation";
+        result.failureReason = dryRunError;
+        return result;
+      }
+    }
+    result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
+    result.writeMethod = "dryRun";
+    return result;
+  }
+
+  try {
+    if (action.action === "addNote") {
+      result.writeAttempted = true;
+      result.writeMethod = "createTicketNote";
+      await addNoteForPlan({
+        client,
+        ticketId: ticket.ticketId,
+        note: action.note,
+        isPublic: action.isPublicNote,
+        dedupe: params.dedupeNotes,
+        result,
+      });
+      result.finalOutcome = "Updated";
+    } else {
+      await addNoteForPlan({
+        client,
+        ticketId: ticket.ticketId,
+        note: action.note,
+        isPublic: action.isPublicNote,
+        dedupe: params.dedupeNotes,
+        result,
+      });
+      const updateInput = await buildApprovedUpdateInput(
+        client,
+        ticket.ticketId,
+        action,
+        action.action === "resolve" ? DEFAULT_RESOLVE_TICKET_STATUS : undefined
+      );
+      const updateError = (updateInput as { error?: unknown }).error;
+      if (typeof updateError === "string") {
+        result.finalOutcome = "Blocked";
+        result.failureStage = "validation";
+        result.failureReason = updateError;
+        result.partialWrite = result.noteAdded;
+        return result;
+      }
+      result.writeAttempted = true;
+      result.writeMethod = action.action === "resolve" ? "resolve_full" : "update";
+      try {
+        await mutateTicketUpdate(client, updateInput as Record<string, unknown>);
+      } catch (error) {
+        if (isRateLimitError(error)) {
+          result.finalOutcome = "Failed";
+          result.failureStage = "rateLimit";
+          result.failureReason = safeErrorMessage(error);
+          result.partialWrite = result.noteAdded;
+          return result;
+        }
+        const fallbackAllowed = action.allowResolveFullFallbackToUpdate ?? params.allowResolveFullFallbackToUpdate;
+        if (action.action === "resolve" && fallbackAllowed && isSuperOpsInternalError(error)) {
+          result.fallbackAttempted = true;
+          result.failureStage = "resolve_full";
+          result.failureReason = safeErrorMessage(error);
+          const reread = await getTicketByInternalId(client, ticket.ticketId);
+          const rereadFailure = validateExpectedTicket(ticketNumber, action, reread, true);
+          if (rereadFailure) {
+            result.finalOutcome = "Blocked";
+            result.fallbackResult = rereadFailure.reason;
+            result.partialWrite = result.noteAdded;
+            return result;
+          }
+          await mutateTicketUpdate(client, updateInput as Record<string, unknown>);
+          result.writeMethod = "update_fallback";
+          result.fallbackResult = "Updated";
+        } else {
+          result.finalOutcome = "Failed";
+          result.failureStage = action.action === "resolve" ? "resolve_full" : "update";
+          result.failureReason = safeErrorMessage(error);
+          result.partialWrite = result.noteAdded;
+          return result;
+        }
+      }
+      result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
+    }
+
+    if (params.verify) {
+      try {
+        const verified = await getTicketByInternalId(client, ticket.ticketId);
+        result.verified = true;
+        result.finalState = ticketFinalState(verified);
+      } catch (error) {
+        result.verified = false;
+        result.partialWrite = true;
+        result.failureStage = "verify";
+        result.failureReason = safeErrorMessage(error);
+      }
+    }
+    return result;
+  } catch (error) {
+    result.finalOutcome = isRateLimitError(error) ? "Failed" : "Failed";
+    result.failureStage = isRateLimitError(error) ? "rateLimit" : "write";
+    result.failureReason = safeErrorMessage(error);
+    result.partialWrite = result.noteAdded;
+    return result;
+  }
+}
+
 function ticketSummary(ticket: Ticket, latestNote?: TicketNote) {
   return {
     ticketId: ticket.ticketId,
@@ -2175,6 +2643,64 @@ export function getTicketsTools(): DomainTools {
               description: "Accepted for future compatibility; Phase 1 snapshots are stateless and are not persisted.",
             },
           },
+        },
+      },      {
+        name: "superops_tickets_apply_triage_plan",
+        description:
+          "Write/high-risk tool. Applies an approved New Calls triage plan to a fixed expected ticket set with metadata validation, updatedTime safety checks, dry-run support, note dedupe, controlled fallback, and verification.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            batchId: {
+              type: "string",
+              description: "Optional batch identifier from an external workflow. Phase 3 requires expectedCandidateTicketNumbers unless a stored batch exists.",
+            },
+            expectedCandidateTicketNumbers: {
+              type: "array",
+              items: { type: "string" },
+              description: "Fixed ticket numbers from the approved snapshot. A result is returned for every ticket in this list.",
+            },
+            actions: {
+              type: "array",
+              description: "Approved per-ticket actions. Supported action values: resolve, update, addNote, leave, skip.",
+            },
+            dryRun: {
+              type: "boolean",
+              default: false,
+              description: "Validate and report intended outcomes without writing.",
+            },
+            verify: {
+              type: "boolean",
+              default: true,
+              description: "Re-read each written ticket once and return final state.",
+            },
+            dedupeNotes: {
+              type: "boolean",
+              default: true,
+              description: "Check existing notes before adding an approved note.",
+            },
+            stopOnFirstFailure: {
+              type: "boolean",
+              default: false,
+              description: "Stop processing remaining candidates after the first failed, blocked, not found, or changed result.",
+            },
+            allowResolveFullFallbackToUpdate: {
+              type: "boolean",
+              default: false,
+              description: "Allow controlled update fallback for resolve actions only after a SuperOps internal server error.",
+            },
+            allowWriteIfUpdatedTimeChanged: {
+              type: "boolean",
+              default: false,
+              description: "Allow writes when the current updatedTime differs from the approved snapshot expectation.",
+            },
+            allowWriteWithoutVerifiedContent: {
+              type: "boolean",
+              default: false,
+              description: "Allow mutating writes without contentVerified=true on the action.",
+            },
+          },
+          required: ["expectedCandidateTicketNumbers"],
         },
       },      {
         name: "superops_tickets_conversation_list",
@@ -2842,6 +3368,87 @@ export function getTicketsTools(): DomainTools {
                         rawHtmlReturned: false,
                         attachmentBodiesReturned: false,
                       },
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+          case "superops_tickets_apply_triage_plan": {
+            const params = args as ApplyTriagePlanParams;
+            const expected = Array.isArray(params.expectedCandidateTicketNumbers)
+              ? params.expectedCandidateTicketNumbers
+                  .map((ticketNumber) => normaliseTicketNumber(ticketNumber))
+                  .filter(Boolean)
+              : [];
+            if (expected.length === 0) {
+              return errorResult(
+                "expectedCandidateTicketNumbers is required for Phase 3 apply triage plan."
+              );
+            }
+
+            const actions = Array.isArray(params.actions) ? params.actions : [];
+            const actionByTicket = new Map<string, TriagePlanAction>();
+            for (const action of actions) {
+              const ticketNumber = normaliseTicketNumber(action.ticketNumber);
+              if (ticketNumber && !actionByTicket.has(ticketNumber)) {
+                actionByTicket.set(ticketNumber, action);
+              }
+            }
+
+            const results: ApplyTriagePlanResult[] = [];
+            let stopped = false;
+            for (const ticketNumber of expected) {
+              if (stopped) {
+                const skipped = baseApplyResult(ticketNumber, actionByTicket.get(ticketNumber));
+                skipped.finalOutcome = "Skipped";
+                skipped.failureStage = "stopOnFirstFailure";
+                skipped.failureReason = "Processing stopped after an earlier failure.";
+                results.push(skipped);
+                continue;
+              }
+
+              const result = await applyApprovedTriageAction({
+                client,
+                ticketNumber,
+                action: actionByTicket.get(ticketNumber),
+                dryRun: params.dryRun ?? false,
+                verify: params.verify ?? true,
+                dedupeNotes: params.dedupeNotes ?? true,
+                allowResolveFullFallbackToUpdate:
+                  params.allowResolveFullFallbackToUpdate ?? false,
+                allowWriteIfUpdatedTimeChanged:
+                  params.allowWriteIfUpdatedTimeChanged ?? false,
+                allowWriteWithoutVerifiedContent:
+                  params.allowWriteWithoutVerifiedContent ?? false,
+              });
+              results.push(result);
+              if (
+                params.stopOnFirstFailure &&
+                [
+                  "Blocked",
+                  "Failed",
+                  "NotFound",
+                  "SkippedChangedSinceSnapshot",
+                ].includes(result.finalOutcome)
+              ) {
+                stopped = true;
+              }
+            }
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      batchId: params.batchId,
+                      initialCandidateCount: expected.length,
+                      expectedCandidateTicketNumbers: expected,
+                      results,
+                      summary: summarizeApplyResults(results),
                     },
                     null,
                     2

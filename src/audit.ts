@@ -28,12 +28,22 @@ export interface AuditMetadata {
     ticketNumbers?: unknown;
     safeRead?: unknown;
   };
+  triagePlan?: {
+    batchId?: unknown;
+    candidateCount?: unknown;
+    ticketNumbers?: unknown;
+    actionTypes?: unknown;
+    dryRun?: unknown;
+    verify?: unknown;
+    fallbackAllowed?: unknown;
+  };
 }
 
 const HIGH_RISK_WRITE_TOOLS = new Set([
   "superops_tickets_create",
   "superops_tickets_update",
   "superops_tickets_resolve_full",
+  "superops_tickets_apply_triage_plan",
   "superops_tickets_add_note",
   "superops_tickets_log_time",
   "superops_alerts_create",
@@ -213,6 +223,14 @@ const WRITE_FIELD_KEYS: Partial<Record<string, string[]>> = {
     "techGroupName",
     "resolution",
   ],
+  superops_tickets_apply_triage_plan: [
+    "batchId",
+    "expectedCandidateTicketNumbers",
+    "actions",
+    "dryRun",
+    "verify",
+    "allowResolveFullFallbackToUpdate",
+  ],
   superops_tickets_resolve_full: [
     "ticketId",
     "ticketNumber",
@@ -266,6 +284,35 @@ export function toolAuditMetadata(
 ): AuditMetadata | undefined {
   const changedFields = changedFieldKeys(name, args);
 
+  if (name === "superops_tickets_apply_triage_plan") {
+    const ticketNumbers = Array.isArray(args.expectedCandidateTicketNumbers)
+      ? args.expectedCandidateTicketNumbers.slice(0, 100)
+      : undefined;
+    const actionTypes = Array.isArray(args.actions)
+      ? args.actions
+          .map((action) =>
+            typeof action === "object" && action !== null
+              ? (action as Record<string, unknown>).action
+              : undefined
+          )
+          .filter(Boolean)
+          .slice(0, 100)
+      : undefined;
+    return {
+      triagePlan: {
+        batchId: args.batchId,
+        candidateCount: Array.isArray(args.expectedCandidateTicketNumbers)
+          ? args.expectedCandidateTicketNumbers.length
+          : undefined,
+        ticketNumbers,
+        actionTypes,
+        dryRun: args.dryRun ?? false,
+        verify: args.verify ?? true,
+        fallbackAllowed: args.allowResolveFullFallbackToUpdate ?? false,
+      },
+      changedFields,
+    };
+  }
   if (name === "superops_tickets_triage_snapshot") {
     return {
       triageSnapshot: {
@@ -365,6 +412,7 @@ export function auditToolCall(args: {
     errorSummary: args.errorSummary ? sanitizeText(args.errorSummary) : undefined,
     changedFields: args.metadata?.changedFields,
     triageSnapshot: args.metadata?.triageSnapshot,
+    triagePlan: args.metadata?.triagePlan,
     customGraphql: args.metadata,
   };
 

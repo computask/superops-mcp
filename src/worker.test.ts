@@ -722,6 +722,61 @@ describe("Cloudflare Worker entrypoint", () => {
       logSpy.mockRestore();
     }
   });
+  it("audits approved triage plan as high-risk write without note content", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 335,
+          method: "tools/call",
+          params: {
+            name: "superops_tickets_apply_triage_plan",
+            arguments: {
+              batchId: "batch-1",
+              expectedCandidateTicketNumbers: ["57400"],
+              dryRun: false,
+              verify: true,
+              allowResolveFullFallbackToUpdate: true,
+              actions: [
+                {
+                  ticketNumber: "57400",
+                  action: "addNote",
+                  note: "Sensitive approved note body",
+                  contentVerified: true,
+                },
+              ],
+            },
+          },
+        },
+        {},
+        { "X-Request-Id": "audit-apply-triage-1" }
+      );
+
+      expect(res.status).toBe(200);
+      const records = auditRecords(logSpy);
+      expect(records[0]).toMatchObject({
+        requestId: "audit-apply-triage-1",
+        toolName: "superops_tickets_apply_triage_plan",
+        toolCategory: "write",
+        highRisk: true,
+        success: false,
+        triagePlan: {
+          batchId: "batch-1",
+          candidateCount: 1,
+          ticketNumbers: ["57400"],
+          actionTypes: ["addNote"],
+          dryRun: false,
+          verify: true,
+          fallbackAllowed: true,
+        },
+      });
+      const serialized = JSON.stringify(records[0]);
+      expect(serialized).not.toContain("Sensitive approved note body");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
   it("does not audit full custom mutation bodies or variable values", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
