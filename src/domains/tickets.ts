@@ -1978,6 +1978,10 @@ function ticketClientName(ticket: Ticket): string | undefined {
   return readableString(ticket.client, ["name", "accountName"]);
 }
 
+function ticketTechGroupName(ticket: Ticket): string | undefined {
+  return readableString(ticket.techGroup, ["name", "groupName"]);
+}
+
 function ticketFinalState(ticket: Ticket): Record<string, unknown> {
   return {
     status: ticket.status,
@@ -1988,8 +1992,88 @@ function ticketFinalState(ticket: Ticket): Record<string, unknown> {
     subcategory: ticket.subcategory,
     cause: ticket.cause,
     resolutionCode: ticket.resolutionCode,
-    techGroup: ticket.techGroup,
+    techGroup: ticketTechGroupName(ticket) ?? ticket.techGroup,
+    client: ticketClientName(ticket) ?? ticket.client,
   };
+}
+
+function ticketVerificationValue(
+  ticket: Ticket,
+  field: string,
+  action: TriagePlanAction
+): unknown {
+  if (field === "techGroup") {
+    return ticketTechGroupName(ticket);
+  }
+  if (field === "client") {
+    const client = jsonRecord(ticket.client);
+    if (action.target?.clientId) {
+      return typeof client?.accountId === "string" ? client.accountId : undefined;
+    }
+    return ticketClientName(ticket);
+  }
+  return (ticket as unknown as Record<string, unknown>)[field];
+}
+
+function compareTicketValue(expected: unknown, actual: unknown): boolean {
+  if (typeof expected === "string" && typeof actual === "string") {
+    return expected.trim() === actual.trim();
+  }
+  return expected === actual;
+}
+
+function verifyFinalTargetState(
+  action: TriagePlanAction,
+  ticket: Ticket
+): { mismatches: { field: string; expected: unknown; actual: unknown }[] } {
+  const target = action.target ?? {};
+  const requested: { field: string; expected: unknown; optionalActual?: boolean }[] = [];
+
+  for (const field of [
+    "status",
+    "priority",
+    "impact",
+    "urgency",
+    "category",
+    "subcategory",
+    "cause",
+    "resolutionCode",
+  ] as const) {
+    if (target[field] !== undefined) {
+      requested.push({ field, expected: target[field] });
+    }
+  }
+
+  if (target.techGroupName !== undefined) {
+    requested.push({
+      field: "techGroup",
+      expected: target.techGroupName,
+      optionalActual: true,
+    });
+  }
+  if (target.clientName !== undefined) {
+    requested.push({
+      field: "client",
+      expected: canonicalClientName(target.clientName),
+      optionalActual: true,
+    });
+  } else if (target.clientId !== undefined) {
+    requested.push({
+      field: "client",
+      expected: target.clientId,
+      optionalActual: true,
+    });
+  }
+
+  const mismatches = requested.flatMap(({ field, expected, optionalActual }) => {
+    const actual = ticketVerificationValue(ticket, field, action);
+    if (optionalActual && actual === undefined) {
+      return [];
+    }
+    return compareTicketValue(expected, actual) ? [] : [{ field, expected, actual }];
+  });
+
+  return { mismatches };
 }
 
 function baseApplyResult(
@@ -2153,6 +2237,125 @@ async function buildApprovedUpdateInput(
   return input;
 }
 
+async function buildApprovedResolveInput(
+  client: SuperOpsClientInstance,
+  ticketId: string,
+  action: TriagePlanAction,
+  currentTicket?: Ticket
+): Promise<Record<string, unknown> | { error: string }> {
+  const target = action.target ?? {};
+  const finalStatus = target.status ?? DEFAULT_RESOLVE_TICKET_STATUS;
+  const input: Record<string, unknown> = {
+    ticketId,
+    status: finalStatus,
+    suppressCloseNotification: target.suppressCloseNotification ?? true,
+  };
+
+  if (invalidValues([finalStatus], VALID_TICKET_STATUSES).length > 0) {
+    return { error: `Invalid ticket status: ${finalStatus}` };
+  }
+
+  const resolvedClient = await resolveClientAccountId(client, {
+    clientId: target.clientId,
+    clientName: target.clientName,
+  });
+  if (resolvedClient.error) {
+    return { error: resolvedClient.error };
+  }
+
+  const resolvedTechGroup = await resolveTechGroup(client, target.techGroupName);
+  if (resolvedTechGroup.error) {
+    return { error: resolvedTechGroup.error };
+  }
+
+  const optionParams: TicketClassificationParams = {
+    priority: target.priority,
+    impact: target.impact,
+    urgency: target.urgency,
+    category: target.category,
+    subcategory: target.subcategory,
+    cause: target.cause,
+    resolutionCode: target.resolutionCode,
+    status: target.status,
+  };
+  const requiresResolvedPreflight = finalStatus === DEFAULT_RESOLVE_TICKET_STATUS;
+  const optionFieldsToFetch = new Set<ValidatedTicketOptionField>(
+    requestedValidatedOptionFields(optionParams)
+  );
+  if (requiresResolvedPreflight) {
+    for (const fieldName of RESOLVED_REQUIRED_OPTION_FIELDS) {
+      optionFieldsToFetch.add(fieldName);
+    }
+  }
+
+  if (
+    requiresResolvedPreflight &&
+    RESOLVED_REQUIRED_FIELDS.some((fieldName) => !optionParams[fieldName])
+  ) {
+    const sourceTicket = currentTicket ?? await getTicketByInternalId(client, ticketId);
+    for (const fieldName of RESOLVED_REQUIRED_FIELDS) {
+      if (!optionParams[fieldName]) {
+        optionParams[fieldName] = ticketClassificationValue(sourceTicket, fieldName);
+      }
+    }
+  }
+
+  const optionFields = optionFieldsToFetch.size > 0
+    ? await getTicketOptionFields(client, [...optionFieldsToFetch])
+    : new Map<ValidatedTicketOptionField, SuperOpsField>();
+
+  if (requiresResolvedPreflight) {
+    const validationError = validateResolvedTicketFields({
+      optionParams,
+      optionFields,
+      input,
+    });
+    if (validationError) {
+      return { error: JSON.stringify(validationError) };
+    }
+
+    const optionalOptionFields = requestedValidatedOptionFields(optionParams).filter(
+      (fieldName) =>
+        !RESOLVED_REQUIRED_OPTION_FIELDS.includes(
+          fieldName as (typeof RESOLVED_REQUIRED_OPTION_FIELDS)[number]
+        )
+    );
+    const optionalValidationError = addValidatedTicketOptionUpdatesFromFields(
+      optionFields,
+      optionParams,
+      input,
+      optionalOptionFields
+    );
+    if (optionalValidationError) {
+      return { error: optionalValidationError };
+    }
+  } else {
+    if (target.category) {
+      if (invalidValues([target.category], VALID_TICKET_CATEGORIES).length > 0) {
+        return { error: `Invalid ticket category: ${target.category}` };
+      }
+      input.category = target.category;
+    }
+
+    const optionValidationError = addValidatedTicketOptionUpdatesFromFields(
+      optionFields,
+      optionParams,
+      input
+    );
+    if (optionValidationError) {
+      return { error: optionValidationError };
+    }
+  }
+
+  if (resolvedClient.accountId) {
+    input.client = { accountId: resolvedClient.accountId };
+  }
+  if (resolvedTechGroup.groupId) {
+    input.techGroup = { groupId: resolvedTechGroup.groupId };
+  }
+
+  return input;
+}
 async function mutateTicketUpdate(
   client: SuperOpsClientInstance,
   input: Record<string, unknown>
@@ -2248,12 +2451,9 @@ async function applyApprovedTriageAction(params: {
 
   if (params.dryRun) {
     if (action.action === "resolve" || action.action === "update") {
-      const dryRunInput = await buildApprovedUpdateInput(
-        client,
-        ticket.ticketId,
-        action,
-        action.action === "resolve" ? DEFAULT_RESOLVE_TICKET_STATUS : undefined
-      );
+      const dryRunInput = action.action === "resolve"
+        ? await buildApprovedResolveInput(client, ticket.ticketId, action, ticket)
+        : await buildApprovedUpdateInput(client, ticket.ticketId, action);
       const dryRunError = (dryRunInput as { error?: unknown }).error;
       if (typeof dryRunError === "string") {
         result.finalOutcome = "Blocked";
@@ -2281,28 +2481,36 @@ async function applyApprovedTriageAction(params: {
       });
       result.finalOutcome = "Updated";
     } else {
-      await addNoteForPlan({
-        client,
-        ticketId: ticket.ticketId,
-        note: action.note,
-        isPublic: action.isPublicNote,
-        dedupe: params.dedupeNotes,
-        result,
-      });
-      const updateInput = await buildApprovedUpdateInput(
-        client,
-        ticket.ticketId,
-        action,
-        action.action === "resolve" ? DEFAULT_RESOLVE_TICKET_STATUS : undefined
-      );
+      const updateInput = action.action === "resolve"
+        ? await buildApprovedResolveInput(client, ticket.ticketId, action, ticket)
+        : await buildApprovedUpdateInput(client, ticket.ticketId, action);
       const updateError = (updateInput as { error?: unknown }).error;
       if (typeof updateError === "string") {
         result.finalOutcome = "Blocked";
         result.failureStage = "validation";
         result.failureReason = updateError;
+        return result;
+      }
+
+      try {
+        await addNoteForPlan({
+          client,
+          ticketId: ticket.ticketId,
+          note: action.note,
+          isPublic: action.isPublicNote,
+          dedupe: params.dedupeNotes,
+          result,
+        });
+      } catch (error) {
+        result.finalOutcome = "Failed";
+        result.writeAttempted = true;
+        result.writeMethod = "createTicketNote";
+        result.failureStage = "createTicketNote";
+        result.failureReason = safeErrorMessage(error);
         result.partialWrite = result.noteAdded;
         return result;
       }
+
       result.writeAttempted = true;
       result.writeMethod = action.action === "resolve" ? "resolve_full" : "update";
       try {
@@ -2345,8 +2553,19 @@ async function applyApprovedTriageAction(params: {
     if (params.verify) {
       try {
         const verified = await getTicketByInternalId(client, ticket.ticketId);
-        result.verified = true;
         result.finalState = ticketFinalState(verified);
+        if (action.action === "resolve" || action.action === "update") {
+          const finalVerification = verifyFinalTargetState(action, verified);
+          if (finalVerification.mismatches.length > 0) {
+            result.finalOutcome = "Failed";
+            result.verified = false;
+            result.partialWrite = result.writeAttempted || result.noteAdded;
+            result.failureStage = "verifyFinalState";
+            result.failureReason = `Final state did not match requested target fields: ${JSON.stringify(finalVerification.mismatches)}`;
+            return result;
+          }
+        }
+        result.verified = true;
       } catch (error) {
         result.verified = false;
         result.partialWrite = true;
