@@ -2010,7 +2010,8 @@ function ticketVerificationValue(
     if (action.target?.clientId) {
       return typeof client?.accountId === "string" ? client.accountId : undefined;
     }
-    return ticketClientName(ticket);
+    const clientName = ticketClientName(ticket);
+    return clientName ? canonicalClientName(clientName) : undefined;
   }
   return (ticket as unknown as Record<string, unknown>)[field];
 }
@@ -2027,17 +2028,10 @@ function verifyFinalTargetState(
   ticket: Ticket
 ): { mismatches: { field: string; expected: unknown; actual: unknown }[] } {
   const target = action.target ?? {};
-  const requested: { field: string; expected: unknown; optionalActual?: boolean }[] = [];
+  const requested: { field: string; expected: unknown }[] = [];
 
   for (const field of [
-    "status",
-    "priority",
-    "impact",
-    "urgency",
-    "category",
-    "subcategory",
-    "cause",
-    "resolutionCode",
+    "status", "priority", "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
   ] as const) {
     if (target[field] !== undefined) {
       requested.push({ field, expected: target[field] });
@@ -2045,31 +2039,16 @@ function verifyFinalTargetState(
   }
 
   if (target.techGroupName !== undefined) {
-    requested.push({
-      field: "techGroup",
-      expected: target.techGroupName,
-      optionalActual: true,
-    });
+    requested.push({ field: "techGroup", expected: target.techGroupName });
   }
   if (target.clientName !== undefined) {
-    requested.push({
-      field: "client",
-      expected: canonicalClientName(target.clientName),
-      optionalActual: true,
-    });
+    requested.push({ field: "client", expected: canonicalClientName(target.clientName) });
   } else if (target.clientId !== undefined) {
-    requested.push({
-      field: "client",
-      expected: target.clientId,
-      optionalActual: true,
-    });
+    requested.push({ field: "client", expected: target.clientId });
   }
 
-  const mismatches = requested.flatMap(({ field, expected, optionalActual }) => {
+  const mismatches = requested.flatMap(({ field, expected }) => {
     const actual = ticketVerificationValue(ticket, field, action);
-    if (optionalActual && actual === undefined) {
-      return [];
-    }
     return compareTicketValue(expected, actual) ? [] : [{ field, expected, actual }];
   });
 
@@ -2157,8 +2136,12 @@ async function existingNoteMatches(
   note: string
 ): Promise<boolean> {
   const notes = await getTicketNotes(client, ticketId);
-  const normalized = normalizePlainText(note);
-  return notes.some((existing) => normalizePlainText(existing.content) === normalized);
+  const normalized = normalizePlanNote(note);
+  return notes.some((existing) => normalizePlanNote(existing.content) === normalized);
+}
+
+function normalizePlanNote(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 async function addNoteForPlan(params: {
@@ -2480,6 +2463,18 @@ async function applyApprovedTriageAction(params: {
         result,
       });
       result.finalOutcome = "Updated";
+      if (params.verify) {
+        try {
+          const verified = await getTicketByInternalId(client, ticket.ticketId);
+          result.finalState = ticketFinalState(verified);
+          result.verified = true;
+        } catch (error) {
+          result.finalOutcome = "Failed";
+          result.partialWrite = result.writeAttempted || result.noteAdded;
+          result.failureStage = "verify";
+          result.failureReason = safeErrorMessage(error);
+        }
+      }
     } else {
       const updateInput = action.action === "resolve"
         ? await buildApprovedResolveInput(client, ticket.ticketId, action, ticket)
@@ -2492,25 +2487,6 @@ async function applyApprovedTriageAction(params: {
         return result;
       }
 
-      try {
-        await addNoteForPlan({
-          client,
-          ticketId: ticket.ticketId,
-          note: action.note,
-          isPublic: action.isPublicNote,
-          dedupe: params.dedupeNotes,
-          result,
-        });
-      } catch (error) {
-        result.finalOutcome = "Failed";
-        result.writeAttempted = true;
-        result.writeMethod = "createTicketNote";
-        result.failureStage = "createTicketNote";
-        result.failureReason = safeErrorMessage(error);
-        result.partialWrite = result.noteAdded;
-        return result;
-      }
-
       result.writeAttempted = true;
       result.writeMethod = action.action === "resolve" ? "resolve_full" : "update";
       try {
@@ -2520,7 +2496,7 @@ async function applyApprovedTriageAction(params: {
           result.finalOutcome = "Failed";
           result.failureStage = "rateLimit";
           result.failureReason = safeErrorMessage(error);
-          result.partialWrite = result.noteAdded;
+          result.partialWrite = result.writeAttempted || result.noteAdded;
           return result;
         }
         const fallbackAllowed = action.allowResolveFullFallbackToUpdate ?? params.allowResolveFullFallbackToUpdate;
@@ -2533,7 +2509,7 @@ async function applyApprovedTriageAction(params: {
           if (rereadFailure) {
             result.finalOutcome = "Blocked";
             result.fallbackResult = rereadFailure.reason;
-            result.partialWrite = result.noteAdded;
+            result.partialWrite = result.writeAttempted || result.noteAdded;
             return result;
           }
           await mutateTicketUpdate(client, updateInput as Record<string, unknown>);
@@ -2543,42 +2519,56 @@ async function applyApprovedTriageAction(params: {
           result.finalOutcome = "Failed";
           result.failureStage = action.action === "resolve" ? "resolve_full" : "update";
           result.failureReason = safeErrorMessage(error);
-          result.partialWrite = result.noteAdded;
+          result.partialWrite = result.writeAttempted || result.noteAdded;
           return result;
         }
       }
-      result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
-    }
-
-    if (params.verify) {
+      let verified: Ticket;
       try {
-        const verified = await getTicketByInternalId(client, ticket.ticketId);
-        result.finalState = ticketFinalState(verified);
-        if (action.action === "resolve" || action.action === "update") {
-          const finalVerification = verifyFinalTargetState(action, verified);
-          if (finalVerification.mismatches.length > 0) {
-            result.finalOutcome = "Failed";
-            result.verified = false;
-            result.partialWrite = result.writeAttempted || result.noteAdded;
-            result.failureStage = "verifyFinalState";
-            result.failureReason = `Final state did not match requested target fields: ${JSON.stringify(finalVerification.mismatches)}`;
-            return result;
-          }
-        }
-        result.verified = true;
+        verified = await getTicketByInternalId(client, ticket.ticketId);
       } catch (error) {
+        result.finalOutcome = "Failed";
+        result.partialWrite = true;
+        result.failureStage = "verifyFinalState";
+        result.failureReason = safeErrorMessage(error);
+        return result;
+      }
+      result.finalState = ticketFinalState(verified);
+      const finalVerification = verifyFinalTargetState(action, verified);
+      if (finalVerification.mismatches.length > 0) {
+        result.finalOutcome = "Failed";
         result.verified = false;
         result.partialWrite = true;
-        result.failureStage = "verify";
-        result.failureReason = safeErrorMessage(error);
+        result.failureStage = "verifyFinalState";
+        result.failureReason = `Final state did not match requested target fields: ${JSON.stringify(finalVerification.mismatches)}`;
+        return result;
       }
+      result.verified = true;
+
+      try {
+        await addNoteForPlan({
+          client,
+          ticketId: ticket.ticketId,
+          note: action.note,
+          isPublic: action.isPublicNote,
+          dedupe: params.dedupeNotes,
+          result,
+        });
+      } catch (error) {
+        result.finalOutcome = "Failed";
+        result.failureStage = "createTicketNote";
+        result.failureReason = safeErrorMessage(error);
+        result.partialWrite = true;
+        return result;
+      }
+      result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
     }
     return result;
   } catch (error) {
     result.finalOutcome = isRateLimitError(error) ? "Failed" : "Failed";
     result.failureStage = isRateLimitError(error) ? "rateLimit" : "write";
     result.failureReason = safeErrorMessage(error);
-    result.partialWrite = result.noteAdded;
+    result.partialWrite = result.writeAttempted || result.noteAdded;
     return result;
   }
 }

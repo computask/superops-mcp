@@ -286,9 +286,7 @@ if SuperOps returns an internal server error and fallback is explicitly allowed,
 the tool re-reads metadata and attempts one update fallback. It does not fallback
 for validation failures.
 
-When `verify=true`, each written ticket is read once after the write and the
-final state is returned. Verification failures are reported with
-`partialWrite: true`. Rate limits are reported with `failureStage: "rateLimit"`;
+Update and resolve actions are always re-read before success is reported. Every requested target field must match the final state; otherwise the outcome is `Failed` with `failureStage: "verifyFinalState"` and `partialWrite: true`. Private notes are added only after that verification succeeds. Note dedupe trims text, collapses whitespace, and compares case-insensitively.`r`n`r`nFor direct human-client tickets that remain in New Calls, use an operational note: classify it, state that it remains for manual engineer reply, and direct the engineer to review the original request, confirm it, and reply before progressing. Rate limits are reported with `failureStage: "rateLimit"`;
 the tool does not perform ad hoc repeated retries.
 
 Every expected ticket gets exactly one final outcome: `Resolved`, `Updated`,

@@ -2326,11 +2326,11 @@ describe("Tickets Domain", () => {
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.results[0]).toMatchObject({
-      finalOutcome: "Updated",
+      finalOutcome: "Failed",
       writeAttempted: true,
       verified: false,
       partialWrite: true,
-      failureStage: "verify",
+      failureStage: "verifyFinalState",
     });
   });
   it("fails final verification when update reports success but verified state stays New Calls", async () => {
@@ -2518,24 +2518,24 @@ describe("Tickets Domain", () => {
           status: "New Calls",
         },
       })
-      .mockResolvedValueOnce({ getTicketNoteList: [] })
       .mockResolvedValueOnce({
         getTicket: {
           ticketId: "ticket-57400",
           displayId: "57400",
           status: "Worked on",
         },
-      });
+      })
+      .mockResolvedValueOnce({ getTicketNoteList: [] });
     mockClient.mutate
+      .mockResolvedValueOnce({
+        updateTicket: { ticketId: "ticket-57400", displayId: "57400" },
+      })
       .mockResolvedValueOnce({
         createTicketNote: {
           noteId: "note-1",
           content: "Approved private note",
           privacyType: "PRIVATE",
         },
-      })
-      .mockResolvedValueOnce({
-        updateTicket: { ticketId: "ticket-57400", displayId: "57400" },
       });
 
     const domain = getTicketsTools();
@@ -2554,7 +2554,7 @@ describe("Tickets Domain", () => {
     const parsed = JSON.parse(result.content[0].text);
 
     expect(mockClient.mutate).toHaveBeenNthCalledWith(
-      1,
+      2,
       expect.stringContaining("createTicketNote"),
       {
         input: {
@@ -2612,7 +2612,7 @@ describe("Tickets Domain", () => {
       finalOutcome: "Failed",
       failureStage: "resolve_full",
       fallbackAttempted: false,
-      partialWrite: false,
+      partialWrite: true,
     });
   });
   it("creates ticket notes using createTicketNote", async () => {
