@@ -11,6 +11,26 @@ vi.mock("../client.js", () => ({
     query: vi.fn(),
     mutate: vi.fn(),
   })),
+  SuperOpsError: class SuperOpsError extends Error {
+    code?: string;
+    retryAfter?: number;
+    constructor(message: string, code?: string, retryAfter?: number) {
+      super(message);
+      this.code = code;
+      this.retryAfter = retryAfter;
+    }
+  },
+  SuperOpsHttpError: class SuperOpsHttpError extends Error {
+    status: number;
+    statusText: string;
+    retryAfter?: number;
+    constructor(message: string, status: number, statusText: string, retryAfter?: number) {
+      super(message);
+      this.status = status;
+      this.statusText = statusText;
+      this.retryAfter = retryAfter;
+    }
+  },
 }));
 
 import { getClient } from "../client.js";
@@ -118,6 +138,9 @@ describe("Tickets Domain", () => {
     expect(domain.tools.map((tool) => tool.name)).toEqual([
       "superops_tickets_list",
       "superops_tickets_recent",
+      "superops_tickets_query",
+      "superops_tickets_created_between",
+      "superops_tickets_report",
       "superops_tickets_get",
       "superops_tickets_get_by_number",
       "superops_tickets_get_safe_by_number",
@@ -370,6 +393,159 @@ describe("Tickets Domain", () => {
     expect(mockClient.query).not.toHaveBeenCalled();
   });
 
+
+  it("queries historical tickets with createdTime DESC pages and safe field selection", async () => {
+    mockClient.query.mockResolvedValue({
+      getTicketList: {
+        tickets: [
+          { ticketId: "2", displayId: "57002", subject: "Inside", createdTime: "2026-07-01T10:00:00Z", status: "New Calls", source: "Email" },
+          { ticketId: "1", displayId: "57001", subject: "Lower boundary", createdTime: "2026-07-01T00:00:00Z", status: "New Calls", source: "Email" },
+          { ticketId: "old", displayId: "56999", subject: "Old", createdTime: "2026-06-30T23:59:59Z", status: "New Calls" },
+        ],
+        listInfo: { page: 1, pageSize: 100, hasMore: true, totalCount: 29291 },
+      },
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_query", {
+      createdFrom: "2026-07-01T00:00:00Z",
+      createdTo: "2026-07-02T00:00:00Z",
+      status: ["New Calls"],
+      fieldProfile: "minimal",
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    const [query, variables] = mockClient.query.mock.calls[0];
+
+    expect(query).toContain("getTicketList");
+    expect(query).toContain("ticketId");
+    expect(query).toContain("displayId");
+    expect(query).toContain("createdTime");
+    expect(query).not.toContain("conversation");
+    expect(query).not.toContain("notes");
+    expect(query).not.toContain("content");
+    expect(variables.input).toEqual({
+      page: 1,
+      pageSize: 100,
+      sort: [{ attribute: "createdTime", order: "DESC" }],
+      condition: { attribute: "status", operator: "is", value: "New Calls" },
+    });
+    expect(parsed.records.map((ticket: { ticketId: string }) => ticket.ticketId)).toEqual(["2", "1"]);
+    expect(parsed.pagination).toMatchObject({ complete: true, stopReason: "crossedCreatedFromBoundary", recordsExamined: 3, recordsMatched: 2, recordsReturned: 2 });
+    expect(parsed.filterExecution).toEqual({ status: "server" });
+  });
+
+  it("excludes createdTo, ignores newer records, dedupes pages, and can return chronological order", async () => {
+    mockClient.query.mockResolvedValueOnce({ getTicketList: { tickets: [{ ticketId: "new", displayId: "57004", subject: "Too new", createdTime: "2026-07-02T00:00:00Z" }, { ticketId: "2", displayId: "57002", subject: "Inside", createdTime: "2026-07-01T10:00:00Z" }], listInfo: { page: 1, pageSize: 100, hasMore: true, totalCount: 4 } } }).mockResolvedValueOnce({ getTicketList: { tickets: [{ ticketId: "2", displayId: "57002", subject: "Duplicate", createdTime: "2026-07-01T10:00:00Z" }, { ticketId: "1", displayId: "57001", subject: "Boundary", createdTime: "2026-07-01T00:00:00Z" }, { ticketId: "old", displayId: "56999", subject: "Old", createdTime: "2026-06-30T23:59:59Z" }], listInfo: { page: 2, pageSize: 100, hasMore: false, totalCount: 4 } } });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_created_between", { createdFrom: "2026-07-01T00:00:00Z", createdTo: "2026-07-02T00:00:00Z", sortOrder: "ASC" });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.query).toHaveBeenCalledTimes(2);
+    expect(parsed.records.map((ticket: { ticketId: string }) => ticket.ticketId)).toEqual(["1", "2"]);
+    expect(parsed.pagination.duplicateRecordsRemoved).toBe(1);
+    expect(parsed.pagination.recordsExamined).toBe(5);
+  });
+
+  it("marks historical queries incomplete for repeated pages, maxPages, maxRecords, and retry exhaustion", async () => {
+    const domain = getTicketsTools();
+    mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "1", displayId: "1", subject: "Loop", createdTime: "2026-07-01T10:00:00Z" }], listInfo: { page: 1, pageSize: 100, hasMore: true, totalCount: 10 } } });
+    let result = await domain.handleCall("superops_tickets_query", { createdFrom: "2026-07-01T00:00:00Z", createdTo: "2026-07-02T00:00:00Z", maxPages: 3 });
+    let parsed = JSON.parse(result.content[0].text);
+    expect(parsed.pagination).toMatchObject({ complete: false, truncated: true, stopReason: "repeatedPageLoop" });
+
+    mockClient.query.mockReset();
+    mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "1", displayId: "1", subject: "Page", createdTime: "2026-07-01T10:00:00Z" }], listInfo: { page: 1, pageSize: 100, hasMore: true, totalCount: 10 } } });
+    result = await domain.handleCall("superops_tickets_query", { createdFrom: "2026-07-01T00:00:00Z", createdTo: "2026-07-02T00:00:00Z", maxPages: 1 });
+    parsed = JSON.parse(result.content[0].text);
+    expect(parsed.pagination).toMatchObject({ complete: false, truncated: true, nextPage: 2, stopReason: "maxPagesReached" });
+
+    mockClient.query.mockReset();
+    mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "1", displayId: "1", subject: "One", createdTime: "2026-07-01T10:00:00Z" }, { ticketId: "2", displayId: "2", subject: "Two", createdTime: "2026-07-01T09:00:00Z" }], listInfo: { page: 1, pageSize: 100, hasMore: true, totalCount: 10 } } });
+    result = await domain.handleCall("superops_tickets_query", { createdFrom: "2026-07-01T00:00:00Z", createdTo: "2026-07-02T00:00:00Z", maxRecords: 1 });
+    parsed = JSON.parse(result.content[0].text);
+    expect(parsed.pagination).toMatchObject({ complete: false, truncated: true, stopReason: "maxRecordsReached", recordsReturned: 1 });
+
+    mockClient.query.mockReset();
+    mockClient.query.mockRejectedValue({ status: 429, retryAfter: 0 });
+    result = await domain.handleCall("superops_tickets_query", { createdFrom: "2026-07-01T00:00:00Z", createdTo: "2026-07-02T00:00:00Z" });
+    parsed = JSON.parse(result.content[0].text);
+    expect(parsed.pagination).toMatchObject({ complete: false, truncated: true, stopReason: "fetchError" });
+    expect(parsed.errors[0]).toMatchObject({ errorType: "rateLimit", retryable: true, attempts: 3 });
+    expect(parsed.retryDiagnostics.retries).toBe(2);
+  });
+
+  it("applies confirmed server filters separately from local reporting filters", async () => {
+    mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "1", displayId: "1", subject: "Email", createdTime: "2026-07-01T10:00:00Z", status: "New Calls", source: "Email", category: "1. Support request", requestType: "Incident", priority: "High", client: { accountId: "c1", name: "Example" }, technician: { userId: "t1", name: "Engineer" } }, { ticketId: "2", displayId: "2", subject: "Portal", createdTime: "2026-07-01T09:00:00Z", status: "New Calls", source: "Portal", category: "2. Change request", requestType: "Service Request", priority: "Low", client: { accountId: "c2", name: "Other" }, technician: { userId: "t2", name: "Other Engineer" } }, { ticketId: "old", displayId: "old", subject: "Old", createdTime: "2026-06-30T23:00:00Z", status: "New Calls" }], listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 3 } } });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_query", { createdFrom: "2026-07-01T00:00:00Z", createdTo: "2026-07-02T00:00:00Z", status: ["New Calls"], sources: ["Email"], categories: ["1. Support request"], requestTypes: ["Incident"], priorities: ["High"], clientNames: ["Example"], technicianIds: ["t1"] });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.records).toHaveLength(1);
+    expect(parsed.records[0]).toMatchObject({ ticketId: "1", source: "Email", category: "1. Support request" });
+    expect(parsed.filterExecution).toMatchObject({ status: "server", sources: "local", categories: "local", requestTypes: "local", priorities: "local", clientNames: "local", technicianIds: "local" });
+  });
+
+  it("rejects unsupported first-version range fields, timeField, and unknown output fields", async () => {
+    const domain = getTicketsTools();
+    for (const unsupported of ["updatedFrom", "updatedTo", "resolvedFrom", "resolvedTo"] as const) {
+      const result = await domain.handleCall("superops_tickets_query", { createdFrom: "2026-07-01T00:00:00Z", createdTo: "2026-07-02T00:00:00Z", [unsupported]: "2026-07-01T00:00:00Z" });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Unsupported first-version ticket reporting input");
+    }
+    let result = await domain.handleCall("superops_tickets_report", { createdFrom: "2026-07-01T00:00:00Z", createdTo: "2026-07-02T00:00:00Z", timezone: "Europe/London", timeField: "resolutionTime" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("only createdTime is supported");
+    result = await domain.handleCall("superops_tickets_query", { createdFrom: "2026-07-01T00:00:00Z", createdTo: "2026-07-02T00:00:00Z", fields: ["ticketId", "conversations"] });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Unsupported ticket reporting field");
+    expect(mockClient.query).not.toHaveBeenCalled();
+  });
+
+  it("builds compact createdTime reports with timezone buckets, topN breakdowns, rows, samples, and current assignee semantics", async () => {
+    mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "1", displayId: "1", subject: "A", createdTime: "2026-07-16T08:15:00Z", client: { accountId: "c1", name: "Example" }, technician: { userId: "t1", name: "Engineer" }, source: "Email", status: "New Calls", category: "1. Support request", priority: "High", requestType: "Incident" }, { ticketId: "2", displayId: "2", subject: "B", createdTime: "2026-07-16T08:45:00Z", client: { accountId: "c1", name: "Example" }, technician: { userId: "t1", name: "Engineer" }, source: "Portal", status: "New Calls", category: "1. Support request", priority: "Low", requestType: "Incident" }, { ticketId: "3", displayId: "3", subject: "C", createdTime: "2026-07-16T09:15:00Z", client: { accountId: "c2", name: "Other" }, technician: null, source: "Email", status: "Resolved", category: "2. Change request", priority: "Low", requestType: "Service Request" }, { ticketId: "old", displayId: "old", subject: "Old", createdTime: "2026-07-15T22:59:59Z" }], listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 4 } } });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_report", { createdFrom: "2026-07-16T00:00:00+01:00", createdTo: "2026-07-17T00:00:00+01:00", timezone: "Europe/London", interval: "hour", groupBy: ["client", "source"], topN: 1, includeSampleTickets: true, sampleSizePerGroup: 3 });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.records).toBeUndefined();
+    expect(parsed.totals.tickets).toBe(3);
+    expect(parsed.series).toEqual([{ bucketStart: "2026-07-16T09:00:00+01:00", bucketEnd: "2026-07-16T10:00:00+01:00", count: 2 }, { bucketStart: "2026-07-16T10:00:00+01:00", bucketEnd: "2026-07-16T11:00:00+01:00", count: 1 }]);
+    expect(parsed.breakdowns.client).toEqual([{ key: "Example", count: 2, percentage: 66.67 }]);
+    expect(parsed.rows).toEqual(expect.arrayContaining([expect.objectContaining({ bucketStart: "2026-07-16T09:00:00+01:00", client: "Example", source: "Email", count: 1 })]));
+    expect(parsed.samples.client[0].tickets[0]).toEqual(expect.objectContaining({ displayId: "1", subject: "A", client: "Example", technician: "Engineer" }));
+    expect(parsed.technicianSemantics).toBe("currentAssigneeAtQueryTime");
+    expect(parsed.pagination).toMatchObject({ complete: true, recordsAnalysed: 3 });
+  });
+
+  it("handles GMT, BST, day, week, month, empty page, and incomplete report diagnostics", async () => {
+    const domain = getTicketsTools();
+    mockClient.query.mockResolvedValueOnce({ getTicketList: { tickets: [], listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 0 } } });
+    let result = await domain.handleCall("superops_tickets_query", { createdFrom: "2026-01-01T00:00:00Z", createdTo: "2026-01-02T00:00:00Z" });
+    let parsed = JSON.parse(result.content[0].text);
+    expect(parsed.pagination).toMatchObject({ complete: true, stopReason: "emptyPage" });
+
+    mockClient.query.mockReset();
+    mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "gmt", displayId: "gmt", subject: "GMT", createdTime: "2026-01-01T10:00:00Z" }, { ticketId: "old", displayId: "old", subject: "Old", createdTime: "2025-12-31T23:59:59Z" }], listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 2 } } });
+    result = await domain.handleCall("superops_tickets_report", { createdFrom: "2026-01-01T00:00:00Z", createdTo: "2026-01-02T00:00:00Z", timezone: "Europe/London", interval: "day" });
+    parsed = JSON.parse(result.content[0].text);
+    expect(parsed.series[0]).toMatchObject({ bucketStart: "2026-01-01T00:00:00+00:00", bucketEnd: "2026-01-02T00:00:00+00:00", count: 1 });
+
+    mockClient.query.mockReset();
+    mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "week", displayId: "week", subject: "Week", createdTime: "2026-07-16T10:00:00Z" }, { ticketId: "old", displayId: "old", subject: "Old", createdTime: "2026-07-01T00:00:00Z" }], listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 2 } } });
+    result = await domain.handleCall("superops_tickets_report", { createdFrom: "2026-07-13T00:00:00+01:00", createdTo: "2026-07-20T00:00:00+01:00", timezone: "Europe/London", interval: "week" });
+    parsed = JSON.parse(result.content[0].text);
+    expect(parsed.series[0]).toMatchObject({ bucketStart: "2026-07-13T00:00:00+01:00", count: 1 });
+
+    mockClient.query.mockReset();
+    mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "month", displayId: "month", subject: "Month", createdTime: "2026-07-16T10:00:00Z" }], listInfo: { page: 1, pageSize: 100, hasMore: true, totalCount: 200 } } });
+    result = await domain.handleCall("superops_tickets_report", { createdFrom: "2026-07-01T00:00:00+01:00", createdTo: "2026-08-01T00:00:00+01:00", timezone: "Europe/London", interval: "month", maxPages: 1 });
+    parsed = JSON.parse(result.content[0].text);
+    expect(parsed.series[0]).toMatchObject({ bucketStart: "2026-07-01T00:00:00+01:00", count: 1 });
+    expect(parsed.pagination).toMatchObject({ complete: false, truncated: true, stopReason: "maxPagesReached", recordsAnalysed: 1 });
+  });
   it("exposes tenant-specific status and category enums", () => {
     const domain = getTicketsTools();
     const listTool = domain.tools.find((tool) => tool.name === "superops_tickets_list");

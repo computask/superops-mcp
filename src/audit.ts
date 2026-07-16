@@ -37,6 +37,19 @@ export interface AuditMetadata {
     verify?: unknown;
     fallbackAllowed?: unknown;
   };
+  ticketReporting?: {
+    createdFrom?: unknown;
+    createdTo?: unknown;
+    statusCount?: number;
+    localFilterKeys?: string[];
+    fieldProfile?: unknown;
+    pageSize?: number;
+    maxRecords?: unknown;
+    maxPages?: unknown;
+    timezone?: unknown;
+    interval?: unknown;
+    groupBy?: unknown;
+  };
 }
 
 const HIGH_RISK_WRITE_TOOLS = new Set([
@@ -313,6 +326,40 @@ export function toolAuditMetadata(
       changedFields,
     };
   }
+
+  if (
+    name === "superops_tickets_query" ||
+    name === "superops_tickets_created_between" ||
+    name === "superops_tickets_report"
+  ) {
+    const localFilterKeys = [
+      "priorities",
+      "clientIds",
+      "clientNames",
+      "technicianIds",
+      "technicianNames",
+      "sources",
+      "requestTypes",
+      "categories",
+      "subcategories",
+      "techGroups",
+    ].filter((key) => Array.isArray(args[key]) && (args[key] as unknown[]).length > 0);
+    return {
+      ticketReporting: {
+        createdFrom: args.createdFrom,
+        createdTo: args.createdTo,
+        statusCount: Array.isArray(args.status) ? args.status.length : undefined,
+        localFilterKeys,
+        fieldProfile: args.fieldProfile,
+        pageSize: 100,
+        maxRecords: args.maxRecords,
+        maxPages: args.maxPages,
+        timezone: args.timezone,
+        interval: args.interval,
+        groupBy: args.groupBy,
+      },
+    };
+  }
   if (name === "superops_tickets_triage_snapshot") {
     return {
       triageSnapshot: {
@@ -413,6 +460,7 @@ export function auditToolCall(args: {
     changedFields: args.metadata?.changedFields,
     triageSnapshot: args.metadata?.triageSnapshot,
     triagePlan: args.metadata?.triagePlan,
+    ticketReporting: args.metadata?.ticketReporting,
     customGraphql: args.metadata,
   };
 

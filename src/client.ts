@@ -52,7 +52,12 @@ export class SuperOpsClient {
     });
 
     if (!response.ok) {
-      throw new Error(`HTTP error: ${response.status} ${response.statusText}`);
+      throw new SuperOpsHttpError(
+        `HTTP error: ${response.status} ${response.statusText}`,
+        response.status,
+        response.statusText,
+        parseRetryAfter(response.headers.get("Retry-After"))
+      );
     }
 
     const result = (await response.json()) as GraphQLResponse<T>;
@@ -105,6 +110,43 @@ export class SuperOpsError extends Error {
     this.code = code;
     this.retryAfter = retryAfter;
   }
+}
+
+export class SuperOpsHttpError extends Error {
+  readonly status: number;
+  readonly statusText: string;
+  readonly retryAfter?: number;
+
+  constructor(
+    message: string,
+    status: number,
+    statusText: string,
+    retryAfter?: number
+  ) {
+    super(message);
+    this.name = "SuperOpsHttpError";
+    this.status = status;
+    this.statusText = statusText;
+    this.retryAfter = retryAfter;
+  }
+}
+
+function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds;
+  }
+
+  const dateMs = Date.parse(value);
+  if (!Number.isNaN(dateMs)) {
+    return Math.max(0, Math.ceil((dateMs - Date.now()) / 1000));
+  }
+
+  return undefined;
 }
 
 // Lazy-loaded singleton client

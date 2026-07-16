@@ -157,6 +157,9 @@ Token rotation plan:
 
 - `superops_tickets_list` - List tickets with filters
 - `superops_tickets_recent` - List the most recently created tickets, optionally with conversations and notes
+- `superops_tickets_query` - Read-only createdTime historical ticket query with automatic sequential pagination and completeness diagnostics
+- `superops_tickets_created_between` - Convenience wrapper for tickets created in a half-open createdTime range
+- `superops_tickets_report` - Read-only compact historical workload reports grouped by time, client, source, status, category, priority, request type, technician, or tech group
 - `superops_tickets_get` - Get ticket details
 - `superops_tickets_get_by_number` - Get ticket details by visible SuperOps ticket number/display ID
 - `superops_tickets_get_safe_by_number` - Safely get ticket metadata and sanitized plain-text context by visible SuperOps ticket number/display ID
@@ -223,6 +226,131 @@ from SuperOps conversation items with type `DESCRIPTION`; the tool does not quer
 Prefer this tool over manually listing New Calls and then issuing many individual
 safe reads.
 
+
+### Historical ticket reporting
+
+Use `superops_tickets_query`, `superops_tickets_created_between`, and
+`superops_tickets_report` for historical ticket workload analysis. These tools
+are read-only and createdTime-based in the first version. They do not use guessed
+SuperOps date comparison operators: live probing confirmed `after`/`before` were
+not reliable for ticket arrays and `greater_than` caused an internal server
+error. Instead, the MCP requests confirmed `getTicketList` pages sorted by
+`createdTime DESC`, with an effective page size of 100, then applies the
+half-open range locally:
+
+- `createdFrom` is inclusive.
+- `createdTo` is exclusive.
+- pages are fetched sequentially, never concurrently.
+- records newer than `createdTo` are ignored.
+- records in `createdFrom <= createdTime < createdTo` are included.
+- paging stops after crossing the `createdFrom` lower boundary.
+- tickets are deduplicated by `ticketId`.
+- `pagination.complete` is false whenever `maxPages`, `maxRecords`, retry
+  exhaustion, or a repeated-page loop prevents crossing the lower boundary.
+
+Confirmed server-side reporting filters are intentionally narrow. `status` is
+sent to SuperOps using the existing proven `is`/`in` condition logic. Filters for
+priority, client, technician, source, request type, category, subcategory, and
+tech group are applied locally after the createdTime range has been collected.
+Responses include `filterExecution` so callers can see which filters were
+`server` versus `local`.
+
+Unsupported first-version inputs are rejected clearly: `updatedFrom`,
+`updatedTo`, `resolvedFrom`, `resolvedTo`, `timeField` values other than
+`createdTime`, closure-rate reports, arbitrary GraphQL conditions, arbitrary
+operators, and raw GraphQL field selection. Resolution-time reporting remains a
+planned capability requiring further safe API investigation.
+
+Technician reporting means the current ticket technician at query time:
+`currentAssigneeAtQueryTime`. It does not prove who originally received the
+ticket because assignment-history support has not been confirmed.
+
+Examples:
+
+Tickets created today:
+
+```json
+{
+  "createdFrom": "2026-07-16T00:00:00+01:00",
+  "createdTo": "2026-07-17T00:00:00+01:00",
+  "sortOrder": "ASC"
+}
+```
+
+Today versus yesterday: call `superops_tickets_report` once for each local day
+and compare the returned hourly `series` arrays.
+
+```json
+{
+  "createdFrom": "2026-07-16T00:00:00+01:00",
+  "createdTo": "2026-07-17T00:00:00+01:00",
+  "timezone": "Europe/London",
+  "interval": "hour"
+}
+```
+
+Monday through Thursday up to the same local time: call the report tool with the
+same local-time cutoff for each window, using `timezone: "Europe/London"`.
+
+Hourly arrivals:
+
+```json
+{
+  "createdFrom": "2026-07-16T00:00:00+01:00",
+  "createdTo": "2026-07-17T00:00:00+01:00",
+  "timezone": "Europe/London",
+  "interval": "hour",
+  "includeZeroBuckets": true
+}
+```
+
+Client breakdown:
+
+```json
+{
+  "createdFrom": "2026-07-01T00:00:00+01:00",
+  "createdTo": "2026-07-08T00:00:00+01:00",
+  "timezone": "Europe/London",
+  "interval": "day",
+  "groupBy": ["client"]
+}
+```
+
+Source breakdown:
+
+```json
+{
+  "createdFrom": "2026-07-01T00:00:00+01:00",
+  "createdTo": "2026-07-08T00:00:00+01:00",
+  "timezone": "Europe/London",
+  "interval": "day",
+  "groupBy": ["source"]
+}
+```
+
+Rolling seven-day trends: request daily buckets over the full period and let the
+caller calculate rolling averages only when `pagination.complete` is true.
+
+```json
+{
+  "createdFrom": "2026-04-17T00:00:00+01:00",
+  "createdTo": "2026-07-16T00:00:00+01:00",
+  "timezone": "Europe/London",
+  "interval": "day",
+  "includeZeroBuckets": true
+}
+```
+
+Busiest hour over 90 days:
+
+```json
+{
+  "createdFrom": "2026-04-17T00:00:00+01:00",
+  "createdTo": "2026-07-16T00:00:00+01:00",
+  "timezone": "Europe/London",
+  "interval": "hour"
+}
+```
 ### Recommended New Calls Triage Workflow
 
 For New Calls triage, start with `superops_tickets_triage_snapshot` and treat
@@ -286,7 +414,9 @@ if SuperOps returns an internal server error and fallback is explicitly allowed,
 the tool re-reads metadata and attempts one update fallback. It does not fallback
 for validation failures.
 
-Update and resolve actions are always re-read before success is reported. Every requested target field must match the final state; otherwise the outcome is `Failed` with `failureStage: "verifyFinalState"` and `partialWrite: true`. Private notes are added only after that verification succeeds. Note dedupe trims text, collapses whitespace, and compares case-insensitively.`r`n`r`nFor direct human-client tickets that remain in New Calls, use an operational note: classify it, state that it remains for manual engineer reply, and direct the engineer to review the original request, confirm it, and reply before progressing. Rate limits are reported with `failureStage: "rateLimit"`;
+Update and resolve actions are always re-read before success is reported. Every requested target field must match the final state; otherwise the outcome is `Failed` with `failureStage: "verifyFinalState"` and `partialWrite: true`. Private notes are added only after that verification succeeds. Note dedupe trims text, collapses whitespace, and compares case-insensitively.
+
+For direct human-client tickets that remain in New Calls, use an operational note: classify it, state that it remains for manual engineer reply, and direct the engineer to review the original request, confirm it, and reply before progressing. Rate limits are reported with `failureStage: "rateLimit"`;
 the tool does not perform ad hoc repeated retries.
 
 Every expected ticket gets exactly one final outcome: `Resolved`, `Updated`,

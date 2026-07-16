@@ -93,7 +93,7 @@ const domainDescriptions: Record<Domain, string> = {
   clients:
     "Client/company management - list, get, search accounts and company information",
   tickets:
-    "Ticket management - list, get, create tickets and manage support workflow",
+    "Ticket management - list, get, read-only created-time historical query/reporting, create tickets, and manage support workflow",
   assets:
     "Asset management - list and get hardware/software assets, endpoint inventory",
   alerts:
