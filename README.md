@@ -431,10 +431,13 @@ Every expected ticket gets exactly one final outcome: `Resolved`, `Updated`,
 execution budget stops the batch, the response includes `operation.complete=false`,
 `continuationRequired=true`, every completed/skipped/failed/unattempted ticket result,
 and a durable `operationId` when the operation ledger is available. This is an
-observable incomplete state, not background success. A generic local continuation
-runner and Durable Object item leases are implemented and tested, but no production
-SuperOps triage mutation adapter is registered for automatic resume yet. Use
-`superops_operations_get` to inspect the stored compact result. The audit record is high-risk write metadata only: batch ID,
+observable incomplete state, not background success. A SuperOps triage continuation
+adapter is implemented for pending apply-plan items and uses the same validation,
+stale-data, note-deduplication, mutation and verification helpers as the synchronous
+path. Automatic fresh-invocation scheduling is disabled by default and requires
+`SUPEROPS_CONTINUATION_ENABLED=true`, `SUPEROPS_CONTINUATION_SERVICE`, and the
+`SUPEROPS_INTERNAL_CONTINUATION_TOKEN` secret. Use `superops_operations_get` to
+inspect the stored compact result. The audit record is high-risk write metadata only: batch ID,
 candidate count, ticket numbers, action types, dry-run/verify flags, and fallback
 allowance. It does not audit raw ticket content or full note bodies.
 Example safe retrieval call:

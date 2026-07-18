@@ -43,7 +43,8 @@
     "SUPEROPS_EXECUTION_MAX_DURATION_MS": "25000",
     "SUPEROPS_EXECUTION_VERIFICATION_MODE": "verifyReads",
     "SUPEROPS_OPERATION_RETENTION_SECONDS": "86400",
-    "SUPEROPS_EXECUTION_CONCURRENCY": "1"
+    "SUPEROPS_EXECUTION_CONCURRENCY": "1",
+    "SUPEROPS_CONTINUATION_ENABLED": "false"
   },
   "durable_objects": {
     "bindings": [
@@ -58,5 +59,11 @@
       "type": "durable-object",
       "storage": "sqlite"
     }
-  }
+  },
+  "services": [
+    {
+      "binding": "SUPEROPS_CONTINUATION_SERVICE",
+      "service": "superops-mcp"
+    }
+  ]
 }

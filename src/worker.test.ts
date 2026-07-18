@@ -444,6 +444,45 @@ describe("Cloudflare Worker entrypoint", () => {
       pendingCount: 1,
     });
   });
+  it("keeps internal continuation disabled by default and requires the internal token", async () => {
+    const disabled = await worker.fetch(
+      new Request(`https://${INTERNAL_HOST}/internal/operations/continue`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          toolName: "superops_tickets_apply_triage_plan",
+          operationId: "op-disabled",
+          ownerHash: stableHash("anonymous"),
+        }),
+      }),
+      {
+        SUPEROPS_API_TOKEN: "test-token",
+        SUPEROPS_SUBDOMAIN: "computaskltd",
+      } as Env
+    );
+    expect(disabled.status).toBe(403);
+    await expect(disabled.json()).resolves.toMatchObject({ error: "Continuation disabled" });
+
+    const forbidden = await worker.fetch(
+      new Request(`https://${INTERNAL_HOST}/internal/operations/continue`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          toolName: "superops_tickets_apply_triage_plan",
+          operationId: "op-forbidden",
+          ownerHash: stableHash("anonymous"),
+        }),
+      }),
+      {
+        SUPEROPS_API_TOKEN: "test-token",
+        SUPEROPS_SUBDOMAIN: "computaskltd",
+        SUPEROPS_CONTINUATION_ENABLED: "true",
+        SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
+      } as Env
+    );
+    expect(forbidden.status).toBe(403);
+    await expect(forbidden.json()).resolves.toMatchObject({ error: "Forbidden" });
+  });
   it("returns a graceful error for a credential-requiring tool when unconfigured", async () => {
     const res = await mcp({
       jsonrpc: "2.0",

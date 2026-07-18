@@ -108,6 +108,7 @@ export interface OperationLedgerRecord {
   updatedAt: string;
   expiresAt: string;
   originalRequestHash: string;
+  operationRequest?: Record<string, unknown>;
   state: OperationState;
   expectedItems: string[];
   currentItem?: string;

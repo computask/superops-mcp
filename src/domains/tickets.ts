@@ -34,6 +34,12 @@ import {
   ExecutionTimeoutBudgetExceededError,
 } from "../execution.js";
 import {
+  runOperationContinuation,
+  type ContinuationItemOutcome,
+  type OperationContinuationAdapter,
+} from "../continuation.js";
+import { scheduleApplyTriageContinuation } from "../continuation-scheduler.js";
+import {
   currentOwnerHash,
   getOperationStore,
   normalizedNoteFingerprint,
@@ -2449,6 +2455,69 @@ function compactApplyResult(result: ApplyTriagePlanResult): Record<string, unkno
   };
 }
 
+function serializableApplyTriageRequest(
+  request: ApplyTriagePlanParams,
+  expected: string[]
+): Record<string, unknown> {
+  return {
+    kind: "applyTriagePlan",
+    schemaVersion: 1,
+    batchId: request.batchId,
+    expectedCandidateTicketNumbers: expected,
+    actions: Array.isArray(request.actions)
+      ? request.actions.map((action) => ({
+          ticketNumber: normaliseTicketNumber(action.ticketNumber),
+          expectedTicketId: action.expectedTicketId,
+          expectedSubject: action.expectedSubject,
+          expectedClient: action.expectedClient,
+          expectedStatus: action.expectedStatus,
+          expectedUpdatedTime: action.expectedUpdatedTime,
+          contentVerified: action.contentVerified,
+          action: action.action,
+          reason: action.reason,
+          note: action.note,
+          isPublicNote: action.isPublicNote,
+          target: action.target ? { ...action.target } : undefined,
+          allowResolveFullFallbackToUpdate: action.allowResolveFullFallbackToUpdate,
+          allowWriteIfUpdatedTimeChanged: action.allowWriteIfUpdatedTimeChanged,
+          allowWriteWithoutVerifiedContent: action.allowWriteWithoutVerifiedContent,
+        }))
+      : [],
+    dryRun: request.dryRun ?? false,
+    verify: request.verify ?? true,
+    dedupeNotes: request.dedupeNotes ?? true,
+    stopOnFirstFailure: request.stopOnFirstFailure ?? false,
+    allowResolveFullFallbackToUpdate: request.allowResolveFullFallbackToUpdate ?? false,
+    allowWriteIfUpdatedTimeChanged: request.allowWriteIfUpdatedTimeChanged ?? false,
+    allowWriteWithoutVerifiedContent: request.allowWriteWithoutVerifiedContent ?? false,
+  };
+}
+
+function operationRequestApplyTriageParams(
+  request: Record<string, unknown> | undefined
+): ApplyTriagePlanParams | undefined {
+  if (!request || request.kind !== "applyTriagePlan") return undefined;
+  return {
+    batchId: typeof request.batchId === "string" ? request.batchId : undefined,
+    expectedCandidateTicketNumbers: Array.isArray(request.expectedCandidateTicketNumbers)
+      ? request.expectedCandidateTicketNumbers.map((value) => String(value))
+      : [],
+    actions: Array.isArray(request.actions)
+      ? request.actions.filter((value): value is TriagePlanAction =>
+          typeof value === "object" && value !== null &&
+          typeof (value as { ticketNumber?: unknown }).ticketNumber === "string" &&
+          typeof (value as { action?: unknown }).action === "string"
+        )
+      : [],
+    dryRun: request.dryRun === true,
+    verify: request.verify !== false,
+    dedupeNotes: request.dedupeNotes !== false,
+    stopOnFirstFailure: request.stopOnFirstFailure === true,
+    allowResolveFullFallbackToUpdate: request.allowResolveFullFallbackToUpdate === true,
+    allowWriteIfUpdatedTimeChanged: request.allowWriteIfUpdatedTimeChanged === true,
+    allowWriteWithoutVerifiedContent: request.allowWriteWithoutVerifiedContent === true,
+  };
+}
 function buildApplyTriageLedgerRecord(params: {
   operationId: string;
   request: ApplyTriagePlanParams;
@@ -2535,6 +2604,7 @@ function buildApplyTriageLedgerRecord(params: {
       dryRun: params.request.dryRun ?? false,
       verify: params.request.verify ?? true,
     }),
+    operationRequest: serializableApplyTriageRequest(params.request, params.expected),
     state: params.continuationRequired ? "ContinuationRequired" : "Completed",
     expectedItems: params.expected,
     currentItem: params.results.at(-1)?.ticketNumber,
@@ -2812,6 +2882,242 @@ async function applyApprovedTriageAction(params: {
   }
 }
 
+function applyResultToContinuationOutcome(
+  result: ApplyTriagePlanResult,
+  stage: OperationItemState["stage"] = triageStageForResult(result)
+): ContinuationItemOutcome {
+  return {
+    stage,
+    outcome: result.finalOutcome,
+    writeAttempted: result.writeAttempted,
+    writeMayHaveSucceeded: result.writeAttempted || result.partialWrite,
+    partialWrite: result.partialWrite,
+    verified: result.verified,
+    verificationFailed: result.failureStage === "verify" || result.failureStage === "verifyFinalState",
+    stale: result.finalOutcome === "SkippedChangedSinceSnapshot",
+    failureReason: result.failureReason ?? undefined,
+    result: compactApplyResult(result),
+    errorClass: result.finalOutcome === "SkippedChangedSinceSnapshot"
+      ? "StaleData"
+      : result.partialWrite
+        ? "VerificationMismatch"
+        : undefined,
+  };
+}
+
+function actionByTicketFromApplyParams(params: ApplyTriagePlanParams): Map<string, TriagePlanAction> {
+  const actions = Array.isArray(params.actions) ? params.actions : [];
+  const actionByTicket = new Map<string, TriagePlanAction>();
+  for (const action of actions) {
+    const ticketNumber = normaliseTicketNumber(action.ticketNumber);
+    if (ticketNumber && !actionByTicket.has(ticketNumber)) {
+      actionByTicket.set(ticketNumber, action);
+    }
+  }
+  return actionByTicket;
+}
+
+function publicNoteBlockedResult(ticketNumber: string, action: TriagePlanAction): ApplyTriagePlanResult {
+  const result = baseApplyResult(ticketNumber, action);
+  result.finalOutcome = "Blocked";
+  result.failureStage = "notePrivacy";
+  result.failureReason = "Continuation will not create public notes; approved triage notes must be private.";
+  return result;
+}
+
+function targetAppliedToTicket(action: TriagePlanAction, ticket: Ticket): boolean {
+  if (action.action === "addNote") return false;
+  return verifyFinalTargetState(action, ticket).mismatches.length === 0;
+}
+
+async function ambiguityCheckedTriageResult(params: {
+  client: SuperOpsClientInstance;
+  ticketNumber: string;
+  action: TriagePlanAction;
+  applyParams: ApplyTriagePlanParams;
+  previousRetryCount: number;
+}): Promise<{ result: ApplyTriagePlanResult; stage?: OperationItemState["stage"]; retryCount?: number }> {
+  const { client, ticketNumber, action, applyParams } = params;
+  if (action.isPublicNote === true && typeof action.note === "string" && action.note.trim()) {
+    return { result: publicNoteBlockedResult(ticketNumber, action) };
+  }
+
+  const resolved = await resolveTicketId(client, { ticketNumber });
+  if (resolved.error || !resolved.ticketId) {
+    const result = baseApplyResult(ticketNumber, action);
+    result.finalOutcome = "NotFound";
+    result.failureStage = "ambiguityRead";
+    result.failureReason = resolved.error ?? "Ticket was not found while resolving an ambiguous write.";
+    return { result };
+  }
+
+  const ticket = await getTicketByInternalId(client, resolved.ticketId);
+  const targetApplied = targetAppliedToTicket(action, ticket);
+  const allowChanged = action.allowWriteIfUpdatedTimeChanged ?? applyParams.allowWriteIfUpdatedTimeChanged ?? false;
+  const validationFailure = targetApplied
+    ? validateExpectedTicket(ticketNumber, { ...action, expectedStatus: undefined, expectedUpdatedTime: undefined }, ticket, true)
+    : validateExpectedTicket(ticketNumber, action, ticket, allowChanged);
+  if (validationFailure) {
+    const result = baseApplyResult(ticketNumber, action, ticket);
+    result.finalOutcome = validationFailure.outcome ?? "Blocked";
+    result.failureStage = validationFailure.stage;
+    result.failureReason = validationFailure.reason;
+    result.partialWrite = true;
+    return {
+      result,
+      stage: validationFailure.outcome === "SkippedChangedSinceSnapshot"
+        ? "StaleAfterRateLimitWait"
+        : "AmbiguousWriteUnresolved",
+    };
+  }
+
+  if (targetApplied) {
+    const result = baseApplyResult(ticketNumber, action, ticket);
+    result.writeAttempted = true;
+    result.writeMethod = action.action === "resolve" ? "resolve_full" : "update";
+    result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
+    result.finalState = ticketFinalState(ticket);
+    result.observedFinalState = result.finalState;
+    result.verifiedState = result.finalState;
+    result.verified = true;
+
+    try {
+      await addNoteForPlan({
+        client,
+        ticketId: ticket.ticketId,
+        note: action.note,
+        isPublic: false,
+        dedupe: applyParams.dedupeNotes ?? true,
+        result,
+      });
+    } catch (error) {
+      result.finalOutcome = "Failed";
+      result.failureStage = "createTicketNote";
+      result.failureReason = safeErrorMessage(error);
+      result.partialWrite = true;
+      return { result, stage: "FailedAfterPartialWrite" };
+    }
+
+    return { result, stage: "CompletedAfterAmbiguousWriteVerification" };
+  }
+
+  if (params.previousRetryCount > 0) {
+    const result = baseApplyResult(ticketNumber, action, ticket);
+    result.finalOutcome = "Failed";
+    result.failureStage = "ambiguousWrite";
+    result.failureReason = "Ambiguous previous write was not observed and retry limit was reached.";
+    result.writeAttempted = true;
+    result.partialWrite = true;
+    return { result, stage: "AmbiguousWriteUnresolved" };
+  }
+
+  const retried = await applyApprovedTriageAction({
+    client,
+    ticketNumber,
+    action,
+    dryRun: applyParams.dryRun ?? false,
+    verify: applyParams.verify ?? true,
+    dedupeNotes: applyParams.dedupeNotes ?? true,
+    allowResolveFullFallbackToUpdate: applyParams.allowResolveFullFallbackToUpdate ?? false,
+    allowWriteIfUpdatedTimeChanged: allowChanged,
+    allowWriteWithoutVerifiedContent: applyParams.allowWriteWithoutVerifiedContent ?? false,
+  });
+  return { result: retried, retryCount: params.previousRetryCount + 1 };
+}
+
+function createApplyTriageContinuationAdapter(
+  client: SuperOpsClientInstance
+): OperationContinuationAdapter {
+  return {
+    toolName: "superops_tickets_apply_triage_plan",
+    estimateItemSubrequests(record, itemKey) {
+      const storedParams = operationRequestApplyTriageParams(record.operationRequest);
+      const action = actionByTicketFromApplyParams(storedParams ?? {}).get(itemKey);
+      if (!action) return 2;
+      if (action.action === "leave" || action.action === "skip") return 3;
+      return storedParams?.verify === false ? 5 : 8;
+    },
+    async processItem({ record, claim }) {
+      const storedParams = operationRequestApplyTriageParams(record.operationRequest);
+      if (!storedParams || !Array.isArray(storedParams.expectedCandidateTicketNumbers)) {
+        return {
+          stage: "FailedBeforeWrite",
+          outcome: "Validation failed",
+          writeAttempted: false,
+          writeMayHaveSucceeded: false,
+          partialWrite: false,
+          failureReason: "Stored apply-triage operation payload is missing or malformed.",
+          errorClass: "ValidationFailure",
+          result: {
+            ticketNumber: claim.itemKey,
+            finalOutcome: "Failed",
+            failureStage: "operationPayload",
+            failureReason: "Stored apply-triage operation payload is missing or malformed.",
+            writeAttempted: false,
+            partialWrite: false,
+          },
+        };
+      }
+
+      const action = actionByTicketFromApplyParams(storedParams).get(claim.itemKey);
+      if (action?.isPublicNote === true && typeof action.note === "string" && action.note.trim()) {
+        return applyResultToContinuationOutcome(publicNoteBlockedResult(claim.itemKey, action));
+      }
+
+      const shouldResolveAmbiguity =
+        claim.item.stage === "WriteStarted" ||
+        claim.item.stage === "WriteAmbiguous" ||
+        claim.item.writeMayHaveSucceeded === true;
+      const applied = shouldResolveAmbiguity && action
+        ? await ambiguityCheckedTriageResult({
+            client,
+            ticketNumber: claim.itemKey,
+            action,
+            applyParams: storedParams,
+            previousRetryCount: claim.item.retryCount,
+          })
+        : {
+            result: await applyApprovedTriageAction({
+              client,
+              ticketNumber: claim.itemKey,
+              action,
+              dryRun: storedParams.dryRun ?? false,
+              verify: storedParams.verify ?? true,
+              dedupeNotes: storedParams.dedupeNotes ?? true,
+              allowResolveFullFallbackToUpdate:
+                storedParams.allowResolveFullFallbackToUpdate ?? false,
+              allowWriteIfUpdatedTimeChanged:
+                storedParams.allowWriteIfUpdatedTimeChanged ?? false,
+              allowWriteWithoutVerifiedContent:
+                storedParams.allowWriteWithoutVerifiedContent ?? false,
+            }),
+          };
+
+      const outcome = applyResultToContinuationOutcome(applied.result, applied.stage);
+      if (typeof applied.retryCount === "number") {
+        outcome.retryCount = applied.retryCount;
+      }
+      return outcome;
+    },
+  };
+}
+
+export async function resumeApplyTriageOperation(params: {
+  operationId: string;
+  ownerHash: string;
+  leaseOwner: string;
+  leaseMs?: number;
+  now?: string;
+}) {
+  return runOperationContinuation({
+    operationId: params.operationId,
+    ownerHash: params.ownerHash,
+    adapter: createApplyTriageContinuationAdapter(getClient()),
+    leaseOwner: params.leaseOwner,
+    leaseMs: params.leaseMs,
+    now: params.now,
+  });
+}
 function ticketSummary(ticket: Ticket, latestNote?: TicketNote) {
   return {
     ticketId: ticket.ticketId,
@@ -4040,6 +4346,7 @@ export function getTicketsTools(): DomainTools {
               `triage-${Date.now()}`;
             let operationPersisted = false;
             let operationStoreError: string | undefined;
+            let continuationScheduling: Record<string, unknown> | undefined;
             try {
               await getOperationStore().put(
                 buildApplyTriageLedgerRecord({
@@ -4057,6 +4364,20 @@ export function getTicketsTools(): DomainTools {
               operationStoreError = safeErrorMessage(error);
             }
 
+            if (executionStopped && operationPersisted) {
+              const scheduled = await scheduleApplyTriageContinuation(
+                operationId,
+                currentOwnerHash()
+              );
+              continuationScheduling = {
+                attempted: true,
+                scheduled: scheduled.scheduled,
+                status: scheduled.status,
+                error: scheduled.scheduled ? undefined : scheduled.reason,
+                mechanism: "serviceBinding",
+              };
+            }
+
             return {
               content: [
                 {
@@ -4071,6 +4392,7 @@ export function getTicketsTools(): DomainTools {
                         continuationRequired: executionStopped,
                         persisted: operationPersisted,
                         storeError: operationStoreError,
+                        continuationScheduling,
                       },
                       initialCandidateCount: expected.length,
                       expectedCandidateTicketNumbers: expected,

@@ -31,6 +31,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { runWithCredentials } from "./client.js";
 import { createMcpServer, resolveGatewayCredentials } from "./mcp-server.js";
+import { resumeApplyTriageOperation } from "./domains/tickets.js";
 import type { SuperOpsCredentials } from "./types.js";
 import {
   auditToolCall,
@@ -39,7 +40,8 @@ import {
   runtimeFlagsFromEnv,
   toolAuditMetadata,
 } from "./audit.js";
-import { runWithExecutionConfig } from "./execution.js";
+import { finishExecution, runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
+import { runWithContinuationScheduler } from "./continuation-scheduler.js";
 import { runWithOperationStore, SuperOpsOperationLedger } from "./operation-store.js";
 export { SuperOpsOperationLedger };
 
@@ -55,6 +57,9 @@ export interface Env {
   OAUTH_KV?: unknown;
   OAUTH_PROVIDER?: unknown;
   SUPEROPS_OPERATION_LEDGER?: unknown;
+  SUPEROPS_CONTINUATION_SERVICE?: unknown;
+  SUPEROPS_CONTINUATION_ENABLED?: string;
+  SUPEROPS_INTERNAL_CONTINUATION_TOKEN?: string;
   CHATGPT_MCP_HOST?: string;
   CHATGPT_MCP_RESOURCE?: string;
   CHATGPT_OAUTH_SCOPES?: string;
@@ -500,6 +505,61 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
   }
 }
 
+async function handleInternalContinuation(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  if (env.SUPEROPS_CONTINUATION_ENABLED !== "true") {
+    return json({ error: "Continuation disabled" }, 403);
+  }
+  const expectedToken = env.SUPEROPS_INTERNAL_CONTINUATION_TOKEN?.trim();
+  if (!expectedToken || request.headers.get("X-SuperOps-Internal-Continuation") !== expectedToken) {
+    return json({ error: "Forbidden" }, 403);
+  }
+  if (!env.SUPEROPS_API_TOKEN || !env.SUPEROPS_SUBDOMAIN) {
+    return json({ error: "Continuation requires env-mode SuperOps credentials" }, 503);
+  }
+
+  let body: { toolName?: unknown; operationId?: unknown; ownerHash?: unknown };
+  try {
+    body = await request.json() as typeof body;
+  } catch {
+    return json({ error: "Invalid continuation request" }, 400);
+  }
+  if (
+    body.toolName !== "superops_tickets_apply_triage_plan" ||
+    typeof body.operationId !== "string" ||
+    typeof body.ownerHash !== "string"
+  ) {
+    return json({ error: "Unsupported continuation request" }, 400);
+  }
+
+  const creds: SuperOpsCredentials = {
+    apiToken: env.SUPEROPS_API_TOKEN,
+    subdomain: env.SUPEROPS_SUBDOMAIN,
+    region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
+  };
+
+  const result = await runWithContinuationScheduler(env, () =>
+    runWithOperationStore(env, () =>
+      runWithExecutionConfig(env, () =>
+        runWithCredentials(creds, () =>
+          runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
+            const continuation = await resumeApplyTriageOperation({
+              operationId: body.operationId as string,
+              ownerHash: body.ownerHash as string,
+              leaseOwner: globalThis.crypto?.randomUUID?.() ?? `worker-${Date.now()}`,
+            });
+            finishExecution(continuation.continuationRequired ? "continuationRequired" : "completed");
+            return continuation;
+          })
+        )
+      )
+    )
+  );
+
+  return json({ ok: true, result });
+}
 async function handleBaseWorkerFetch(
   request: Request,
   env: Env,
@@ -507,6 +567,10 @@ async function handleBaseWorkerFetch(
   auditContextApplied = false
 ): Promise<Response> {
   const url = new URL(request.url);
+
+  if (url.pathname === "/internal/operations/continue") {
+    return handleInternalContinuation(request, env);
+  }
 
   // CORS preflight
   if (request.method === "OPTIONS") {

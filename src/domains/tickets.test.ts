@@ -34,9 +34,15 @@ vi.mock("../client.js", () => ({
 }));
 
 import { getClient } from "../client.js";
-import { getTicketsTools } from "./tickets.js";
-import { runWithExecutionConfig } from "../execution.js";
-import { getOperationStore } from "../operation-store.js";
+import { getTicketsTools, resumeApplyTriageOperation } from "./tickets.js";
+import {
+  getExecutionState,
+  recordSubrequestFinish,
+  recordTypedSubrequestStart,
+  runWithExecutionConfig,
+  runWithExecutionContext,
+} from "../execution.js";
+import { getOperationStore, stableHash } from "../operation-store.js";
 
 const VALID_TICKET_STATUSES = [
   "Worked on",
@@ -2884,6 +2890,241 @@ describe("Tickets Domain", () => {
     expect(notesResult.isError).toBe(true);
     expect(notesResult.content[0].text).toContain("notes read failed");
   });
+  it("resumes a pending approved triage update using the real adapter", async () => {
+    const domain = getTicketsTools();
+    const initial = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () =>
+        domain.handleCall("superops_tickets_apply_triage_plan", {
+          expectedCandidateTicketNumbers: ["57400", "57401"],
+          actions: [
+            {
+              ticketNumber: "57401",
+              expectedStatus: "New Calls",
+              expectedUpdatedTime: "2026-07-18T10:00:00Z",
+              contentVerified: true,
+              action: "update",
+              target: { status: "Awaiting Engineer" },
+            },
+          ],
+        })
+    );
+    const parsedInitial = JSON.parse(initial.content[0].text);
+    const operationId = parsedInitial.operation.operationId;
+    const stored = await getOperationStore().get(operationId);
+    expect(stored?.operationRequest).toMatchObject({ kind: "applyTriagePlan" });
+
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57401",
+          displayId: "57401",
+          subject: "Resume update",
+          status: "New Calls",
+          updatedTime: "2026-07-18T10:00:00Z",
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57401",
+          displayId: "57401",
+          status: "Awaiting Engineer",
+          updatedTime: "2026-07-18T10:01:00Z",
+        },
+      });
+    mockClient.mutate.mockResolvedValueOnce({
+      updateTicket: { ticketId: "ticket-57401", status: "Awaiting Engineer" },
+    });
+
+    await runWithExecutionConfig({}, async () => {
+      await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
+        const resumed = await resumeApplyTriageOperation({
+          operationId,
+          ownerHash: stored?.ownerHash ?? stableHash("anonymous"),
+          leaseOwner: "test-resume",
+        });
+        expect(resumed.state).toBe("Completed");
+      });
+    });
+
+    const finalRecord = await getOperationStore().get(operationId);
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "Completed",
+      outcome: "Updated",
+      writeAttempted: true,
+      verificationState: "Verified",
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not resume a pending triage write when updatedTime is stale", async () => {
+    const domain = getTicketsTools();
+    const initial = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () =>
+        domain.handleCall("superops_tickets_apply_triage_plan", {
+          expectedCandidateTicketNumbers: ["57400", "57401"],
+          actions: [
+            {
+              ticketNumber: "57401",
+              expectedUpdatedTime: "2026-07-18T10:00:00Z",
+              contentVerified: true,
+              action: "update",
+              target: { status: "Awaiting Engineer" },
+            },
+          ],
+        })
+    );
+    const operationId = JSON.parse(initial.content[0].text).operation.operationId;
+    const stored = await getOperationStore().get(operationId);
+
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57401",
+          displayId: "57401",
+          status: "New Calls",
+          updatedTime: "2026-07-18T10:05:00Z",
+        },
+      });
+
+    await runWithExecutionConfig({}, async () => {
+      await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
+        await resumeApplyTriageOperation({
+          operationId,
+          ownerHash: stored?.ownerHash ?? stableHash("anonymous"),
+          leaseOwner: "test-stale",
+        });
+      });
+    });
+
+    const finalRecord = await getOperationStore().get(operationId);
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "Stale",
+      outcome: "SkippedChangedSinceSnapshot",
+      writeAttempted: false,
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("resolves ambiguous started updates by reading state before retrying", async () => {
+    const domain = getTicketsTools();
+    const initial = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () =>
+        domain.handleCall("superops_tickets_apply_triage_plan", {
+          expectedCandidateTicketNumbers: ["57400", "57401"],
+          actions: [
+            {
+              ticketNumber: "57401",
+              expectedUpdatedTime: "2026-07-18T10:00:00Z",
+              contentVerified: true,
+              action: "update",
+              target: { status: "Awaiting Engineer" },
+            },
+          ],
+        })
+    );
+    const operationId = JSON.parse(initial.content[0].text).operation.operationId;
+    const stored = await getOperationStore().get(operationId);
+    if (!stored) throw new Error("missing operation");
+    stored.itemStates["57401"] = {
+      ...stored.itemStates["57401"],
+      stage: "WriteStarted",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: true,
+    };
+    await getOperationStore().put(stored);
+
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57401",
+          displayId: "57401",
+          status: "Awaiting Engineer",
+          updatedTime: "2026-07-18T10:01:00Z",
+        },
+      });
+
+    await runWithExecutionConfig({}, async () => {
+      await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
+        await resumeApplyTriageOperation({
+          operationId,
+          ownerHash: stored.ownerHash,
+          leaseOwner: "test-ambiguous",
+        });
+      });
+    });
+
+    const finalRecord = await getOperationStore().get(operationId);
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "CompletedAfterAmbiguousWriteVerification",
+      outcome: "Updated",
+      writeAttempted: true,
+      verificationState: "Verified",
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects public-note continuation without writing", async () => {
+    const domain = getTicketsTools();
+    const initial = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () =>
+        domain.handleCall("superops_tickets_apply_triage_plan", {
+          expectedCandidateTicketNumbers: ["57400", "57401"],
+          actions: [
+            {
+              ticketNumber: "57401",
+              contentVerified: true,
+              action: "addNote",
+              note: "Do not publish",
+              isPublicNote: true,
+            },
+          ],
+        })
+    );
+    const operationId = JSON.parse(initial.content[0].text).operation.operationId;
+    const stored = await getOperationStore().get(operationId);
+
+    await runWithExecutionConfig({}, async () => {
+      await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
+        await resumeApplyTriageOperation({
+          operationId,
+          ownerHash: stored?.ownerHash ?? stableHash("anonymous"),
+          leaseOwner: "test-public-note",
+        });
+      });
+    });
+
+    const finalRecord = await getOperationStore().get(operationId);
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "FailedBeforeWrite",
+      outcome: "Blocked",
+      writeAttempted: false,
+    });
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
 });
 
 describe("Tickets triage execution budget", () => {
@@ -2943,5 +3184,117 @@ describe("Tickets triage execution budget", () => {
     });
     expect(mockClient.query).not.toHaveBeenCalled();
     expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+  it("runs the real triage adapter across a 250-item mocked continuation harness", async () => {
+    const domain = getTicketsTools();
+    const expected = Array.from({ length: 250 }, (_, index) => String(58000 + index));
+    const actions = expected.slice(1).map((ticketNumber) => ({
+      ticketNumber,
+      expectedStatus: "New Calls",
+      expectedUpdatedTime: "2026-07-18T10:00:00Z",
+      contentVerified: true,
+      action: "update" as const,
+      target: { status: "Awaiting Engineer" },
+    }));
+
+    const initial = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () =>
+        domain.handleCall("superops_tickets_apply_triage_plan", {
+          expectedCandidateTicketNumbers: expected,
+          actions,
+        })
+    );
+    const operationId = JSON.parse(initial.content[0].text).operation.operationId;
+    const stored = await getOperationStore().get(operationId);
+    if (!stored) throw new Error("missing operation");
+
+    const ticketState = new Map(
+      expected.slice(1).map((ticketNumber) => [
+        ticketNumber,
+        {
+          ticketId: `ticket-${ticketNumber}`,
+          displayId: ticketNumber,
+          status: "New Calls",
+          updatedTime: "2026-07-18T10:00:00Z",
+        },
+      ])
+    );
+    const mutationCounts = new Map<string, number>();
+    mockClient.query.mockImplementation(async (query: string, variables: { input?: { condition?: { value?: string }; ticketId?: string } }) => {
+      const started = recordTypedSubrequestStart({
+        type: query.includes("getTicketList") ? "initialRead" : "verificationRead",
+        operationType: "query",
+        operationName: query.includes("getTicketList") ? "getTicketList" : "getTicket",
+      });
+      recordSubrequestFinish(started, 200, true);
+      if (query.includes("getTicketList")) {
+        const ticketNumber = String(variables.input?.condition?.value ?? "");
+        const ticket = ticketState.get(ticketNumber);
+        return {
+          getTicketList: {
+            tickets: ticket ? [{ ticketId: ticket.ticketId, displayId: ticket.displayId }] : [],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: ticket ? 1 : 0 },
+          },
+        };
+      }
+      if (query.includes("getTicket")) {
+        const ticketId = String(variables.input?.ticketId ?? "");
+        const ticket = [...ticketState.values()].find((item) => item.ticketId === ticketId);
+        if (!ticket) throw new Error(`missing ticket ${ticketId}`);
+        return { getTicket: { ...ticket } };
+      }
+      throw new Error("unexpected query");
+    });
+    mockClient.mutate.mockImplementation(async (_mutation: string, variables: { input?: { ticketId?: string; status?: string } }) => {
+      const started = recordTypedSubrequestStart({
+        type: "write",
+        operationType: "mutation",
+        operationName: "updateTicket",
+      });
+      recordSubrequestFinish(started, 200, true);
+      const ticketId = String(variables.input?.ticketId ?? "");
+      const ticket = [...ticketState.values()].find((item) => item.ticketId === ticketId);
+      if (!ticket) throw new Error(`missing ticket ${ticketId}`);
+      mutationCounts.set(ticket.displayId, (mutationCounts.get(ticket.displayId) ?? 0) + 1);
+      ticket.status = String(variables.input?.status ?? ticket.status);
+      ticket.updatedTime = "2026-07-18T10:01:00Z";
+      return { updateTicket: { ticketId, status: ticket.status } };
+    });
+
+    const subrequestsByInvocation: number[] = [];
+    let continuationRequired = true;
+    let continuations = 0;
+    while (continuationRequired && continuations < 200) {
+      continuations += 1;
+      await runWithExecutionConfig(
+        {
+          SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "14",
+          SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "2",
+          SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+        },
+        async () => {
+          await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
+            const result = await resumeApplyTriageOperation({
+              operationId,
+              ownerHash: stored.ownerHash,
+              leaseOwner: `load-${continuations}`,
+            });
+            continuationRequired = result.continuationRequired;
+            subrequestsByInvocation.push(getExecutionState()?.subrequests ?? 0);
+          });
+        }
+      );
+    }
+
+    const finalRecord = await getOperationStore().get(operationId);
+    expect(finalRecord?.expectedItems).toHaveLength(250);
+    expect(finalRecord?.pendingItems).toHaveLength(0);
+    expect(finalRecord?.completedItems).toHaveLength(249);
+    expect(finalRecord?.skippedItems).toEqual([expected[0]]);
+    expect(continuations).toBeGreaterThan(1);
+    expect(Math.max(...subrequestsByInvocation)).toBeLessThanOrEqual(12);
+    expect(mutationCounts.size).toBe(249);
+    expect([...mutationCounts.values()].filter((count) => count !== 1)).toHaveLength(0);
   });
 });
