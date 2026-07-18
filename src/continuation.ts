@@ -114,25 +114,54 @@ export async function runOperationContinuation(
     record = (await store.get(params.operationId)) ?? record;
     const estimated = params.adapter.estimateItemSubrequests(record, claim.itemKey);
     if (!hasExecutionBudgetFor(estimated)) {
+      // A resumed item may already be across a durable mutation boundary. Do
+      // not turn it into an ordinary reschedule just because this invocation
+      // cannot fund its reconciliation unit: that would lose the ambiguity
+      // marker and could permit a duplicate mutation on a later invocation.
+      const hasPriorWrite = claim.item.writeAttempted === true ||
+        claim.item.writeMayHaveSucceeded === true;
+      const noteWrite = claim.item.stage === "NoteWriteStarted" ||
+        claim.item.stage === "NoteWriteAmbiguous";
+      const mutationBoundary = claim.item.stage === "WriteStarted" ||
+        claim.item.stage === "WriteAmbiguous" || noteWrite;
+      // Only an in-flight mutation boundary becomes explicitly ambiguous.
+      // A later durable stage (for example FieldsUpdated) already records a
+      // reliable response and must retain that exact progress instead.
+      const stage = mutationBoundary
+        ? noteWrite ? "NoteWriteAmbiguous" : "WriteAmbiguous"
+        : hasPriorWrite ? claim.item.stage : "Rescheduled";
       record = await store.completeItem({
         operationId: params.operationId,
         ownerHash: params.ownerHash,
         itemKey: claim.itemKey,
         leaseId: claim.lease.leaseId,
         patch: {
-          stage: "Rescheduled",
-          outcome: "NotAttemptedExecutionBudget",
-          writeAttempted: false,
-          writeMayHaveSucceeded: false,
-          partialWrite: false,
+          stage,
+          outcome: mutationBoundary
+            ? "AmbiguousWriteRequiresVerification"
+            : "NotAttemptedExecutionBudget",
+          writeAttempted: claim.item.writeAttempted,
+          writeMayHaveSucceeded: claim.item.writeMayHaveSucceeded,
+          partialWrite: claim.item.partialWrite === true,
           verificationState: "Pending",
+          errorClass: mutationBoundary ? "CloudflareSubrequestBudget" : undefined,
+          failureReason: mutationBoundary
+            ? "Execution budget was insufficient to reconcile a possible write."
+            : undefined,
         },
-        result: {
-          itemKey: claim.itemKey,
-          finalOutcome: "NotAttemptedExecutionBudget",
-          writeAttempted: false,
-          partialWrite: false,
-        },
+        result: mutationBoundary
+          ? {
+              itemKey: claim.itemKey,
+              finalOutcome: "AmbiguousWriteRequiresVerification",
+              writeAttempted: true,
+              partialWrite: true,
+            }
+          : {
+              itemKey: claim.itemKey,
+              finalOutcome: "NotAttemptedExecutionBudget",
+              writeAttempted: false,
+              partialWrite: false,
+            },
       });
       record = await store.scheduleContinuation({
         operationId: params.operationId,

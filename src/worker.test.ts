@@ -9,6 +9,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import worker, { type Env } from "./worker.js";
+import { chatGptDirectBlockedMutationToolNames } from "./mcp-server.js";
 import { getOperationStore, runWithOperationStore, stableHash, type OperationLedgerRecord } from "./operation-store.js";
 
 const MCP_HEADERS = {
@@ -299,6 +300,27 @@ async function getOAuthAccessToken(env: Env): Promise<string> {
   expect(tokenJson.resource).toBe(MCP_RESOURCE);
   return tokenJson.access_token!;
 }
+
+
+describe("ChatGPT direct mutation policy", () => {
+  it("derives synchronous mutation blocks from the registry while preserving the durable workflow and reads", async () => {
+    const blocked = await chatGptDirectBlockedMutationToolNames();
+    expect([...blocked].sort()).toEqual([
+      "superops_alerts_create",
+      "superops_alerts_resolve",
+      "superops_custom_mutation",
+      "superops_custom_query",
+      "superops_tickets_add_note",
+      "superops_tickets_create",
+      "superops_tickets_log_time",
+      "superops_tickets_resolve_full",
+      "superops_tickets_update",
+    ]);
+    expect(blocked.has("superops_tickets_apply_triage_plan")).toBe(false);
+
+    expect(blocked.has("superops_operations_get")).toBe(false);
+  });
+});
 
 describe("Cloudflare Worker entrypoint", () => {
   beforeAll(async () => {
@@ -1134,13 +1156,81 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(body.result?.content?.[0]?.text).toMatch(/disabled/i);
   });
 
+  it("does not execute blocked direct-route tools when credentials are present", async () => {
+    const env = chatGptEnv({
+      SUPEROPS_API_TOKEN: "test-token",
+      SUPEROPS_SUBDOMAIN: "acme",
+    });
+    const token = await getOAuthAccessToken(env);
+    const superOpsCalls: string[] = [];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (url.startsWith("https://api.superops.ai/")) {
+          superOpsCalls.push(url);
+          return new Response("blocked test request", { status: 500 });
+        }
+        return originalFetch(input, init);
+      }
+    );
+
+    try {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 10,
+          method: "tools/call",
+          params: { name: "superops_custom_query", arguments: {} },
+        },
+        env,
+        { Authorization: `Bearer ${token}` },
+        `${AUTH_SERVER}/mcp`
+      );
+
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: { text?: string }[] };
+      };
+      expect(body.result?.content?.[0]?.text).toMatch(/disabled/i);
+      expect(superOpsCalls).toEqual([]);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("allows permitted direct-route tools without SuperOps credentials", async () => {
+    const env = chatGptEnv();
+    const token = await getOAuthAccessToken(env);
+    const res = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: { name: "superops_status", arguments: {} },
+      },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+
+    const body = (await res.json()) as {
+      result?: { isError?: boolean; content?: { text?: string }[] };
+    };
+    expect(body.result?.isError).toBeUndefined();
+    expect(body.result?.content?.[0]?.text).not.toMatch(/disabled/i);
+  });
+
   it("keeps the internal hostname on the existing /mcp behavior", async () => {
     const res = await mcp(
       {
         jsonrpc: "2.0",
         id: 9,
-        method: "tools/list",
-        params: {},
+        method: "tools/call",
+        params: { name: "superops_custom_query", arguments: {} },
       },
       chatGptEnv(),
       {},
@@ -1148,5 +1238,12 @@ describe("Cloudflare Worker entrypoint", () => {
     );
 
     expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result?: { isError?: boolean; content?: { text?: string }[] };
+    };
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.content?.[0]?.text).toContain(
+      "SuperOps API credentials are not configured."
+    );
   });
 });

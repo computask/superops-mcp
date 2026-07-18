@@ -22,6 +22,7 @@ import { setServerRef } from "./utils/server-ref.js";
 import {
   auditToolCall,
   blockedToolReason,
+  classifyTool,
   errorSummaryFromResult,
   sanitizeError,
   sanitizeToolResult,
@@ -140,6 +141,31 @@ async function getAllDomainTools(): Promise<ToolDefinition[]> {
   return tools;
 }
 
+/**
+ * ChatGPT direct-route policy derives its synchronous-mutation and broad-query
+ * blocklist from the same assembled registry returned by tools/list. The one
+ * reviewed durable write workflow is intentionally exempt.
+ */
+const CHATGPT_DIRECT_DURABLE_MUTATION_ALLOWLIST = new Set([
+  "superops_tickets_apply_triage_plan",
+]);
+
+export async function chatGptDirectBlockedMutationToolNames(): Promise<Set<string>> {
+  const domainTools = await getAllDomainTools();
+  return new Set(
+    domainTools
+      .filter((tool) => {
+        const category = classifyTool(tool.name).category;
+        return (
+          (category === "write" ||
+            category === "custom_mutation" ||
+            category === "custom_query") &&
+          !CHATGPT_DIRECT_DURABLE_MUTATION_ALLOWLIST.has(tool.name)
+        );
+      })
+      .map((tool) => tool.name)
+  );
+}
 // Navigation / discovery tool - helps the LLM find the right tools
 const navigationTool: ToolDefinition = {
   name: "superops_navigate",

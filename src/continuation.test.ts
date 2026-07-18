@@ -288,6 +288,73 @@ describe("durable continuation runner", () => {
     expect(writeAttempts).toBe(1);
   });
 
+  it("retains an ambiguous write boundary when a fresh invocation cannot fund reconciliation", async () => {
+    const ownerHash = stableHash("owner@example.com");
+    let processed = 0;
+    const adapter: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      // Two requests permit claiming; this three-request recovery unit must
+      // defer without clearing the persisted ambiguity boundary.
+      estimateItemSubrequests: () => 3,
+      async processItem() {
+        processed += 1;
+        throw new Error("an unfunded recovery unit must not execute");
+      },
+    };
+
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      await store.put(ledgerRecord({
+        operationId: "op-ambiguous-before-budget", ownerHash, itemKeys: ["ticket-checkpoint"],
+      }));
+      const initialClaim = await store.claimNextItem({
+        operationId: "op-ambiguous-before-budget", ownerHash, leaseOwner: "checkpoint-owner",
+        leaseMs: 60_000, now: "2026-07-18T00:00:00.000Z",
+      });
+      if (!initialClaim) throw new Error("expected checkpoint claim");
+      await store.checkpointItem({
+        operationId: "op-ambiguous-before-budget", ownerHash, itemKey: "ticket-checkpoint",
+        leaseId: initialClaim.lease.leaseId,
+        patch: {
+          stage: "WriteStarted", writeAttempted: true, writeMayHaveSucceeded: true,
+          partialWrite: false, verificationState: "Pending",
+        },
+      });
+      await store.completeItem({
+        operationId: "op-ambiguous-before-budget", ownerHash, itemKey: "ticket-checkpoint",
+        leaseId: initialClaim.lease.leaseId,
+        patch: {
+          stage: "WriteAmbiguous", writeAttempted: true, writeMayHaveSucceeded: true,
+          partialWrite: true, verificationState: "Pending",
+        },
+      });
+
+      await runWithExecutionConfig({
+        SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "4",
+        SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "2",
+        SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+      }, async () => {
+        await runWithExecutionContext("test_batch_tool", async () => {
+          await runOperationContinuation({
+            operationId: "op-ambiguous-before-budget", ownerHash, adapter,
+            leaseOwner: "unfunded-recovery",
+          });
+        });
+      });
+
+      await expect(store.get("op-ambiguous-before-budget")).resolves.toMatchObject({
+        itemStates: {
+          "ticket-checkpoint": {
+            stage: "WriteAmbiguous", writeAttempted: true,
+            writeMayHaveSucceeded: true, partialWrite: true,
+          },
+        },
+      });
+    });
+
+    expect(processed).toBe(0);
+  });
+
   it("preserves a write-start checkpoint when the execution budget stops the item", async () => {
     const ownerHash = stableHash("owner@example.com");
     let resumedItems = 0;

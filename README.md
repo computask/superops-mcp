@@ -658,3 +658,7 @@ Apache-2.0
 ## Support
 
 For issues and feature requests, please visit the [GitHub repository](https://github.com/wyre-technology/superops-mcp/issues).
+
+### Deterministic continuation acceptance harness
+
+Run `npm run test:continuation-harness` to execute only `src/continuation-mixed-fault-harness.test.ts`. The fixed seed is `0x5eed250`; it processes exactly 250 mocked tickets through the real apply-triage continuation adapter. Its required assertions are 250 expected and accounted items, zero duplicate successful updates/resolutions/private notes, and zero invocations over the configured request threshold. It is a no-network test and is required evidence before enabling durable continuation outside staging.

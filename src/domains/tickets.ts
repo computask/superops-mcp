@@ -2439,6 +2439,18 @@ async function mutateTicketUpdate(
   return response.updateTicket;
 }
 
+/**
+ * A continuation must not turn a failed durable mutation-start checkpoint into
+ * an ambiguous write. The checkpoint occurs before any outbound mutation, so
+ * its failure has to reach the continuation runner unchanged.
+ */
+class MutationStartCheckpointError extends Error {
+  constructor(cause: unknown) {
+    super(`Mutation-start checkpoint failed: ${safeErrorMessage(cause)}`);
+    this.name = "MutationStartCheckpointError";
+  }
+}
+
 function triageStageForResult(result: ApplyTriagePlanResult): OperationItemState["stage"] {
   if (result.partialWrite) return "FailedAfterPartialWrite";
   switch (result.finalOutcome) {
@@ -2837,6 +2849,7 @@ async function applyApprovedTriageAction(params: {
         await params.beforeMutation?.(action.action === "resolve" ? "resolution" : "update");
         await mutateTicketUpdate(client, updateInput as Record<string, unknown>);
       } catch (error) {
+        if (error instanceof MutationStartCheckpointError) throw error;
         if (isRateLimitError(error)) {
           const rateLimit = rateLimitRetryMetadata(error);
           result.finalOutcome = "Failed";
@@ -2909,6 +2922,7 @@ async function applyApprovedTriageAction(params: {
         beforeCreate: () => params.beforeMutation?.("note") ?? Promise.resolve(),
         });
       } catch (error) {
+        if (error instanceof MutationStartCheckpointError) throw error;
         result.finalOutcome = "Failed";
         result.failureStage = "createTicketNote";
         result.failureReason = safeErrorMessage(error);
@@ -2919,8 +2933,11 @@ async function applyApprovedTriageAction(params: {
     }
     return result;
   } catch (error) {
+    if (error instanceof MutationStartCheckpointError) throw error;
     result.finalOutcome = isRateLimitError(error) ? "Failed" : "Failed";
-    result.failureStage = isRateLimitError(error) ? "rateLimit" : "write";
+    result.failureStage = isRateLimitError(error)
+      ? "rateLimit"
+      : result.writeMethod === "createTicketNote" ? "createTicketNote" : "write";
     result.failureReason = safeErrorMessage(error);
     result.partialWrite = result.writeAttempted || result.noteAdded;
     return result;
@@ -3080,28 +3097,17 @@ async function ambiguityCheckedTriageResult(params: {
     return { result, stage: "CompletedAfterAmbiguousWriteVerification" };
   }
 
-  if (params.previousRetryCount > 0) {
-    const result = baseApplyResult(ticketNumber, action, ticket);
-    result.finalOutcome = "Failed";
-    result.failureStage = "ambiguousWrite";
-    result.failureReason = "Ambiguous previous write was not observed and retry limit was reached.";
-    result.writeAttempted = true;
-    result.partialWrite = true;
-    return { result, stage: "AmbiguousWriteUnresolved" };
-  }
-
-  const retried = await applyApprovedTriageAction({
-    client,
-    ticketNumber,
-    action,
-    dryRun: applyParams.dryRun ?? false,
-    verify: applyParams.verify ?? true,
-    dedupeNotes: applyParams.dedupeNotes ?? true,
-    allowResolveFullFallbackToUpdate: applyParams.allowResolveFullFallbackToUpdate ?? false,
-    allowWriteIfUpdatedTimeChanged: allowChanged,
-    allowWriteWithoutVerifiedContent: applyParams.allowWriteWithoutVerifiedContent ?? false,
-  });
-  return { result: retried, retryCount: params.previousRetryCount + 1 };
+  // A WriteStarted checkpoint means the preceding invocation may have reached
+  // SuperOps even when no matching target is visible on this read.  Retrying
+  // would replay a possible successful mutation and requires a backward stage
+  // transition, so retain an explicit unresolved ambiguity instead.
+  const result = baseApplyResult(ticketNumber, action, ticket);
+  result.finalOutcome = "Failed";
+  result.failureStage = "ambiguousWrite";
+  result.failureReason = "Ambiguous write was not observed; it will not be retried automatically.";
+  result.writeAttempted = true;
+  result.partialWrite = true;
+  return { result, stage: "AmbiguousWriteUnresolved" };
 }
 
 function createApplyTriageContinuationAdapter(
@@ -3145,22 +3151,26 @@ function createApplyTriageContinuationAdapter(
 
       let checkpointStage = claim.item.stage;
       const beforeMutation = async (mutationType: "update" | "resolution" | "note") => {
-        const stages = mutationType === "note"
-          ? checkpointStage === "WriteStarted" || checkpointStage === "WriteAmbiguous" || checkpointStage === "FieldsUpdated" || checkpointStage === "StatusUpdated"
-            ? ["NoteChecked", "NoteWriteStarted"] as const
-            : ["Validated", "WriteNotStarted", "WriteStarted", "NoteChecked", "NoteWriteStarted"] as const
-          : ["Validated", "WriteNotStarted", "WriteStarted"] as const;
-        for (const stage of stages) {
-          if (stage === checkpointStage) continue;
-          await checkpoint({
-            stage,
-            writeAttempted: true,
-            writeMayHaveSucceeded: true,
-            partialWrite: false,
-            verificationState: "Pending",
-            attemptCount: (claim.item.attemptCount ?? 0) + 1,
-          });
-          checkpointStage = stage;
+        try {
+          const stages = mutationType === "note"
+            ? checkpointStage === "WriteStarted" || checkpointStage === "WriteAmbiguous" || checkpointStage === "FieldsUpdated" || checkpointStage === "StatusUpdated"
+              ? ["NoteChecked", "NoteWriteStarted"] as const
+              : ["Validated", "WriteNotStarted", "WriteStarted", "NoteChecked", "NoteWriteStarted"] as const
+            : ["Validated", "WriteNotStarted", "WriteStarted"] as const;
+          for (const stage of stages) {
+            if (stage === checkpointStage) continue;
+            await checkpoint({
+              stage,
+              writeAttempted: true,
+              writeMayHaveSucceeded: true,
+              partialWrite: false,
+              verificationState: "Pending",
+              attemptCount: (claim.item.attemptCount ?? 0) + 1,
+            });
+            checkpointStage = stage;
+          }
+        } catch (error) {
+          throw new MutationStartCheckpointError(error);
         }
       };
       const shouldResolveAmbiguity =

@@ -245,4 +245,57 @@ describe("SuperOpsClient rate-limit handling", () => {
     ).rejects.toThrow("HTTP error: 429");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+  it("retries reset-header throttling, 5xx, network failure, and timeout with bounded diagnostics", async () => {
+    const failureCases: Array<{ name: string; response: Response | Error }> = [
+      { name: "reset header", response: new Response("slow down", { status: 429, headers: { "X-RateLimit-Reset": String(Math.floor(Date.now() / 1000) + 10) } }) },
+      { name: "5xx", response: new Response("unavailable", { status: 503 }) },
+      { name: "network", response: new Error("network unavailable") },
+      { name: "timeout", response: Object.assign(new Error("request timeout"), { name: "AbortError" }) },
+    ];
+
+    for (const testCase of failureCases) {
+      const fetchMock = vi.fn()
+        .mockImplementationOnce(() => testCase.response instanceof Response ? Promise.resolve(testCase.response) : Promise.reject(testCase.response))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ data: { ok: true } }), { status: 200 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new SuperOpsClient({ apiToken: "secret-token", subdomain: "example" });
+      let diagnostics: ReturnType<typeof executionDiagnostics> | undefined;
+      await runWithExecutionConfig(
+        { SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0", SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0" },
+        () => runWithExecutionContext("superops_custom_query", async () => {
+          await expect(client.query("query Test { ok }")).resolves.toEqual({ ok: true });
+          diagnostics = executionDiagnostics();
+        })
+      );
+      expect(fetchMock, testCase.name).toHaveBeenCalledTimes(2);
+      expect(diagnostics?.retries).toMatchObject({ count: 1, delaysMs: [0] });
+    }
+  });
+
+  it("stops deterministically on retry exhaustion and leaves a long Retry-After for the durable adapter", async () => {
+    const exhaustedFetch = vi.fn().mockResolvedValue(
+      new Response("unavailable", { status: 503 })
+    );
+    vi.stubGlobal("fetch", exhaustedFetch);
+    const client = new SuperOpsClient({ apiToken: "secret-token", subdomain: "example" });
+    await expect(
+      runWithExecutionConfig(
+        { SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "2", SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0", SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0" },
+        () => runWithExecutionContext("superops_custom_query", () => client.query("query Test { ok }"))
+      )
+    ).rejects.toThrow("HTTP error: 503");
+    expect(exhaustedFetch).toHaveBeenCalledTimes(2);
+
+    const delayedFetch = vi.fn().mockResolvedValue(
+      new Response("slow down", { status: 429, headers: { "Retry-After": "60" } })
+    );
+    vi.stubGlobal("fetch", delayedFetch);
+    await expect(
+      runWithExecutionConfig(
+        { SUPEROPS_EXECUTION_MAX_RETRY_DURATION_MS: "10", SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "60000" },
+        () => runWithExecutionContext("superops_custom_query", () => client.query("query Test { ok }"))
+      )
+    ).rejects.toMatchObject({ name: "SuperOpsHttpError", retryAfter: 60 });
+    expect(delayedFetch).toHaveBeenCalledTimes(1);
+  });
 });

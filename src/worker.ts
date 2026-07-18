@@ -30,7 +30,11 @@ import {
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { runWithCredentials } from "./client.js";
-import { createMcpServer, resolveGatewayCredentials } from "./mcp-server.js";
+import {
+  chatGptDirectBlockedMutationToolNames,
+  createMcpServer,
+  resolveGatewayCredentials,
+} from "./mcp-server.js";
 import { resumeApplyTriageOperation } from "./domains/tickets.js";
 import type { SuperOpsCredentials } from "./types.js";
 import {
@@ -108,17 +112,6 @@ const DEFAULT_CHATGPT_OAUTH_SCOPES = ["superops.read"];
 
 const CHATGPT_REDIRECT_HOSTS = new Set(["chatgpt.com", "chat.openai.com"]);
 
-const DEFAULT_CHATGPT_BLOCKED_TOOLS = new Set([
-  "superops_tickets_create",
-  "superops_tickets_update",
-  "superops_tickets_resolve_full",
-  "superops_tickets_add_note",
-  "superops_tickets_log_time",
-  "superops_alerts_create",
-  "superops_alerts_resolve",
-  "superops_custom_mutation",
-  "superops_custom_query",
-]);
 
 const remoteJwksCache = new Map<
   string,
@@ -291,7 +284,7 @@ async function rejectBlockedChatGptToolCall(
   const toolName = (params as { name?: unknown }).name;
   if (
     typeof toolName !== "string" ||
-    !DEFAULT_CHATGPT_BLOCKED_TOOLS.has(toolName)
+    !(await chatGptDirectBlockedMutationToolNames()).has(toolName)
   ) {
     return undefined;
   }
