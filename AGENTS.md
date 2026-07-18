@@ -21,7 +21,8 @@
 - `src/index.ts` - Node CLI entrypoint for stdio or HTTP transport selected by `MCP_TRANSPORT`.
 - `src/client.ts` - SuperOps GraphQL POST client for US/EU endpoints, AsyncLocalStorage credentials, subrequest instrumentation, read retry/rate-limit handling.
 - `src/execution.ts` - invocation IDs, operation IDs, subrequest budgets, safety margin, elapsed-time checks, per-item stats, retry diagnostics, structured execution logs.
-- `src/operation-store.ts` - Durable Object-compatible operation ledger plus in-memory fallback for tests/local unbound contexts.
+- `src/operation-store.ts` - Durable Object-compatible operation ledger, item leases, completion/schedule primitives, plus in-memory fallback for tests/local unbound contexts.
+- `src/continuation.ts` - generic budget-aware continuation runner for exact unfinished-item resume; it does not contain SuperOps-specific write logic.
 - `src/audit.ts` - runtime flags, high-risk tool classification, audit metadata, secret/error redaction, audit log records.
 - `src/domains/tickets.ts` - largest domain; ticket CRUD, safe retrieval, triage snapshot, approved triage plan, validation, note dedupe, partial-write reporting.
 - `src/domains/ticket-reporting.ts` - createdTime historical ticket query/report aggregation, bounded pagination, local filtering, retry diagnostics.
@@ -32,7 +33,7 @@
 - `src/test-shims/cloudflare-workers.ts` - test shim for `cloudflare:workers` imports.
 - `src/*.test.ts` and `src/domains/*.test.ts` - Vitest unit/integration coverage for client, worker, domains, navigation, operation store.
 - `docs/execution-audit.md` - verified outbound-call inventory, implementation matrix, root cause, risk assessment, and known execution-safety limits.
-- `docs/execution-architecture-decision.md` - ADR for execution budget, SuperOps rate limits, Durable Object ledger, and deferred automatic continuation.
+- `docs/execution-architecture-decision.md` - ADR for execution budget, SuperOps rate limits, Durable Object ledger, and continuation boundaries.
 - `README.md` - operator-facing deployment/configuration/tool documentation and confirmed workflow guidance.
 - `wrangler.json` - Cloudflare Worker config, non-secret vars, `OAUTH_KV`, and `SUPEROPS_OPERATION_LEDGER` Durable Object binding/export.
 - `package.json` - scripts, dependencies, package metadata. Node engine is `>=20.0.0`; module system is ESM/NodeNext.
@@ -110,8 +111,9 @@ Notes:
 - `src/operation-store.ts` stores compact operation metadata only: operation ID, owner hash, expected item IDs, item stages, target fields, note fingerprints, verification state, partial-write flags, pending/unattempted sets, and compact results.
 - Operation-status MCP tools are read-only: `superops_operations_get` and `superops_operations_results`.
 - Current ledger support is implemented for `superops_tickets_apply_triage_plan` result/status visibility.
-- Automatic fresh-invocation continuation is not implemented. Do not claim it is. The current behavior is honest `ContinuationRequired` plus durable status inspection.
-- There is no safe `resume` or `cancel` tool yet. Add one only after implementing per-operation locking, exact item resume, stale checks, note fingerprint checks, and tests.
+- Generic fresh-budget continuation primitives are implemented in `src/continuation.ts` and tested with a non-live 250-item harness.
+- Production automatic SuperOps ticket mutation resume is not registered. Do not claim it is. The current MCP behavior is honest `ContinuationRequired` plus durable status inspection.
+- There is no safe `resume` or `cancel` tool yet. Add one only after implementing a SuperOps-specific adapter with stale checks, note fingerprint checks, ambiguity recovery, ownership checks, and tests.
 
 ## Ticket Domain Safety Rules
 
@@ -155,7 +157,8 @@ Notes:
 - Worker tests drive the exported Worker `fetch` handler directly and use local memory shims.
 - Client tests mock `fetch` and cover execution accounting, HTTP/GraphQL rate-limit handling, and write retry restraint.
 - Ticket tests mock `getClient()` and cover triage snapshots, apply-plan validation, partial writes, budget stops, and operation-ledger persistence.
-- Operation-store tests cover memory store behavior, compact result projection, and Durable Object fetch handlers.
+- Operation-store tests cover memory store behavior, item leases, transition validation, compact result projection, and Durable Object fetch handlers.
+- Continuation tests cover multiple fresh budgets, delayed rate-limit reschedule, ambiguous write verification, and duplicate-write prevention in a non-live harness.
 - Use deterministic or capped retry delays in tests; do not make tests sleep for real upstream retry windows.
 - Do not run live SuperOps mutations from automated tests.
 

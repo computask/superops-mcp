@@ -1,0 +1,289 @@
+import { describe, expect, it } from "vitest";
+import {
+  getExecutionState,
+  recordSubrequestFinish,
+  recordTypedSubrequestStart,
+  runWithExecutionConfig,
+  runWithExecutionContext,
+} from "./execution.js";
+import { runOperationContinuation, type OperationContinuationAdapter } from "./continuation.js";
+import {
+  getOperationStore,
+  runWithOperationStore,
+  stableHash,
+  type OperationItemState,
+  type OperationLedgerRecord,
+} from "./operation-store.js";
+
+function ledgerRecord(params: {
+  operationId: string;
+  ownerHash: string;
+  itemCount?: number;
+  itemKeys?: string[];
+}): OperationLedgerRecord {
+  const expectedItems = params.itemKeys ?? Array.from({ length: params.itemCount ?? 3 }, (_, index) => `ticket-${index + 1}`);
+  const itemStates = expectedItems.reduce<Record<string, OperationItemState>>((states, itemKey) => {
+    states[itemKey] = {
+      itemKey,
+      stage: "Pending",
+      idempotencyKey: stableHash({ operationId: params.operationId, itemKey }),
+      writeAttempted: false,
+      writeMayHaveSucceeded: false,
+      partialWrite: false,
+      verificationState: "Pending",
+      retryCount: 0,
+    };
+    return states;
+  }, {});
+
+  return {
+    responseVersion: 1,
+    operationId: params.operationId,
+    toolName: "test_batch_tool",
+    ownerHash: params.ownerHash,
+    createdAt: "2026-07-18T00:00:00.000Z",
+    updatedAt: "2026-07-18T00:00:00.000Z",
+    expiresAt: "2026-07-19T00:00:00.000Z",
+    originalRequestHash: stableHash({ operationId: params.operationId }),
+    state: "Running",
+    expectedItems,
+    completedItems: [],
+    failedItems: [],
+    skippedItems: [],
+    unattemptedItems: [],
+    pendingItems: expectedItems,
+    itemStates,
+    summary: {},
+    compactResults: [],
+    partialWriteCount: 0,
+    ambiguousWriteCount: 0,
+    rateLimitedItems: [],
+    continuationCount: 0,
+  };
+}
+
+function countedRequest(type: "write" | "verificationRead" = "write"): void {
+  const request = recordTypedSubrequestStart({
+    type,
+    operationType: type === "write" ? "mutation" : "query",
+    operationName: type === "write" ? "testMutation" : "testVerify",
+  });
+  recordSubrequestFinish(request, 200, true);
+}
+
+function completingAdapter(processed: Map<string, number>): OperationContinuationAdapter {
+  return {
+    toolName: "test_batch_tool",
+    estimateItemSubrequests: () => 2,
+    async processItem({ claim }) {
+      countedRequest("write");
+      countedRequest("verificationRead");
+      processed.set(claim.itemKey, (processed.get(claim.itemKey) ?? 0) + 1);
+      return {
+        stage: "Completed",
+        outcome: "Updated",
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+        partialWrite: false,
+        verified: true,
+        result: {
+          itemKey: claim.itemKey,
+          finalOutcome: "Updated",
+          writeAttempted: true,
+          partialWrite: false,
+          verified: true,
+        },
+      };
+    },
+  };
+}
+
+describe("durable continuation runner", () => {
+  it("continues a 250-item operation across fresh invocation budgets without duplicate writes", async () => {
+    const ownerHash = stableHash("owner@example.com");
+    const processed = new Map<string, number>();
+    const adapter = completingAdapter(processed);
+    const subrequestsByInvocation: number[] = [];
+    let resultState = "";
+    let continuationRequired = true;
+    let continuations = 0;
+
+    await runWithOperationStore({}, async () => {
+      await getOperationStore().put(
+        ledgerRecord({ operationId: "op-250", ownerHash, itemCount: 250 })
+      );
+
+      while (continuationRequired && continuations < 100) {
+        continuations += 1;
+        await runWithExecutionConfig(
+          {
+            SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "12",
+            SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "2",
+            SUPEROPS_EXECUTION_MAX_DURATION_MS: "25000",
+            SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+          },
+          async () => {
+            await runWithExecutionContext("test_batch_tool", async () => {
+              const result = await runOperationContinuation({
+                operationId: "op-250",
+                ownerHash,
+                adapter,
+                leaseOwner: `invocation-${continuations}`,
+                leaseMs: 60_000,
+                now: `2026-07-18T00:${String(continuations).padStart(2, "0")}:00.000Z`,
+              });
+              resultState = result.state;
+              continuationRequired = result.continuationRequired;
+              subrequestsByInvocation.push(getExecutionState()?.subrequests ?? 0);
+            });
+          }
+        );
+      }
+
+      const finalRecord = await getOperationStore().get("op-250");
+      expect(finalRecord).toMatchObject({
+        state: "Completed",
+        completedItems: expect.arrayContaining(["ticket-1", "ticket-250"]),
+        pendingItems: [],
+      });
+    });
+
+    expect(resultState).toBe("Completed");
+    expect(continuations).toBeGreaterThan(1);
+    expect(Math.max(...subrequestsByInvocation)).toBeLessThanOrEqual(10);
+    expect(processed.size).toBe(250);
+    expect([...processed.values()].filter((count) => count !== 1)).toHaveLength(0);
+  });
+
+  it("reschedules a long Retry-After item and resumes only after it is eligible", async () => {
+    const ownerHash = stableHash("owner@example.com");
+    const attempts = new Map<string, number>();
+    const adapter: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      estimateItemSubrequests: () => 1,
+      async processItem({ claim }) {
+        countedRequest("write");
+        const attempt = (attempts.get(claim.itemKey) ?? 0) + 1;
+        attempts.set(claim.itemKey, attempt);
+        if (claim.itemKey === "ticket-rate" && attempt === 1) {
+          return {
+            stage: "RateLimitedRescheduled",
+            outcome: "RateLimitedRescheduled",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+            partialWrite: false,
+            nextEligibleTime: "2026-07-18T00:10:00.000Z",
+            retryCount: 1,
+            rateLimited: true,
+            errorClass: "SuperOpsRateLimit",
+          };
+        }
+        return {
+          stage: "CompletedAfterRetry",
+          outcome: "CompletedAfterRetry",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          partialWrite: false,
+          verified: true,
+        };
+      },
+    };
+
+    await runWithOperationStore({}, async () => {
+      await getOperationStore().put(
+        ledgerRecord({ operationId: "op-rate", ownerHash, itemKeys: ["ticket-rate"] })
+      );
+
+      await runWithExecutionConfig({}, async () => {
+        await runWithExecutionContext("test_batch_tool", async () => {
+          const first = await runOperationContinuation({
+            operationId: "op-rate",
+            ownerHash,
+            adapter,
+            leaseOwner: "invocation-1",
+            now: "2026-07-18T00:00:00.000Z",
+          });
+          expect(first).toMatchObject({
+            state: "Rescheduled",
+            continuationRequired: true,
+            stopReason: "RateLimitedRescheduled",
+          });
+        });
+      });
+
+      await runWithExecutionConfig({}, async () => {
+        await runWithExecutionContext("test_batch_tool", async () => {
+          const tooEarly = await runOperationContinuation({
+            operationId: "op-rate",
+            ownerHash,
+            adapter,
+            leaseOwner: "invocation-2",
+            now: "2026-07-18T00:05:00.000Z",
+          });
+          expect(tooEarly.stopReason).toBe("NotEligibleYet");
+        });
+      });
+
+      await runWithExecutionConfig({}, async () => {
+        await runWithExecutionContext("test_batch_tool", async () => {
+          const resumed = await runOperationContinuation({
+            operationId: "op-rate",
+            ownerHash,
+            adapter,
+            leaseOwner: "invocation-3",
+            now: "2026-07-18T00:11:00.000Z",
+          });
+          expect(resumed.state).toBe("Completed");
+        });
+      });
+    });
+
+    expect(attempts.get("ticket-rate")).toBe(2);
+  });
+
+  it("keeps ambiguous accepted writes terminal and unrepeated", async () => {
+    const ownerHash = stableHash("owner@example.com");
+    let writeAttempts = 0;
+    const adapter: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      estimateItemSubrequests: () => 2,
+      async processItem() {
+        writeAttempts += 1;
+        countedRequest("write");
+        countedRequest("verificationRead");
+        return {
+          stage: "CompletedAfterAmbiguousWriteVerification",
+          outcome: "CompletedAfterAmbiguousWriteVerification",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          partialWrite: false,
+          verified: true,
+        };
+      },
+    };
+
+    await runWithOperationStore({}, async () => {
+      await getOperationStore().put(
+        ledgerRecord({ operationId: "op-ambiguous", ownerHash, itemKeys: ["ticket-a"] })
+      );
+      await runWithExecutionConfig({}, async () => {
+        await runWithExecutionContext("test_batch_tool", async () => {
+          await runOperationContinuation({
+            operationId: "op-ambiguous",
+            ownerHash,
+            adapter,
+            leaseOwner: "invocation-1",
+          });
+          await runOperationContinuation({
+            operationId: "op-ambiguous",
+            ownerHash,
+            adapter,
+            leaseOwner: "invocation-duplicate",
+          });
+        });
+      });
+    });
+
+    expect(writeAttempts).toBe(1);
+  });
+});

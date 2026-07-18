@@ -27,10 +27,10 @@ Waiting inside the same Worker invocation would not reset the Cloudflare invocat
 | GraphQL throttling detection | Yes |  |  | `isGraphQLRateLimit()` in `src/client.ts` | `src/client.test.ts` | Message matching can miss vendor-specific shapes | Add cases when real SuperOps shapes are observed |
 | Read retry safety | Yes |  |  | `SuperOpsClient.query()` read retry loop | `src/client.test.ts` | Pagination page retry is central per request, not durable per page | Add per-page resume for very deep reads if needed |
 | Write retry safety | Yes by restraint | Partial |  | Writes default to one attempt; no blind retry | `src/client.test.ts` | Ambiguous write resolution is implemented in triage paths but not central for all writes | Do not raise write retries without idempotency/verification wrapper |
-| Durable operation state | Yes for triage result ledger | Partial |  | `src/operation-store.ts`, `wrangler.json`, triage persistence | `src/operation-store.test.ts`, worker status test | Ledger stores outcomes but does not yet drive automatic processing | Add a processor/resume state machine before claiming continuation execution |
-| Fresh-invocation continuation |  |  | Yes | No Workflow/Queue/DO alarm processor exists | None | Large operations stop with `ContinuationRequired` but are not auto-resumed | Implement a safe processor with locks and exact item resume |
+| Durable operation state | Yes | Partial for production write integration |  | `src/operation-store.ts`, `wrangler.json`, triage persistence | `src/operation-store.test.ts`, `src/continuation.test.ts`, worker status test | Ledger supports leases, validated terminal transitions, rate-limit metadata and continuation scheduling; only triage currently persists real SuperOps operation outcomes | Integrate one write tool at a time with a verified adapter |
+| Fresh-invocation continuation |  | Yes |  | `src/continuation.ts`, `src/operation-store.ts` | `src/continuation.test.ts` | Generic runner and exact item resume are implemented locally; no SuperOps ticket mutation adapter or Workflow binding is registered for production auto-resume | Register a SuperOps-specific adapter only after it revalidates `updatedTime`, note fingerprints and verification states |
 | Operation status tools | Yes |  |  | `superops_operations_get`, `superops_operations_results` | `src/worker.test.ts` | Read-only only; no resume/cancel | Add resume only when item processor is safe |
-| Load/fault harness | Partial | Yes |  | Budget, rate-limit, DO and partial-write tests | 205 tests passing | No standalone hundreds-item harness script yet | Add a dedicated non-live load harness before production deployment |
+| Load/fault harness | Yes | Partial for domain-specific SuperOps adapters |  | `src/continuation.test.ts` | 250-item simulated operation plus rate-limit and ambiguity tests | Harness is local and non-live; it does not prove real SuperOps triage auto-resume | Keep it as the gate for future adapters |
 
 ## Outbound Call Inventory
 
@@ -99,7 +99,8 @@ Reads use bounded retry attempts. Writes do not retry by default, even if `SUPER
 
 - `src/execution.ts`: invocation IDs, operation IDs, configurable budget, safety margin, elapsed-time checks, per-item stats, request classification, retry counters, structured diagnostics.
 - `src/client.ts`: central HTTP/GraphQL rate-limit detection, bounded read retries, Retry-After parsing, no blind write retries.
-- `src/operation-store.ts`: SQLite Durable Object compatible operation ledger plus memory fallback for local tests.
+- `src/operation-store.ts`: SQLite Durable Object compatible operation ledger plus memory fallback for local tests; owner-scoped claim, complete and continuation scheduling primitives.
+- `src/continuation.ts`: generic budget-aware continuation runner for exact unfinished-item resume.
 - `src/mcp-server.ts`: read-only `superops_operations_get` and `superops_operations_results` tools.
 - `src/worker.ts` and `wrangler.json`: operation-store binding wiring.
 - `src/domains/tickets.ts`: triage result ledger persistence and durable classification of completed, skipped, failed, pending and unattempted items.
@@ -107,11 +108,11 @@ Reads use bounded retry attempts. Writes do not retry by default, even if `SUPER
 
 ## Known Limitations
 
-- Automatic fresh-invocation continuation is not implemented yet. The MCP now returns and persists `ContinuationRequired`; it does not silently continue in the background.
+- Automatic production SuperOps ticket mutation continuation is not registered yet. The generic local continuation runner is implemented and tested, but the MCP still returns and persists `ContinuationRequired` rather than silently continuing in the background.
 - Operation ledger state is implemented for `superops_tickets_apply_triage_plan`; other mutating tools still rely on immediate return contracts.
 - Direct one-off mutations cannot be fully idempotent without either SuperOps idempotency support or per-tool verification wrappers.
 - Custom GraphQL tools remain intentionally broad. They are budgeted and instrumented at the client layer but cannot be statically call-counted from schema alone.
-- There is no standalone hundreds-item load harness script yet; current coverage is unit/integration fault simulation.
+- The hundreds-item load/fault harness is implemented as a fast Vitest simulation in `src/continuation.test.ts`; it does not call live SuperOps.
 
 ## Deployment Boundary
 
