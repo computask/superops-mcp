@@ -3085,6 +3085,48 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it("does not repeat an ambiguous resolution when the requested target is already applied", async () => {
+    const domain = getTicketsTools();
+    const initial = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () => domain.handleCall("superops_tickets_apply_triage_plan", {
+        expectedCandidateTicketNumbers: ["57400", "57401"],
+        actions: [{
+          ticketNumber: "57401", expectedUpdatedTime: "2026-07-18T10:00:00Z",
+          contentVerified: true, action: "resolve", target: { status: "Resolved" },
+        }],
+      })
+    );
+    const operationId = JSON.parse(initial.content[0].text).operation.operationId;
+    const stored = await getOperationStore().get(operationId);
+    if (!stored) throw new Error("missing operation");
+    stored.itemStates["57401"] = {
+      ...stored.itemStates["57401"], stage: "WriteStarted",
+      writeAttempted: true, writeMayHaveSucceeded: true, partialWrite: true,
+    };
+    await getOperationStore().put(stored);
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "Resolved",
+          updatedTime: "2026-07-18T10:01:00Z" },
+      });
+    await runWithExecutionConfig({}, async () => {
+      await runWithExecutionContext("superops_tickets_apply_triage_plan", async () =>
+        resumeApplyTriageOperation({ operationId, ownerHash: stored.ownerHash, leaseOwner: "test-resolution-ambiguous" })
+      );
+    });
+    const finalRecord = await getOperationStore().get(operationId);
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "CompletedAfterAmbiguousWriteVerification", outcome: "Resolved",
+      writeAttempted: true, verificationState: "Verified",
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
   it("rejects public-note continuation without writing", async () => {
     const domain = getTicketsTools();
     const initial = await runWithExecutionConfig(
