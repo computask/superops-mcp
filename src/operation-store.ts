@@ -257,9 +257,34 @@ function assertRecordOwner(record: OperationLedgerRecord, ownerHash: string): vo
   }
 }
 
+const EXPLICIT_STAGE_TRANSITIONS: Partial<Record<OperationItemStage, ReadonlySet<OperationItemStage>>> = {
+  Pending: new Set(["Validating", "Validated", "WriteNotStarted", "Rescheduled", "RateLimitedRescheduled"]),
+  Unattempted: new Set(["Validating", "Validated", "WriteNotStarted", "Rescheduled", "RateLimitedRescheduled"]),
+  Validating: new Set(["Validated", "WriteNotStarted"]),
+  Validated: new Set(["WriteNotStarted", "WriteStarted", "Verifying"]),
+  WriteNotStarted: new Set(["WriteStarted", "Verifying"]),
+  WriteStarted: new Set(["FieldsUpdated", "StatusUpdated", "NoteChecked", "Verifying", "WriteAmbiguous"]),
+  WriteAmbiguous: new Set(["FieldsUpdated", "StatusUpdated", "NoteChecked", "Verifying"]),
+  FieldsUpdated: new Set(["StatusUpdated", "NoteChecked", "Verifying"]),
+  StatusUpdated: new Set(["NoteChecked", "Verifying"]),
+  NoteChecked: new Set(["NoteAdded", "Verifying"]),
+  NoteAdded: new Set(["Verifying"]),
+  Verifying: new Set(),
+  RateLimited: new Set(["RateLimitedRetrying", "RateLimitedRescheduled"]),
+  RateLimitedRetrying: new Set(["RateLimitedRescheduled"]),
+  RateLimitedRescheduled: new Set(["Validating", "Validated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "Verifying"]),
+  Rescheduled: new Set(["Validating", "Validated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "Verifying"]),
+};
+
 function assertTransition(current: OperationItemStage, next: OperationItemStage): void {
   if (current === next) return;
   if (TERMINAL_STAGES.has(current)) {
+    throw new Error(`Invalid operation item transition from ${current} to ${next}.`);
+  }
+  // Any unfinished stage may finish in an explicit terminal outcome. Non-terminal
+  // transitions must follow the persisted processing lifecycle, never claim state.
+  if (TERMINAL_STAGES.has(next)) return;
+  if (!EXPLICIT_STAGE_TRANSITIONS[current]?.has(next)) {
     throw new Error(`Invalid operation item transition from ${current} to ${next}.`);
   }
 }
@@ -393,6 +418,12 @@ function applyItemPatch(
   }
   assertTransition(current.stage, params.patch.stage);
 
+  if (current.writeAttempted && params.patch.writeAttempted === false) {
+    throw new Error(`Operation item writeAttempted cannot be reset: ${params.itemKey}`);
+  }
+  if (current.writeMayHaveSucceeded && params.patch.writeMayHaveSucceeded === false) {
+    throw new Error(`Operation item writeMayHaveSucceeded cannot be reset without verification: ${params.itemKey}`);
+  }
   const item: OperationItemState = {
     ...current,
     ...params.patch,

@@ -190,6 +190,32 @@ describe("operation store", () => {
     });
   });
 
+  it("rejects backward mutation transitions and write-state resets", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const ownerHash = stableHash("owner@example.com");
+      const initial = record({ operationId: "op-transitions" });
+      initial.itemStates["57401"] = {
+        ...initial.itemStates["57401"],
+        stage: "WriteStarted",
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+      };
+      await store.put(initial);
+      const claim = await store.claimNextItem({
+        operationId: "op-transitions", ownerHash, leaseOwner: "worker", leaseMs: 60_000,
+      });
+      await expect(store.completeItem({
+        operationId: "op-transitions", ownerHash, itemKey: "57401", leaseId: claim?.lease.leaseId,
+        patch: { stage: "Validating" },
+      })).rejects.toThrow(/Invalid operation item transition/);
+      await expect(store.completeItem({
+        operationId: "op-transitions", ownerHash, itemKey: "57401", leaseId: claim?.lease.leaseId,
+        patch: { stage: "Completed", writeAttempted: false, writeMayHaveSucceeded: false },
+      })).rejects.toThrow(/writeAttempted cannot be reset/);
+    });
+  });
+
   it("preserves an ambiguous write stage across an expired lease recovery", async () => {
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();
