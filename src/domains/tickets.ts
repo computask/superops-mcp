@@ -4,7 +4,7 @@
  * Tools for managing service tickets in SuperOps.ai PSA.
  */
 
-import { getClient } from "../client.js";
+import { getClient, SuperOpsError, SuperOpsHttpError } from "../client.js";
 import type {
   DomainTools,
   Client,
@@ -621,6 +621,9 @@ interface ApplyTriagePlanResult {
   attemptedState?: Record<string, unknown> | null;
   observedFinalState?: Record<string, unknown> | null;
   verifiedState?: Record<string, unknown> | null;
+  /** Compact retry metadata only; never include an upstream response body. */
+  rateLimitRetryAfterMs?: number;
+  rateLimitConclusiveRejection?: boolean;
 }
 interface StructuredValidationFailure {
   ok: false;
@@ -2025,8 +2028,32 @@ function isSuperOpsInternalError(error: unknown): boolean {
 }
 
 function isRateLimitError(error: unknown): boolean {
+  if (error instanceof SuperOpsHttpError) return error.status === 429;
+  if (error instanceof SuperOpsError) {
+    return /rate|thrott|too_many_requests/i.test(error.code ?? "") ||
+      /rate limit|too many requests|throttl/i.test(error.message);
+  }
   const message = error instanceof Error ? error.message : String(error);
   return /rate limit|too many requests|status\s*429/i.test(message);
+}
+
+function rateLimitRetryMetadata(error: unknown): { delayMs: number; conclusiveRejection: boolean } {
+  const retryAfterSeconds = error instanceof SuperOpsHttpError || error instanceof SuperOpsError
+    ? error.retryAfter
+    : undefined;
+  const configured = getExecutionConfig();
+  const requestedDelayMs = typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds)
+    ? Math.max(0, Math.ceil(retryAfterSeconds * 1000))
+    : configured.backoffBaseDelayMs;
+  // Durable waits may exceed the short in-invocation delay cap, but never the
+  // configured total retry window. A 429/structured throttle is a reliable
+  // rejection, so a resumed adapter may make one bounded retry after re-read.
+  return {
+    delayMs: Math.min(requestedDelayMs, configured.maxRetryDurationMs),
+    conclusiveRejection: error instanceof SuperOpsHttpError
+      ? error.status === 429
+      : error instanceof SuperOpsError && isRateLimitError(error),
+  };
 }
 
 function ticketClientName(ticket: Ticket): string | undefined {
@@ -2195,12 +2222,14 @@ async function existingNoteMatches(
   note: string
 ): Promise<boolean> {
   const notes = await getTicketNotes(client, ticketId);
-  const normalized = normalizePlanNote(note);
-  return notes.some((existing) => normalizePlanNote(existing.content) === normalized);
-}
-
-function normalizePlanNote(value: string): string {
-  return value.trim().replace(/\s+/g, " ").toLowerCase();
+  const fingerprint = normalizedNoteFingerprint(note);
+  // Continuation recovery is deliberately private-note only. A public note with
+  // identical text is neither evidence that the approved private note was
+  // written nor a reason to skip its private write.
+  return Boolean(fingerprint) && notes.some(
+    (existing) => existing.privacyType === "PRIVATE" &&
+      normalizedNoteFingerprint(existing.content) === fingerprint
+  );
 }
 
 async function addNoteForPlan(params: {
@@ -2210,6 +2239,7 @@ async function addNoteForPlan(params: {
   isPublic?: boolean;
   dedupe: boolean;
   result: ApplyTriagePlanResult;
+  beforeCreate?: () => Promise<void>;
 }): Promise<void> {
   if (typeof params.note !== "string" || params.note.trim().length === 0) {
     return;
@@ -2218,6 +2248,7 @@ async function addNoteForPlan(params: {
     params.result.noteDeduped = true;
     return;
   }
+  await params.beforeCreate?.();
   await createTicketNote(params.client, params.ticketId, params.note, params.isPublic ?? false);
   params.result.noteAdded = true;
 }
@@ -2531,6 +2562,9 @@ function buildApplyTriageLedgerRecord(params: {
   const expiresAt = new Date(
     now.getTime() + getExecutionConfig().operationRetentionSeconds * 1000
   );
+  const maxOperationLifetimeAt = new Date(
+    now.getTime() + getExecutionConfig().operationMaxLifetimeSeconds * 1000
+  );
   const itemStates = Object.fromEntries(
     params.expected.map((ticketNumber) => {
       const result = params.results.find((item) => item.ticketNumber === ticketNumber);
@@ -2592,6 +2626,7 @@ function buildApplyTriageLedgerRecord(params: {
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     expiresAt: expiresAt.toISOString(),
+    maxOperationLifetimeAt: maxOperationLifetimeAt.toISOString(),
     originalRequestHash: stableHash({
       batchId: params.request.batchId,
       expectedCandidateTicketNumbers: params.expected,
@@ -2676,6 +2711,7 @@ async function applyApprovedTriageAction(params: {
   allowResolveFullFallbackToUpdate: boolean;
   allowWriteIfUpdatedTimeChanged: boolean;
   allowWriteWithoutVerifiedContent: boolean;
+  beforeMutation?: (mutationType: "update" | "resolution" | "note") => Promise<void>;
 }): Promise<ApplyTriagePlanResult> {
   const { client, ticketNumber, action } = params;
   if (!action) {
@@ -2765,6 +2801,7 @@ async function applyApprovedTriageAction(params: {
         isPublic: action.isPublicNote,
         dedupe: params.dedupeNotes,
         result,
+        beforeCreate: () => params.beforeMutation?.("note") ?? Promise.resolve(),
       });
       result.finalOutcome = "Updated";
       if (params.verify) {
@@ -2797,13 +2834,20 @@ async function applyApprovedTriageAction(params: {
       result.attemptedState = updateInput as Record<string, unknown>;
       result.writeMethod = action.action === "resolve" ? "resolve_full" : "update";
       try {
+        await params.beforeMutation?.(action.action === "resolve" ? "resolution" : "update");
         await mutateTicketUpdate(client, updateInput as Record<string, unknown>);
       } catch (error) {
         if (isRateLimitError(error)) {
+          const rateLimit = rateLimitRetryMetadata(error);
           result.finalOutcome = "Failed";
           result.failureStage = "rateLimit";
           result.failureReason = safeErrorMessage(error);
-          result.partialWrite = result.writeAttempted || result.noteAdded;
+          result.rateLimitRetryAfterMs = rateLimit.delayMs;
+          result.rateLimitConclusiveRejection = rateLimit.conclusiveRejection;
+          // The outbound write checkpoint remains conservative. The response
+          // classification separately records that this particular request was
+          // reliably rejected and therefore eligible for one checked retry.
+          result.partialWrite = !rateLimit.conclusiveRejection && (result.writeAttempted || result.noteAdded);
           return result;
         }
         const fallbackAllowed = action.allowResolveFullFallbackToUpdate ?? params.allowResolveFullFallbackToUpdate;
@@ -2862,6 +2906,7 @@ async function applyApprovedTriageAction(params: {
           isPublic: action.isPublicNote,
           dedupe: params.dedupeNotes,
           result,
+        beforeCreate: () => params.beforeMutation?.("note") ?? Promise.resolve(),
         });
       } catch (error) {
         result.finalOutcome = "Failed";
@@ -2886,19 +2931,34 @@ function applyResultToContinuationOutcome(
   result: ApplyTriagePlanResult,
   stage: OperationItemState["stage"] = triageStageForResult(result)
 ): ContinuationItemOutcome {
+  const rateLimitReschedule = result.failureStage === "rateLimit" &&
+    result.rateLimitConclusiveRejection === true;
+  const ambiguousMutation = result.writeAttempted && result.partialWrite && (
+    result.failureStage === "update" || result.failureStage === "resolve_full" ||
+    result.failureStage === "createTicketNote" || result.failureStage === "write"
+  );
+  const persistedStage = ambiguousMutation
+    ? result.failureStage === "createTicketNote" ? "NoteWriteAmbiguous" : "WriteAmbiguous"
+    : stage;
   return {
-    stage,
-    outcome: result.finalOutcome,
+    stage: rateLimitReschedule ? "RateLimitedRescheduled" : persistedStage,
+    outcome: rateLimitReschedule ? "SuperOpsRateLimitRescheduled" : result.finalOutcome,
     writeAttempted: result.writeAttempted,
     writeMayHaveSucceeded: result.writeAttempted || result.partialWrite,
     partialWrite: result.partialWrite,
     verified: result.verified,
+    rateLimited: rateLimitReschedule,
+    nextEligibleTime: rateLimitReschedule
+      ? new Date(Date.now() + (result.rateLimitRetryAfterMs ?? 0)).toISOString()
+      : undefined,
     verificationFailed: result.failureStage === "verify" || result.failureStage === "verifyFinalState",
     stale: result.finalOutcome === "SkippedChangedSinceSnapshot",
     failureReason: result.failureReason ?? undefined,
     result: compactApplyResult(result),
-    errorClass: result.finalOutcome === "SkippedChangedSinceSnapshot"
-      ? "StaleData"
+    errorClass: rateLimitReschedule
+      ? "SuperOpsRateLimit"
+      : result.finalOutcome === "SkippedChangedSinceSnapshot"
+        ? "StaleData"
       : result.partialWrite
         ? "VerificationMismatch"
         : undefined,
@@ -2936,6 +2996,7 @@ async function ambiguityCheckedTriageResult(params: {
   action: TriagePlanAction;
   applyParams: ApplyTriagePlanParams;
   previousRetryCount: number;
+  beforeMutation?: (mutationType: "update" | "resolution" | "note") => Promise<void>;
 }): Promise<{ result: ApplyTriagePlanResult; stage?: OperationItemState["stage"]; retryCount?: number }> {
   const { client, ticketNumber, action, applyParams } = params;
   if (action.isPublicNote === true && typeof action.note === "string" && action.note.trim()) {
@@ -2952,6 +3013,23 @@ async function ambiguityCheckedTriageResult(params: {
   }
 
   const ticket = await getTicketByInternalId(client, resolved.ticketId);
+  if (action.action === "addNote") {
+    const result = baseApplyResult(ticketNumber, action, ticket);
+    result.writeAttempted = true;
+    result.writeMethod = "createTicketNote";
+    if (typeof action.note === "string" && await existingNoteMatches(client, ticket.ticketId, action.note)) {
+      result.noteDeduped = true;
+      result.finalOutcome = "Updated";
+      result.verified = true;
+      result.verifiedState = ticketFinalState(ticket);
+      return { result, stage: "CompletedAfterAmbiguousWriteVerification" };
+    }
+    result.finalOutcome = "Failed";
+    result.failureStage = "ambiguousWrite";
+    result.failureReason = "Ambiguous private-note write was not observed; it will not be retried automatically.";
+    result.partialWrite = true;
+    return { result, stage: "AmbiguousWriteUnresolved" };
+  }
   const targetApplied = targetAppliedToTicket(action, ticket);
   const allowChanged = action.allowWriteIfUpdatedTimeChanged ?? applyParams.allowWriteIfUpdatedTimeChanged ?? false;
   const validationFailure = targetApplied
@@ -2989,6 +3067,7 @@ async function ambiguityCheckedTriageResult(params: {
         isPublic: false,
         dedupe: applyParams.dedupeNotes ?? true,
         result,
+        beforeCreate: () => params.beforeMutation?.("note") ?? Promise.resolve(),
       });
     } catch (error) {
       result.finalOutcome = "Failed";
@@ -3037,7 +3116,7 @@ function createApplyTriageContinuationAdapter(
       if (action.action === "leave" || action.action === "skip") return 3;
       return storedParams?.verify === false ? 5 : 8;
     },
-    async processItem({ record, claim }) {
+    async processItem({ record, claim, checkpoint }) {
       const storedParams = operationRequestApplyTriageParams(record.operationRequest);
       if (!storedParams || !Array.isArray(storedParams.expectedCandidateTicketNumbers)) {
         return {
@@ -3064,9 +3143,31 @@ function createApplyTriageContinuationAdapter(
         return applyResultToContinuationOutcome(publicNoteBlockedResult(claim.itemKey, action));
       }
 
+      let checkpointStage = claim.item.stage;
+      const beforeMutation = async (mutationType: "update" | "resolution" | "note") => {
+        const stages = mutationType === "note"
+          ? checkpointStage === "WriteStarted" || checkpointStage === "WriteAmbiguous" || checkpointStage === "FieldsUpdated" || checkpointStage === "StatusUpdated"
+            ? ["NoteChecked", "NoteWriteStarted"] as const
+            : ["Validated", "WriteNotStarted", "WriteStarted", "NoteChecked", "NoteWriteStarted"] as const
+          : ["Validated", "WriteNotStarted", "WriteStarted"] as const;
+        for (const stage of stages) {
+          if (stage === checkpointStage) continue;
+          await checkpoint({
+            stage,
+            writeAttempted: true,
+            writeMayHaveSucceeded: true,
+            partialWrite: false,
+            verificationState: "Pending",
+            attemptCount: (claim.item.attemptCount ?? 0) + 1,
+          });
+          checkpointStage = stage;
+        }
+      };
       const shouldResolveAmbiguity =
         claim.item.stage === "WriteStarted" ||
         claim.item.stage === "WriteAmbiguous" ||
+        claim.item.stage === "NoteWriteStarted" ||
+        claim.item.stage === "NoteWriteAmbiguous" ||
         claim.item.writeMayHaveSucceeded === true;
       const applied = shouldResolveAmbiguity && action
         ? await ambiguityCheckedTriageResult({
@@ -3075,6 +3176,7 @@ function createApplyTriageContinuationAdapter(
             action,
             applyParams: storedParams,
             previousRetryCount: claim.item.retryCount,
+            beforeMutation,
           })
         : {
             result: await applyApprovedTriageAction({
@@ -3090,6 +3192,7 @@ function createApplyTriageContinuationAdapter(
                 storedParams.allowWriteIfUpdatedTimeChanged ?? false,
               allowWriteWithoutVerifiedContent:
                 storedParams.allowWriteWithoutVerifiedContent ?? false,
+              beforeMutation,
             }),
           };
 

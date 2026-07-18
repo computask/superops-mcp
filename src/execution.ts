@@ -27,6 +27,7 @@ export interface ExecutionConfigInput {
   SUPEROPS_EXECUTION_MAX_DURATION_MS?: string;
   SUPEROPS_EXECUTION_VERIFICATION_MODE?: string;
   SUPEROPS_OPERATION_RETENTION_SECONDS?: string;
+  SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS?: string;
   SUPEROPS_EXECUTION_CONCURRENCY?: string;
 }
 
@@ -46,6 +47,7 @@ export interface ExecutionConfig {
   maxDurationMs: number;
   verificationMode: "mutationResponse" | "verifyReads";
   operationRetentionSeconds: number;
+  operationMaxLifetimeSeconds: number;
   concurrency: number;
 }
 
@@ -109,6 +111,7 @@ const DEFAULT_CONFIG: ExecutionConfig = {
   maxDurationMs: 25_000,
   verificationMode: "verifyReads",
   operationRetentionSeconds: 86_400,
+  operationMaxLifetimeSeconds: 21_600,
   concurrency: 1,
 };
 
@@ -263,6 +266,12 @@ export function executionConfigFromEnv(
     operationRetentionSeconds: integer(
       merged("SUPEROPS_OPERATION_RETENTION_SECONDS"),
       DEFAULT_CONFIG.operationRetentionSeconds,
+      60,
+      31_536_000
+    ),
+    operationMaxLifetimeSeconds: integer(
+      merged("SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS"),
+      DEFAULT_CONFIG.operationMaxLifetimeSeconds,
       60,
       31_536_000
     ),

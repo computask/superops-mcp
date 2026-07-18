@@ -353,9 +353,32 @@ describe("Custom Domain", () => {
       });
 
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("Error: Permission denied");
+      expect(JSON.parse(result.content[0].text)).toMatchObject({
+        finalOutcome: "AmbiguousWriteUnresolved",
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+        retryable: false,
+      });
     });
 
+    it("marks a reliable GraphQL rejection as not accepted without retrying", async () => {
+      const rejection = Object.assign(new Error("Validation failed"), { name: "SuperOpsError" });
+      mockClient.mutate.mockRejectedValue(rejection);
+
+      const result = await getCustomTools().handleCall("superops_custom_mutation", {
+        mutation: "mutation { rejected { ok } }",
+      });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text)).toMatchObject({
+        finalOutcome: "WriteRejected",
+        writeAttempted: true,
+        writeMayHaveSucceeded: false,
+        partialWrite: false,
+        retryable: false,
+      });
+      expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    });
     it("handles non-Error exceptions for queries", async () => {
       mockClient.query.mockRejectedValue("String error from API");
 

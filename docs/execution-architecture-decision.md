@@ -1,7 +1,7 @@
 # ADR: Execution Budget, Rate Limits and Operation Ledger
 
 Date: 2026-07-18
-Status: implemented for triage ledger/status, triage continuation adapter, and disabled-by-default service-binding continuation
+Status: implemented for triage ledger/status, checkpointed triage continuation, and disabled-by-default durable alarm continuation
 
 ## Context
 
@@ -21,7 +21,7 @@ Official Cloudflare references used for this decision:
 | Option | Use | Decision | Reason |
 | --- | --- | --- | --- |
 | SQLite-backed Durable Object | Strongly consistent operation ledger, per-operation item state, owner checks, local testability | Selected | Provides a small durable authority for operation status without repurposing OAuth KV. Wrangler supports module `exports` for new DO classes. |
-| Cloudflare Workflows | Durable multi-step execution, sleep, retries | Deferred | Official Workflows support durable steps and sleep, but this project now uses a simpler service-binding fresh-invocation trigger for triage continuation. Workflows remain the preferred later mechanism for long rate-limit sleeps. |
+| Cloudflare Workflows | Durable multi-step execution, sleep, retries | Deferred | The installed project has no Workflow binding or local Workflow tooling. The compatible fallback is one Durable Object alarm per operation, which re-enters the existing internal continuation adapter. |
 | Queues | Fire-and-forget background continuation | Rejected for current phase | Good for buffering, but less direct for synchronous MCP-visible status and exact per-operation locking. |
 | KV only | Simple persisted operation blobs | Rejected | Eventual consistency is a poor fit for exact item locking and idempotency. `OAUTH_KV` must not be reused. |
 | D1/R2 | External ledger storage | Rejected for current phase | More operational surface than needed for a compact per-operation ledger. |
@@ -67,7 +67,7 @@ Implemented now:
 
 Not implemented yet:
 
-- Workflow or Durable Object alarm support for durable long Retry-After sleeps.
+- Whole-MCP durable scheduling beyond apply-triage; apply-triage uses a Durable Object alarm fallback for long Retry-After waits.
 - Whole-MCP continuation beyond apply-triage.
 - Resume/cancel MCP tools.
 - Full durable state machine enforcement across all write tools.
@@ -87,9 +87,9 @@ The current triage processor behavior is:
 7. Stop again before the next safe unit if budget is low.
 8. Return `ContinuationRequired` until the synchronous MCP call or explicit resume can observe completion.
 
-If long sleeps for rate limits are required, either a Durable Object alarm or Workflows step should be added. Official Durable Object alarms are at-least-once and retry automatically, so item leases and idempotency remain required. Workflows are better for durable sleep/retry orchestration; Durable Object storage remains the source of truth for item state and locking. Cloudflare Workflows step retries must not blindly retry non-idempotent SuperOps writes.
+Long Retry-After waits use the Durable Object alarm fallback because this repository has no Workflow binding or installed local Workflow tooling. The alarm stores only compact operation identity, is at-least-once, and re-enters the internal continuation endpoint; it never directly repeats a mutation. The resumed adapter reclaims the persisted item, re-reads the ticket, and validates identity, updated time, and the exact checkpoint stage. Workflows remain a possible future replacement, but Workflow retries must likewise never blindly repeat non-idempotent SuperOps writes.
 
-## Provisioning Notes
+## Retention and Cleanup\n\n`expiresAt` is derived from `SUPEROPS_OPERATION_RETENTION_SECONDS`. Terminal records are purged only after that retention deadline by both the in-memory fallback and Durable Object read/list paths. Non-terminal records are deliberately retained even when overdue: ambiguity and partial-write evidence must remain available to the checked continuation adapter rather than being deleted by cleanup.\n\n## Provisioning Notes
 
 `wrangler.json` declares:
 

@@ -17,6 +17,7 @@ import {
 export interface ContinuationItemContext {
   record: OperationLedgerRecord;
   claim: OperationItemClaim;
+  checkpoint(patch: OperationCompleteItemParams["patch"]): Promise<OperationLedgerRecord>;
 }
 
 export interface ContinuationItemOutcome {
@@ -144,7 +145,17 @@ export async function runOperationContinuation(
     try {
       const currentRecord = record;
       const outcome = await withExecutionItem(claim.itemKey, () =>
-        params.adapter.processItem({ record: currentRecord, claim })
+        params.adapter.processItem({
+          record: currentRecord,
+          claim,
+          checkpoint: (patch) => store.checkpointItem({
+            operationId: params.operationId,
+            ownerHash: params.ownerHash,
+            itemKey: claim.itemKey,
+            leaseId: claim.lease.leaseId,
+            patch,
+          }),
+        })
       );
       record = await store.completeItem({
         operationId: params.operationId,
@@ -206,25 +217,49 @@ export async function runOperationContinuation(
         error instanceof ExecutionBudgetExceededError ||
         error instanceof ExecutionTimeoutBudgetExceededError
       ) {
+        // The adapter may have durably crossed a mutation-start boundary before
+        // a later read or write consumed the last available subrequest. Read
+        // the current state rather than trusting the original claim: completing
+        // that item as an ordinary reschedule would both erase the checkpoint
+        // and permit a duplicate write on the next invocation.
+        const currentItem = (await store.get(params.operationId))?.itemStates[claim.itemKey];
+        const possibleWrite = currentItem?.writeAttempted === true ||
+          currentItem?.writeMayHaveSucceeded === true;
+        const noteWrite = currentItem?.stage === "NoteWriteStarted" ||
+          currentItem?.stage === "NoteWriteAmbiguous";
         record = await store.completeItem({
           operationId: params.operationId,
           ownerHash: params.ownerHash,
           itemKey: claim.itemKey,
           leaseId: claim.lease.leaseId,
           patch: {
-            stage: "Rescheduled",
-            outcome: error instanceof ExecutionBudgetExceededError
-              ? "CloudflareSubrequestBudgetReached"
-              : "CloudflareExecutionTimeout",
-            writeAttempted: false,
-            writeMayHaveSucceeded: false,
-            partialWrite: false,
+            stage: possibleWrite
+              ? noteWrite ? "NoteWriteAmbiguous" : "WriteAmbiguous"
+              : "Rescheduled",
+            outcome: possibleWrite
+              ? "AmbiguousWriteRequiresVerification"
+              : error instanceof ExecutionBudgetExceededError
+                ? "CloudflareSubrequestBudgetReached"
+                : "CloudflareExecutionTimeout",
+            writeAttempted: possibleWrite || currentItem?.writeAttempted === true,
+            writeMayHaveSucceeded: possibleWrite || currentItem?.writeMayHaveSucceeded === true,
+            partialWrite: possibleWrite || currentItem?.partialWrite === true,
             verificationState: "Pending",
             errorClass: error instanceof ExecutionBudgetExceededError
               ? "CloudflareSubrequestBudget"
               : "CloudflareExecutionTimeout",
-            failureReason: error.message,
+            failureReason: possibleWrite
+              ? `Execution stopped after a mutation-start checkpoint: ${error.message}`
+              : error.message,
           },
+          result: possibleWrite
+            ? {
+                itemKey: claim.itemKey,
+                finalOutcome: "AmbiguousWriteRequiresVerification",
+                writeAttempted: true,
+                partialWrite: true,
+              }
+            : undefined,
         });
         record = await store.scheduleContinuation({
           operationId: params.operationId,

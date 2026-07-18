@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ExecutionBudgetExceededError,
   getExecutionState,
   recordSubrequestFinish,
   recordTypedSubrequestStart,
@@ -285,5 +286,75 @@ describe("durable continuation runner", () => {
     });
 
     expect(writeAttempts).toBe(1);
+  });
+
+  it("preserves a write-start checkpoint when the execution budget stops the item", async () => {
+    const ownerHash = stableHash("owner@example.com");
+    let resumedItems = 0;
+    const checkpointThenStop: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      estimateItemSubrequests: () => 1,
+      async processItem({ checkpoint }) {
+        await checkpoint({
+          stage: "WriteStarted",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          partialWrite: false,
+          verificationState: "Pending",
+        });
+        const state = getExecutionState();
+        if (!state) throw new Error("missing execution state");
+        throw new ExecutionBudgetExceededError(state, 1);
+      },
+    };
+    const reconcileOnly: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      estimateItemSubrequests: () => 1,
+      async processItem({ claim }) {
+        resumedItems += 1;
+        expect(claim.item.stage).toBe("WriteAmbiguous");
+        expect(claim.item.writeMayHaveSucceeded).toBe(true);
+        return {
+          stage: "CompletedAfterAmbiguousWriteVerification",
+          outcome: "CompletedAfterAmbiguousWriteVerification",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          partialWrite: false,
+          verified: true,
+        };
+      },
+    };
+
+    await runWithOperationStore({}, async () => {
+      await getOperationStore().put(ledgerRecord({
+        operationId: "op-checkpoint-budget", ownerHash, itemKeys: ["ticket-checkpoint"],
+      }));
+      await runWithExecutionConfig({}, async () => {
+        await runWithExecutionContext("test_batch_tool", async () => {
+          await runOperationContinuation({
+            operationId: "op-checkpoint-budget", ownerHash, adapter: checkpointThenStop,
+            leaseOwner: "first-invocation",
+          });
+        });
+      });
+      await expect(getOperationStore().get("op-checkpoint-budget")).resolves.toMatchObject({
+        itemStates: {
+          "ticket-checkpoint": {
+            stage: "WriteAmbiguous", writeAttempted: true,
+            writeMayHaveSucceeded: true, partialWrite: true,
+          },
+        },
+      });
+      await runWithExecutionConfig({}, async () => {
+        await runWithExecutionContext("test_batch_tool", async () => {
+          await runOperationContinuation({
+            operationId: "op-checkpoint-budget", ownerHash, adapter: reconcileOnly,
+            leaseOwner: "reconciliation-invocation",
+          });
+        });
+      });
+    });
+
+    expect(resumedItems).toBe(1);
   });
 });

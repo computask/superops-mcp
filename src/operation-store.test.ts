@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   getOperationStore,
   operationResultView,
+  operationTotals,
   runWithOperationStore,
   stableHash,
   SuperOpsOperationLedger,
@@ -90,6 +91,32 @@ describe("operation store", () => {
     });
     expect(JSON.stringify(view)).not.toContain("originalRequestHash");
     expect(JSON.stringify(view)).not.toContain("idempotencyKey");
+  });
+
+  it("derives public category totals from item states rather than a caller summary", () => {
+    const totals = operationTotals(record({
+      summary: { updated: 9999 },
+      itemStates: {
+        "57400": {
+          ...record().itemStates["57400"],
+          stage: "CompletedAfterAmbiguousWriteVerification",
+          outcome: "Updated",
+        },
+        "57401": {
+          ...record().itemStates["57401"],
+          stage: "RateLimitedRescheduled",
+          outcome: "SuperOpsRateLimitRescheduled",
+        },
+      },
+    }));
+
+    expect(totals).toMatchObject({
+      expected: 2,
+      updated: 1,
+      completedAfterAmbiguousVerification: 1,
+      waitingForRateLimit: 1,
+      pending: 1,
+    });
   });
 
   it("serves operation records through the Durable Object fetch API", async () => {
@@ -216,6 +243,36 @@ describe("operation store", () => {
     });
   });
 
+  it("keeps a mutation checkpoint leased and recoverable after a crash boundary", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const ownerHash = stableHash("owner@example.com");
+      await store.put(record({ operationId: "op-checkpoint" }));
+      const claim = await store.claimNextItem({
+        operationId: "op-checkpoint", ownerHash, leaseOwner: "worker", leaseMs: 1,
+        now: "2026-07-18T00:00:00.000Z",
+      });
+      if (!claim) throw new Error("expected claim");
+      const checkpointed = await store.checkpointItem({
+        operationId: "op-checkpoint", ownerHash, itemKey: "57401", leaseId: claim.lease.leaseId,
+        patch: {
+          stage: "WriteStarted", writeAttempted: true, writeMayHaveSucceeded: true,
+          verificationState: "Pending", attemptCount: 1,
+        },
+      });
+      expect(checkpointed.itemStates["57401"]).toMatchObject({
+        stage: "WriteStarted", writeAttempted: true, writeMayHaveSucceeded: true,
+        lease: { leaseId: claim.lease.leaseId },
+      });
+      const recovered = await store.claimNextItem({
+        operationId: "op-checkpoint", ownerHash, leaseOwner: "recovery", leaseMs: 60_000,
+        now: "2026-07-18T00:00:02.000Z",
+      });
+      expect(recovered?.item).toMatchObject({
+        stage: "WriteStarted", writeAttempted: true, writeMayHaveSucceeded: true,
+      });
+    });
+  });
   it("preserves an ambiguous write stage across an expired lease recovery", async () => {
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();
@@ -351,4 +408,200 @@ describe("operation store", () => {
       completedItems: ["57400", "57401"],
     });
   });
-});
+
+  it("schedules one durable alarm per operation and keeps duplicate scheduling idempotent", async () => {
+    const values = new Map<string, unknown>();
+    const alarms: number[] = [];
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+        setAlarm: async (time: number | Date) => { alarms.push(Number(time)); },
+      },
+    }, {
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+    });
+    await durableObject.fetch(new Request("https://operation.local/operations/op-alarm", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record({ operationId: "op-alarm" })),
+    }));
+    const schedule = () => durableObject.fetch(new Request("https://operation.local/operations/op-alarm/schedule-continuation", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        operationId: "op-alarm", ownerHash: stableHash("owner@example.com"),
+        reason: "RateLimitedRescheduled", nextEligibleTime: "2026-07-18T00:05:00.000Z",
+      }),
+    }));
+    const first = await schedule();
+    const second = await schedule();
+    await expect(first.json()).resolves.toMatchObject({
+      continuationMechanism: "durableObjectAlarm", schedulingSucceeded: true, continuationCount: 2,
+    });
+    await expect(second.json()).resolves.toMatchObject({ continuationCount: 2 });
+    expect(alarms).toEqual([Date.parse("2026-07-18T00:05:00.000Z")]);
+  });
+
+  it("removes expired terminal records from the durable ledger without deleting active work", async () => {
+    const values = new Map<string, unknown>();
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+      },
+    });
+    values.set("op:op-durable-expired", record({
+      operationId: "op-durable-expired",
+      state: "Completed",
+      expiresAt: "2000-01-01T00:00:00.000Z",
+      expectedItems: ["57400"],
+      itemStates: { "57400": record().itemStates["57400"] },
+    }));
+    values.set("op:op-durable-active", record({
+      operationId: "op-durable-active",
+      expiresAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    const expired = await durableObject.fetch(new Request("https://operation.local/operations/op-durable-expired"));
+    expect(expired.status).toBe(404);
+    expect(values.has("op:op-durable-expired")).toBe(false);
+
+    const active = await durableObject.fetch(new Request("https://operation.local/operations/op-durable-active"));
+    expect(active.status).toBe(200);
+    expect(values.has("op:op-durable-active")).toBe(true);
+  });
+  it("records a durable scheduling failure without claiming delivery", async () => {
+    const values = new Map<string, unknown>();
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+        setAlarm: async () => { throw new Error("alarm unavailable"); },
+      },
+    }, {
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+    });
+    await durableObject.fetch(new Request("https://operation.local/operations/op-alarm-failure", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record({ operationId: "op-alarm-failure" })),
+    }));
+    const response = await durableObject.fetch(new Request("https://operation.local/operations/op-alarm-failure/schedule-continuation", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        operationId: "op-alarm-failure", ownerHash: stableHash("owner@example.com"),
+        reason: "RateLimitedRescheduled", nextEligibleTime: "2026-07-18T00:05:00.000Z",
+      }),
+    }));
+    await expect(response.json()).resolves.toMatchObject({
+      state: "Rescheduled",
+      schedulingAttempted: true,
+      schedulingSucceeded: false,
+      schedulingError: "alarm unavailable",
+    });
+  });
+
+  it("wakes a due durable continuation with compact identity only", async () => {
+    const values = new Map<string, unknown>();
+    const requests: Request[] = [];
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+        setAlarm: async () => undefined,
+      },
+    }, {
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "test-token",
+      SUPEROPS_CONTINUATION_SERVICE: {
+        fetch: async (request: Request) => { requests.push(request); return new Response(null, { status: 204 }); },
+      },
+    });
+    values.set("op:op-wake", {
+      ...record({ operationId: "op-wake", nextEligibleTime: "2020-01-01T00:00:00.000Z" }),
+      continuationMechanism: "durableObjectAlarm",
+      schedulingAttempted: true,
+      schedulingSucceeded: true,
+    });
+    await durableObject.alarm();
+    expect(requests).toHaveLength(1);
+    expect(await requests[0].json()).toEqual({
+      toolName: "superops_tickets_apply_triage_plan", operationId: "op-wake",
+      ownerHash: stableHash("owner@example.com"),
+    });
+    expect(requests[0].headers.get("X-SuperOps-Internal-Continuation")).toBe("test-token");
+    expect(values.get("op:op-wake")).toMatchObject({ schedulingSucceeded: false });
+  });
+
+  it("retains active operations but removes terminal records only after retention expires", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      await store.put(record({
+        operationId: "op-expired-terminal",
+        state: "Completed",
+        expiresAt: "2000-01-01T00:00:00.000Z",
+        expectedItems: ["57400"],
+        itemStates: { "57400": record().itemStates["57400"] },
+      }));
+      await store.put(record({
+        operationId: "op-expired-active",
+        expiresAt: "2000-01-01T00:00:00.000Z",
+      }));
+
+      await expect(store.get("op-expired-terminal")).resolves.toBeUndefined();
+      await expect(store.get("op-expired-active")).resolves.toMatchObject({
+        operationId: "op-expired-active",
+        state: "ContinuationRequired",
+      });
+      await expect(store.list(stableHash("owner@example.com"))).resolves.toEqual(
+        expect.arrayContaining([expect.objectContaining({ operationId: "op-expired-active" })])
+      );
+    });
+  });
+  it("marks terminal stale and partial-write outcomes as completed with failures", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const staleItem = {
+        ...record().itemStates["57401"],
+        stage: "Stale" as const,
+        outcome: "SkippedChangedSinceSnapshot",
+      };
+      await store.put(record({
+        itemStates: { "57400": record().itemStates["57400"], "57401": staleItem },
+      }));
+      await expect(store.get("op-1")).resolves.toMatchObject({
+        state: "CompletedWithFailures",
+        staleItems: ["57401"],
+      });
+    });
+  });
+
+  it("stops an overdue non-terminal operation without discarding possible-write evidence", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const ownerHash = stableHash("owner@example.com");
+      const initial = record({ operationId: "op-lifetime", maxOperationLifetimeAt: "2026-07-18T00:00:01.000Z" });
+      initial.itemStates["57401"] = {
+        ...initial.itemStates["57401"], stage: "WriteStarted", writeAttempted: true,
+        writeMayHaveSucceeded: true, verificationState: "Pending",
+      };
+      await store.put(initial);
+      await expect(store.claimNextItem({
+        operationId: "op-lifetime", ownerHash, leaseOwner: "late-worker", leaseMs: 60_000,
+        now: "2026-07-18T00:00:02.000Z",
+      })).resolves.toBeUndefined();
+      await expect(store.get("op-lifetime")).resolves.toMatchObject({
+        state: "CompletedWithFailures", terminalFailureReason: "Operation maximum lifetime exceeded.",
+        itemStates: { "57401": { stage: "AmbiguousWriteUnresolved", writeMayHaveSucceeded: true, partialWrite: true } },
+      });
+    });
+  });});

@@ -5,7 +5,28 @@
  */
 
 import { getClient } from "../client.js";
+import { sanitizeError } from "../audit.js";
 import type { DomainTools } from "../types.js";
+
+/** Opaque custom mutations cannot safely derive a verification target. */
+function customMutationFailure(error: unknown): Record<string, unknown> {
+  const candidate = error as { name?: unknown; status?: unknown } | null;
+  const name = typeof candidate?.name === "string" ? candidate.name : "";
+  const status = typeof candidate?.status === "number" ? candidate.status : undefined;
+  const conclusivelyRejected = name === "SuperOpsError" ||
+    (name === "SuperOpsHttpError" && status !== undefined && status < 500);
+
+  return {
+    errorClass: conclusivelyRejected ? "SuperOpsGraphQLError" : "AmbiguousWrite",
+    writeAttempted: true,
+    writeMayHaveSucceeded: !conclusivelyRejected,
+    partialWrite: !conclusivelyRejected,
+    retryable: false,
+    retrySafe: false,
+    finalOutcome: conclusivelyRejected ? "WriteRejected" : "AmbiguousWriteUnresolved",
+    message: sanitizeError(error),
+  };
+}
 
 export function getCustomTools(): DomainTools {
   return {
@@ -79,16 +100,17 @@ export function getCustomTools(): DomainTools {
               variables?: Record<string, unknown>;
             };
 
-            const response = await client.mutate(params.mutation, params.variables);
-
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify(response, null, 2),
-                },
-              ],
-            };
+            try {
+              const response = await client.mutate(params.mutation, params.variables);
+              return {
+                content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+              };
+            } catch (error) {
+              return {
+                content: [{ type: "text", text: JSON.stringify(customMutationFailure(error)) }],
+                isError: true,
+              };
+            }
           }
 
           default:
@@ -98,7 +120,7 @@ export function getCustomTools(): DomainTools {
             };
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = sanitizeError(error);
         return {
           content: [{ type: "text", text: `Error: ${message}` }],
           isError: true,

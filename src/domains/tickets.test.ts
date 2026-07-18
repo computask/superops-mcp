@@ -2408,6 +2408,42 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it("does not treat an identically worded public note as a private-note dedupe match", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" },
+      })
+      .mockResolvedValueOnce({
+        getTicketNoteList: [{
+          noteId: "public-copy", content: "Approved private note", privacyType: "PUBLIC",
+        }],
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" },
+      });
+    mockClient.mutate.mockResolvedValueOnce({
+      createTicketNote: { noteId: "private-copy", privacyType: "PRIVATE" },
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400", contentVerified: true, action: "addNote", note: "Approved private note",
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({ finalOutcome: "Updated", noteAdded: true, noteDeduped: false });
+    expect(mockClient.mutate).toHaveBeenCalledWith(expect.stringContaining("createTicketNote"), {
+      input: { ticket: { ticketId: "ticket-57400" }, content: "Approved private note", privacyType: "PRIVATE" },
+    });
+  });
   it("uses controlled update fallback for approved resolve internal server errors", async () => {
     mockClient.query
       .mockResolvedValueOnce({
@@ -3122,6 +3158,48 @@ describe("Tickets Domain", () => {
     const finalRecord = await getOperationStore().get(operationId);
     expect(finalRecord?.itemStates["57401"]).toMatchObject({
       stage: "CompletedAfterAmbiguousWriteVerification", outcome: "Resolved",
+      writeAttempted: true, verificationState: "Verified",
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("does not repeat an ambiguous private note when its canonical content is observed", async () => {
+    const domain = getTicketsTools();
+    const initial = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () => domain.handleCall("superops_tickets_apply_triage_plan", {
+        expectedCandidateTicketNumbers: ["57400", "57401"],
+        actions: [{ ticketNumber: "57401", contentVerified: true, action: "addNote", note: "Approved private note" }],
+      })
+    );
+    const operationId = JSON.parse(initial.content[0].text).operation.operationId;
+    const stored = await getOperationStore().get(operationId);
+    if (!stored) throw new Error("missing operation");
+    stored.itemStates["57401"] = {
+      ...stored.itemStates["57401"], stage: "NoteWriteStarted",
+      writeAttempted: true, writeMayHaveSucceeded: true, partialWrite: true,
+    };
+    await getOperationStore().put(stored);
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "Awaiting Engineer",
+          updatedTime: "2026-07-18T10:01:00Z" },
+      })
+      .mockResolvedValueOnce({
+        getTicketNoteList: [{ noteId: "note-1", content: "Approved private note", privacyType: "PRIVATE" }],
+      });
+    await runWithExecutionConfig({}, async () => {
+      await runWithExecutionContext("superops_tickets_apply_triage_plan", async () =>
+        resumeApplyTriageOperation({ operationId, ownerHash: stored.ownerHash, leaseOwner: "test-note-ambiguous" })
+      );
+    });
+    const finalRecord = await getOperationStore().get(operationId);
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "CompletedAfterAmbiguousWriteVerification", outcome: "Updated",
       writeAttempted: true, verificationState: "Verified",
     });
     expect(mockClient.mutate).not.toHaveBeenCalled();

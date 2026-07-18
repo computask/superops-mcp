@@ -83,10 +83,10 @@ mechanism rather than committing it to this file.
 - Health endpoint: `https://<your-mcp-host>/health`
 - Required non-secret vars: `AUTH_MODE=env`, `SUPEROPS_SUBDOMAIN=computaskltd`, `SUPEROPS_REGION=us`, `LOG_LEVEL=warn`
 - Optional non-secret safety vars: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=true`, `ENABLE_CUSTOM_MUTATION=true`
-- Execution-budget vars: `SUPEROPS_EXECUTION_SUBREQUEST_BUDGET`, `SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN`, `SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH`, `SUPEROPS_EXECUTION_MAX_PAGINATION_DEPTH`, `SUPEROPS_EXECUTION_MAX_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_WRITE_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_RETRY_DURATION_MS`, `SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS`, `SUPEROPS_EXECUTION_BACKOFF_BASE_DELAY_MS`, `SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO`, `SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS`, `SUPEROPS_EXECUTION_MAX_DURATION_MS`, `SUPEROPS_OPERATION_RETENTION_SECONDS`
+- Execution-budget vars: `SUPEROPS_EXECUTION_SUBREQUEST_BUDGET`, `SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN`, `SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH`, `SUPEROPS_EXECUTION_MAX_PAGINATION_DEPTH`, `SUPEROPS_EXECUTION_MAX_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_WRITE_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_RETRY_DURATION_MS`, `SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS`, `SUPEROPS_EXECUTION_BACKOFF_BASE_DELAY_MS`, `SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO`, `SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS`, `SUPEROPS_EXECUTION_MAX_DURATION_MS`, `SUPEROPS_OPERATION_RETENTION_SECONDS`, `SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS`
 - Required secrets: the SuperOps API token Worker secret, plus any OAuth/session secrets required by the deployed auth provider
 - Never commit: API token values, OAuth access/refresh tokens, bearer tokens, Cloudflare service token values, client secrets, private keys, or full request headers
-- Durable operation status uses the `SUPEROPS_OPERATION_LEDGER` Durable Object binding declared in `wrangler.json`. Do not reuse `OAUTH_KV` for operation state.
+- Durable operation status uses the `SUPEROPS_OPERATION_LEDGER` Durable Object binding declared in `wrangler.json`. Delayed rate-limit wake-ups remain disabled unless both `SUPEROPS_CONTINUATION_ENABLED=true` and `SUPEROPS_DURABLE_RETRY_ENABLED=true`; they also require the existing internal service binding and `SUPEROPS_INTERNAL_CONTINUATION_TOKEN` secret. Do not reuse `OAUTH_KV` for operation state.
 
 Safe local validation:
 
@@ -436,8 +436,7 @@ adapter is implemented for pending apply-plan items and uses the same validation
 stale-data, note-deduplication, mutation and verification helpers as the synchronous
 path. Automatic fresh-invocation scheduling is disabled by default and requires
 `SUPEROPS_CONTINUATION_ENABLED=true`, `SUPEROPS_CONTINUATION_SERVICE`, and the
-`SUPEROPS_INTERNAL_CONTINUATION_TOKEN` secret. Use `superops_operations_get` to
-inspect the stored compact result. The audit record is high-risk write metadata only: batch ID,
+`SUPEROPS_INTERNAL_CONTINUATION_TOKEN` secret. Long Retry-After wake-ups additionally require `SUPEROPS_DURABLE_RETRY_ENABLED=true`: the operation ledger retains the exact item stage and schedules a Durable Object alarm with compact operation identity only. Alarm delivery is at-least-once, so the resumed adapter must reclaim the item, re-read it, and revalidate identity/updated time before acting. Mutation-capable stages persist `WriteStarted`/`WriteAmbiguous` or `NoteWriteStarted`/`NoteWriteAmbiguous` before and after uncertain writes; a lost response is verified rather than blindly retried. Use `superops_operations_get` to inspect the stored compact result. The audit record is high-risk write metadata only: batch ID,
 candidate count, ticket numbers, action types, dry-run/verify flags, and fallback
 allowance. It does not audit raw ticket content or full note bodies.
 Example safe retrieval call:
