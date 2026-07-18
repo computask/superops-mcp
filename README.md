@@ -122,6 +122,8 @@ GraphQL bodies and variable values are not logged by default.
 
 See [docs/execution-audit.md](docs/execution-audit.md) for the outbound-call inventory, risk assessment, root-cause analysis, and execution-limit migration plan.
 
+See [docs/continuation-operations.md](docs/continuation-operations.md) for the continuation checkpoint model, feature-flag defaults, external validation, staging rollout, production enablement, and rollback safeguards.
+
 Audit logs are structured JSON records emitted for MCP tool calls. They include
 timestamp, request/correlation ID, tool name, user identity when available from
 the auth layer, tool category, high-risk marker, success/failure, duration, and

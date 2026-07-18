@@ -30,7 +30,7 @@ Waiting inside the same Worker invocation would not reset the Cloudflare invocat
 | Durable operation state | Yes for triage | Partial for whole-MCP write integration |  | `src/operation-store.ts`, `wrangler.json`, triage persistence | `src/operation-store.test.ts`, `src/continuation.test.ts`, `src/domains/tickets.test.ts`, worker status test | Apply-triage persists approved action snapshots; other write tools still use immediate contracts | Integrate one write tool at a time with a verified adapter |
 | Fresh-invocation continuation | Yes for apply-triage when enabled |  |  | `src/continuation.ts`, `src/continuation-scheduler.ts`, `src/operation-store.ts`, `src/worker.ts` | continuation, operation-store, and triage tests | Durable Object alarm delivery is at-least-once; state/claim adapter remains authoritative | Keep both continuation flags disabled until staging evidence exists |
 | Operation status tools | Yes |  |  | `superops_operations_get`, `superops_operations_results` | `src/worker.test.ts` | Read-only only; no resume/cancel | Add resume only when item processor is safe |
-| Load/fault harness | Yes | Partial for durable-wake fault mix |  | `src/continuation.test.ts`, `src/domains/tickets.test.ts`, `src/operation-store.test.ts` | Generic 250-item operation, real apply-triage mocked harness, and durable alarm tests | No live SuperOps calls | Extend the harness before enabling production continuation |
+| Load/fault harness |  | Yes - deterministic basic 250-item accounting and real-adapter update mix only | mixed update/resolution/note and every required injected fault are not yet one evidence-producing harness | `src/continuation.test.ts`, `src/domains/tickets.test.ts`, `src/operation-store.test.ts` | Generic 250-item operation, real apply-triage mocked update harness, durable alarm tests | No live SuperOps calls | Complete the mixed-fault harness before enabling production continuation |
 
 ## Outbound Call Inventory
 
@@ -116,6 +116,22 @@ Reads use bounded retry attempts. Writes do not retry by default, even if `SUPER
 - Direct one-off mutations cannot be fully idempotent without either SuperOps idempotency support or per-tool verification wrappers.
 - Custom GraphQL tools remain intentionally broad. They are budgeted and instrumented at the client layer but cannot be statically call-counted from schema alone. An opaque custom mutation is intentionally non-resumable: a possible-write error is returned as `AmbiguousWriteUnresolved`, never automatically retried, because the tool cannot safely derive a canonical verification target.
 - The hundreds-item load/fault harness is implemented as fast Vitest simulations in `src/continuation.test.ts` and `src/domains/tickets.test.ts`; they do not call live SuperOps.
+
+## Audit Conclusions and Remaining Local Work
+
+The central client is the sole SuperOps GraphQL transport and records every standard read/write request. Its deterministic coverage includes HTTP 429 with Retry-After seconds and HTTP dates, structured GraphQL throttling, a false-positive GraphQL validation message, retry accounting, and restraint on write retries. The current test suite does **not** yet demonstrate every required fault classification (reset-header variants, 5xx/network/timeout exhaustion and all long-wait cap boundaries) in a single deterministic regression matrix.
+
+The mutation inventory above is complete. The safety implementation is intentionally tiered:
+
+- Apply-triage is the only multi-item durable mutation workflow. It owns mutation-start checkpoints, stale checks, ambiguity reads, private-note fingerprint recovery, long-wait scheduling, and owner-scoped status.
+- Alert and direct ticket writes are centrally budgeted and never blindly retried. They remain synchronous; where a final-state verification exists, they return that result, but they do not have a per-write durable checkpoint/continuation adapter.
+- Opaque custom mutations are explicitly non-resumable. A transport-style possible write is returned as `AmbiguousWriteUnresolved`; a reliable rejection is `WriteRejected`.
+
+Therefore whole-MCP durable recovery is **not** complete. Before representing it as such, implement and test canonical verification/checkpoint adapters for each remaining direct mutation or deliberately narrow/disable the corresponding tools in the deployment policy. The mixed-fault 250-item harness and the extended deterministic rate-limit matrix are also still required acceptance evidence.
+
+## Read-only Audit
+
+The inventory's read-only tools are bounded as follows: single-page list tools cap caller page size; ticket reporting uses sequential capped pagination with local post-filtering and explicit truncation/completeness metadata; alert ID fallback has a fixed page limit; recent/triage safe-content enrichment is capped; and all standard reads use central bounded retry accounting. Read-only custom GraphQL remains caller-defined and cannot be statically guaranteed to paginate or cap its response; treat it as an advanced operator tool rather than a safe reporting primitive. No standard report retrieves ticket descriptions, conversation bodies, note bodies, or attachment bodies unless an explicitly requested safe-retrieval tool does so under its caps.
 
 ## Deployment Boundary
 
