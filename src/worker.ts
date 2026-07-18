@@ -39,6 +39,9 @@ import {
   runtimeFlagsFromEnv,
   toolAuditMetadata,
 } from "./audit.js";
+import { runWithExecutionConfig } from "./execution.js";
+import { runWithOperationStore, SuperOpsOperationLedger } from "./operation-store.js";
+export { SuperOpsOperationLedger };
 
 export interface Env {
   SUPEROPS_API_TOKEN?: string;
@@ -51,6 +54,7 @@ export interface Env {
   ENABLE_CUSTOM_MUTATION?: string;
   OAUTH_KV?: unknown;
   OAUTH_PROVIDER?: unknown;
+  SUPEROPS_OPERATION_LEDGER?: unknown;
   CHATGPT_MCP_HOST?: string;
   CHATGPT_MCP_RESOURCE?: string;
   CHATGPT_OAUTH_SCOPES?: string;
@@ -58,6 +62,20 @@ export interface Env {
   CHATGPT_AUTH_ACCESS_ISSUER?: string;
   CHATGPT_AUTH_ACCESS_AUD?: string;
   CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS?: string;
+  SUPEROPS_EXECUTION_SUBREQUEST_BUDGET?: string;
+  SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN?: string;
+  SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH?: string;
+  SUPEROPS_EXECUTION_MAX_PAGINATION_DEPTH?: string;
+  SUPEROPS_EXECUTION_MAX_RETRY_ATTEMPTS?: string;
+  SUPEROPS_EXECUTION_MAX_RETRY_DURATION_MS?: string;
+  SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS?: string;
+  SUPEROPS_EXECUTION_BACKOFF_BASE_DELAY_MS?: string;
+  SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO?: string;
+  SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS?: string;
+  SUPEROPS_EXECUTION_MAX_DURATION_MS?: string;
+  SUPEROPS_EXECUTION_VERIFICATION_MODE?: string;
+  SUPEROPS_OPERATION_RETENTION_SECONDS?: string;
+  SUPEROPS_EXECUTION_CONCURRENCY?: string;
 }
 
 type WorkerExecutionContext = {
@@ -542,11 +560,16 @@ async function handleBaseWorkerFetch(
     return handleMcp(request);
     };
 
+    const runConfiguredMcpRequest = () =>
+      runWithOperationStore(env, () =>
+        runWithExecutionConfig(env, runMcpRequest)
+      );
+
     if (auditContextApplied) {
-      return runMcpRequest();
+      return runConfiguredMcpRequest();
     }
 
-    return runWithWorkerAuditContext(request, env, props, runMcpRequest);
+    return runWithWorkerAuditContext(request, env, props, runConfiguredMcpRequest);
   }
 
   return json({ error: "Not found", endpoints: ["/mcp", "/health"] }, 404);

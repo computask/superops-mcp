@@ -6,6 +6,14 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { SuperOpsCredentials, GraphQLResponse } from "./types.js";
+import {
+  classifyGraphQLRequest,
+  getExecutionConfig,
+  hasExecutionBudgetFor,
+  recordRetryDelay,
+  recordSubrequestFinish,
+  recordSubrequestStart,
+} from "./execution.js";
 
 const API_ENDPOINTS = {
   us: "https://api.superops.ai/msp",
@@ -41,26 +49,88 @@ export class SuperOpsClient {
     query: string,
     variables?: Record<string, unknown>
   ): Promise<T> {
-    const response = await fetch(this.endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiToken}`,
-        CustomerSubDomain: this.subdomain,
-      },
-      body: JSON.stringify({ query, variables }),
-    });
+    const operation = classifyGraphQLRequest(query);
+    const isWrite = operation.operationType === "mutation";
+    const config = getExecutionConfig();
+    const maxAttempts = isWrite
+      ? config.maxWriteRetryAttempts
+      : config.maxReadRetryAttempts;
+    const startedMs = Date.now();
+    let attempt = 0;
+    let lastError: unknown;
+
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      try {
+        return await this.requestOnce<T>(query, variables, attempt - 1);
+      } catch (error) {
+        lastError = error;
+        const retryable = shouldRetrySuperOpsRequest(error, isWrite);
+        if (!retryable || attempt >= maxAttempts) {
+          throw error;
+        }
+
+        const delayMs = retryDelayMs(error, attempt, config);
+        const elapsedAfterDelay = Date.now() - startedMs + delayMs;
+        if (
+          elapsedAfterDelay > config.maxRetryDurationMs ||
+          !hasExecutionBudgetFor(1) ||
+          elapsedAfterDelay + config.safeRemainingTimeMs >= config.maxDurationMs
+        ) {
+          throw error;
+        }
+
+        recordRetryDelay(delayMs);
+        await delay(delayMs);
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private async requestOnce<T = unknown>(
+    query: string,
+    variables: Record<string, unknown> | undefined,
+    retryCount: number
+  ): Promise<T> {
+    const subrequest = recordSubrequestStart(query, retryCount);
+    let response: Response;
+    try {
+      response = await fetch(this.endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.apiToken}`,
+          CustomerSubDomain: this.subdomain,
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    } catch (error) {
+      recordSubrequestFinish(subrequest, "networkError", false);
+      throw new SuperOpsNetworkError(
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+
+    recordSubrequestFinish(subrequest, response.status, response.ok);
 
     if (!response.ok) {
       throw new SuperOpsHttpError(
         `HTTP error: ${response.status} ${response.statusText}`,
         response.status,
         response.statusText,
-        parseRetryAfter(response.headers.get("Retry-After"))
+        retryAfterFromHeaders(response.headers)
       );
     }
 
-    const result = (await response.json()) as GraphQLResponse<T>;
+    let result: GraphQLResponse<T>;
+    try {
+      result = (await response.json()) as GraphQLResponse<T>;
+    } catch (error) {
+      throw new SuperOpsMalformedResponseError(
+        error instanceof Error ? error.message : String(error)
+      );
+    }
 
 	if (result.errors && result.errors.length > 0) {
 	  const error = result.errors[0];
@@ -86,7 +156,7 @@ export class SuperOpsClient {
 	}
 
     if (!result.data) {
-      throw new Error("No data returned from GraphQL query");
+      throw new SuperOpsMalformedResponseError("No data returned from GraphQL query");
     }
 
     return result.data;
@@ -129,6 +199,112 @@ export class SuperOpsHttpError extends Error {
     this.statusText = statusText;
     this.retryAfter = retryAfter;
   }
+}
+
+export class SuperOpsNetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SuperOpsNetworkError";
+  }
+}
+
+export class SuperOpsMalformedResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SuperOpsMalformedResponseError";
+  }
+}
+
+function retryAfterFromHeaders(headers: Headers): number | undefined {
+  return (
+    parseRetryAfter(headers.get("Retry-After")) ??
+    parseRateLimitReset(headers.get("X-RateLimit-Reset")) ??
+    parseRateLimitReset(headers.get("RateLimit-Reset")) ??
+    parseRateLimitReset(headers.get("X-Rate-Limit-Reset"))
+  );
+}
+
+function parseRateLimitReset(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+
+  const now = Date.now();
+  if (parsed > 1_000_000_000_000) {
+    return Math.max(0, Math.ceil((parsed - now) / 1000));
+  }
+  if (parsed > 1_000_000_000) {
+    return Math.max(0, Math.ceil(parsed - now / 1000));
+  }
+  return parsed;
+}
+
+function shouldRetrySuperOpsRequest(error: unknown, isWrite: boolean): boolean {
+  if (isWrite) return false;
+  if (error instanceof SuperOpsHttpError) {
+    return error.status === 429 || (error.status >= 500 && error.status < 600);
+  }
+  if (error instanceof SuperOpsError) {
+    return isGraphQLRateLimit(error) || isRetryableGraphQLServerError(error);
+  }
+  return error instanceof SuperOpsNetworkError;
+}
+
+function isGraphQLRateLimit(error: SuperOpsError): boolean {
+  const code = (error.code ?? "").toLowerCase();
+  const message = error.message.toLowerCase();
+  if (/\bnot\s+(a\s+)?rate[-\s]?limit(?:ed|ing)?\b/.test(message)) {
+    return false;
+  }
+  return (
+    code.includes("rate") ||
+    code.includes("thrott") ||
+    code === "too_many_requests" ||
+    /\b(rate[-\s]?limit(?:ed|ing)?|too many requests|throttl(?:e|ed|ing))\b/i.test(
+      error.message
+    )
+  );
+}
+
+function isRetryableGraphQLServerError(error: SuperOpsError): boolean {
+  const code = (error.code ?? "").toLowerCase();
+  const message = error.message.toLowerCase();
+  return (
+    code.includes("timeout") ||
+    code.includes("temporar") ||
+    code.includes("internal") ||
+    message.includes("temporarily unavailable") ||
+    message.includes("service unavailable")
+  );
+}
+
+function retryDelayMs(
+  error: unknown,
+  attempt: number,
+  config: ReturnType<typeof getExecutionConfig>
+): number {
+  const retryAfterSeconds =
+    error instanceof SuperOpsHttpError || error instanceof SuperOpsError
+      ? error.retryAfter
+      : undefined;
+  if (typeof retryAfterSeconds === "number") {
+    return Math.min(
+      config.maxSingleDelayMs,
+      Math.max(0, Math.ceil(retryAfterSeconds * 1000))
+    );
+  }
+
+  const base = config.backoffBaseDelayMs * 2 ** Math.max(0, attempt - 1);
+  const jitter =
+    config.backoffJitterRatio <= 0
+      ? 0
+      : base * config.backoffJitterRatio * Math.random();
+  return Math.min(config.maxSingleDelayMs, Math.ceil(base + jitter));
+}
+
+function delay(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseRetryAfter(value: string | null): number | undefined {

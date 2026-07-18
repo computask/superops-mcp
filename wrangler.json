@@ -1,34 +1,62 @@
 {
-	"name": "superops-mcp",
-	"main": "src/worker.ts",
-	"compatibility_date": "2026-02-01",
-	"compatibility_flags": [
-		"nodejs_compat",
-		"global_fetch_strictly_public"
-	],
-	"workers_dev": false,
-	"preview_urls": false,
-	"keep_vars": true,
-	"kv_namespaces": [
-		{
-			"binding": "OAUTH_KV",
-			"id": "39ba0813eacf4c64a3408d65239d0c5d"
-		}
-	],
-	"vars": {
-		"AUTH_MODE": "env",
-		"SUPEROPS_SUBDOMAIN": "computaskltd",
-		"SUPEROPS_REGION": "us",
-		"LOG_LEVEL": "warn",
-		"MCP_ENABLED": "true",
-		"ENABLE_WRITE_TOOLS": "true",
-		"ENABLE_CUSTOM_MUTATION": "true",
-		"CHATGPT_MCP_HOST": "superops-mcp-chatgpt-direct.taskgroup.co.uk",
-		"CHATGPT_MCP_RESOURCE": "https://superops-mcp-chatgpt-direct.taskgroup.co.uk/mcp",
-		"CHATGPT_OAUTH_SCOPES": "superops.read",
-		"CHATGPT_AUTH_ALLOWED_EMAIL": "sam@computask.co.uk",
-		"CHATGPT_AUTH_ACCESS_ISSUER": "https://super-bar-5ae4.cloudflareaccess.com",
-		"CHATGPT_AUTH_ACCESS_AUD": "9e9e3c95cfb18bbfacfd7e8cc0ceb1a971fc61a382d4c839780f32f18cde1bf2",
-		"CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS": "true"
-	}
+  "name": "superops-mcp",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-02-01",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "global_fetch_strictly_public"
+  ],
+  "workers_dev": false,
+  "preview_urls": false,
+  "keep_vars": true,
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "39ba0813eacf4c64a3408d65239d0c5d"
+    }
+  ],
+  "vars": {
+    "AUTH_MODE": "env",
+    "SUPEROPS_SUBDOMAIN": "computaskltd",
+    "SUPEROPS_REGION": "us",
+    "LOG_LEVEL": "warn",
+    "MCP_ENABLED": "true",
+    "ENABLE_WRITE_TOOLS": "true",
+    "ENABLE_CUSTOM_MUTATION": "true",
+    "CHATGPT_MCP_HOST": "superops-mcp-chatgpt-direct.taskgroup.co.uk",
+    "CHATGPT_MCP_RESOURCE": "https://superops-mcp-chatgpt-direct.taskgroup.co.uk/mcp",
+    "CHATGPT_OAUTH_SCOPES": "superops.read",
+    "CHATGPT_AUTH_ALLOWED_EMAIL": "sam@computask.co.uk",
+    "CHATGPT_AUTH_ACCESS_ISSUER": "https://super-bar-5ae4.cloudflareaccess.com",
+    "CHATGPT_AUTH_ACCESS_AUD": "9e9e3c95cfb18bbfacfd7e8cc0ceb1a971fc61a382d4c839780f32f18cde1bf2",
+    "CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS": "true",
+    "SUPEROPS_EXECUTION_SUBREQUEST_BUDGET": "45",
+    "SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN": "8",
+    "SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH": "25",
+    "SUPEROPS_EXECUTION_MAX_PAGINATION_DEPTH": "50",
+    "SUPEROPS_EXECUTION_MAX_RETRY_ATTEMPTS": "3",
+    "SUPEROPS_EXECUTION_MAX_RETRY_DURATION_MS": "15000",
+    "SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS": "2000",
+    "SUPEROPS_EXECUTION_BACKOFF_BASE_DELAY_MS": "100",
+    "SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO": "0.2",
+    "SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS": "5000",
+    "SUPEROPS_EXECUTION_MAX_DURATION_MS": "25000",
+    "SUPEROPS_EXECUTION_VERIFICATION_MODE": "verifyReads",
+    "SUPEROPS_OPERATION_RETENTION_SECONDS": "86400",
+    "SUPEROPS_EXECUTION_CONCURRENCY": "1"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SUPEROPS_OPERATION_LEDGER",
+        "class_name": "SuperOpsOperationLedger"
+      }
+    ]
+  },
+  "exports": {
+    "SuperOpsOperationLedger": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
 }

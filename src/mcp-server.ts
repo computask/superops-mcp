@@ -29,6 +29,16 @@ import {
   type ToolResult,
   type AuditMetadata,
 } from "./audit.js";
+import {
+  finishExecution,
+  logExecutionDiagnostics,
+  runWithExecutionContext,
+} from "./execution.js";
+import {
+  currentOwnerHash,
+  getOperationStore,
+  operationResultView,
+} from "./operation-store.js";
 
 // Lazy-loaded domain modules
 const domainCache = new Map<Domain, DomainTools>();
@@ -164,6 +174,32 @@ const statusTool: ToolDefinition = {
   },
 };
 
+const operationTools: ToolDefinition[] = [
+  {
+    name: "superops_operations_get",
+    description:
+      "Read durable execution status for one SuperOps MCP operation by operation ID. Does not call SuperOps.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        operationId: {
+          type: "string",
+          description: "Durable operation ID returned by an incomplete operation.",
+        },
+      },
+      required: ["operationId"],
+    },
+  },
+  {
+    name: "superops_operations_results",
+    description:
+      "List recent durable operation summaries visible to the current authenticated caller. Does not call SuperOps.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+];
 // Connection test tool
 const testConnectionTool: ToolDefinition = {
   name: "superops_test_connection",
@@ -309,6 +345,31 @@ async function executeToolCall(
     };
   }
 
+  if (name === "superops_operations_get") {
+    const operationId = typeof args.operationId === "string" ? args.operationId.trim() : "";
+    if (!operationId) {
+      return errorResult("operationId is required.");
+    }
+    const record = await getOperationStore().get(operationId);
+    if (!record || record.ownerHash !== currentOwnerHash()) {
+      return errorResult("Operation was not found or is not visible to this caller.");
+    }
+    return {
+      content: [{ type: "text", text: JSON.stringify(operationResultView(record), null, 2) }],
+    };
+  }
+
+  if (name === "superops_operations_results") {
+    const records = await getOperationStore().list(currentOwnerHash());
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(records.map(operationResultView), null, 2),
+        },
+      ],
+    };
+  }
   // Check for credential issues before domain calls
   const creds = getCredentials();
   if (!creds) {
@@ -411,7 +472,7 @@ export function createMcpServer(): Server {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const domainTools = await getAllDomainTools();
     return {
-      tools: [navigationTool, statusTool, testConnectionTool, ...domainTools],
+      tools: [navigationTool, statusTool, testConnectionTool, ...operationTools, ...domainTools],
     };
   });
 
@@ -419,31 +480,40 @@ export function createMcpServer(): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name } = request.params;
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
-    const started = Date.now();
-    let metadata = toolAuditMetadata(name, args);
 
-    try {
-      const result = sanitizeToolResult(await executeToolCall(name, args));
-      metadata = enrichAuditMetadataFromResult(name, result, metadata);
-      auditToolCall({
-        toolName: name,
-        success: !result.isError,
-        durationMs: Date.now() - started,
-        errorSummary: errorSummaryFromResult(result),
-        metadata,
-      });
-      return result as never;
-    } catch (error) {
-      const result = errorResult(sanitizeError(error));
-      auditToolCall({
-        toolName: name,
-        success: false,
-        durationMs: Date.now() - started,
-        errorSummary: errorSummaryFromResult(result),
-        metadata,
-      });
-      return result as never;
-    }
+    return runWithExecutionContext(name, async () => {
+      const started = Date.now();
+      let metadata = toolAuditMetadata(name, args);
+
+      try {
+        const result = sanitizeToolResult(await executeToolCall(name, args));
+        metadata = enrichAuditMetadataFromResult(name, result, metadata);
+        const errorSummary = errorSummaryFromResult(result);
+        finishExecution(result.isError ? "toolError" : "completed");
+        auditToolCall({
+          toolName: name,
+          success: !result.isError,
+          durationMs: Date.now() - started,
+          errorSummary,
+          metadata,
+        });
+        logExecutionDiagnostics(!result.isError, errorSummary);
+        return result as never;
+      } catch (error) {
+        const result = errorResult(sanitizeError(error));
+        const errorSummary = errorSummaryFromResult(result);
+        finishExecution("unhandledError");
+        auditToolCall({
+          toolName: name,
+          success: false,
+          durationMs: Date.now() - started,
+          errorSummary,
+          metadata,
+        });
+        logExecutionDiagnostics(false, errorSummary);
+        return result as never;
+      }
+    });
   });
 
   return server;

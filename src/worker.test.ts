@@ -9,6 +9,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import worker, { type Env } from "./worker.js";
+import { getOperationStore, runWithOperationStore, stableHash, type OperationLedgerRecord } from "./operation-store.js";
 
 const MCP_HEADERS = {
   Accept: "application/json, text/event-stream",
@@ -388,12 +389,61 @@ describe("Cloudflare Worker entrypoint", () => {
     const names = (body.result?.tools ?? []).map((t) => t.name);
     expect(names).toContain("superops_navigate");
     expect(names).toContain("superops_status");
+    expect(names).toContain("superops_operations_get");
+    expect(names).toContain("superops_operations_results");
     expect(names).toContain("superops_tickets_list");
     expect(names).toContain("superops_alerts_list");
     expect(names).toContain("superops_alerts_create");
     expect(names.length).toBeGreaterThan(10);
   });
 
+  it("returns MCP-visible durable operation status without SuperOps credentials", async () => {
+    const record: OperationLedgerRecord = {
+      responseVersion: 1,
+      operationId: "worker-op-1",
+      toolName: "superops_tickets_apply_triage_plan",
+      ownerHash: stableHash("anonymous"),
+      createdAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:01.000Z",
+      expiresAt: "2026-07-19T00:00:00.000Z",
+      originalRequestHash: stableHash({ batchId: "batch-1" }),
+      state: "ContinuationRequired",
+      expectedItems: ["57400"],
+      completedItems: [],
+      failedItems: [],
+      skippedItems: [],
+      unattemptedItems: ["57400"],
+      pendingItems: ["57400"],
+      itemStates: {},
+      summary: { unattempted: 1 },
+      compactResults: [{ ticketNumber: "57400", finalOutcome: "NotAttemptedExecutionStopped" }],
+      partialWriteCount: 0,
+      ambiguousWriteCount: 0,
+      rateLimitedItems: [],
+      continuationCount: 1,
+    };
+    await runWithOperationStore({}, () => getOperationStore().put(record));
+
+    const res = await mcp({
+      jsonrpc: "2.0",
+      id: 23,
+      method: "tools/call",
+      params: {
+        name: "superops_operations_get",
+        arguments: { operationId: "worker-op-1" },
+      },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      result?: { isError?: boolean; content?: { text?: string }[] };
+    };
+    expect(body.result?.isError).toBeUndefined();
+    expect(JSON.parse(body.result?.content?.[0]?.text ?? "{}")).toMatchObject({
+      operationId: "worker-op-1",
+      state: "ContinuationRequired",
+      pendingCount: 1,
+    });
+  });
   it("returns a graceful error for a credential-requiring tool when unconfigured", async () => {
     const res = await mcp({
       jsonrpc: "2.0",

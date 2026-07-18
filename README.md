@@ -83,8 +83,10 @@ mechanism rather than committing it to this file.
 - Health endpoint: `https://<your-mcp-host>/health`
 - Required non-secret vars: `AUTH_MODE=env`, `SUPEROPS_SUBDOMAIN=computaskltd`, `SUPEROPS_REGION=us`, `LOG_LEVEL=warn`
 - Optional non-secret safety vars: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=true`, `ENABLE_CUSTOM_MUTATION=true`
+- Execution-budget vars: `SUPEROPS_EXECUTION_SUBREQUEST_BUDGET`, `SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN`, `SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH`, `SUPEROPS_EXECUTION_MAX_PAGINATION_DEPTH`, `SUPEROPS_EXECUTION_MAX_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_WRITE_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_RETRY_DURATION_MS`, `SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS`, `SUPEROPS_EXECUTION_BACKOFF_BASE_DELAY_MS`, `SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO`, `SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS`, `SUPEROPS_EXECUTION_MAX_DURATION_MS`, `SUPEROPS_OPERATION_RETENTION_SECONDS`
 - Required secrets: the SuperOps API token Worker secret, plus any OAuth/session secrets required by the deployed auth provider
 - Never commit: API token values, OAuth access/refresh tokens, bearer tokens, Cloudflare service token values, client secrets, private keys, or full request headers
+- Durable operation status uses the `SUPEROPS_OPERATION_LEDGER` Durable Object binding declared in `wrangler.json`. Do not reuse `OAUTH_KV` for operation state.
 
 Safe local validation:
 
@@ -118,6 +120,8 @@ GraphQL mutation text. Audit logs record only safe metadata for custom GraphQL:
 operation type, operation name when parseable, and variable key names. Full
 GraphQL bodies and variable values are not logged by default.
 
+See [docs/execution-audit.md](docs/execution-audit.md) for the outbound-call inventory, risk assessment, root-cause analysis, and execution-limit migration plan.
+
 Audit logs are structured JSON records emitted for MCP tool calls. They include
 timestamp, request/correlation ID, tool name, user identity when available from
 the auth layer, tool category, high-risk marker, success/failure, duration, and
@@ -146,6 +150,8 @@ Token rotation plan:
 - `superops_navigate` - Navigate to a domain
 - `superops_back` - Return to main menu
 - `superops_test_connection` - Test API connectivity
+- `superops_operations_get` - Read durable status and compact results for one operation ID
+- `superops_operations_results` - List recent durable operation results visible to the caller
 
 ### Clients Domain
 
@@ -420,10 +426,16 @@ For direct human-client tickets that remain in New Calls, use an operational not
 the tool does not perform ad hoc repeated retries.
 
 Every expected ticket gets exactly one final outcome: `Resolved`, `Updated`,
-`Left`, `Skipped`, `Blocked`, `Failed`, `NoApprovedAction`, `NotFound`, or
-`SkippedChangedSinceSnapshot`. The audit record is high-risk write metadata only:
-batch ID, candidate count, ticket numbers, action types, dry-run/verify flags,
-and fallback allowance. It does not audit raw ticket content or full note bodies.
+`Left`, `Skipped`, `Blocked`, `Failed`, `NoApprovedAction`, `NotFound`,
+`SkippedChangedSinceSnapshot`, or `NotAttemptedExecutionStopped`. If the configured
+execution budget stops the batch, the response includes `operation.complete=false`,
+`continuationRequired=true`, every completed/skipped/failed/unattempted ticket result,
+and a durable `operationId` when the operation ledger is available. This is an
+observable incomplete state, not background success; automatic fresh-invocation
+resume is not implemented yet. Use `superops_operations_get` to inspect the stored
+compact result. The audit record is high-risk write metadata only: batch ID,
+candidate count, ticket numbers, action types, dry-run/verify flags, and fallback
+allowance. It does not audit raw ticket content or full note bodies.
 Example safe retrieval call:
 
 ```json
@@ -628,7 +640,11 @@ The priority override has been validated and applied.
 
 ## Rate Limits
 
-SuperOps.ai API has a rate limit of 800 requests per minute per API token.
+SuperOps.ai API has a published rate limit of 800 requests per minute per API token.
+The MCP distinguishes SuperOps upstream throttling from Cloudflare invocation-budget
+exhaustion. Read calls retry only with bounded attempts and capped Retry-After or
+exponential backoff delays. Write calls are not blindly retried by the central client;
+a write path must prove idempotency or verify current state before adding safe retries.
 
 ## License
 

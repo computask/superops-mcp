@@ -1,4 +1,5 @@
 import { SuperOpsError, SuperOpsHttpError } from "../client.js";
+import { getExecutionConfig, hasExecutionBudgetFor } from "../execution.js";
 import type { ListInfo, ListInfoInput, SuperOpsJson, Ticket } from "../types.js";
 
 export const CREATED_TIME_REPORT_PAGE_SIZE = 100;
@@ -85,6 +86,8 @@ export async function fetchTicketPage(client: QueryableClient, input: ListInfoIn
 }
 export async function fetchTicketsPaginated(client: QueryableClient, params: HistoricalTicketQueryParams): Promise<TicketQueryResult> {
   const effective = validateHistoricalTicketQueryParams(params);
+  const executionConfig = getExecutionConfig();
+  const maxPageLimit = Math.min(effective.maxPages, executionConfig.maxPaginationDepth);
   const retryDiagnostics: RetryDiagnostics = { retries: 0, retryDelaysMs: [] };
   const warnings: string[] = []; const errors: FetchErrorDiagnostic[] = [];
   const recordsById = new Map<string, NormalizedReportingTicket>(); const rangeMatched: NormalizedReportingTicket[] = []; const seenPages = new Set<string>();
@@ -92,6 +95,8 @@ export async function fetchTicketsPaginated(client: QueryableClient, params: His
   const pagination: TicketPaginationDiagnostics = { pagesFetched: 0, pageSize: CREATED_TIME_REPORT_PAGE_SIZE, recordsExamined: 0, recordsMatched: 0, recordsReturned: 0, duplicateRecordsRemoved: 0, complete: false, truncated: false, nextPage: null, stopReason: "fetchError" };
   let page = 1; let done = false;
   while (!done) {
+    if (page > maxPageLimit) { pagination.complete = false; pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "maxPagesReached"; warnings.push("Configured pagination depth reached; results are partial."); break; }
+    if (!hasExecutionBudgetFor(1)) { errors.push({ stage: "fetchPage", page, errorType: "network", message: "Execution subrequest budget exhausted before fetching the next page.", retryable: true, attempts: 0 }); pagination.complete = false; pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "fetchError"; warnings.push("Execution budget reached before all pages were fetched; results are partial."); break; }
     const input: ListInfoInput = { page, pageSize: CREATED_TIME_REPORT_PAGE_SIZE, sort: buildTicketSort(), condition };
     if (!condition) delete input.condition;
     const pageResult = await fetchTicketPage(client, input, effective.fetchFields, page, retryDiagnostics);
@@ -115,7 +120,7 @@ export async function fetchTicketsPaginated(client: QueryableClient, params: His
     if (done) break;
     if (crossedLowerBoundary) { pagination.complete = true; pagination.stopReason = "crossedCreatedFromBoundary"; break; }
     if (!ticketList?.listInfo?.hasMore) { pagination.complete = true; pagination.stopReason = "hasMoreFalse"; break; }
-    if (page >= effective.maxPages) { pagination.complete = false; pagination.truncated = true; pagination.nextPage = page + 1; pagination.stopReason = "maxPagesReached"; break; }
+    if (page >= maxPageLimit) { pagination.complete = false; pagination.truncated = true; pagination.nextPage = page + 1; pagination.stopReason = "maxPagesReached"; break; }
     page += 1;
   }
   const filtered = applyLocalFilters(rangeMatched, params);

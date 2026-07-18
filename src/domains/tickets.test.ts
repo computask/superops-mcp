@@ -35,6 +35,8 @@ vi.mock("../client.js", () => ({
 
 import { getClient } from "../client.js";
 import { getTicketsTools } from "./tickets.js";
+import { runWithExecutionConfig } from "../execution.js";
+import { getOperationStore } from "../operation-store.js";
 
 const VALID_TICKET_STATUSES = [
   "Worked on",
@@ -2881,5 +2883,65 @@ describe("Tickets Domain", () => {
     });
     expect(notesResult.isError).toBe(true);
     expect(notesResult.content[0].text).toContain("notes read failed");
+  });
+});
+
+describe("Tickets triage execution budget", () => {
+  let mockClient: { query: ReturnType<typeof vi.fn>; mutate: ReturnType<typeof vi.fn> };
+
+  beforeEach(() => {
+    mockClient = {
+      query: vi.fn(),
+      mutate: vi.fn(),
+    };
+    vi.mocked(getClient).mockReturnValue(mockClient as unknown as ReturnType<typeof getClient>);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns a result for every expected ticket when maxItemsPerBatch stops execution", async () => {
+    const domain = getTicketsTools();
+    const result = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () =>
+        domain.handleCall("superops_tickets_apply_triage_plan", {
+          expectedCandidateTicketNumbers: ["57400", "57401", "57402"],
+          actions: [],
+        })
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results).toHaveLength(3);
+    expect(parsed.results[0]).toMatchObject({
+      ticketNumber: "57400",
+      finalOutcome: "NoApprovedAction",
+    });
+    expect(parsed.results[1]).toMatchObject({
+      ticketNumber: "57401",
+      finalOutcome: "FailedBeforeProcessing",
+      failureStage: "executionBudget",
+    });
+    expect(parsed.results[2]).toMatchObject({
+      ticketNumber: "57402",
+      finalOutcome: "NotAttemptedExecutionStopped",
+      failureStage: "executionBudget",
+    });
+    expect(parsed.operation).toMatchObject({
+      complete: false,
+      continuationRequired: true,
+      persisted: true,
+    });
+    await expect(getOperationStore().get(parsed.operation.operationId)).resolves.toMatchObject({
+      state: "ContinuationRequired",
+      expectedItems: ["57400", "57401", "57402"],
+      completedItems: [],
+      skippedItems: ["57400"],
+      pendingItems: ["57401", "57402"],
+      unattemptedItems: ["57401", "57402"],
+    });
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 });

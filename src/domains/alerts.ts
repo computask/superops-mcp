@@ -6,6 +6,7 @@
 
 import { getClient } from "../client.js";
 import { sanitizeError } from "../audit.js";
+import { hasExecutionBudgetFor } from "../execution.js";
 import type {
   Alert,
   DomainTools,
@@ -753,16 +754,22 @@ export function getAlertsTools(): DomainTools {
             }
 
             const resolved = await resolveAlerts(client, ids);
-            const verification = params.verify === false
-              ? undefined
-              : Object.fromEntries(
-                  await Promise.all(
-                    ids.map(async (id) => [
-                      id,
-                      verificationResult(await findAlertById(client, id)),
-                    ])
-                  )
-                );
+            const verification: Record<string, unknown> | undefined =
+              params.verify === false ? undefined : {};
+            if (verification) {
+              for (const id of ids) {
+                if (!hasExecutionBudgetFor(2)) {
+                  verification[id] = {
+                    found: false,
+                    resolved: false,
+                    verificationSkipped: true,
+                    reason: "Execution budget reached before this alert could be verified.",
+                  };
+                  continue;
+                }
+                verification[id] = verificationResult(await findAlertById(client, id));
+              }
+            }
             return textResult({
               dryRun: false,
               requestedIds: ids,

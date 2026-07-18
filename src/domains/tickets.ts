@@ -24,6 +24,23 @@ import {
   type HistoricalTicketQueryParams,
   type HistoricalTicketReportParams,
 } from "./ticket-reporting.js";
+import {
+  executionDiagnostics,
+  getExecutionConfig,
+  hasExecutionBudgetFor,
+  markExecutionItem,
+  withExecutionItem,
+  ExecutionBudgetExceededError,
+  ExecutionTimeoutBudgetExceededError,
+} from "../execution.js";
+import {
+  currentOwnerHash,
+  getOperationStore,
+  normalizedNoteFingerprint,
+  stableHash,
+  type OperationItemState,
+  type OperationLedgerRecord,
+} from "../operation-store.js";
 
 const DEFAULT_LIST_PAGE = 1;
 
@@ -536,7 +553,9 @@ type TriageFinalOutcome =
   | "Failed"
   | "NoApprovedAction"
   | "NotFound"
-  | "SkippedChangedSinceSnapshot";
+  | "SkippedChangedSinceSnapshot"
+  | "FailedBeforeProcessing"
+  | "NotAttemptedExecutionStopped";
 
 interface TriagePlanAction {
   ticketNumber: string;
@@ -592,6 +611,10 @@ interface ApplyTriagePlanResult {
   fallbackAttempted: boolean;
   fallbackResult?: string | null;
   partialWrite: boolean;
+  requestedState?: Record<string, unknown> | null;
+  attemptedState?: Record<string, unknown> | null;
+  observedFinalState?: Record<string, unknown> | null;
+  verifiedState?: Record<string, unknown> | null;
 }
 interface StructuredValidationFailure {
   ok: false;
@@ -2084,6 +2107,10 @@ function baseApplyResult(
     fallbackAttempted: false,
     fallbackResult: null,
     partialWrite: false,
+    requestedState: action?.target ? { ...action.target } : null,
+    attemptedState: null,
+    observedFinalState: ticket ? ticketFinalState(ticket) : null,
+    verifiedState: null,
   };
 }
 
@@ -2355,6 +2382,167 @@ async function mutateTicketUpdate(
   return response.updateTicket;
 }
 
+function triageStageForResult(result: ApplyTriagePlanResult): OperationItemState["stage"] {
+  if (result.partialWrite) return "FailedAfterPartialWrite";
+  switch (result.finalOutcome) {
+    case "Resolved":
+    case "Updated":
+    case "Left":
+      return "Completed";
+    case "Skipped":
+    case "NoApprovedAction":
+      return "Skipped";
+    case "SkippedChangedSinceSnapshot":
+      return "Stale";
+    case "FailedBeforeProcessing":
+    case "NotAttemptedExecutionStopped":
+      return "Unattempted";
+    case "NotFound":
+    case "Blocked":
+      return "FailedBeforeWrite";
+    case "Failed":
+    default:
+      return result.writeAttempted ? "FailedAfterPartialWrite" : "FailedBeforeWrite";
+  }
+}
+
+function compactApplyResult(result: ApplyTriagePlanResult): Record<string, unknown> {
+  return {
+    ticketNumber: result.ticketNumber,
+    ticketId: result.ticketId,
+    requestedAction: result.requestedAction,
+    finalOutcome: result.finalOutcome,
+    writeAttempted: result.writeAttempted,
+    writeMethod: result.writeMethod,
+    noteAdded: result.noteAdded,
+    noteDeduped: result.noteDeduped,
+    verified: result.verified,
+    failureStage: result.failureStage,
+    failureReason: result.failureReason,
+    fallbackAttempted: result.fallbackAttempted,
+    fallbackResult: result.fallbackResult,
+    partialWrite: result.partialWrite,
+    requestedState: result.requestedState,
+    attemptedState: result.attemptedState,
+    observedFinalState: result.observedFinalState,
+    verifiedState: result.verifiedState,
+  };
+}
+
+function buildApplyTriageLedgerRecord(params: {
+  operationId: string;
+  request: ApplyTriagePlanParams;
+  expected: string[];
+  results: ApplyTriagePlanResult[];
+  actionsByTicket: Map<string, TriagePlanAction>;
+  continuationRequired: boolean;
+  summary: Record<string, unknown>;
+}): OperationLedgerRecord {
+  const now = new Date();
+  const expiresAt = new Date(
+    now.getTime() + getExecutionConfig().operationRetentionSeconds * 1000
+  );
+  const itemStates = Object.fromEntries(
+    params.expected.map((ticketNumber) => {
+      const result = params.results.find((item) => item.ticketNumber === ticketNumber);
+      const action = params.actionsByTicket.get(ticketNumber);
+      const stage = result ? triageStageForResult(result) : "Pending";
+      const state: OperationItemState = {
+        itemKey: ticketNumber,
+        stage,
+        outcome: result?.finalOutcome,
+        idempotencyKey: stableHash({ operationId: params.operationId, ticketNumber }),
+        writeAttempted: result?.writeAttempted ?? false,
+        writeMayHaveSucceeded: Boolean(result?.partialWrite),
+        partialWrite: result?.partialWrite ?? false,
+        noteFingerprint: normalizedNoteFingerprint(action?.note),
+        verificationState: result?.verified
+          ? "Verified"
+          : result?.writeAttempted
+            ? "Failed"
+            : "NotRequired",
+        retryCount: 0,
+        failureReason: result?.failureReason ?? undefined,
+        updatedTimeExpectation: action?.expectedUpdatedTime,
+        targetFields: action?.target ? { ...action.target } : undefined,
+      };
+      return [ticketNumber, state];
+    })
+  );
+  const completedItems = params.results
+    .filter((result) => ["Resolved", "Updated", "Left"].includes(result.finalOutcome))
+    .map((result) => result.ticketNumber);
+  const failedItems = params.results
+    .filter(
+      (result) =>
+        ["Failed", "Blocked", "NotFound", "FailedBeforeProcessing"].includes(
+          result.finalOutcome
+        ) && result.failureStage !== "executionBudget"
+    )
+    .map((result) => result.ticketNumber);
+  const skippedItems = params.results
+    .filter((result) => ["Skipped", "NoApprovedAction", "SkippedChangedSinceSnapshot"].includes(result.finalOutcome))
+    .map((result) => result.ticketNumber);
+  const unattemptedItems = params.results
+    .filter(
+      (result) =>
+        result.finalOutcome === "NotAttemptedExecutionStopped" ||
+        (result.finalOutcome === "FailedBeforeProcessing" &&
+          result.failureStage === "executionBudget")
+    )
+    .map((result) => result.ticketNumber);
+  const terminalFailure = params.continuationRequired
+    ? "Continuation required before all expected items were processed."
+    : undefined;
+
+  return {
+    responseVersion: 1,
+    operationId: params.operationId,
+    toolName: "superops_tickets_apply_triage_plan",
+    ownerHash: currentOwnerHash(),
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    originalRequestHash: stableHash({
+      batchId: params.request.batchId,
+      expectedCandidateTicketNumbers: params.expected,
+      actions: Array.isArray(params.request.actions)
+        ? params.request.actions.map((action) => ({
+            ...action,
+            note: action.note ? normalizedNoteFingerprint(action.note) : undefined,
+          }))
+        : [],
+      dryRun: params.request.dryRun ?? false,
+      verify: params.request.verify ?? true,
+    }),
+    state: params.continuationRequired ? "ContinuationRequired" : "Completed",
+    expectedItems: params.expected,
+    currentItem: params.results.at(-1)?.ticketNumber,
+    completedItems,
+    failedItems,
+    skippedItems,
+    unattemptedItems,
+    pendingItems: [
+      ...new Set([
+        ...unattemptedItems,
+        ...params.expected.filter(
+          (ticketNumber) =>
+            !params.results.some((result) => result.ticketNumber === ticketNumber)
+        ),
+      ]),
+    ],
+    itemStates,
+    summary: params.summary,
+    compactResults: params.results.map(compactApplyResult),
+    partialWriteCount: params.results.filter((result) => result.partialWrite).length,
+    ambiguousWriteCount: 0,
+    rateLimitedItems: params.results
+      .filter((result) => result.failureStage === "rateLimit")
+      .map((result) => result.ticketNumber),
+    continuationCount: params.continuationRequired ? 1 : 0,
+    terminalFailureReason: terminalFailure,
+  };
+}
 function summarizeApplyResults(results: ApplyTriagePlanResult[]) {
   return {
     resolved: results.filter((result) => result.finalOutcome === "Resolved").length,
@@ -2364,8 +2552,28 @@ function summarizeApplyResults(results: ApplyTriagePlanResult[]) {
     blocked: results.filter((result) => result.finalOutcome === "Blocked").length,
     failed: results.filter((result) => result.finalOutcome === "Failed").length,
     notFound: results.filter((result) => result.finalOutcome === "NotFound").length,
+    notAttempted: results.filter((result) => result.finalOutcome === "NotAttemptedExecutionStopped" || result.finalOutcome === "FailedBeforeProcessing").length,
+    partialWrites: results.filter((result) => result.partialWrite).length,
     verified: results.filter((result) => result.verified).length,
   };
+}
+
+function executionStoppedApplyResult(
+  ticketNumber: string,
+  action: TriagePlanAction | undefined,
+  reason: string,
+  outcome: TriageFinalOutcome = "NotAttemptedExecutionStopped"
+): ApplyTriagePlanResult {
+  const result = baseApplyResult(ticketNumber, action);
+  result.finalOutcome = outcome;
+  result.failureStage = "executionBudget";
+  result.failureReason = reason;
+  return result;
+}
+
+function isExecutionBudgetError(error: unknown): boolean {
+  return error instanceof ExecutionBudgetExceededError ||
+    error instanceof ExecutionTimeoutBudgetExceededError;
 }
 
 async function applyApprovedTriageAction(params: {
@@ -2473,6 +2681,8 @@ async function applyApprovedTriageAction(params: {
         try {
           const verified = await getTicketByInternalId(client, ticket.ticketId);
           result.finalState = ticketFinalState(verified);
+          result.observedFinalState = result.finalState;
+          result.verifiedState = result.finalState;
           result.verified = true;
         } catch (error) {
           result.finalOutcome = "Failed";
@@ -2494,6 +2704,7 @@ async function applyApprovedTriageAction(params: {
       }
 
       result.writeAttempted = true;
+      result.attemptedState = updateInput as Record<string, unknown>;
       result.writeMethod = action.action === "resolve" ? "resolve_full" : "update";
       try {
         await mutateTicketUpdate(client, updateInput as Record<string, unknown>);
@@ -2540,6 +2751,7 @@ async function applyApprovedTriageAction(params: {
         return result;
       }
       result.finalState = ticketFinalState(verified);
+      result.observedFinalState = result.finalState;
       const finalVerification = verifyFinalTargetState(action, verified);
       if (finalVerification.mismatches.length > 0) {
         result.finalOutcome = "Failed";
@@ -2550,6 +2762,7 @@ async function applyApprovedTriageAction(params: {
         return result;
       }
       result.verified = true;
+      result.verifiedState = result.finalState;
 
       try {
         await addNoteForPlan({
@@ -3685,32 +3898,106 @@ export function getTicketsTools(): DomainTools {
             }
 
             const results: ApplyTriagePlanResult[] = [];
+            const executionConfig = getExecutionConfig();
+            const estimatedCallsPerTriageItem = params.verify === false ? 5 : 8;
             let stopped = false;
-            for (const ticketNumber of expected) {
+            let executionStopped = false;
+
+            for (let index = 0; index < expected.length; index += 1) {
+              const ticketNumber = expected[index];
+              const action = actionByTicket.get(ticketNumber);
+              const remainingAfterThis = expected.length - index - 1;
+
               if (stopped) {
-                const skipped = baseApplyResult(ticketNumber, actionByTicket.get(ticketNumber));
+                const skipped = baseApplyResult(ticketNumber, action);
                 skipped.finalOutcome = "Skipped";
                 skipped.failureStage = "stopOnFirstFailure";
                 skipped.failureReason = "Processing stopped after an earlier failure.";
                 results.push(skipped);
+                markExecutionItem({ completed: true, remainingItems: remainingAfterThis });
                 continue;
               }
 
-              const result = await applyApprovedTriageAction({
-                client,
-                ticketNumber,
-                action: actionByTicket.get(ticketNumber),
-                dryRun: params.dryRun ?? false,
-                verify: params.verify ?? true,
-                dedupeNotes: params.dedupeNotes ?? true,
-                allowResolveFullFallbackToUpdate:
-                  params.allowResolveFullFallbackToUpdate ?? false,
-                allowWriteIfUpdatedTimeChanged:
-                  params.allowWriteIfUpdatedTimeChanged ?? false,
-                allowWriteWithoutVerifiedContent:
-                  params.allowWriteWithoutVerifiedContent ?? false,
-              });
+              if (
+                index >= executionConfig.maxItemsPerBatch ||
+                !hasExecutionBudgetFor(estimatedCallsPerTriageItem)
+              ) {
+                executionStopped = true;
+                const reason = index >= executionConfig.maxItemsPerBatch
+                  ? `Configured maxItemsPerBatch ${executionConfig.maxItemsPerBatch} reached before processing this ticket.`
+                  : "Execution stopped before starting this ticket because the remaining invocation budget cannot safely cover the estimated read/write/verification calls.";
+                for (let pendingIndex = index; pendingIndex < expected.length; pendingIndex += 1) {
+                  const pendingTicketNumber = expected[pendingIndex];
+                  results.push(
+                    executionStoppedApplyResult(
+                      pendingTicketNumber,
+                      actionByTicket.get(pendingTicketNumber),
+                      reason,
+                      pendingIndex === index ? "FailedBeforeProcessing" : "NotAttemptedExecutionStopped"
+                    )
+                  );
+                }
+                markExecutionItem({ remainingItems: expected.length - index });
+                break;
+              }
+
+              let result: ApplyTriagePlanResult;
+              try {
+                result = await withExecutionItem(ticketNumber, () =>
+                  applyApprovedTriageAction({
+                    client,
+                    ticketNumber,
+                    action,
+                    dryRun: params.dryRun ?? false,
+                    verify: params.verify ?? true,
+                    dedupeNotes: params.dedupeNotes ?? true,
+                    allowResolveFullFallbackToUpdate:
+                      params.allowResolveFullFallbackToUpdate ?? false,
+                    allowWriteIfUpdatedTimeChanged:
+                      params.allowWriteIfUpdatedTimeChanged ?? false,
+                    allowWriteWithoutVerifiedContent:
+                      params.allowWriteWithoutVerifiedContent ?? false,
+                  })
+                );
+              } catch (error) {
+                const reason = safeErrorMessage(error);
+                result = executionStoppedApplyResult(
+                  ticketNumber,
+                  action,
+                  reason,
+                  isExecutionBudgetError(error) ? "FailedBeforeProcessing" : "Failed"
+                );
+                if (!isExecutionBudgetError(error)) {
+                  result.failureStage = "unexpected";
+                }
+                executionStopped = isExecutionBudgetError(error);
+              }
+
               results.push(result);
+              markExecutionItem({
+                completed: true,
+                remainingItems: remainingAfterThis,
+                partialWrite: result.partialWrite,
+                stale: result.finalOutcome === "SkippedChangedSinceSnapshot",
+                verificationFailure: result.failureStage === "verifyFinalState" ||
+                  result.failureStage === "verify",
+              });
+
+              if (executionStopped) {
+                for (let pendingIndex = index + 1; pendingIndex < expected.length; pendingIndex += 1) {
+                  const pendingTicketNumber = expected[pendingIndex];
+                  results.push(
+                    executionStoppedApplyResult(
+                      pendingTicketNumber,
+                      actionByTicket.get(pendingTicketNumber),
+                      "Execution stopped after the previous item before the remaining tickets were attempted."
+                    )
+                  );
+                }
+                markExecutionItem({ remainingItems: expected.length - index - 1 });
+                break;
+              }
+
               if (
                 params.stopOnFirstFailure &&
                 [
@@ -3718,10 +4005,36 @@ export function getTicketsTools(): DomainTools {
                   "Failed",
                   "NotFound",
                   "SkippedChangedSinceSnapshot",
+                  "FailedBeforeProcessing",
                 ].includes(result.finalOutcome)
               ) {
                 stopped = true;
               }
+            }
+
+            const summary = summarizeApplyResults(results);
+            const diagnostics = executionDiagnostics();
+            const operationId =
+              params.batchId ??
+              (diagnostics?.operationId as string | undefined) ??
+              `triage-${Date.now()}`;
+            let operationPersisted = false;
+            let operationStoreError: string | undefined;
+            try {
+              await getOperationStore().put(
+                buildApplyTriageLedgerRecord({
+                  operationId,
+                  request: params,
+                  expected,
+                  results,
+                  actionsByTicket: actionByTicket,
+                  continuationRequired: executionStopped,
+                  summary,
+                })
+              );
+              operationPersisted = true;
+            } catch (error) {
+              operationStoreError = safeErrorMessage(error);
             }
 
             return {
@@ -3731,10 +4044,19 @@ export function getTicketsTools(): DomainTools {
                   text: JSON.stringify(
                     {
                       batchId: params.batchId,
+                      operation: {
+                        operationId,
+                        idempotencyKey: params.batchId ?? operationId,
+                        complete: !executionStopped,
+                        continuationRequired: executionStopped,
+                        persisted: operationPersisted,
+                        storeError: operationStoreError,
+                      },
                       initialCandidateCount: expected.length,
                       expectedCandidateTicketNumbers: expected,
                       results,
-                      summary: summarizeApplyResults(results),
+                      summary,
+                      execution: diagnostics,
                     },
                     null,
                     2
