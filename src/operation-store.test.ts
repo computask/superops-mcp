@@ -140,7 +140,7 @@ describe("operation store", () => {
         now: "2026-07-18T00:00:02.000Z",
       });
       expect(claim).toMatchObject({ itemKey: "57401" });
-      expect(claim?.item).toMatchObject({ stage: "Validating" });
+      expect(claim?.item).toMatchObject({ stage: "Unattempted" });
 
       await expect(
         store.claimNextItem({
@@ -187,6 +187,39 @@ describe("operation store", () => {
           patch: { stage: "WriteStarted" },
         })
       ).rejects.toThrow(/Invalid operation item transition/);
+    });
+  });
+
+  it("preserves an ambiguous write stage across an expired lease recovery", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const ownerHash = stableHash("owner@example.com");
+      const initial = record({ operationId: "op-stage" });
+      initial.itemStates["57401"] = {
+        ...initial.itemStates["57401"],
+        stage: "WriteStarted",
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+      };
+      await store.put(initial);
+
+      const first = await store.claimNextItem({
+        operationId: "op-stage", ownerHash, leaseOwner: "first", leaseMs: 1,
+        now: "2026-07-18T00:00:02.000Z",
+      });
+      expect(first?.item.stage).toBe("WriteStarted");
+
+      const recovered = await store.claimNextItem({
+        operationId: "op-stage", ownerHash, leaseOwner: "second", leaseMs: 60_000,
+        now: "2026-07-18T00:00:03.000Z",
+      });
+      expect(recovered?.item).toMatchObject({
+        stage: "WriteStarted", writeAttempted: true, writeMayHaveSucceeded: true,
+      });
+      await expect(store.completeItem({
+        operationId: "op-stage", ownerHash, itemKey: "57401",
+        leaseId: first?.lease.leaseId, patch: { stage: "Completed" },
+      })).rejects.toThrow(/lease mismatch/);
     });
   });
 

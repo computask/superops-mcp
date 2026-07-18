@@ -357,7 +357,9 @@ function claimNextItemInRecord(
   const item = record.itemStates[itemKey];
   const claimedItem: OperationItemState = {
     ...item,
-    stage: TERMINAL_STAGES.has(item.stage) ? item.stage : "Validating",
+    // A lease is independent from processing progress. Preserve the exact stage so
+    // resumed work can resolve an ambiguous mutation before considering a replay.
+    stage: item.stage,
     lease,
     claimedAt: now,
   };
