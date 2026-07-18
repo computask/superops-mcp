@@ -608,7 +608,6 @@ const chatGptDefaultHandler = {
 };
 
 function getChatGptOAuthOptions(env: Env): OAuthProviderOptions<Env> {
-  const host = getChatGptMcpHost(env);
   const resource = getChatGptMcpResource(env);
   const authServer = getChatGptAuthorizationServer(env);
   const scopes = getChatGptScopes(env);

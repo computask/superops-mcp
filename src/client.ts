@@ -132,28 +132,28 @@ export class SuperOpsClient {
       );
     }
 
-	if (result.errors && result.errors.length > 0) {
-	  const error = result.errors[0];
+    if (result.errors && result.errors.length > 0) {
+      const error = result.errors[0];
 
-	  const message =
-		error.message ||
-		JSON.stringify(
-		  {
-			message: error.message,
-			path: error.path,
-			locations: error.locations,
-			extensions: error.extensions,
-		  },
-		  null,
-		  2
-		);
+      const message =
+        error.message ||
+        JSON.stringify(
+          {
+            message: error.message,
+            path: error.path,
+            locations: error.locations,
+            extensions: error.extensions,
+          },
+          null,
+          2
+        );
 
-	  throw new SuperOpsError(
-		message,
-		error.extensions?.code,
-		error.extensions?.retryAfter
-	  );
-	}
+      throw new SuperOpsError(
+        message,
+        error.extensions?.code,
+        error.extensions?.retryAfter
+      );
+    }
 
     if (!result.data) {
       throw new SuperOpsMalformedResponseError("No data returned from GraphQL query");

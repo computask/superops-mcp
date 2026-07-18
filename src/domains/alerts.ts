@@ -13,7 +13,6 @@ import type {
   ListInfo,
   ListInfoInput,
   NormalizedAlert,
-  SuperOpsJson,
 } from "../types.js";
 
 const DEFAULT_PAGE = 1;
@@ -183,9 +182,6 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function numberValue(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
 
 function firstStringFromRecord(
   record: Record<string, unknown> | undefined,

@@ -898,7 +898,7 @@ function decodeHtmlEntities(value: string): string {
 
 function htmlToPlainText(value: string): { text: string; stripped: boolean } {
   const hadHtml = /<[^>]+>/.test(value);
-  let text = value
+  const text = value
     .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(
       /<(script|style|iframe|object|embed|svg|form|input|button)\b[\s\S]*?<\/\1>/gi,
@@ -915,6 +915,29 @@ function htmlToPlainText(value: string): { text: string; stripped: boolean } {
   return { text: decodeHtmlEntities(text), stripped: hadHtml };
 }
 
+function isBinaryLikeControlChar(char: string): boolean {
+  const code = char.charCodeAt(0);
+  return code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31);
+}
+
+function stripBinaryLikeControlText(value: string): { text: string; removed: boolean } {
+  let output = "";
+  let removed = false;
+  let inRemovedRun = false;
+  for (const char of value) {
+    if (isBinaryLikeControlChar(char)) {
+      removed = true;
+      if (!inRemovedRun) {
+        output += "[removed binary-like content]";
+      }
+      inRemovedRun = true;
+      continue;
+    }
+    output += char;
+    inRemovedRun = false;
+  }
+  return { text: output, removed };
+}
 function stripRawEmailHeaders(value: string): { text: string; removed: boolean } {
   const headerLine =
     /^(?:Received|DKIM-Signature|Authentication-Results|SPF|Return-Path|Message-ID|MIME-Version|Content-Type|Content-Transfer-Encoding|ARC-[A-Za-z-]+|X-[A-Za-z0-9-]+)\s*:/i;
@@ -978,9 +1001,10 @@ function redactRiskyText(
     return "[removed base64 content]";
   });
 
-  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(text)) {
+  const strippedBinaryText = stripBinaryLikeControlText(text);
+  if (strippedBinaryText.removed) {
     binaryRemoved = true;
-    text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]+/g, "[removed binary-like content]");
+    text = strippedBinaryText.text;
   }
 
   if (redactCredentials) {
@@ -1569,10 +1593,6 @@ function validationFailure(params?: {
   };
 }
 
-function isPriorityMandatoryValidation(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /mandatory_validation_failed\s*:\s*priority/i.test(message);
-}
 
 function mandatoryValidationFields(error: unknown): string[] {
   const message = error instanceof Error ? error.message : String(error);
