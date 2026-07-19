@@ -374,7 +374,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       const totals = operationTotals(finalRecord);
       const rateLimitTelemetry = states.map((item) => item.rateLimit).filter(Boolean);
       const terminalCount = states.filter((item) => terminal.has(item.stage)).length;
-      const totalRetries = [...mutationCounts.values()].reduce((sum, count) => sum + Math.max(0, count - 1), 0);
+      const totalRetries = states.reduce((sum, item) => sum + Math.max(0, (item.attemptCount ?? 0) - 1), 0);
       const counters = {
         seed: SEED,
         itemsExpected: numbers.length,

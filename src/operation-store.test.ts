@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   getOperationStore,
+  MalformedStoredOperationError,
   normalizedNoteFingerprint,
   operationResultView,
   operationTotals,
@@ -278,6 +279,23 @@ describe("operation store", () => {
       )
     );
     await expect(list.json()).resolves.toHaveLength(1);
+  });
+
+  it("preserves MalformedStoredOperation through the Durable Object operation-store wrapper", async () => {
+    const durable = ownerScopedDurableNamespace();
+    const ownerHash = stableHash("owner@example.com");
+    const malformed = record({ operationId: "op-malformed-wrapper", ownerHash });
+    malformed.itemStates["57401"] = {
+      ...malformed.itemStates["57401"],
+      retryCount: "bad" as unknown as number,
+    };
+    durable.valuesFor("owner:" + ownerHash).set("op:op-malformed-wrapper", malformed);
+
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+      await expect(getOperationStore().get("op-malformed-wrapper", ownerHash)).rejects.toBeInstanceOf(
+        MalformedStoredOperationError
+      );
+    });
   });
 
   it("uses only the dedicated key for approved private-note encryption and recovery", async () => {

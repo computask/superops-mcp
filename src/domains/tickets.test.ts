@@ -3388,6 +3388,188 @@ describe("Tickets Domain", () => {
       expect(mockClient.mutate).not.toHaveBeenCalled();
     });
   });
+
+  it("counts two legitimate sequential durable mutation attempts", async () => {
+    await runWithOperationStore({}, async () => {
+      let getTicketReads = 0;
+      mockClient.query.mockImplementation(async (query: string) => {
+        if (query.includes("getTicketList")) {
+          return { getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } };
+        }
+        if (query.includes("getTicketNoteList")) return { getTicketNoteList: [] };
+        getTicketReads += 1;
+        return { getTicket: { ticketId: "ticket-57400", displayId: "57400",
+          status: getTicketReads === 1 ? "New Calls" : "Awaiting Engineer",
+          updatedTime: getTicketReads === 1 ? "2026-07-18T10:00:00Z" : "2026-07-18T10:01:00Z" } };
+      });
+      mockClient.mutate
+        .mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-57400", status: "Awaiting Engineer" } })
+        .mockResolvedValueOnce({ createTicketNote: { noteId: "note-57400", privacyType: "PRIVATE" } });
+
+      const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+        batchId: "sequential-attempt-count",
+        expectedCandidateTicketNumbers: ["57400"],
+        actions: [{
+          ticketNumber: "57400",
+          expectedStatus: "New Calls",
+          expectedUpdatedTime: "2026-07-18T10:00:00Z",
+          contentVerified: true,
+          action: "update",
+          target: { status: "Awaiting Engineer" },
+          note: "Approved private follow-up",
+        }],
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      const stored = await getOperationStore().get("sequential-attempt-count");
+
+      expect(result.isError).not.toBe(true);
+      expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+      expect(stored?.itemStates["57400"]).toMatchObject({
+        stage: "Completed",
+        writeAttempted: true,
+        attemptCount: 2,
+        verificationState: "Verified",
+      });
+      expect(parsed.operation.items).toContainEqual(expect.objectContaining({
+        itemId: "57400",
+        attemptCount: 2,
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+        verificationState: "Verified",
+      }));
+    });
+  });
+
+  it("persists conclusive rejection before retry scheduling", async () => {
+    await runWithOperationStore({}, async () => {
+      const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+        { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "rejection-before-schedule",
+          expectedCandidateTicketNumbers: ["57400", "57401"],
+          actions: [{ ticketNumber: "57401", contentVerified: true, action: "addNote", note: "Retry after throttle" }],
+        })
+      ));
+      const operationId = JSON.parse(initial.content[0].text).operation.operationId as string;
+      const stored = await getOperationStore().get(operationId);
+      if (!stored) throw new Error("missing rejection-before-schedule operation");
+
+      const events: string[] = [];
+      const store = getOperationStore();
+      const checkpoint = store.checkpointItem.bind(store);
+      const schedule = store.scheduleContinuation.bind(store);
+      store.checkpointItem = async (params) => {
+        const updated = await checkpoint(params);
+        if (params.patch.observedMutationResult === "Rejected") events.push("rejection-checkpoint");
+        return updated;
+      };
+      store.scheduleContinuation = async (params) => {
+        events.push("schedule-continuation");
+        expect(events).toContain("rejection-checkpoint");
+        const current = await store.get(params.operationId, params.ownerHash);
+        expect(current?.itemStates["57401"]).toMatchObject({
+          stage: "RateLimitedRescheduled",
+          observedMutationResult: "Rejected",
+          errorClass: "SuperOpsRateLimit",
+        });
+        return schedule(params);
+      };
+      mockClient.query.mockImplementation(async (query: string) => {
+        if (query.includes("getTicketList")) return { getTicketList: {
+          tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        } };
+        if (query.includes("getTicketNoteList")) return { getTicketNoteList: [] };
+        return { getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" } };
+      });
+      mockClient.mutate.mockRejectedValueOnce(new SuperOpsHttpError("rate limited", 429, "Too Many Requests", 0));
+
+      await runWithExecutionConfig({}, () => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => resumeApplyTriageOperation({ operationId, ownerHash: stored.ownerHash, leaseOwner: "reject-before-schedule" })
+      ));
+      expect(events).toEqual(expect.arrayContaining(["rejection-checkpoint", "schedule-continuation"]));
+      expect(events.indexOf("rejection-checkpoint")).toBeLessThan(events.indexOf("schedule-continuation"));
+    });
+  });
+
+  it("resumes from a conclusive rejection checkpoint after a crash before retry", async () => {
+    await runWithOperationStore({}, async () => {
+      const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+        { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "rejection-crash-restart",
+          expectedCandidateTicketNumbers: ["57400", "57401"],
+          actions: [{ ticketNumber: "57401", contentVerified: true, action: "addNote", note: "Recover rejected note" }],
+        })
+      ));
+      const operationId = JSON.parse(initial.content[0].text).operation.operationId as string;
+      const stored = await getOperationStore().get(operationId);
+      if (!stored) throw new Error("missing rejection-crash-restart operation");
+
+      const store = getOperationStore();
+      const checkpoint = store.checkpointItem.bind(store);
+      let crashAfterRejection = true;
+      store.checkpointItem = async (params) => {
+        const updated = await checkpoint(params);
+        if (params.patch.observedMutationResult === "Rejected" && crashAfterRejection) {
+          crashAfterRejection = false;
+          throw new Error("simulated crash after rejection checkpoint");
+        }
+        return updated;
+      };
+      mockClient.query.mockImplementation(async (query: string) => {
+        if (query.includes("getTicketList")) return { getTicketList: {
+          tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        } };
+        if (query.includes("getTicketNoteList")) return { getTicketNoteList: [] };
+        return { getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" } };
+      });
+      mockClient.mutate
+        .mockRejectedValueOnce(new SuperOpsHttpError("rate limited", 429, "Too Many Requests", 0))
+        .mockResolvedValueOnce({ createTicketNote: { noteId: "note-recovered", privacyType: "PRIVATE" } });
+
+      await expect(runWithExecutionConfig({}, () => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => resumeApplyTriageOperation({
+          operationId,
+          ownerHash: stored.ownerHash,
+          leaseOwner: "reject-crash-1",
+          leaseMs: 1,
+          now: "2026-07-18T00:00:00.000Z",
+        })
+      ))).rejects.toThrow(/simulated crash after rejection checkpoint/);
+
+      const rejected = await store.get(operationId, stored.ownerHash);
+      expect(rejected?.itemStates["57401"]).toMatchObject({
+        stage: "RateLimitedRescheduled",
+        observedMutationResult: "Rejected",
+        writeAttempted: true,
+        attemptCount: 1,
+        errorClass: "SuperOpsRateLimit",
+      });
+
+      await runWithExecutionConfig({}, () => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => resumeApplyTriageOperation({
+          operationId,
+          ownerHash: stored.ownerHash,
+          leaseOwner: "reject-crash-2",
+          now: new Date(Date.now() + 1_000).toISOString(),
+        })
+      ));
+      const finalRecord = await store.get(operationId, stored.ownerHash);
+      expect(finalRecord?.itemStates["57401"]).toMatchObject({
+        stage: "Completed",
+        observedMutationResult: "VerifiedApplied",
+        attemptCount: 2,
+        verificationState: "Verified",
+      });
+      expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    });
+  });
   it("resumes a pending approved triage update using the real adapter", async () => {
     const domain = getTicketsTools();
     const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
@@ -3827,7 +4009,7 @@ describe("Tickets Domain", () => {
       mutationType: "note",
       mutationStartStage: "NoteWriteStarted",
       writeAttempted: true,
-      writeMayHaveSucceeded: true,
+      writeMayHaveSucceeded: false,
       reliableResponseReceived: true,
       observedMutationResult: "Rejected",
       partialWrite: false,
@@ -3889,6 +4071,7 @@ describe("Tickets Domain", () => {
       writeAttempted: true,
       writeMayHaveSucceeded: true,
       partialWrite: true,
+      errorClass: "AmbiguousWrite",
     });
     expect(finalRecord?.itemStates["57401"].nextEligibleTime).toBeUndefined();
     expect(mockClient.mutate).toHaveBeenCalledTimes(1);
@@ -3944,7 +4127,7 @@ describe("Tickets Domain", () => {
     expect(finalRecord?.itemStates["57401"]).toMatchObject({
       outcome: "Updated",
       writeAttempted: true,
-      writeMayHaveSucceeded: true,
+      writeMayHaveSucceeded: false,
       reliableResponseReceived: true,
       observedMutationResult: "Rejected",
       verificationState: "Verified",

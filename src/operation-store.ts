@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getAuditContext, sanitizeText } from "./audit.js";
-import { recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
+import { getExecutionState, recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
 
 export type OperationState =
   | "Running"
@@ -810,8 +810,8 @@ function terminalizeContinuationFailureInRecord(
       outcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : params.outcome,
       ambiguousWrite: possibleWrite || item.ambiguousWrite,
       partialWrite: possibleWrite || item.partialWrite,
-      errorClass: params.errorClass,
-      failureReason: params.reason,
+      errorClass: item.errorClass ?? params.errorClass,
+      failureReason: item.failureReason ?? params.reason,
       lease: undefined,
       completedAt: now,
     };
@@ -897,6 +897,15 @@ function assertCheckpointTransition(current: OperationItemStage, next: Operation
   }
   assertTransition(current, next);
 }
+
+function isConclusiveRejectedWritePatch(
+  patch: OperationCompleteItemParams["patch"]
+): boolean {
+  return patch.reliableResponseReceived === true &&
+    patch.observedMutationResult === "Rejected" &&
+    patch.partialWrite !== true;
+}
+
 function itemResultKey(value: unknown): string | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
@@ -1011,6 +1020,7 @@ function claimNextItemInRecord(
   record.itemStates[itemKey] = claimedItem;
   record.currentItem = itemKey;
   record.currentLease = lease;
+  record.lastInvocationId = getExecutionState()?.invocationId ?? params.leaseOwner;
   record.state = "Running";
   record.updatedAt = now;
   const normalized = normalizeOperationRecord(record);
@@ -1041,7 +1051,8 @@ function applyItemPatch(
   if (current.writeAttempted && params.patch.writeAttempted === false) {
     throw new Error(`Operation item writeAttempted cannot be reset: ${params.itemKey}`);
   }
-  if (current.writeMayHaveSucceeded && params.patch.writeMayHaveSucceeded === false) {
+  if (current.writeMayHaveSucceeded && params.patch.writeMayHaveSucceeded === false &&
+      !isConclusiveRejectedWritePatch(params.patch)) {
     throw new Error(`Operation item writeMayHaveSucceeded cannot be reset without verification: ${params.itemKey}`);
   }
   const definedPatch = Object.fromEntries(
@@ -1086,7 +1097,8 @@ function applyItemCheckpoint(
   if (current.writeAttempted && params.patch.writeAttempted === false) {
     throw new Error(`Operation item writeAttempted cannot be reset: ${params.itemKey}`);
   }
-  if (current.writeMayHaveSucceeded && params.patch.writeMayHaveSucceeded === false) {
+  if (current.writeMayHaveSucceeded && params.patch.writeMayHaveSucceeded === false &&
+      !isConclusiveRejectedWritePatch(params.patch)) {
     throw new Error(`Operation item writeMayHaveSucceeded cannot be reset: ${params.itemKey}`);
   }
   const definedPatch = Object.fromEntries(
@@ -1659,10 +1671,44 @@ export function operationResultView(record: OperationLedgerRecord): Record<strin
     continuationCount: record.continuationCount,
     terminalFailureReason: record.terminalFailureReason,
     workflowId: record.workflowId,
+    lastInvocationId: record.lastInvocationId,
     totals: operationTotals(record),
     summary: record.summary,
+    items: operationItemTelemetry(record),
     results: record.compactResults,
   }) as Record<string, unknown>;
+}
+
+function operationItemTelemetry(record: OperationLedgerRecord): Record<string, unknown>[] {
+  const now = new Date().toISOString();
+  return record.expectedItems.map((itemKey) => {
+    const item = record.itemStates[itemKey];
+    const retryEligible = Boolean(
+      item &&
+      !TERMINAL_STAGES.has(item.stage) &&
+      (
+        item.observedMutationResult === "Rejected" ||
+        item.stage === "RateLimitedRescheduled" ||
+        item.stage === "RateLimitedRetrying" ||
+        item.stage === "Rescheduled" ||
+        item.stage === "Unattempted"
+      ) &&
+      (!item.nextEligibleTime || item.nextEligibleTime <= now)
+    );
+    return {
+      operationId: record.operationId,
+      invocationId: record.lastInvocationId,
+      itemId: itemKey,
+      stage: item?.stage ?? "Unattempted",
+      finalErrorClass: item?.errorClass,
+      attemptCount: item?.attemptCount ?? 0,
+      retryEligible,
+      writeAttempted: item?.writeAttempted ?? false,
+      writeMayHaveSucceeded: item?.writeMayHaveSucceeded ?? false,
+      verificationState: item?.verificationState,
+      finalReason: item?.failureReason ?? item?.outcome,
+    };
+  });
 }
 
 function redactPublicOperationValue(value: unknown, depth = 0): unknown {

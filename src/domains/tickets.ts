@@ -43,6 +43,7 @@ import {
   currentOwnerHash,
   getOperationStore,
   normalizedNoteFingerprint,
+  operationResultView,
   stableHash,
   type OperationItemState,
   type OperationLedgerRecord,
@@ -2874,6 +2875,16 @@ function completeApplyResultsFromLedger(
   });
 }
 
+type DurableMutationType = "update" | "resolution" | "note" | "resolveFallback";
+
+type ConclusiveMutationRejection = {
+  delayMs: number;
+  requestedDelayMs: number;
+  retryAfterSupplied: boolean;
+  delaySource: "retry-after" | "backoff";
+  conclusiveRejection: boolean;
+};
+
 async function applyApprovedTriageAction(params: {
   client: SuperOpsClientInstance;
   ticketNumber: string;
@@ -2885,12 +2896,15 @@ async function applyApprovedTriageAction(params: {
   allowWriteIfUpdatedTimeChanged: boolean;
   allowWriteWithoutVerifiedContent: boolean;
   beforeNoteCheck?: () => Promise<void>;
-  beforeMutation?: (
-    mutationType: "update" | "resolution" | "note" | "resolveFallback"
-  ) => Promise<void>;
+  beforeMutation?: (mutationType: DurableMutationType) => Promise<void>;
   afterMutation?: (
-    mutationType: "update" | "resolution" | "note" | "resolveFallback",
+    mutationType: DurableMutationType,
     observed: { ticketId?: string; noteId?: string }
+  ) => Promise<void>;
+  afterConclusiveRejection?: (
+    mutationType: DurableMutationType,
+    rejection: ConclusiveMutationRejection,
+    failureReason: string | undefined
   ) => Promise<void>;
   afterVerification?: (mutationType: "update" | "resolution" | "note") => Promise<void>;
 }): Promise<ApplyTriagePlanResult> {
@@ -3023,8 +3037,8 @@ async function applyApprovedTriageAction(params: {
 
       result.attemptedState = updateInput as Record<string, unknown>;
       result.writeMethod = action.action === "resolve" ? "resolve_full" : "update";
+      const mutationType: DurableMutationType = action.action === "resolve" ? "resolution" : "update";
       try {
-        const mutationType = action.action === "resolve" ? "resolution" : "update";
         await params.beforeMutation?.(mutationType);
         result.writeAttempted = true;
         const mutationResult = await mutateTicketUpdate(
@@ -3048,6 +3062,9 @@ async function applyApprovedTriageAction(params: {
           // classification separately records that this particular request was
           // reliably rejected and therefore eligible for one checked retry.
           result.partialWrite = !rateLimit.conclusiveRejection && (result.writeAttempted || result.noteAdded);
+          if (rateLimit.conclusiveRejection) {
+            await params.afterConclusiveRejection?.(mutationType, rateLimit, result.failureReason ?? undefined);
+          }
           return result;
         }
         const fallbackAllowed = action.allowResolveFullFallbackToUpdate ?? params.allowResolveFullFallbackToUpdate;
@@ -3180,6 +3197,14 @@ async function applyApprovedTriageAction(params: {
       // ambiguous transport or upstream failure remains possible-write truth.
       result.partialWrite = !rateLimit.conclusiveRejection &&
         (result.writeAttempted || result.noteAdded);
+      if (rateLimit.conclusiveRejection) {
+        const mutationType: DurableMutationType = result.writeMethod === "createTicketNote"
+          ? "note"
+          : result.writeMethod === "resolve_full"
+            ? "resolution"
+            : "update";
+        await params.afterConclusiveRejection?.(mutationType, rateLimit, result.failureReason ?? undefined);
+      }
     } else {
       result.partialWrite = result.writeAttempted || result.noteAdded;
     }
@@ -3213,10 +3238,10 @@ function applyResultToContinuationOutcome(
     outcome: rateLimitReschedule ? "SuperOpsRateLimitRescheduled" :
       result.failureStage === "ambiguousWrite" ? "AmbiguousWriteUnresolved" : result.finalOutcome,
     writeAttempted: result.writeAttempted,
-    // A durable mutation-start checkpoint remains conservative even when the
-    // response is a conclusive throttle; the reliable rejection marker is what
-    // authorises a checked retry without moving this boolean backwards.
-    writeMayHaveSucceeded: result.writeAttempted || result.partialWrite,
+    // A conclusive throttle proves this mutation was not accepted. Ambiguous
+    // transports remain conservative; only a reliable rejection can clear
+    // possible-write state and authorise a checked retry.
+    writeMayHaveSucceeded: rateLimitReschedule ? false : result.writeAttempted || result.partialWrite,
     reliableResponseReceived: rateLimitReschedule ? true : undefined,
     retryDelaySource: result.rateLimitDelaySource,
     retryAfterSupplied: result.rateLimitRetryAfterSupplied,
@@ -3244,10 +3269,12 @@ function applyResultToContinuationOutcome(
       ? "SuperOpsRateLimit"
       : result.finalOutcome === "SkippedChangedSinceSnapshot"
         ? "StaleData"
-      : result.failureStage === "ambiguousWrite"
+      : result.failureStage === "ambiguousWrite" || ambiguousMutation
         ? "AmbiguousWrite"
-      : result.partialWrite
+      : result.failureStage === "verify" || result.failureStage === "verifyFinalState"
         ? "VerificationMismatch"
+      : result.partialWrite
+        ? "AmbiguousWrite"
         : undefined,
   };
 }
@@ -3285,12 +3312,15 @@ async function ambiguityCheckedTriageResult(params: {
   previousRetryCount: number;
   ambiguityStage: OperationItemState["stage"];
   beforeNoteCheck?: () => Promise<void>;
-  beforeMutation?: (
-    mutationType: "update" | "resolution" | "note" | "resolveFallback"
-  ) => Promise<void>;
+  beforeMutation?: (mutationType: DurableMutationType) => Promise<void>;
   afterMutation?: (
-    mutationType: "update" | "resolution" | "note" | "resolveFallback",
+    mutationType: DurableMutationType,
     observed: { ticketId?: string; noteId?: string }
+  ) => Promise<void>;
+  afterConclusiveRejection?: (
+    mutationType: DurableMutationType,
+    rejection: ConclusiveMutationRejection,
+    failureReason: string | undefined
   ) => Promise<void>;
   afterVerification?: (mutationType: "update" | "resolution" | "note") => Promise<void>;
 }): Promise<{ result: ApplyTriagePlanResult; stage?: OperationItemState["stage"]; retryCount?: number }> {
@@ -3500,6 +3530,7 @@ function createApplyTriageContinuationAdapter(
       let observedMutationResult = claim.item.observedMutationResult;
       let durableWriteAttempted = claim.item.writeAttempted === true;
       let durableWriteMayHaveSucceeded = claim.item.writeMayHaveSucceeded === true;
+      let durableAttemptCount = claim.item.attemptCount ?? 0;
       let fallbackAttempted = claim.item.fallbackAttempted === true;
       let fallbackApplied = claim.item.fallbackApplied === true;
       const canonicalTargetHash = stableHash({
@@ -3533,7 +3564,7 @@ function createApplyTriageContinuationAdapter(
         }
       };
       const beforeMutation = async (
-        mutationType: "update" | "resolution" | "note" | "resolveFallback"
+        mutationType: DurableMutationType
       ) => {
         const checkpointCount = mutationType === "note" ? 2 : mutationType === "resolveFallback" ? 1 : 3;
         const verificationReserve = mutationType === "note"
@@ -3563,6 +3594,7 @@ function createApplyTriageContinuationAdapter(
             const nextObservedMutationResult = mutationStarted
               ? "Ambiguous"
               : observedMutationResult;
+            const nextAttemptCount = mutationStarted ? durableAttemptCount + 1 : undefined;
             await checkpoint({
               stage,
               mutationType,
@@ -3579,9 +3611,10 @@ function createApplyTriageContinuationAdapter(
               fallbackAttempted: fallbackAttempted || mutationType === "resolveFallback",
               partialWrite: claim.item.partialWrite,
               verificationState: "Pending",
-              attemptCount: (claim.item.attemptCount ?? 0) + 1,
+              attemptCount: nextAttemptCount,
             });
             checkpointStage = stage;
+            if (nextAttemptCount !== undefined) durableAttemptCount = nextAttemptCount;
             durableWriteAttempted = nextWriteAttempted;
             durableWriteMayHaveSucceeded = nextWriteMayHaveSucceeded;
             reliableResponseReceived = nextReliableResponseReceived;
@@ -3593,7 +3626,7 @@ function createApplyTriageContinuationAdapter(
         }
       };
       const afterMutation = async (
-        mutationType: "update" | "resolution" | "note" | "resolveFallback",
+        mutationType: DurableMutationType,
         observed: { ticketId?: string; noteId?: string }
       ) => {
         const stage: OperationItemState["stage"] = mutationType === "note"
@@ -3627,6 +3660,59 @@ function createApplyTriageContinuationAdapter(
             fallbackAttempted = true;
             fallbackApplied = true;
           }
+        } catch (error) {
+          throw new DurableCheckpointError(error);
+        }
+      };
+      const afterConclusiveRejection = async (
+        mutationType: DurableMutationType,
+        rejection: ConclusiveMutationRejection,
+        failureReason: string | undefined
+      ) => {
+        const nextEligibleTime = new Date(Date.now() + rejection.delayMs).toISOString();
+        const observedAt = new Date().toISOString();
+        try {
+          durableWriteAttempted = true;
+          reliableResponseReceived = true;
+          observedMutationResult = "Rejected";
+          await checkpoint({
+            stage: "RateLimitedRescheduled",
+            mutationType,
+            writeAttempted: durableWriteAttempted,
+            writeMayHaveSucceeded: false,
+            reliableResponseReceived: true,
+            observedMutationResult: "Rejected",
+            canonicalTargetHash,
+            noteFingerprint: action?.noteFingerprint ?? normalizedNoteFingerprint(action?.note),
+            fallbackAllowed: action?.allowResolveFullFallbackToUpdate ??
+              storedParams.allowResolveFullFallbackToUpdate ?? false,
+            fallbackAttempted,
+            fallbackApplied,
+            partialWrite: false,
+            verificationState: "Pending",
+            nextEligibleTime,
+            failureReason,
+            errorClass: "SuperOpsRateLimit",
+            rateLimit: {
+              endpoint: "SuperOps GraphQL /msp",
+              operationName: mutationType === "note" ? "CreateTicketNote" : "UpdateTicket",
+              source: rejection.delaySource,
+              attempts: (claim.item.rateLimit?.attempts ?? 0) + 1,
+              suppliedDelayMs: rejection.retryAfterSupplied ? rejection.requestedDelayMs : undefined,
+              parsedDelayMs: rejection.delayMs,
+              cappedDelayMs: rejection.delayMs,
+              appliedDelayMs: rejection.delayMs,
+              scheduledAt: observedAt,
+              firstThrottledAt: claim.item.rateLimit?.firstThrottledAt ?? observedAt,
+              nextEligibleAt: nextEligibleTime,
+              retryAfterSupplied: rejection.retryAfterSupplied,
+              continuedInAnotherInvocation: true,
+              writeAttempted: true,
+              finalResult: "SuperOpsRateLimitRescheduled",
+            },
+          });
+          checkpointStage = "RateLimitedRescheduled";
+          durableWriteMayHaveSucceeded = false;
         } catch (error) {
           throw new DurableCheckpointError(error);
         }
@@ -3684,6 +3770,7 @@ function createApplyTriageContinuationAdapter(
             beforeNoteCheck,
             beforeMutation,
             afterMutation,
+            afterConclusiveRejection,
             afterVerification,
           })
         : {
@@ -3703,6 +3790,7 @@ function createApplyTriageContinuationAdapter(
               beforeNoteCheck,
               beforeMutation,
               afterMutation,
+              afterConclusiveRejection,
               afterVerification,
             }),
           };
@@ -5018,9 +5106,12 @@ export function getTicketsTools(): DomainTools {
               : conservativeOutcome?.verificationFailed === true
                 ? "Failed"
                 : conservativeWriteMayHaveSucceeded ? "Pending" : undefined;
-            const conservativeFinalReason = continuationError
+            const operationView = operationResultView(finalRecord);
+            const durableFinalErrorClass = durableItems.find((item) => item.errorClass)?.errorClass ??
+              conservativeOutcome?.errorClass;
+            const conservativeFinalReason = continuationError && !durableFinalErrorClass
               ? "OperationStorePostWriteFailure"
-              : conservativeOutcome?.outcome;
+              : conservativeOutcome?.outcome ?? durableItems.find((item) => item.failureReason)?.failureReason;
 
             return {
               content: [{ type: "text", text: JSON.stringify({
@@ -5028,8 +5119,9 @@ export function getTicketsTools(): DomainTools {
                 operation: { operationId, idempotencyKey: params.batchId ?? operationId,
                   complete, continuationRequired: !complete, persisted: true,
                   storeError: continuationError, continuationScheduling, state: finalRecord.state,
-                  errorClass: continuationError ? "OperationStoreFailure" : undefined,
+                  errorClass: durableFinalErrorClass ?? (continuationError ? "OperationStoreFailure" : undefined),
                   finalReason: conservativeFinalReason,
+                  items: operationView.items,
                   partialWrite: conservativePartialWrite,
                   verificationState: conservativeVerificationState,
                   writeAttempted: conservativeWriteAttempted,
