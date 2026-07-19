@@ -87,6 +87,29 @@ describe("SuperOpsClient execution instrumentation", () => {
     expect(JSON.stringify(diagnostics)).not.toContain("secret-token");
   });
 
+  it("counts SuperOps verification reads once", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ data: { getTicket: { id: "ticket-1" } } }), { status: 200 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new SuperOpsClient({ apiToken: "secret-token", subdomain: "example" });
+
+    let diagnostics: ReturnType<typeof executionDiagnostics> | undefined;
+    const result = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "5", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "1" },
+      () =>
+        runWithExecutionContext("superops_verification_read", async () => {
+          const value = await client.query("query getTicket { getTicket { id } }");
+          diagnostics = executionDiagnostics();
+          return value;
+        })
+    );
+
+    expect(result).toEqual({ getTicket: { id: "ticket-1" } });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(diagnostics?.subrequests).toMatchObject({ used: 1 });
+    expect(diagnostics?.requestsByType).toMatchObject({ verificationRead: 1 });
+  });
   it("throws before fetching when the invocation budget is exhausted", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

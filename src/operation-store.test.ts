@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { getExecutionState, runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
 import {
   getOperationStore,
   MalformedStoredOperationError,
@@ -943,6 +944,142 @@ describe("operation store", () => {
     });
   });
 
+  it("counts Durable Object store calls through the central execution context", async () => {
+    const durable = ownerScopedDurableNamespace();
+    let subrequests = 0;
+    let durableObjectCalls = 0;
+
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+      await runWithExecutionConfig(
+        { SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "5", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "1" },
+        async () => {
+          await runWithExecutionContext("operation_store_accounting_test", async () => {
+            await getOperationStore().put(record({ operationId: "op-do-accounting" }));
+            const state = getExecutionState();
+            subrequests = state?.subrequests ?? 0;
+            durableObjectCalls = state?.requests.filter(
+              (request) => request.operationType === "durableObject"
+            ).length ?? 0;
+          });
+        }
+      );
+    });
+
+    expect(subrequests).toBe(1);
+    expect(durableObjectCalls).toBe(1);
+  });
+
+  it("counts Workflow createBatch scheduling calls in the central execution context", async () => {
+    const values = new Map<string, unknown>();
+    const batches: Array<Array<{ id: string; params: Record<string, unknown> }>> = [];
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+      },
+    }, {
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+      SUPEROPS_CONTINUATION_WORKFLOW: {
+        createBatch: async (batch) => { batches.push(batch); return batch.map(({ id }) => ({ id })); },
+      },
+    });
+    await durableObject.fetch(new Request("https://operation.local/operations/op-workflow-accounting", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record({ operationId: "op-workflow-accounting" })),
+    }));
+
+    let subrequests = 0;
+    let workflowCalls = 0;
+    await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "5", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "1" },
+      async () => {
+        await runWithExecutionContext("workflow_create_batch_accounting_test", async () => {
+          const response = await durableObject.fetch(new Request("https://operation.local/operations/op-workflow-accounting/schedule-continuation", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              operationId: "op-workflow-accounting", ownerHash: stableHash("owner@example.com"),
+              reason: "RateLimitedRescheduled", nextEligibleTime: "2026-07-18T00:05:00.000Z",
+            }),
+          }));
+          expect(response.ok).toBe(true);
+          const state = getExecutionState();
+          subrequests = state?.subrequests ?? 0;
+          workflowCalls = state?.requests.filter(
+            (request) => request.operationType === "workflow" && request.operationName === "continuationCreateBatch"
+          ).length ?? 0;
+        });
+      }
+    );
+
+    expect(batches).toHaveLength(1);
+    expect(subrequests).toBe(1);
+    expect(workflowCalls).toBe(1);
+  });
+
+  it("counts one failed Workflow scheduling attempt and stops at the invocation limit", async () => {
+    const values = new Map<string, unknown>();
+    let attempts = 0;
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+      },
+    }, {
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+      SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS: "3",
+      SUPEROPS_CONTINUATION_WORKFLOW: {
+        createBatch: async () => { attempts += 1; throw new Error("workflow unavailable"); },
+      },
+    });
+    await durableObject.fetch(new Request("https://operation.local/operations/op-workflow-budget", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record({ operationId: "op-workflow-budget" })),
+    }));
+
+    let subrequests = 0;
+    let workflowCalls = 0;
+    let failedWorkflowCalls = 0;
+    let body: unknown;
+    await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "1", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "0" },
+      async () => {
+        await runWithExecutionContext("workflow_create_batch_limit_test", async () => {
+          const response = await durableObject.fetch(new Request("https://operation.local/operations/op-workflow-budget/schedule-continuation", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              operationId: "op-workflow-budget", ownerHash: stableHash("owner@example.com"),
+              reason: "RateLimitedRescheduled", nextEligibleTime: "2026-07-18T00:05:00.000Z",
+            }),
+          }));
+          body = await response.json();
+          const state = getExecutionState();
+          subrequests = state?.subrequests ?? 0;
+          const workflowRequests = state?.requests.filter(
+            (request) => request.operationType === "workflow" && request.operationName === "continuationCreateBatch"
+          ) ?? [];
+          workflowCalls = workflowRequests.length;
+          failedWorkflowCalls = workflowRequests.filter((request) => request.ok === false).length;
+        });
+      }
+    );
+
+    expect(attempts).toBe(1);
+    expect(subrequests).toBe(1);
+    expect(workflowCalls).toBe(1);
+    expect(failedWorkflowCalls).toBe(1);
+    expect(body).toMatchObject({
+      state: "CompletedWithFailures",
+      schedulingAttempted: true,
+      schedulingSucceeded: false,
+      schedulingAttemptCount: 1,
+    });
+  });
   it("schedules one idempotent Workflow instance per durable wait", async () => {
     const values = new Map<string, unknown>();
     const batches: Array<Array<{ id: string; params: Record<string, unknown> }>> = [];

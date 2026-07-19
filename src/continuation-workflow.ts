@@ -1,4 +1,12 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
+import {
+  type ExecutionConfigInput,
+  finishExecution,
+  recordSubrequestFinish,
+  recordTypedSubrequestStart,
+  runWithExecutionConfig,
+  runWithExecutionContext,
+} from "./execution.js";
 import { getOperationStore, runWithOperationStore, type OperationStoreEnv } from "./operation-store.js";
 
 export interface ContinuationWorkflowParams {
@@ -8,7 +16,7 @@ export interface ContinuationWorkflowParams {
   scheduleIdentity: string;
 }
 
-interface ContinuationWorkflowEnv extends OperationStoreEnv {
+interface ContinuationWorkflowEnv extends OperationStoreEnv, ExecutionConfigInput {
   SUPEROPS_CONTINUATION_SERVICE?: { fetch(request: Request): Promise<Response> };
   SUPEROPS_INTERNAL_CONTINUATION_TOKEN?: string;
 }
@@ -26,56 +34,78 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
       throw new Error("Malformed continuation workflow payload.");
     }
 
+    return runWithExecutionConfig(this.env, () =>
+      runWithExecutionContext(
+        "superops_continuation_workflow",
+        async () => {
+          try {
+            const result = await this.deliver(params, step);
+            finishExecution(result.delivered ? "delivered" : "deliveryFailed");
+            return result;
+          } catch (error) {
+            finishExecution("failed");
+            throw error;
+          }
+        },
+        params.operationId
+      )
+    );
+  }
+
+  private async deliver(
+    params: ContinuationWorkflowParams,
+    step: WorkflowStep
+  ): Promise<{ operationId: string; delivered: boolean }> {
     await step.sleepUntil("wait-until-next-eligible", new Date(params.nextEligibleTime));
     try {
       await step.do(
         "deliver-checked-continuation",
         { retries: { limit: 8, delay: "1 second", backoff: "exponential" }, timeout: "30 seconds" },
         async () => {
-        const service = this.env.SUPEROPS_CONTINUATION_SERVICE;
-        const token = this.env.SUPEROPS_INTERNAL_CONTINUATION_TOKEN?.trim();
-        if (!service || !token) throw new Error("Continuation service binding or token is unavailable.");
+          const service = this.env.SUPEROPS_CONTINUATION_SERVICE;
+          const token = this.env.SUPEROPS_INTERNAL_CONTINUATION_TOKEN?.trim();
+          if (!service || !token) throw new Error("Continuation service binding or token is unavailable.");
 
-        await runWithOperationStore(this.env, async () => {
-          const store = getOperationStore();
-          const record = await store.get(params.operationId, params.ownerHash);
-          if (!record || record.ownerHash !== params.ownerHash) return;
-          await store.update(params.operationId, params.ownerHash, (current) => ({
-            ...current,
-            wakeAttemptCount: (current.wakeAttemptCount ?? 0) + 1,
-            lastWakeAttemptAt: new Date().toISOString(),
-          }));
-        });
+          await runWithOperationStore(this.env, async () => {
+            const store = getOperationStore();
+            const record = await store.get(params.operationId, params.ownerHash);
+            if (!record || record.ownerHash !== params.ownerHash) return;
+            await store.update(params.operationId, params.ownerHash, (current) => ({
+              ...current,
+              wakeAttemptCount: (current.wakeAttemptCount ?? 0) + 1,
+              lastWakeAttemptAt: new Date().toISOString(),
+            }));
+          });
 
-        const response = await service.fetch(new Request(
-          "https://superops-continuation.local/internal/operations/continue",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-SuperOps-Internal-Continuation": token,
-            },
-            body: JSON.stringify({
-              toolName: "superops_tickets_apply_triage_plan",
-              operationId: params.operationId,
-              ownerHash: params.ownerHash,
-            }),
+          const response = await fetchContinuationService(service, new Request(
+            "https://superops-continuation.local/internal/operations/continue",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-SuperOps-Internal-Continuation": token,
+              },
+              body: JSON.stringify({
+                toolName: "superops_tickets_apply_triage_plan",
+                operationId: params.operationId,
+                ownerHash: params.ownerHash,
+              }),
+            }
+          ));
+          if (!response.ok) {
+            throw new Error(`Continuation service rejected workflow wake with status ${response.status}.`);
           }
-        ));
-        if (!response.ok) {
-          throw new Error(`Continuation service rejected workflow wake with status ${response.status}.`);
-        }
 
-        await runWithOperationStore(this.env, async () => {
-          const store = getOperationStore();
-          const record = await store.get(params.operationId, params.ownerHash);
-          if (!record || record.ownerHash !== params.ownerHash) return;
-          await store.update(params.operationId, params.ownerHash, (current) => ({
-            ...current,
-            wakeDeliveryCount: (current.wakeDeliveryCount ?? 0) + 1,
-            lastWakeSucceededAt: new Date().toISOString(),
-          }));
-        });
+          await runWithOperationStore(this.env, async () => {
+            const store = getOperationStore();
+            const record = await store.get(params.operationId, params.ownerHash);
+            if (!record || record.ownerHash !== params.ownerHash) return;
+            await store.update(params.operationId, params.ownerHash, (current) => ({
+              ...current,
+              wakeDeliveryCount: (current.wakeDeliveryCount ?? 0) + 1,
+              lastWakeSucceededAt: new Date().toISOString(),
+            }));
+          });
         }
       );
     } catch {
@@ -86,16 +116,19 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
         async () => {
           await runWithOperationStore(this.env, async () => {
             const store = getOperationStore();
-            const record = await store.get(params.operationId, params.ownerHash);
-            if (!record || record.ownerHash !== params.ownerHash) return;
-            await store.terminalizeContinuationFailure({
-              operationId: params.operationId,
-              ownerHash: params.ownerHash,
-              errorClass: "ContinuationExecutionFailure",
-              outcome: "ContinuationDeliveryFailed",
-              reason,
-              deliveryFailure: true,
-            });
+            try {
+              await store.terminalizeContinuationFailure({
+                operationId: params.operationId,
+                ownerHash: params.ownerHash,
+                errorClass: "ContinuationExecutionFailure",
+                outcome: "ContinuationDeliveryFailed",
+                reason,
+                deliveryFailure: true,
+              });
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              if (!/not found|404/i.test(message)) throw error;
+            }
           });
         }
       );
@@ -103,5 +136,24 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
     }
 
     return { operationId: params.operationId, delivered: true };
+  }
+}
+
+async function fetchContinuationService(
+  service: { fetch(request: Request): Promise<Response> },
+  request: Request
+): Promise<Response> {
+  const started = recordTypedSubrequestStart({
+    type: "custom",
+    operationType: "serviceBinding",
+    operationName: "workflowContinuationDelivery",
+  });
+  try {
+    const response = await service.fetch(request);
+    recordSubrequestFinish(started, response.status, response.ok);
+    return response;
+  } catch (error) {
+    recordSubrequestFinish(started, "serviceBindingError", false);
+    throw error;
   }
 }

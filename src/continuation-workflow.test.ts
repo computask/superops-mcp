@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+import { getExecutionState } from "./execution.js";
 import { SuperOpsContinuationWorkflow } from "./continuation-workflow.js";
-import { getOperationStore, runWithOperationStore, stableHash } from "./operation-store.js";
+import {
+  getOperationStore,
+  runWithOperationStore,
+  stableHash,
+  SuperOpsOperationLedger,
+} from "./operation-store.js";
 
 function terminalRecord() {
   return {
@@ -48,6 +54,62 @@ function activeRecord() {
   };
 }
 
+function ownerScopedDurableNamespace() {
+  const valuesByName = new Map<string, Map<string, unknown>>();
+  const ledgers = new Map<string, SuperOpsOperationLedger>();
+  const valuesFor = (name: string) => {
+    let values = valuesByName.get(name);
+    if (!values) {
+      values = new Map<string, unknown>();
+      valuesByName.set(name, values);
+    }
+    return values;
+  };
+  const namespace = {
+    idFromName: (name: string) => name,
+    get: (id: unknown) => {
+      const name = String(id);
+      let ledger = ledgers.get(name);
+      if (!ledger) {
+        const values = valuesFor(name);
+        ledger = new SuperOpsOperationLedger({
+          storage: {
+            get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+            put: async (key: string | Record<string, unknown>, value?: unknown) => {
+              if (typeof key === "string") values.set(key, value);
+              else for (const [entryKey, entryValue] of Object.entries(key)) values.set(entryKey, entryValue);
+            },
+            delete: async (key: string) => values.delete(key),
+            list: async <T = unknown>(options?: { prefix?: string }) => new Map(
+              [...values.entries()].filter(([key]) => !options?.prefix || key.startsWith(options.prefix))
+            ) as Map<string, T>,
+          },
+        });
+        ledgers.set(name, ledger);
+      }
+      return { fetch: (request: Request) => ledger!.fetch(request) };
+    },
+  };
+  return { namespace };
+}
+
+function workflowStep(afterDo?: (name: string) => void) {
+  return {
+    sleepUntil: vi.fn(async () => undefined),
+    do: vi.fn(async (
+      name: string,
+      configOrCallback: unknown,
+      maybeCallback?: () => Promise<unknown>
+    ) => {
+      const callback = typeof configOrCallback === "function"
+        ? configOrCallback as () => Promise<unknown>
+        : maybeCallback!;
+      const result = await callback();
+      afterDo?.(name);
+      return result;
+    }),
+  };
+}
 describe("SuperOps continuation Workflow", () => {
   it("durably sleeps then calls the guarded real continuation route with compact identity", async () => {
     await runWithOperationStore({}, () => getOperationStore().put(terminalRecord()));
@@ -94,6 +156,90 @@ describe("SuperOps continuation Workflow", () => {
     expect(JSON.stringify(requests)).not.toContain("note");
   });
 
+  it("creates a fresh accounting context for each Workflow delivery", async () => {
+    const firstRecord = { ...terminalRecord(), operationId: "workflow-fresh-1", originalRequestHash: stableHash("workflow-fresh-1") };
+    const secondRecord = { ...terminalRecord(), operationId: "workflow-fresh-2", originalRequestHash: stableHash("workflow-fresh-2") };
+    await runWithOperationStore({}, async () => {
+      await getOperationStore().put(firstRecord);
+      await getOperationStore().put(secondRecord);
+    });
+
+    const snapshots: Array<{ invocationId?: string; operationId?: string; subrequests: number }> = [];
+    const service = { fetch: vi.fn(async () => {
+      const state = getExecutionState();
+      snapshots.push({
+        invocationId: state?.invocationId,
+        operationId: state?.operationId,
+        subrequests: state?.subrequests ?? 0,
+      });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) };
+    const workflow = new SuperOpsContinuationWorkflow(undefined, {
+      SUPEROPS_CONTINUATION_SERVICE: service,
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "internal-token",
+    });
+
+    for (const record of [firstRecord, secondRecord]) {
+      await workflow.run({
+        payload: {
+          operationId: record.operationId,
+          ownerHash: record.ownerHash,
+          nextEligibleTime: "2026-07-18T00:05:00.000Z",
+          scheduleIdentity: `wf-${record.operationId}`,
+        },
+        timestamp: new Date(),
+        instanceId: `wf-${record.operationId}`,
+        workflowName: "test",
+      }, workflowStep());
+    }
+
+    expect(service.fetch).toHaveBeenCalledTimes(2);
+    expect(snapshots).toEqual([
+      expect.objectContaining({ operationId: "workflow-fresh-1", subrequests: 1 }),
+      expect.objectContaining({ operationId: "workflow-fresh-2", subrequests: 1 }),
+    ]);
+    expect(snapshots[0].invocationId).toBeTruthy();
+    expect(snapshots[1].invocationId).toBeTruthy();
+    expect(snapshots[0].invocationId).not.toBe(snapshots[1].invocationId);
+  });
+
+  it("counts Durable Object store and service-binding calls during Workflow delivery", async () => {
+    const durable = ownerScopedDurableNamespace();
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, () =>
+      getOperationStore().put(terminalRecord())
+    );
+
+    const workflow = new SuperOpsContinuationWorkflow(undefined, {
+      SUPEROPS_OPERATION_LEDGER: durable.namespace,
+      SUPEROPS_CONTINUATION_SERVICE: {
+        fetch: vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 })),
+      },
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "internal-token",
+    });
+    const snapshots: Array<{ subrequests: number; durableObjectCalls: number; serviceBindingCalls: number }> = [];
+
+    await workflow.run({
+      payload: {
+        operationId: "workflow-op",
+        ownerHash: stableHash("workflow-owner"),
+        nextEligibleTime: "2026-07-18T00:05:00.000Z",
+        scheduleIdentity: "wf-123",
+      },
+      timestamp: new Date(),
+      instanceId: "wf-123",
+      workflowName: "test",
+    }, workflowStep((name) => {
+      if (name !== "deliver-checked-continuation") return;
+      const state = getExecutionState();
+      snapshots.push({
+        subrequests: state?.subrequests ?? 0,
+        durableObjectCalls: state?.requests.filter((request) => request.operationType === "durableObject").length ?? 0,
+        serviceBindingCalls: state?.requests.filter((request) => request.operationType === "serviceBinding").length ?? 0,
+      });
+    }));
+
+    expect(snapshots).toEqual([{ subrequests: 7, durableObjectCalls: 6, serviceBindingCalls: 1 }]);
+  });
   it("records exhausted Workflow delivery as a durable terminal failure", async () => {
     const initial = activeRecord();
     await runWithOperationStore({}, () => getOperationStore().put(initial));

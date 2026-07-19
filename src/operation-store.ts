@@ -1,6 +1,13 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getAuditContext, sanitizeText } from "./audit.js";
-import { getExecutionState, recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
+import {
+  ExecutionBudgetExceededError,
+  ExecutionCpuBudgetExceededError,
+  ExecutionTimeoutBudgetExceededError,
+  getExecutionState,
+  recordSubrequestFinish,
+  recordTypedSubrequestStart,
+} from "./execution.js";
 
 export type OperationState =
   | "Running"
@@ -1504,6 +1511,20 @@ function recordOperationStoreSubrequest(operationName: string) {
   });
 }
 
+function recordWorkflowSchedulingSubrequest() {
+  return recordTypedSubrequestStart({
+    type: "custom",
+    operationType: "workflow",
+    operationName: "continuationCreateBatch",
+  });
+}
+
+function isExecutionBudgetError(error: unknown): boolean {
+  return error instanceof ExecutionBudgetExceededError ||
+    error instanceof ExecutionTimeoutBudgetExceededError ||
+    error instanceof ExecutionCpuBudgetExceededError;
+}
+
 export function runWithOperationStore<T>(
   env: OperationStoreEnv,
   fn: () => T
@@ -1900,7 +1921,9 @@ export class SuperOpsOperationLedger {
     let lastError = "Workflow scheduling failed.";
     while (attempt < this.maxSchedulingAttempts()) {
       attempt += 1;
+      let started: ReturnType<typeof recordWorkflowSchedulingSubrequest> | undefined;
       try {
+        started = recordWorkflowSchedulingSubrequest();
         await this.env.SUPEROPS_CONTINUATION_WORKFLOW!.createBatch([{
           id: scheduleIdentity,
           params: {
@@ -1910,6 +1933,7 @@ export class SuperOpsOperationLedger {
             scheduleIdentity,
           },
         }]);
+        recordSubrequestFinish(started, "workflowCreated", true);
         return {
           ...record,
           workflowId: scheduleIdentity,
@@ -1921,7 +1945,20 @@ export class SuperOpsOperationLedger {
           schedulingAttemptCount: attempt,
         };
       } catch (error) {
+        if (started) recordSubrequestFinish(started, "workflowCreateBatchError", false);
         lastError = error instanceof Error ? error.message : lastError;
+        if (isExecutionBudgetError(error)) {
+          return this.terminalizeSchedulingFailure(
+            {
+              ...record,
+              schedulingAttempted: started !== undefined || record.schedulingAttempted,
+              schedulingSucceeded: false,
+              schedulingAttemptCount: started ? attempt : Math.max(0, attempt - 1),
+            },
+            `Workflow scheduling budget exhausted: ${lastError}`,
+            now
+          );
+        }
         if (attempt < this.maxSchedulingAttempts()) {
           const backoffMs = Math.min(500, 25 * (2 ** (attempt - 1)));
           await new Promise<void>((resolve) => setTimeout(resolve, backoffMs));
