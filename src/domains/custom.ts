@@ -57,6 +57,13 @@ function customMutationFailure(error: unknown): Record<string, unknown> {
     errorClass: conclusivelyRejected ? "SuperOpsGraphQLError" : "AmbiguousWrite",
     writeAttempted: true,
     writeMayHaveSucceeded: !conclusivelyRejected,
+    writeCount: { attempted: 1, maximum: 1, exact: true },
+    verification: {
+      performed: false,
+      possible: false,
+      verified: null,
+      reason: "Opaque custom mutation has no canonical final-state target.",
+    },
     reliableResponseReceived: conclusivelyRejected,
     partialWrite: !conclusivelyRejected,
     replaySafe: conclusivelyRejected,
@@ -144,6 +151,14 @@ export function getCustomTools(): DomainTools {
                 writeMayHaveSucceeded: true,
                 reliableResponseReceived: true,
                 replaySafe: false,
+                partialWrite: false,
+                writeCount: { attempted: 1, maximum: 1, exact: true },
+                verification: {
+                  performed: false,
+                  possible: false,
+                  verified: null,
+                  reason: "Opaque custom mutation has no canonical final-state target.",
+                },
                 failureClassification: null,
               };
               return boundedCustomResponse({ ...responseObject, ...writeContract }, writeContract);

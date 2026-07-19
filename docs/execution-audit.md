@@ -74,7 +74,7 @@ Durable rate state records attempt count, first-throttled time, parsed/capped/ap
 
 ## Durable record and checkpoint inventory
 
-The record contains no note body or customer message content. The approved request snapshot stores fixed candidates, action type, canonical target hashes, expected metadata hashes, and note fingerprints. Runtime-only plaintext required for the current invocation is not serialized. A later process that lacks a pending note body fails safely before write unless the persisted note stage can be reconciled from its fingerprint/created note identity.
+The public operation record contains no note body or customer message content. The approved request snapshot stores fixed candidates, action type, canonical target hashes, expected metadata hashes, and note fingerprints. Approved private-note body content needed for durable recovery is persisted separately as AES-GCM encrypted recovery content keyed by SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY, and plaintext is excluded from operation status, compact results, diagnostics, logs, audit data, and errors. A later process that lacks recoverable private-note content fails safely before write unless the persisted note stage can be reconciled from its fingerprint/created note identity.
 
 Required stages:
 
@@ -110,3 +110,56 @@ npx wrangler deploy --dry-run --config wrangler.json
 ```
 
 Exact approved staging/production resource-changing commands and pending-Workflow rollback rules are in `docs/continuation-operations.md`. No commit, push, deployment, provisioning, secret creation, or live SuperOps mutation was performed in this repair cycle.
+
+### Exact per-tool call and response matrix
+
+Counts below are logical SuperOps GraphQL POSTs before read retry multiplication. A read marked `R` can consume up to 3 total attempts under committed defaults; a synchronous write marked `W` is one attempt and is not retried by the shared client. Durable apply-triage is the only resumable write path.
+
+| Tool | Calls before read retries | Pagination/fallback | Verification | Worst-case committed SuperOps attempts | Output bound |
+| --- | --- | --- | --- | --- | --- |
+| `superops_clients_list` | 1R | one requested page, page size max 500 | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_clients_get` | 1R | none | same read is retrieval | 3 | MCP serialized response cap 1 MiB |
+| `superops_clients_search` | 1R | one requested page, max 20 unless supplied | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_assets_list` | 1R | one requested page, page size max 500 | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_assets_get` | 1R | none | same read is retrieval | 3 | MCP serialized response cap 1 MiB |
+| `superops_assets_software` | 1R | one requested page | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_assets_patches` | 1R | one requested page | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_technicians_list` | 1R | one requested page, page size max 500 | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_technicians_get` | 1R | none | same read is retrieval | 3 | MCP serialized response cap 1 MiB |
+| `superops_technicians_groups` | 1R | one requested page | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_alerts_list` | 1R | one requested page, page size max 500 | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_alerts_for_asset` | 1R, fallback 1R if status condition is rejected | one requested page | none | 6 | MCP serialized response cap 1 MiB |
+| `superops_alerts_get` | 1R exact-condition lookup plus up to 10 fallback pages | fallback stops when found or `hasMore=false` | same read is retrieval | 33 | MCP serialized response cap 1 MiB |
+| `superops_alerts_summary` | 1R | one requested page, default 100 | aggregate only | 3 | aggregate counts plus 10 compact samples, MCP cap |
+| `superops_alerts_create` | 1W plus optional alert lookup | lookup uses alert-get path when `verify` is not false | returns verification or accepted-followup failure | 34 | one alert plus compact verification, MCP cap |
+| `superops_alerts_resolve` | 1W plus optional lookup per requested alert ID | each lookup uses alert-get path | per-alert verification or skipped reason | `1 + 33 * ids` | compact per-ID verification, MCP cap |
+| `superops_custom_query` | 1R | caller-defined query, bounded only by input/response bytes | none | 3 | custom response cap 1 MiB plus MCP cap |
+| `superops_custom_mutation` | 1W | none | explicitly not possible for opaque mutation | 1 | custom response cap 1 MiB plus MCP cap |
+| `superops_tickets_list` | 1R | one requested page, page size max 500 | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_tickets_recent` | 1R plus up to 2R per included content ticket | recent page is capped; content tickets capped at 10 | content retrieval only | 63 | per-content char/item caps plus MCP cap |
+| `superops_tickets_query`, `superops_tickets_created_between`, `superops_tickets_report` | sequential R pages | bounded by `maxPages`, `maxRecords`, and execution budget | aggregate/report only | `3 * fetchedPages` | max records/pages plus MCP cap |
+| `superops_tickets_get` | 1R | none | same read is retrieval | 3 | MCP serialized response cap 1 MiB |
+| `superops_tickets_get_by_number` | up to 2R | display lookup then internal read | same read is retrieval | 6 | MCP serialized response cap 1 MiB |
+| `superops_tickets_get_safe_by_number` | up to 4R | metadata plus optional conversations/notes | safe content retrieval | 12 | per-item and total char caps plus MCP cap |
+| `superops_tickets_field_options` | 1R | selected field list | metadata validation | 3 | MCP serialized response cap 1 MiB |
+| `superops_tickets_conversation_list` | 1R | bounded by SuperOps response and MCP cap | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_tickets_notes_list` | 1R | bounded by SuperOps response and MCP cap | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_tickets_triage_snapshot` | 1R list plus up to 2R per candidate | candidate count and per-ticket content caps | read-only evidence | `3 * (1 + 2 * candidates)` | per-ticket content caps plus MCP cap |
+| `superops_tickets_create` | 1W plus optional 1R read-back when response has ticket ID | none | ticket read-back when `verify` is not false | 4 | created ticket plus compact verification, MCP cap |
+| `superops_tickets_update` | 0-1R metadata option lookup plus 1W plus optional 1R read-back | option lookup only for validated dynamic fields | scalar field read-back when `verify` is not false | 7 | update result plus compact verification, MCP cap |
+| `superops_tickets_resolve_full` | lookup/metadata/options reads, optional 1W note, 1W update, optional ticket/notes verification reads | no pagination beyond lookup helpers | final state and optional note ID verification unless `verify=false` | bounded by selected fields; at most two writes | compact result, exact write count, MCP cap |
+| `superops_tickets_add_note` | 1W plus optional 1R notes read-back | none | returned note ID checked when `verify` is not false | 4 | note ID/privacy metadata only, MCP cap |
+| `superops_tickets_log_time` | 1W | none | no bounded worklog read-back exists; response states this | 1 | worklog mutation result plus non-verification reason, MCP cap |
+| `superops_tickets_apply_triage_plan` | durable per-item units | stops before unsafe unit; resumes by ledger | mandatory read-back/dedupe/stale verification according to action | max 37 counted SuperOps calls per default invocation | compact results for every expected item plus MCP cap |
+
+### Retry telemetry fields
+
+Read retry diagnostics now include `source`, `retryAfterSupplied`, `suppliedDelayMs`, `parsedDelayMs`, `cappedDelayMs`, `actualDelayMs`, `attempt`, endpoint, GraphQL operation type/name, invocation ID, operation ID, and item key when present. Durable rate-limit state records the same delay taxonomy plus attempts, first-throttled time, scheduled time, actual observed wait from the prior schedule, total retry duration, elapsed time, continuation flag, mutation operation name, endpoint marker, write truth, and final result.
+
+### Synchronous mutation contract
+
+Every synchronous write response, including rejected and ambiguous failures, reports write attempt truth, `writeMayHaveSucceeded`, reliable-response state, replay safety, classification/final outcome, and write count. Direct ticket and alert writes perform read-back verification where the tool has a bounded final-state target; `superops_tickets_log_time` and `superops_custom_mutation` explicitly report why verification is not locally derivable.
+
+### Repository milestone evidence
+
+This document records the current repair-cycle implementation and gate commands, but it is not historical proof that every earlier milestone was separately reviewed, materially committed, and continued. That proof can only come from repository history and external CI/audit records. This repair cycle therefore documents the limitation rather than overstating progress-note evidence as historical proof.

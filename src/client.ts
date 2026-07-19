@@ -70,7 +70,8 @@ export class SuperOpsClient {
           throw error;
         }
 
-        const delayMs = retryDelayMs(error, attempt, config);
+        const retryDelay = retryDelayInfo(error, attempt, config);
+        const delayMs = retryDelay.actualDelayMs;
         const elapsedAfterDelay = Date.now() - startedMs + delayMs;
         if (
           elapsedAfterDelay > config.maxRetryDurationMs ||
@@ -80,7 +81,13 @@ export class SuperOpsClient {
           throw error;
         }
 
-        recordRetryDelay(delayMs);
+        recordRetryDelay({
+          ...retryDelay,
+          attempt,
+          endpoint: this.endpoint,
+          operationType: operation.operationType,
+          operationName: operation.operationName,
+        });
         await delay(delayMs);
       }
     }
@@ -93,7 +100,7 @@ export class SuperOpsClient {
     variables: Record<string, unknown> | undefined,
     retryCount: number
   ): Promise<T> {
-    const subrequest = recordSubrequestStart(query, retryCount);
+    const subrequest = recordSubrequestStart(query, retryCount, this.endpoint);
     const controller = new AbortController();
     const timeout = setTimeout(
       () => controller.abort(new SuperOpsTimeoutError("SuperOps request timed out.")),
@@ -299,20 +306,35 @@ function isRetryableGraphQLServerError(error: SuperOpsError): boolean {
   );
 }
 
-function retryDelayMs(
+interface RetryDelayInfo {
+  source: "retry-after" | "backoff";
+  retryAfterSupplied: boolean;
+  suppliedDelayMs?: number;
+  parsedDelayMs: number;
+  cappedDelayMs: number;
+  actualDelayMs: number;
+}
+
+function retryDelayInfo(
   error: unknown,
   attempt: number,
   config: ReturnType<typeof getExecutionConfig>
-): number {
+): RetryDelayInfo {
   const retryAfterSeconds =
     error instanceof SuperOpsHttpError || error instanceof SuperOpsError
       ? error.retryAfter
       : undefined;
   if (typeof retryAfterSeconds === "number") {
-    return Math.min(
-      config.maxSingleDelayMs,
-      Math.max(0, Math.ceil(retryAfterSeconds * 1000))
-    );
+    const suppliedDelayMs = Math.max(0, Math.ceil(retryAfterSeconds * 1000));
+    const cappedDelayMs = Math.min(config.maxSingleDelayMs, suppliedDelayMs);
+    return {
+      source: "retry-after",
+      retryAfterSupplied: true,
+      suppliedDelayMs,
+      parsedDelayMs: suppliedDelayMs,
+      cappedDelayMs,
+      actualDelayMs: cappedDelayMs,
+    };
   }
 
   const base = config.backoffBaseDelayMs * 2 ** Math.max(0, attempt - 1);
@@ -320,7 +342,15 @@ function retryDelayMs(
     config.backoffJitterRatio <= 0
       ? 0
       : base * config.backoffJitterRatio * Math.random();
-  return Math.min(config.maxSingleDelayMs, Math.ceil(base + jitter));
+  const parsedDelayMs = Math.ceil(base + jitter);
+  const cappedDelayMs = Math.min(config.maxSingleDelayMs, parsedDelayMs);
+  return {
+    source: "backoff",
+    retryAfterSupplied: false,
+    parsedDelayMs,
+    cappedDelayMs,
+    actualDelayMs: cappedDelayMs,
+  };
 }
 
 function delay(ms: number): Promise<void> {

@@ -35,6 +35,7 @@ import {
   logExecutionDiagnostics,
   runWithExecutionContext,
 } from "./execution.js";
+import { boundedToolResult } from "./utils/tool-result.js";
 import {
   currentOwnerHash,
   getOperationStore,
@@ -513,7 +514,7 @@ export function createMcpServer(): Server {
       let metadata = toolAuditMetadata(name, args);
 
       try {
-        const result = sanitizeToolResult(await executeToolCall(name, args));
+        const result = boundedToolResult(sanitizeToolResult(await executeToolCall(name, args)));
         metadata = enrichAuditMetadataFromResult(name, result, metadata);
         const errorSummary = errorSummaryFromResult(result);
         finishExecution(result.isError ? "toolError" : "completed");

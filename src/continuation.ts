@@ -40,6 +40,11 @@ export interface ContinuationItemOutcome {
   errorClass?: OperationCompleteItemParams["patch"]["errorClass"];
   reliableResponseReceived?: boolean;
   observedMutationResult?: "Accepted" | "Rejected" | "VerifiedApplied" | "Ambiguous";
+  retryDelaySource?: "retry-after" | "backoff";
+  retryAfterSupplied?: boolean;
+  suppliedDelayMs?: number;
+  retryOperationName?: string;
+  retryEndpoint?: string;
 }
 
 export interface OperationContinuationAdapter {
@@ -306,7 +311,11 @@ export async function runOperationContinuation(
           observedMutationResult: effectiveOutcome.observedMutationResult,
           rateLimit: outcome.rateLimited
             ? {
+                endpoint: effectiveOutcome.retryEndpoint ?? "SuperOps GraphQL /msp",
+                operationName: effectiveOutcome.retryOperationName ?? (claim.item.mutationType === "note" ? "CreateTicketNote" : "UpdateTicket"),
+                source: effectiveOutcome.retryDelaySource ?? (effectiveOutcome.retryAfterSupplied ? "retry-after" : "backoff"),
                 attempts: rateAttempts,
+                suppliedDelayMs: effectiveOutcome.suppliedDelayMs,
                 parsedDelayMs: requestedDelayMs,
                 cappedDelayMs,
                 appliedDelayMs: cappedDelayMs,
@@ -316,7 +325,7 @@ export async function runOperationContinuation(
                 totalRetryDurationMs,
                 totalElapsedMs: firstThrottledAt ? rateObservedAtMs - Date.parse(firstThrottledAt) : undefined,
                 nextEligibleAt: effectiveOutcome.nextEligibleTime,
-                retryAfterSupplied: Boolean(effectiveOutcome.nextEligibleTime),
+                retryAfterSupplied: effectiveOutcome.retryAfterSupplied ?? Boolean(effectiveOutcome.nextEligibleTime),
                 continuedInAnotherInvocation: effectiveOutcome.stage === "RateLimitedRescheduled",
                 writeAttempted: effectiveOutcome.writeAttempted,
                 finalResult: effectiveOutcome.outcome,

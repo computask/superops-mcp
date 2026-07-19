@@ -1452,6 +1452,15 @@ describe("Tickets Domain", () => {
         subject: "Tenant Issue",
       },
     });
+    mockClient.query.mockResolvedValue({
+      getTicket: {
+        ticketId: "created-ticket",
+        displayId: "062822-0005",
+        subject: "Tenant Issue",
+        status: "New Calls",
+        category: "1. Support request",
+      },
+    });
 
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_create", {
@@ -1478,7 +1487,24 @@ describe("Tickets Domain", () => {
       }
     );
     expect(mockClient.mutate.mock.calls[0][0]).toContain("displayId");
-    expect(result.content[0].text).toContain("created-ticket");
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining("getTicket"),
+      { input: { ticketId: "created-ticket" } }
+    );
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      result: { ticketId: "created-ticket" },
+      finalOutcome: "Created",
+      verification: {
+        performed: true,
+        possible: true,
+        verified: true,
+        result: { ticketId: "created-ticket", status: "New Calls" },
+      },
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      reliableResponseReceived: true,
+      replaySafe: false,
+    });
     expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
   });
 
@@ -2070,9 +2096,13 @@ describe("Tickets Domain", () => {
   ] as const)(
     "updates tickets with validated %s option values",
     async (fieldName, optionValue) => {
-      mockClient.query.mockResolvedValue({
-        getFields: [ticketField(fieldName, [optionValue])],
-      });
+      mockClient.query
+        .mockResolvedValueOnce({
+          getFields: [ticketField(fieldName, [optionValue])],
+        })
+        .mockResolvedValueOnce({
+          getTicket: { ticketId: "ticket-123", [fieldName]: optionValue },
+        });
       mockClient.mutate.mockResolvedValue({
         updateTicket: { ticketId: "ticket-123", [fieldName]: optionValue },
       });
@@ -2099,7 +2129,26 @@ describe("Tickets Domain", () => {
         }
       );
       expect(mockClient.mutate.mock.calls[0][0]).toContain(fieldName);
-      expect(result.content[0].text).toContain(optionValue);
+      expect(mockClient.query).toHaveBeenNthCalledWith(
+        2,
+        expect.stringContaining("getTicket"),
+        { input: { ticketId: "ticket-123" } }
+      );
+      expect(JSON.parse(result.content[0].text)).toMatchObject({
+        result: { ticketId: "ticket-123", [fieldName]: optionValue },
+        finalOutcome: "Updated",
+        verification: {
+          performed: true,
+          possible: true,
+          verified: true,
+          comparedFields: [fieldName],
+          mismatches: [],
+        },
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+        reliableResponseReceived: true,
+        replaySafe: false,
+      });
     }
   );
 
@@ -2110,14 +2159,24 @@ describe("Tickets Domain", () => {
         category: "1. Support request",
       },
     });
+    mockClient.query.mockResolvedValue({
+      getTicket: {
+        ticketId: "ticket-123",
+        category: "1. Support request",
+      },
+    });
 
     const domain = getTicketsTools();
-    await domain.handleCall("superops_tickets_update", {
+    const result = await domain.handleCall("superops_tickets_update", {
       ticketId: "ticket-123",
       category: "1. Support request",
     });
 
-    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.query).toHaveBeenCalledOnce();
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining("getTicket"),
+      { input: { ticketId: "ticket-123" } }
+    );
     expect(mockClient.mutate).toHaveBeenCalledWith(
       expect.stringContaining("updateTicket"),
       {
@@ -2127,6 +2186,15 @@ describe("Tickets Domain", () => {
         },
       }
     );
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      verification: {
+        performed: true,
+        possible: true,
+        verified: true,
+        comparedFields: ["category"],
+        mismatches: [],
+      },
+    });
   });
 
   it("rejects invalid dynamic ticket option names before mutation", async () => {

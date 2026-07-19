@@ -576,6 +576,10 @@ function compactAlert(alert: NormalizedAlert) {
   };
 }
 
+function synchronousWriteCount(attempted: number, maximum: number) {
+  return { attempted, maximum, exact: true };
+}
+
 function verificationResult(alert: NormalizedAlert | undefined) {
   if (!alert) {
     return {
@@ -774,7 +778,10 @@ export function getAlertsTools(): DomainTools {
               dryRun: false,
               requestedIds: ids,
               resolved,
-              verification,
+              finalOutcome: "Resolved",
+              partialWrite: false,
+              verification: verification ?? { performed: false, possible: true, verified: null, reason: "verify=false" },
+              writeCount: synchronousWriteCount(1, 1),
               writeAttempted: true,
               writeMayHaveSucceeded: true,
               reliableResponseReceived: true,
@@ -813,7 +820,12 @@ export function getAlertsTools(): DomainTools {
                 ? await findAlertById(client, alert.id)
                 : undefined;
             return textResult({
-              dryRun: false, alert, verification,
+              dryRun: false,
+              alert,
+              finalOutcome: "Created",
+              partialWrite: false,
+              verification: verification ?? { performed: false, possible: Boolean(alert.id), verified: null, reason: "verify=false or mutation response had no alert ID" },
+              writeCount: synchronousWriteCount(1, 1),
               writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true,
             });
           }
@@ -855,6 +867,7 @@ export function getAlertsTools(): DomainTools {
               error: alertErrorMessage(error),
               writeAttempted: synchronousWriteAttempted,
               writeMayHaveSucceeded: synchronousWriteAttempted,
+              writeCount: synchronousWriteCount(synchronousWriteAttempted ? 1 : 0, 1),
               reliableResponseReceived: synchronousWriteAccepted,
               replaySafe: !synchronousWriteAttempted,
               classification: synchronousWriteAccepted

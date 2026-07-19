@@ -5,18 +5,8 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("./client.js", () => ({
-  getClient: vi.fn(() => ({ query: vi.fn(), mutate: vi.fn() })),
-  SuperOpsError: class SuperOpsError extends Error {
-    constructor(message: string, public code?: string, public retryAfter?: number) { super(message); }
-  },
-  SuperOpsHttpError: class SuperOpsHttpError extends Error {
-    constructor(message: string, public status: number, public statusText: string, public retryAfter?: number) { super(message); }
-  },
-}));
-
-import { getClient, SuperOpsError, SuperOpsHttpError } from "./client.js";
-import { getExecutionState, recordSubrequestFinish, recordTypedSubrequestStart, runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
+import { runWithCredentials } from "./client.js";
+import { getExecutionState, runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
 import { getOperationStore, operationTotals, runWithOperationStore } from "./operation-store.js";
 import { getTicketsTools, resumeApplyTriageOperation } from "./domains/tickets.js";
 import { runWithContinuationScheduler } from "./continuation-scheduler.js";
@@ -24,8 +14,62 @@ import { runWithContinuationScheduler } from "./continuation-scheduler.js";
 const SEED = 0x5eed250;
 const EXPECTED = 250;
 const MAX_HARNESS_CONTINUATION_INVOCATIONS = EXPECTED * 4;
+const LARGE_HARNESS_TIMEOUT_MS = 60_000;
 const UPDATED = "2026-07-18T10:01:00.000Z";
 
+const HARNESS_CREDS = { apiToken: "harness-token", subdomain: "harness" };
+
+function graphQlData(data: unknown): Response {
+  return new Response(JSON.stringify({ data }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function graphQlThrottle(retryAfter: number): Response {
+  return new Response(JSON.stringify({
+    errors: [{ message: "GraphQL throttled", extensions: { code: "THROTTLED", retryAfter } }],
+  }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonBody(init?: RequestInit): { query: string; variables?: { input?: Record<string, unknown> } } {
+  if (typeof init?.body !== "string") throw new Error("missing mocked GraphQL body");
+  return JSON.parse(init.body) as { query: string; variables?: { input?: Record<string, unknown> } };
+}
+
+function runWithHarnessCredentials<T>(fn: () => T): T {
+  return runWithCredentials(HARNESS_CREDS, fn);
+}
+async function deliverInternalContinuation(operationId: string, ownerHash: string): Promise<Response> {
+  const worker = (await import("./worker.js")).default;
+  return worker.fetch(
+    new Request("http://worker.local/internal/operations/continue", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-SuperOps-Internal-Continuation": "harness-internal-token",
+      },
+      body: JSON.stringify({
+        toolName: "superops_tickets_apply_triage_plan",
+        operationId,
+        ownerHash,
+      }),
+    }),
+    {
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "harness-internal-token",
+      SUPEROPS_API_TOKEN: HARNESS_CREDS.apiToken,
+      SUPEROPS_SUBDOMAIN: HARNESS_CREDS.subdomain,
+      SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "14",
+      SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "2",
+      SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+      SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT: "1000",
+    }
+  );
+}
 function withSuccessfulContinuationScheduling<T>(fn: () => T): T {
   return runWithContinuationScheduler({
     SUPEROPS_CONTINUATION_ENABLED: "true",
@@ -60,10 +104,10 @@ class Seeded {
   next() { this.value = (Math.imul(this.value, 1664525) + 1013904223) >>> 0; return this.value; }
 }
 
-type TicketState = { ticketId: string; displayId: string; status: string; updatedTime: string; notes: Array<{ content: string; privacyType: string }> };
+type TicketState = { ticketId: string; displayId: string; status: string; updatedTime: string; notes: Array<{ noteId: string; content: string; privacyType: string }> };
 
 describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", () => {
-  afterEach(() => { vi.clearAllMocks(); });
+  afterEach(() => { vi.clearAllMocks(); vi.unstubAllGlobals(); });
 
   it("accounts for every item through the real adapter without duplicate mutations", async () => {
     const random = new Seeded(SEED);
@@ -129,51 +173,53 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
     const staleDuringWaitCandidate = [...remainingUpdates]
       .reverse().find((action) => Number(action.ticketNumber) > Number(rateLimitCandidate.ticketNumber)) ?? remainingUpdates.at(-1)!;
     const checkpointFailureCandidate = remainingUpdates.find((action) => !faults.has(String(action.ticketNumber)))!;
-    const mockClient = { query: vi.fn(), mutate: vi.fn() };
-    vi.mocked(getClient).mockReturnValue(mockClient as never);
-    mockClient.query.mockImplementation(async (query: string, variables: { input?: { condition?: { value?: string }; ticketId?: string } }) => {
-      const started = recordTypedSubrequestStart({ type: query.includes("getTicketList") ? "initialRead" : "verificationRead", operationType: "query", operationName: "harnessRead" });
-      recordSubrequestFinish(started, 200, true);
+    const fetchMock = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      const { query, variables } = jsonBody(init);
+      const input = variables?.input ?? {};
       if (query.includes("getTicketList")) {
-        const ticket = tickets.get(String(variables.input?.condition?.value ?? ""));
-        return { getTicketList: { tickets: ticket ? [{ ticketId: ticket.ticketId, displayId: ticket.displayId }] : [], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: ticket ? 1 : 0 } } };
+        const condition = input.condition as { value?: string } | undefined;
+        const ticket = tickets.get(String(condition?.value ?? ""));
+        return graphQlData({ getTicketList: { tickets: ticket ? [{ ticketId: ticket.ticketId, displayId: ticket.displayId }] : [], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: ticket ? 1 : 0 } } });
       }
       if (query.includes("getTicketNoteList")) {
-        const ticket = [...tickets.values()].find((item) => item.ticketId === variables.input?.ticketId);
-        return { getTicketNoteList: ticket?.notes ?? [] };
+        const ticket = [...tickets.values()].find((item) => item.ticketId === input.ticketId);
+        return graphQlData({ getTicketNoteList: ticket?.notes ?? [] });
       }
-      if (query.includes("getFields")) return { getFields: fields() };
-      const ticket = [...tickets.values()].find((item) => item.ticketId === variables.input?.ticketId);
-      if (!ticket) throw new Error("missing ticket");
-      return { getTicket: { ...ticket } };
-    });
-    mockClient.mutate.mockImplementation(async (mutation: string, variables: { input?: Record<string, unknown> }) => {
-      const started = recordTypedSubrequestStart({ type: "write", operationType: "mutation", operationName: "harnessWrite" });
-      const input = variables.input ?? {};
-      const ticketId = String((input.ticket as { ticketId?: string } | undefined)?.ticketId ?? input.ticketId ?? "");
-      const ticket = [...tickets.values()].find((item) => item.ticketId === ticketId);
-      if (!ticket) throw new Error("missing ticket");
-      const isNote = mutation.includes("createTicketNote");
-      const fault = faults.get(ticket.displayId);
-      const count = (mutationCounts.get(ticket.displayId) ?? 0) + 1;
-      mutationCounts.set(ticket.displayId, count);
-      if (fault === "rateLimit" && count === 1) { recordSubrequestFinish(started, 429, false); throw new SuperOpsHttpError("rate limited", 429, "Too Many Requests", 3600); }
-      if (fault === "graphqlThrottle" && count === 1) { recordSubrequestFinish(started, 200, false); throw new SuperOpsError("GraphQL throttled", "THROTTLED", 3600); }
-      if ((fault === "fiveHundred" || fault === "network") && count === 1) { recordSubrequestFinish(started, fault === "fiveHundred" ? 500 : "network", false); throw new Error(fault === "fiveHundred" ? "status 500" : "network timeout"); }
-      if (isNote) {
-        ticket.notes.push({ content: String(input.content ?? ""), privacyType: "PRIVATE" });
-        successfulNotes.set(ticket.displayId, (successfulNotes.get(ticket.displayId) ?? 0) + 1);
-        recordSubrequestFinish(started, 200, true);
-        if (fault === "lostNote" && count === 1) throw new Error("network response lost after accepted private note");
-        return { createTicketNote: { noteId: `note-${ticket.displayId}`, content: input.content, privacyType: "PRIVATE" } };
+      if (query.includes("getFields")) return graphQlData({ getFields: fields() });
+      if (query.includes("mutation")) {
+        const ticketId = String((input.ticket as { ticketId?: string } | undefined)?.ticketId ?? input.ticketId ?? "");
+        const ticket = [...tickets.values()].find((item) => item.ticketId === ticketId);
+        if (!ticket) throw new Error("missing ticket");
+        const isNote = query.includes("createTicketNote");
+        const fault = faults.get(ticket.displayId);
+        const count = (mutationCounts.get(ticket.displayId) ?? 0) + 1;
+        mutationCounts.set(ticket.displayId, count);
+        if (fault === "rateLimit" && count === 1) {
+          return new Response("rate limited", { status: 429, statusText: "Too Many Requests", headers: { "Retry-After": "3600" } });
+        }
+        if (fault === "graphqlThrottle" && count === 1) return graphQlThrottle(3600);
+        if (fault === "fiveHundred" && count === 1) {
+          return new Response("server error", { status: 500, statusText: "Internal Server Error" });
+        }
+        if (fault === "network" && count === 1) throw new Error("network timeout");
+        if (isNote) {
+          const noteId = `note-${ticket.displayId}`;
+          ticket.notes.push({ noteId, content: String(input.content ?? ""), privacyType: "PRIVATE" });
+          successfulNotes.set(ticket.displayId, (successfulNotes.get(ticket.displayId) ?? 0) + 1);
+          if (fault === "lostNote" && count === 1) throw new Error("network response lost after accepted private note");
+          return graphQlData({ createTicketNote: { noteId, content: input.content, privacyType: "PRIVATE" } });
+        }
+        Object.assign(ticket, input, { updatedTime: UPDATED });
+        const resolved = String(input.status ?? "") === "Resolved";
+        (resolved ? successfulResolutions : successfulUpdates).set(ticket.displayId, ((resolved ? successfulResolutions : successfulUpdates).get(ticket.displayId) ?? 0) + 1);
+        if ((fault === "lostUpdate" || fault === "lostResolution") && count === 1) throw new Error("network response lost after accepted mutation");
+        return graphQlData({ updateTicket: { ticketId, status: ticket.status } });
       }
-      Object.assign(ticket, input, { updatedTime: UPDATED });
-      const resolved = String(input.status ?? "") === "Resolved";
-      (resolved ? successfulResolutions : successfulUpdates).set(ticket.displayId, ((resolved ? successfulResolutions : successfulUpdates).get(ticket.displayId) ?? 0) + 1);
-      recordSubrequestFinish(started, 200, true);
-      if ((fault === "lostUpdate" || fault === "lostResolution") && count === 1) throw new Error("network response lost after accepted mutation");
-      return { updateTicket: { ticketId, status: ticket.status } };
+      const ticket = [...tickets.values()].find((item) => item.ticketId === input.ticketId);
+      if (!ticket) throw new Error("missing ticket");
+      return graphQlData({ getTicket: { ...ticket } });
     });
+    vi.stubGlobal("fetch", fetchMock);
 
     await runWithOperationStore({}, async () => {
       const domain = getTicketsTools();
@@ -214,11 +260,11 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       let initial!: Awaited<ReturnType<typeof domain.handleCall>>;
       await runWithExecutionConfig({ SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "4", SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "45", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8" }, async () => {
         await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
-          initial = await withSuccessfulContinuationScheduling(() =>
+          initial = await runWithHarnessCredentials(() => withSuccessfulContinuationScheduling(() =>
             domain.handleCall("superops_tickets_apply_triage_plan", {
               expectedCandidateTicketNumbers: numbers, actions,
             })
-          );
+          ));
           callsByInvocation.push({ calls: getExecutionState()?.subrequests ?? 0, effectiveBudget: 37, phase: "initial" });
         });
       });
@@ -226,7 +272,11 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       const record = await store.get(operationId);
       if (!record) throw new Error("missing harness operation");
 
-      await expect(resumeApplyTriageOperation({ operationId, ownerHash: "wrong-owner", leaseOwner: "attacker" })).rejects.toThrow("not found");
+      const fetchCallsBeforeWrongOwner = fetchMock.mock.calls.length;
+      await expect(runWithHarnessCredentials(() =>
+        resumeApplyTriageOperation({ operationId, ownerHash: "wrong-owner", leaseOwner: "attacker" })
+      )).rejects.toThrow("not found");
+      expect(fetchMock).toHaveBeenCalledTimes(fetchCallsBeforeWrongOwner);
       const expired = await store.claimNextItem({ operationId, ownerHash: record.ownerHash, leaseOwner: "expired", leaseMs: 1, now: "2026-07-18T10:00:00.000Z" });
       expect(expired).toBeDefined();
       await expect(store.claimNextItem({
@@ -257,11 +307,11 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       let staleChangedDuringWait = false;
       for (let invocation = 0; continuationRequired && invocation < MAX_HARNESS_CONTINUATION_INVOCATIONS; invocation += 1) {
         continuationInvocations += 1;
-        await runWithExecutionConfig({ SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "14", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "2", SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0", SUPEROPS_EXECUTION_MAX_RETRY_DURATION_MS: "7200000", SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT: "1000" }, async () => {
+        await runWithExecutionConfig({ SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "14", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "2", SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0", SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT: "1000" }, async () => {
           await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
             try {
               const now = new Date(Date.parse("2026-07-18T11:00:00.000Z") + invocation * 1000).toISOString();
-              const result = await resumeApplyTriageOperation({ operationId, ownerHash: record.ownerHash, leaseOwner: `seed-${invocation}`, now, leaseMs: 1 });
+              const result = await runWithHarnessCredentials(() => resumeApplyTriageOperation({ operationId, ownerHash: record.ownerHash, leaseOwner: `seed-${invocation}`, now, leaseMs: 1 }));
               continuationRequired = result.continuationRequired;
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
@@ -308,9 +358,21 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       const finalRecord = await store.get(operationId);
       if (!finalRecord) throw new Error("missing final harness operation");
       expect(continuationRequired, `harness exhausted ${MAX_HARNESS_CONTINUATION_INVOCATIONS} invocations`).toBe(false);
+      const successfulWritesBeforeDuplicateDelivery = [...successfulUpdates.values(), ...successfulResolutions.values(), ...successfulNotes.values()]
+        .reduce((sum, count) => sum + count, 0);
+      const duplicateDeliveryResponses = await Promise.all([
+        deliverInternalContinuation(operationId, record.ownerHash),
+        deliverInternalContinuation(operationId, record.ownerHash),
+      ]);
+      expect(duplicateDeliveryResponses.map((response) => response.status)).toEqual([200, 200]);
+      const successfulWritesAfterDuplicateDelivery = [...successfulUpdates.values(), ...successfulResolutions.values(), ...successfulNotes.values()]
+        .reduce((sum, count) => sum + count, 0);
+      expect(successfulWritesAfterDuplicateDelivery).toBe(successfulWritesBeforeDuplicateDelivery);
+
       const states = Object.values(finalRecord.itemStates);
       const terminal = new Set(["Completed", "CompletedAfterRetry", "CompletedAfterAmbiguousWriteVerification", "AmbiguousWriteUnresolved", "Stale", "Skipped", "FailedBeforeWrite", "FailedAfterPartialWrite", "RateLimitExceeded", "StaleAfterRateLimitWait"]);
       const totals = operationTotals(finalRecord);
+      const rateLimitTelemetry = states.map((item) => item.rateLimit).filter(Boolean);
       const terminalCount = states.filter((item) => terminal.has(item.stage)).length;
       const totalRetries = [...mutationCounts.values()].reduce((sum, count) => sum + Math.max(0, count - 1), 0);
       const counters = {
@@ -343,6 +405,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
         schedulingFailures,
         storeFailures,
         malformedStoredOperations,
+        duplicateInternalDeliveries: duplicateDeliveryResponses.length,
       };
       expect(counters.itemsExpected).toBe(250);
       expect(counters.itemsAccounted).toBe(250);
@@ -363,9 +426,22 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       expect(counters.maxDurableWaitMs).toBeGreaterThan(25_000);
       expect(staleChangedDuringWait).toBe(true);
       expect(rateLimitRescheduled).toBeGreaterThan(0);
+      expect(rateLimitTelemetry).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            source: "retry-after",
+            retryAfterSupplied: true,
+            suppliedDelayMs: 3_600_000,
+            parsedDelayMs: expect.any(Number),
+            cappedDelayMs: 900_000,
+            endpoint: "SuperOps GraphQL /msp",
+          }),
+        ])
+      );
       expect(schedulingFailures).toBe(1);
       expect(storeFailures).toBe(1);
       expect(malformedStoredOperations).toBe(1);
+      expect(counters.duplicateInternalDeliveries).toBe(2);
       expect(states.every((item) => terminal.has(item.stage))).toBe(true);
       expect(mutationCounts.get(String(updateCandidate.ticketNumber))).toBe(1);
       expect(mutationCounts.get(String(resolveCandidate.ticketNumber))).toBe(1);
@@ -388,7 +464,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
         expect(allCheckpointStages).toContain(requiredStage);
       }
     });
-  });
+  }, LARGE_HARNESS_TIMEOUT_MS);
 
   it("terminates before and after every real update, resolution, and note checkpoint", async () => {
     const checkpointLifecycles = {
@@ -435,27 +511,26 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
               notes: [],
             };
             let mutationCount = 0;
-            const mockClient = {
-              query: vi.fn(async (query: string, _variables: { input?: { condition?: { value?: string }; ticketId?: string } }) => {
-                if (query.includes("getTicketList")) {
-                  return { getTicketList: { tickets: [{ ticketId: ticket.ticketId, displayId: ticket.displayId }], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } };
-                }
-                if (query.includes("getTicketNoteList")) return { getTicketNoteList: ticket.notes };
-                if (query.includes("getFields")) return { getFields: fields() };
-                return { getTicket: { ...ticket } };
-              }),
-              mutate: vi.fn(async (mutation: string, variables: { input?: Record<string, unknown> }) => {
+            vi.stubGlobal("fetch", vi.fn(async (_input: unknown, init?: RequestInit) => {
+              const { query, variables } = jsonBody(init);
+              const input = variables?.input ?? {};
+              if (query.includes("getTicketList")) {
+                return graphQlData({ getTicketList: { tickets: [{ ticketId: ticket.ticketId, displayId: ticket.displayId }], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } });
+              }
+              if (query.includes("getTicketNoteList")) return graphQlData({ getTicketNoteList: ticket.notes });
+              if (query.includes("getFields")) return graphQlData({ getFields: fields() });
+              if (query.includes("mutation")) {
                 mutationCount += 1;
-                const input = variables.input ?? {};
-                if (mutation.includes("createTicketNote")) {
-                  ticket.notes.push({ content: String(input.content ?? ""), privacyType: "PRIVATE" });
-                  return { createTicketNote: { noteId: `note-${ticketNumber}`, privacyType: "PRIVATE" } };
+                if (query.includes("createTicketNote")) {
+                  const noteId = `note-${ticketNumber}`;
+                  ticket.notes.push({ noteId, content: String(input.content ?? ""), privacyType: "PRIVATE" });
+                  return graphQlData({ createTicketNote: { noteId, privacyType: "PRIVATE" } });
                 }
                 Object.assign(ticket, input, { updatedTime: UPDATED });
-                return { updateTicket: { ticketId: ticket.ticketId, status: ticket.status } };
-              }),
-            };
-            vi.mocked(getClient).mockReturnValue(mockClient as never);
+                return graphQlData({ updateTicket: { ticketId: ticket.ticketId, status: ticket.status } });
+              }
+              return graphQlData({ getTicket: { ...ticket } });
+            }));
 
             let injected = false;
             store.checkpointItem = async (params) => {
@@ -485,13 +560,13 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
 
             await runWithExecutionConfig({ SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" }, async () => {
               await runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
-                withSuccessfulContinuationScheduling(() =>
+                runWithHarnessCredentials(() => withSuccessfulContinuationScheduling(() =>
                   domain.handleCall("superops_tickets_apply_triage_plan", {
                     batchId: operationId,
                     expectedCandidateTicketNumbers: [ticketNumber],
                     actions: [action],
                   })
-                ), operationId
+                )), operationId
               );
             });
 

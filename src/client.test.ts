@@ -140,6 +140,16 @@ describe("SuperOpsClient rate-limit handling", () => {
     expect(result).toEqual({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(diagnostics?.retries).toMatchObject({ count: 1, delaysMs: [1] });
+    expect((diagnostics?.retries as { details?: unknown[] } | undefined)?.details?.[0]).toMatchObject({
+      source: "retry-after",
+      retryAfterSupplied: true,
+      suppliedDelayMs: 1000,
+      parsedDelayMs: 1000,
+      cappedDelayMs: 1,
+      actualDelayMs: 1,
+      endpoint: "https://api.superops.ai/msp",
+      operationName: "Test",
+    });
     expect(diagnostics?.subrequests).toMatchObject({ used: 2 });
   });
 

@@ -75,6 +75,23 @@ export interface SubrequestRecord {
   retryCount: number;
   durationMs?: number;
   ok?: boolean;
+  endpoint?: string;
+}
+
+export interface RetryDelayRecord {
+  attempt: number;
+  source: "retry-after" | "backoff";
+  retryAfterSupplied: boolean;
+  suppliedDelayMs?: number;
+  parsedDelayMs: number;
+  cappedDelayMs: number;
+  actualDelayMs: number;
+  endpoint?: string;
+  operationType?: string;
+  operationName?: string;
+  invocationId?: string;
+  operationId?: string;
+  itemKey?: string;
 }
 
 export interface ExecutionItemStats {
@@ -108,6 +125,7 @@ export interface ExecutionState {
   requests: SubrequestRecord[];
   retryCount: number;
   retryDelaysMs: number[];
+  retryDelayDetails: RetryDelayRecord[];
 }
 
 const DEFAULT_CONFIG: ExecutionConfig = {
@@ -388,6 +406,7 @@ export function runWithExecutionContext<T>(
     requests: [],
     retryCount: 0,
     retryDelaysMs: [],
+    retryDelayDetails: [],
   };
   return EXECUTION_STORE.run(state, fn);
 }
@@ -480,7 +499,8 @@ export function classifyGraphQLRequest(
 
 export function recordSubrequestStart(
   query: string,
-  retryCount = 0
+  retryCount = 0,
+  endpoint?: string
 ): { index: number; startedMs: number; record?: SubrequestRecord } {
   const classified = classifyGraphQLRequest(query, retryCount);
   return recordTypedSubrequestStart({
@@ -488,6 +508,7 @@ export function recordSubrequestStart(
     operationType: classified.operationType,
     operationName: classified.operationName,
     retryCount,
+    endpoint,
   });
 }
 
@@ -497,6 +518,7 @@ export function recordTypedSubrequestStart(params: {
   operationName?: string;
   retryCount?: number;
   allowSafetyMargin?: boolean;
+  endpoint?: string;
 }): { index: number; startedMs: number; record?: SubrequestRecord } {
   const state = getExecutionState();
   if (!state) return { index: 0, startedMs: Date.now() };
@@ -525,6 +547,7 @@ export function recordTypedSubrequestStart(params: {
     operationName: params.operationName,
     itemKey: state.itemKey,
     retryCount: params.retryCount ?? 0,
+    endpoint: params.endpoint,
   };
   state.requests.push(record);
   if (state.itemKey) {
@@ -578,11 +601,32 @@ export function markExecutionItem(params: {
   }
 }
 
-export function recordRetryDelay(delayMs: number): void {
+export function recordRetryDelay(
+  delay: number | Omit<RetryDelayRecord, "invocationId" | "operationId" | "itemKey">
+): void {
   const state = getExecutionState();
   if (!state) return;
+  const actualDelayMs = typeof delay === "number" ? delay : delay.actualDelayMs;
   state.retryCount += 1;
-  state.retryDelaysMs.push(delayMs);
+  state.retryDelaysMs.push(actualDelayMs);
+  state.retryDelayDetails.push(typeof delay === "number"
+    ? {
+        attempt: state.retryCount,
+        source: "backoff",
+        retryAfterSupplied: false,
+        parsedDelayMs: actualDelayMs,
+        cappedDelayMs: actualDelayMs,
+        actualDelayMs,
+        invocationId: state.invocationId,
+        operationId: state.operationId,
+        itemKey: state.itemKey,
+      }
+    : {
+        ...delay,
+        invocationId: state.invocationId,
+        operationId: state.operationId,
+        itemKey: state.itemKey,
+      });
 }
 
 export function finishExecution(reason: string): void {
@@ -624,6 +668,7 @@ export function executionDiagnostics(): Record<string, unknown> | undefined {
     retries: {
       count: state.retryCount,
       delaysMs: state.retryDelaysMs,
+      details: state.retryDelayDetails,
     },
     requestsByType: state.requests.reduce<Record<string, number>>((counts, request) => {
       counts[request.type] = (counts[request.type] ?? 0) + 1;

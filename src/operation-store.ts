@@ -77,7 +77,9 @@ export interface OperationLease {
 export interface OperationRateLimitState {
   endpoint?: string;
   operationName?: string;
+  source?: "retry-after" | "backoff";
   attempts: number;
+  suppliedDelayMs?: number;
   retryAfterSupplied: boolean;
   parsedDelayMs?: number;
   cappedDelayMs?: number;

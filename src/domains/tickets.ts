@@ -531,6 +531,7 @@ interface TicketClassificationParams {
 
 interface UpdateTicketParams extends TicketClassificationParams {
   ticketId: string;
+  verify?: boolean;
   assigneeId?: string;
   techGroupName?: string;
   resolution?: string;
@@ -626,6 +627,9 @@ interface ApplyTriagePlanResult {
   verifiedState?: Record<string, unknown> | null;
   /** Compact retry metadata only; never include an upstream response body. */
   rateLimitRetryAfterMs?: number;
+  rateLimitRetryAfterSupplied?: boolean;
+  rateLimitRequestedDelayMs?: number;
+  rateLimitDelaySource?: "retry-after" | "backoff";
   rateLimitConclusiveRejection?: boolean;
 }
 interface StructuredValidationFailure {
@@ -2051,19 +2055,30 @@ function isRateLimitError(error: unknown): boolean {
   return /rate limit|too many requests|status\s*429/i.test(message);
 }
 
-function rateLimitRetryMetadata(error: unknown): { delayMs: number; conclusiveRejection: boolean } {
+function rateLimitRetryMetadata(error: unknown): {
+  delayMs: number;
+  requestedDelayMs: number;
+  retryAfterSupplied: boolean;
+  delaySource: "retry-after" | "backoff";
+  conclusiveRejection: boolean;
+} {
   const retryAfterSeconds = error instanceof SuperOpsHttpError || error instanceof SuperOpsError
     ? error.retryAfter
     : undefined;
   const configured = getExecutionConfig();
-  const requestedDelayMs = typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds)
+  const retryAfterSupplied = typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds);
+  const requestedDelayMs = retryAfterSupplied
     ? Math.max(0, Math.ceil(retryAfterSeconds * 1000))
     : configured.backoffBaseDelayMs;
   // Durable waits may exceed the short in-invocation delay cap, but never the
-  // configured total retry window. A 429/structured throttle is a reliable
+  // configured durable retry window. The continuation runner applies the
+  // durable single-wait cap before scheduling. A 429/structured throttle is a reliable
   // rejection, so a resumed adapter may make one bounded retry after re-read.
   return {
-    delayMs: Math.min(requestedDelayMs, configured.maxRetryDurationMs),
+    delayMs: Math.min(requestedDelayMs, configured.maxDurableRetryDurationMs),
+    requestedDelayMs,
+    retryAfterSupplied,
+    delaySource: retryAfterSupplied ? "retry-after" : "backoff",
     conclusiveRejection: error instanceof SuperOpsHttpError
       ? error.status === 429
       : error instanceof SuperOpsError && isRateLimitError(error),
@@ -2078,6 +2093,52 @@ function ticketTechGroupName(ticket: Ticket): string | undefined {
   return readableString(ticket.techGroup, ["name", "groupName"]);
 }
 
+
+const DIRECT_TICKET_VERIFY_FIELDS = [
+  "status",
+  "priority",
+  "impact",
+  "urgency",
+  "category",
+  "subcategory",
+  "cause",
+  "resolutionCode",
+] as const;
+
+function synchronousWriteCount(attempted: number, maximum: number) {
+  return { attempted, maximum, exact: true };
+}
+
+function verifyDirectTicketUpdate(input: Record<string, unknown>, ticket: Ticket): Record<string, unknown> {
+  const finalState = ticketFinalState(ticket);
+  const compared = DIRECT_TICKET_VERIFY_FIELDS.filter((field) => input[field] !== undefined);
+  const mismatches = compared
+    .filter((field) => finalState[field] !== input[field])
+    .map((field) => ({ field, expected: input[field], observed: finalState[field] }));
+  return {
+    performed: true,
+    possible: compared.length > 0,
+    verified: compared.length > 0 && mismatches.length === 0,
+    comparedFields: compared,
+    mismatches,
+    finalState,
+    reason: compared.length === 0
+      ? "No scalar ticket fields with a confirmed read-back mapping were supplied."
+      : undefined,
+  };
+}
+
+function noteVerificationResult(notes: TicketNote[], createdNote: TicketNote): Record<string, unknown> {
+  const createdId = createdNote.noteId;
+  const found = Boolean(createdId) && notes.some((note) => note.noteId === createdId);
+  return {
+    performed: true,
+    possible: Boolean(createdId),
+    verified: found,
+    noteId: createdId,
+    reason: createdId ? undefined : "Mutation response did not include a note ID for read-back verification.",
+  };
+}
 function ticketFinalState(ticket: Ticket): Record<string, unknown> {
   return {
     status: ticket.status,
@@ -2972,6 +3033,9 @@ async function applyApprovedTriageAction(params: {
           result.failureStage = "rateLimit";
           result.failureReason = safeErrorMessage(error);
           result.rateLimitRetryAfterMs = rateLimit.delayMs;
+          result.rateLimitRequestedDelayMs = rateLimit.requestedDelayMs;
+          result.rateLimitRetryAfterSupplied = rateLimit.retryAfterSupplied;
+          result.rateLimitDelaySource = rateLimit.delaySource;
           result.rateLimitConclusiveRejection = rateLimit.conclusiveRejection;
           // The outbound write checkpoint remains conservative. The response
           // classification separately records that this particular request was
@@ -3089,7 +3153,10 @@ async function applyApprovedTriageAction(params: {
     if (rateLimited) {
       const rateLimit = rateLimitRetryMetadata(error);
       result.rateLimitRetryAfterMs = rateLimit.delayMs;
-      result.rateLimitConclusiveRejection = rateLimit.conclusiveRejection;
+          result.rateLimitRequestedDelayMs = rateLimit.requestedDelayMs;
+          result.rateLimitRetryAfterSupplied = rateLimit.retryAfterSupplied;
+          result.rateLimitDelaySource = rateLimit.delaySource;
+          result.rateLimitConclusiveRejection = rateLimit.conclusiveRejection;
       // NoteWriteStarted remains the durable mutation boundary. A reliable
       // rejection permits only a later re-read/dedupe/revalidation cycle; an
       // ambiguous transport or upstream failure remains possible-write truth.
@@ -3129,6 +3196,11 @@ function applyResultToContinuationOutcome(
     // authorises a checked retry without moving this boolean backwards.
     writeMayHaveSucceeded: result.writeAttempted || result.partialWrite,
     reliableResponseReceived: rateLimitReschedule ? true : undefined,
+    retryDelaySource: result.rateLimitDelaySource,
+    retryAfterSupplied: result.rateLimitRetryAfterSupplied,
+    suppliedDelayMs: result.rateLimitRetryAfterSupplied ? result.rateLimitRequestedDelayMs : undefined,
+    retryOperationName: result.writeMethod === "createTicketNote" ? "CreateTicketNote" : "UpdateTicket",
+    retryEndpoint: "SuperOps GraphQL /msp",
     observedMutationResult: rateLimitReschedule
       ? "Rejected"
       : result.verified
@@ -4079,6 +4151,11 @@ export function getTicketsTools(): DomainTools {
                 `Configured top-level ticket category: ${VALID_TICKET_CATEGORIES.join(", ")}`,
               enum: [...VALID_TICKET_CATEGORIES],
             },
+            verify: {
+              type: "boolean",
+              description: "Re-read the created ticket when the mutation returns a ticket ID. Defaults to true.",
+              default: true,
+            },
             // TODO: Add subcategoryName after the SuperOps ticket input shape for
             // configured subcategory references is confirmed.
           },
@@ -4937,6 +5014,7 @@ export function getTicketsTools(): DomainTools {
               requesterEmail?: string;
               techGroupName?: string;
               categoryName?: string;
+              verify?: boolean;
             };
 
             if (
@@ -4966,12 +5044,46 @@ export function getTicketsTools(): DomainTools {
               { input }
             );
             synchronousWriteAccepted = true;
+            const createdTicket = response.createTicket;
+            const createdTicketId = typeof createdTicket?.ticketId === "string"
+              ? createdTicket.ticketId
+              : undefined;
+            const verification = params.verify === false
+              ? {
+                  performed: false,
+                  possible: Boolean(createdTicketId),
+                  verified: null,
+                  reason: "verify=false",
+                }
+              : createdTicketId
+                ? {
+                    performed: true,
+                    possible: true,
+                    verified: true,
+                    result: ticketSummary(await getTicketByInternalId(client, createdTicketId)),
+                  }
+                : {
+                    performed: false,
+                    possible: false,
+                    verified: null,
+                    reason: "Mutation response did not include a ticket ID for read-back verification.",
+                  };
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify({ result: response.createTicket, writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true }, null, 2),
+                  text: JSON.stringify({
+                    result: createdTicket,
+                    finalOutcome: "Created",
+                    partialWrite: false,
+                    verification,
+                    writeCount: synchronousWriteCount(1, 1),
+                    writeAttempted: true,
+                    writeMayHaveSucceeded: true,
+                    reliableResponseReceived: true,
+                    replaySafe: false,
+                  }, null, 2),
                 },
               ],
             };
@@ -5167,6 +5279,9 @@ export function getTicketsTools(): DomainTools {
                       text: JSON.stringify(
                         {
                           partialFailure: true,
+                          finalOutcome: "PartialWriteThenUpdateFailed",
+                          verification: { performed: false, possible: true, verified: null, reason: "Update failed after note creation; no final ticket verification was attempted." },
+                          writeCount: synchronousWriteCount(2, 2),
                           writeAttempted: true,
                           writeMayHaveSucceeded: true,
                           reliableResponseReceived: isReliableSynchronousMutationRejection(error),
@@ -5213,8 +5328,8 @@ export function getTicketsTools(): DomainTools {
 
               throw error;
             }
-
             if (params.verify === false) {
+              const writes = createdNote ? 2 : 1;
               return {
                 content: [
                   {
@@ -5231,9 +5346,14 @@ export function getTicketsTools(): DomainTools {
                               update: updateResponse.updateTicket,
                             }
                           : updateResponse.updateTicket,
+                        finalOutcome: "Updated",
+                        partialWrite: false,
+                        verification: { performed: false, possible: true, verified: null, reason: "verify=false" },
+                        writeCount: synchronousWriteCount(writes, writes),
                         writeAttempted: true,
                         writeMayHaveSucceeded: true,
                         reliableResponseReceived: true,
+                        replaySafe: false,
                       },
                       null,
                       2
@@ -5250,6 +5370,7 @@ export function getTicketsTools(): DomainTools {
             const latestNotes = createdNote
               ? await getTicketNotes(client, resolvedTicket.ticketId)
               : [];
+            const writes = createdNote ? 2 : 1;
 
             return {
               content: [
@@ -5258,9 +5379,14 @@ export function getTicketsTools(): DomainTools {
                   text: JSON.stringify(
                     {
                       result: ticketSummary(verifiedTicket, latestNotes[0] ?? createdNote),
+                      finalOutcome: "Updated",
+                      partialWrite: false,
+                      verification: { performed: true, possible: true, verified: true },
+                      writeCount: synchronousWriteCount(writes, writes),
                       writeAttempted: true,
                       writeMayHaveSucceeded: true,
                       reliableResponseReceived: true,
+                      replaySafe: false,
                     },
                     null,
                     2
@@ -5329,7 +5455,19 @@ export function getTicketsTools(): DomainTools {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify({ result: response.updateTicket, writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true }, null, 2),
+                  text: JSON.stringify({
+                    result: response.updateTicket,
+                    finalOutcome: "Updated",
+                    partialWrite: false,
+                    verification: params.verify === false
+                      ? { performed: false, possible: true, verified: null, reason: "verify=false" }
+                      : verifyDirectTicketUpdate(input, await getTicketByInternalId(client, params.ticketId)),
+                    writeCount: synchronousWriteCount(1, 1),
+                    writeAttempted: true,
+                    writeMayHaveSucceeded: true,
+                    reliableResponseReceived: true,
+                    replaySafe: false,
+                  }, null, 2),
                 },
               ],
             };
@@ -5340,6 +5478,7 @@ export function getTicketsTools(): DomainTools {
               ticketId: string;
               content: string;
               isPublic?: boolean;
+              verify?: boolean;
             };
 
             synchronousWriteAttempted = true;
@@ -5356,7 +5495,23 @@ export function getTicketsTools(): DomainTools {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify({ result: response.createTicketNote, writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true }, null, 2),
+                  text: JSON.stringify({
+                    result: {
+                      noteId: response.createTicketNote.noteId,
+                      addedOn: response.createTicketNote.addedOn,
+                      privacyType: response.createTicketNote.privacyType,
+                    },
+                    finalOutcome: "NoteAdded",
+                    partialWrite: false,
+                    verification: params.verify === false
+                      ? { performed: false, possible: Boolean(response.createTicketNote.noteId), verified: null, reason: "verify=false" }
+                      : noteVerificationResult(await getTicketNotes(client, params.ticketId), response.createTicketNote),
+                    writeCount: synchronousWriteCount(1, 1),
+                    writeAttempted: true,
+                    writeMayHaveSucceeded: true,
+                    reliableResponseReceived: true,
+                    replaySafe: false,
+                  }, null, 2),
                 },
               ],
             };
@@ -5395,7 +5550,22 @@ export function getTicketsTools(): DomainTools {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify({ result: response.createWorklogEntries, writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true }, null, 2),
+                  text: JSON.stringify({
+                    result: response.createWorklogEntries,
+                    finalOutcome: "TimeLogged",
+                    partialWrite: false,
+                    verification: {
+                      performed: false,
+                      possible: false,
+                      verified: null,
+                      reason: "No bounded worklog read-back tool is implemented for direct time-log verification.",
+                    },
+                    writeCount: synchronousWriteCount(1, 1),
+                    writeAttempted: true,
+                    writeMayHaveSucceeded: true,
+                    reliableResponseReceived: true,
+                    replaySafe: false,
+                  }, null, 2),
                 },
               ],
             };
@@ -5421,6 +5591,11 @@ export function getTicketsTools(): DomainTools {
               error: message,
               writeAttempted: synchronousWriteAttempted,
               writeMayHaveSucceeded: synchronousWriteAttempted && !reliablyRejected,
+              writeCount: {
+                attempted: synchronousWriteAttempted ? 1 : 0,
+                maximum: name === "superops_tickets_resolve_full" ? 2 : 1,
+                exact: name !== "superops_tickets_resolve_full",
+              },
               reliableResponseReceived: synchronousWriteAccepted || reliablyRejected,
               replaySafe: reliablyRejected || !synchronousWriteAttempted,
               classification: synchronousWriteAccepted
