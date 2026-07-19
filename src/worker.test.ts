@@ -8,7 +8,7 @@
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
-import worker, { type Env } from "./worker.js";
+import worker, { gatewayOwnerHash, type Env } from "./worker.js";
 import { chatGptDirectBlockedMutationToolNames } from "./mcp-server.js";
 import { getOperationStore, runWithOperationStore, stableHash, type OperationLedgerRecord } from "./operation-store.js";
 
@@ -419,7 +419,7 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(names.length).toBeGreaterThan(10);
   });
 
-  it("returns MCP-visible durable operation status without SuperOps credentials", async () => {
+  it("fails closed for owner-scoped operation status without a trustworthy identity", async () => {
     const record: OperationLedgerRecord = {
       responseVersion: 1,
       operationId: "worker-op-1",
@@ -471,12 +471,75 @@ describe("Cloudflare Worker entrypoint", () => {
     const body = (await res.json()) as {
       result?: { isError?: boolean; content?: { text?: string }[] };
     };
-    expect(body.result?.isError).toBeUndefined();
-    expect(JSON.parse(body.result?.content?.[0]?.text ?? "{}")).toMatchObject({
-      operationId: "worker-op-1",
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.content?.[0]?.text).toContain("Authenticated owner identity is unavailable");
+  });
+
+  it("uses a stable gateway caller owner and rejects a different credential", async () => {
+    const caller = { apiToken: "gateway-token-a", subdomain: "acme", region: "us" as const };
+    const otherCaller = { apiToken: "gateway-token-b", subdomain: "acme", region: "us" as const };
+    const ownerHash = await gatewayOwnerHash(caller);
+    expect(await gatewayOwnerHash(caller)).toBe(ownerHash);
+    expect(await gatewayOwnerHash(otherCaller)).not.toBe(ownerHash);
+    const record: OperationLedgerRecord = {
+      responseVersion: 1,
+      operationId: "gateway-owned-operation",
+      toolName: "superops_tickets_apply_triage_plan",
+      ownerHash,
+      createdAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:01.000Z",
+      expiresAt: "2026-07-19T00:00:00.000Z",
+      originalRequestHash: stableHash({ batchId: "gateway-owner" }),
       state: "ContinuationRequired",
-      pendingCount: 1,
-    });
+      expectedItems: ["57400"],
+      completedItems: [],
+      failedItems: [],
+      skippedItems: [],
+      unattemptedItems: ["57400"],
+      pendingItems: ["57400"],
+      itemStates: { "57400": {
+        itemKey: "57400", stage: "Unattempted", idempotencyKey: "gateway-item",
+        writeAttempted: false, writeMayHaveSucceeded: false, partialWrite: false, retryCount: 0,
+      } },
+      summary: {},
+      compactResults: [],
+      partialWriteCount: 0,
+      ambiguousWriteCount: 0,
+      rateLimitedItems: [],
+      continuationCount: 0,
+    };
+    await runWithOperationStore({}, () => getOperationStore().put(record));
+    const call = (apiToken: string, subdomain = "acme") => mcp(
+      {
+        jsonrpc: "2.0", id: 24, method: "tools/call",
+        params: { name: "superops_operations_get", arguments: { operationId: record.operationId } },
+      },
+      { AUTH_MODE: "gateway" },
+      { "X-SuperOps-API-Token": apiToken, "X-SuperOps-Subdomain": subdomain }
+    );
+
+    const same = await call(caller.apiToken);
+    const sameBody = await same.json() as { result?: { isError?: boolean; content?: { text?: string }[] } };
+    expect(sameBody.result?.isError).toBeUndefined();
+    const sameText = sameBody.result?.content?.[0]?.text ?? "";
+    expect(JSON.parse(sameText)).toMatchObject({ operationId: record.operationId });
+    expect(JSON.stringify(sameBody)).not.toContain(caller.apiToken);
+    expect(JSON.stringify(await getOperationStore().get(record.operationId))).not.toContain(caller.apiToken);
+
+    const different = await call(otherCaller.apiToken);
+    const differentBody = await different.json() as { result?: { isError?: boolean; content?: { text?: string }[] } };
+    expect(differentBody.result?.isError).toBe(true);
+    expect(differentBody.result?.content?.[0]?.text).toContain("not found or is not visible");
+
+    const missingIdentity = await mcp(
+      {
+        jsonrpc: "2.0", id: 25, method: "tools/call",
+        params: { name: "superops_operations_get", arguments: { operationId: record.operationId } },
+      },
+      { AUTH_MODE: "gateway" },
+      { "X-SuperOps-API-Token": caller.apiToken }
+    );
+    expect(missingIdentity.status).toBe(401);
   });
   it("keeps internal continuation disabled by default and requires the internal token", async () => {
     const disabled = await worker.fetch(

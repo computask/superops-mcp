@@ -76,7 +76,7 @@ export async function runOperationContinuation(
   params: RunOperationContinuationParams
 ): Promise<RunOperationContinuationResult> {
   const store = getOperationStore();
-  let record = await store.get(params.operationId);
+  let record = await store.get(params.operationId, params.ownerHash);
   if (!record) {
     throw new Error(`Operation not found: ${params.operationId}`);
   }
@@ -149,11 +149,11 @@ export async function runOperationContinuation(
       now,
     });
     if (!claim) {
-      record = (await store.get(params.operationId)) ?? record;
+      record = (await store.get(params.operationId, params.ownerHash)) ?? record;
       return continuationResult(record, record.pendingItems.length > 0, "NoEligibleItem");
     }
 
-    record = (await store.get(params.operationId)) ?? record;
+    record = (await store.get(params.operationId, params.ownerHash)) ?? record;
     const estimated = params.adapter.estimateItemSubrequests(record, claim.itemKey);
     if (!hasExecutionBudgetFor(estimated)) {
       // A resumed item may already be across a durable mutation boundary. Do
@@ -253,7 +253,7 @@ export async function runOperationContinuation(
         totalRetryDurationMs > config.maxDurableRetryDurationMs ||
         record.continuationCount >= config.maxContinuationCount
       );
-      const effectiveOutcome: ContinuationItemOutcome = durableRetryExhausted
+      const adapterOutcome: ContinuationItemOutcome = durableRetryExhausted
         ? {
             ...outcome,
             stage: "RateLimitExceeded",
@@ -264,6 +264,21 @@ export async function runOperationContinuation(
             failureReason: "Durable rate-limit retry ceiling was reached.",
           }
         : outcome;
+      const writeAttempted = claim.item.writeAttempted || adapterOutcome.writeAttempted;
+      const writeMayHaveSucceeded = claim.item.writeMayHaveSucceeded ||
+        adapterOutcome.writeMayHaveSucceeded;
+      const effectiveOutcome: ContinuationItemOutcome = {
+        ...adapterOutcome,
+        // These flags are durable historical facts. A resumed adapter may
+        // finish through validation or dedupe without issuing a new mutation,
+        // but that must not erase an earlier mutation-start checkpoint.
+        writeAttempted,
+        writeMayHaveSucceeded,
+        result: typeof adapterOutcome.result === "object" && adapterOutcome.result !== null &&
+            !Array.isArray(adapterOutcome.result)
+          ? { ...adapterOutcome.result as Record<string, unknown>, writeAttempted }
+          : adapterOutcome.result,
+      };
       if (outcome.rateLimited && outcome.nextEligibleTime && cappedDelayMs !== requestedDelayMs) {
         effectiveOutcome.nextEligibleTime = new Date(Date.now() + cappedDelayMs).toISOString();
       }
@@ -359,7 +374,7 @@ export async function runOperationContinuation(
         // the current state rather than trusting the original claim: completing
         // that item as an ordinary reschedule would both erase the checkpoint
         // and permit a duplicate write on the next invocation.
-        const currentItem = (await store.get(params.operationId))?.itemStates[claim.itemKey];
+        const currentItem = (await store.get(params.operationId, params.ownerHash))?.itemStates[claim.itemKey];
         const hasPriorWrite = currentItem?.writeAttempted === true ||
           currentItem?.writeMayHaveSucceeded === true;
         const possibleWrite = currentItem?.writeMayHaveSucceeded === true &&
@@ -443,5 +458,3 @@ function continuationResult(
     view: operationResultView(record),
   };
 }
-
-

@@ -46,7 +46,12 @@ import {
 } from "./audit.js";
 import { finishExecution, runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
 import { runWithContinuationScheduler } from "./continuation-scheduler.js";
-import { runWithOperationStore, SuperOpsOperationLedger } from "./operation-store.js";
+import {
+  envTenantOwnerHash,
+  gatewayOwnerHash,
+  runWithOperationStore,
+  SuperOpsOperationLedger,
+} from "./operation-store.js";
 import { SuperOpsContinuationWorkflow } from "./continuation-workflow.js";
 export { SuperOpsOperationLedger, SuperOpsContinuationWorkflow };
 
@@ -197,16 +202,36 @@ function userFromOAuthProps(props: unknown): string | undefined {
   return typeof email === "string" && email.trim() ? email.trim() : undefined;
 }
 
-function runWithWorkerAuditContext<T>(
+export { gatewayOwnerHash };
+
+async function workerOwnerHash(request: Request, env: Env): Promise<string | undefined> {
+  if ((env.AUTH_MODE ?? "env") === "gateway") {
+    const resolved = resolveGatewayCredentials(
+      (name) => request.headers.get(name) ?? undefined
+    );
+    return resolved.creds ? gatewayOwnerHash(resolved.creds) : undefined;
+  }
+  if (!env.SUPEROPS_API_TOKEN || !env.SUPEROPS_SUBDOMAIN) return undefined;
+  return envTenantOwnerHash({
+    subdomain: env.SUPEROPS_SUBDOMAIN,
+    region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
+  });
+}
+
+async function runWithWorkerAuditContext<T>(
   request: Request,
   env: Env,
   props: unknown,
   fn: () => T
-): T {
-  return runWithAuditContext(
+): Promise<Awaited<T>> {
+  const oauthUser = userFromOAuthProps(props);
+  const ownerHash = oauthUser ? undefined : await workerOwnerHash(request, env);
+  return await runWithAuditContext(
     {
       requestId: requestIdFromHeaders(request.headers),
-      user: userFromOAuthProps(props),
+      user: oauthUser,
+      ownerHash,
+      ownerIdentityRequired: true,
       ...runtimeFlagsFromEnv(env),
     },
     fn

@@ -47,15 +47,20 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { getCredentials, runWithCredentials } from "./client.js";
 import { createMcpServer } from "./mcp-server.js";
 import { runWithAuditContext, runtimeFlagsFromEnv } from "./audit.js";
+import { envTenantOwnerHash, gatewayOwnerHash } from "./operation-store.js";
 
 /**
  * Start the server with stdio transport (default).
  */
 async function startStdioTransport(): Promise<void> {
-  const server = createMcpServer();
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("SuperOps.ai MCP server running on stdio (all tools available)");
+  const creds = getCredentials();
+  const ownerHash = creds ? await envTenantOwnerHash(creds) : undefined;
+  await runWithAuditContext({ ownerHash, ownerIdentityRequired: true }, async () => {
+    const server = createMcpServer();
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("SuperOps.ai MCP server running on stdio (all tools available)");
+  });
 }
 
 /**
@@ -107,9 +112,27 @@ async function startHttpTransport(): Promise<void> {
 
       // MCP endpoint - each request gets a fresh server + transport
       if (url.pathname === "/mcp") {
+        const apiTokenHeader = req.headers["x-superops-api-token"];
+        const subdomainHeader = req.headers["x-superops-subdomain"];
+        const apiToken = typeof apiTokenHeader === "string" && apiTokenHeader.trim()
+          ? apiTokenHeader.trim()
+          : undefined;
+        const subdomain = typeof subdomainHeader === "string" && subdomainHeader.trim()
+          ? subdomainHeader.trim()
+          : undefined;
+        const envCredentials = !isGatewayMode ? getCredentials() : undefined;
+        const ownerHash = isGatewayMode
+          ? apiToken && subdomain
+            ? await gatewayOwnerHash({ apiToken, subdomain })
+            : undefined
+          : envCredentials
+            ? await envTenantOwnerHash(envCredentials)
+            : undefined;
         await runWithAuditContext(
           {
             requestId: requestId(req),
+            ownerHash,
+            ownerIdentityRequired: true,
             ...runtimeFlagsFromEnv({
               MCP_ENABLED: process.env.MCP_ENABLED,
               ENABLE_WRITE_TOOLS: process.env.ENABLE_WRITE_TOOLS,
@@ -119,13 +142,6 @@ async function startHttpTransport(): Promise<void> {
           async () => {
             // Gateway mode: extract credentials from headers
             if (isGatewayMode) {
-              const apiToken = req.headers["x-superops-api-token"] as
-                | string
-                | undefined;
-              const subdomain = req.headers["x-superops-subdomain"] as
-                | string
-                | undefined;
-
               if (!apiToken || !subdomain) {
                 res.writeHead(401, { "Content-Type": "application/json" });
                 res.end(

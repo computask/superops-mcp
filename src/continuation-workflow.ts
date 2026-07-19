@@ -38,7 +38,7 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
 
         await runWithOperationStore(this.env, async () => {
           const store = getOperationStore();
-          const record = await store.get(params.operationId);
+          const record = await store.get(params.operationId, params.ownerHash);
           if (!record || record.ownerHash !== params.ownerHash) return;
           await store.update(params.operationId, params.ownerHash, (current) => ({
             ...current,
@@ -68,7 +68,7 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
 
         await runWithOperationStore(this.env, async () => {
           const store = getOperationStore();
-          const record = await store.get(params.operationId);
+          const record = await store.get(params.operationId, params.ownerHash);
           if (!record || record.ownerHash !== params.ownerHash) return;
           await store.update(params.operationId, params.ownerHash, (current) => ({
             ...current,
@@ -86,7 +86,7 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
         async () => {
           await runWithOperationStore(this.env, async () => {
             const store = getOperationStore();
-            const record = await store.get(params.operationId);
+            const record = await store.get(params.operationId, params.ownerHash);
             if (!record || record.ownerHash !== params.ownerHash) return;
             await store.terminalizeContinuationFailure({
               operationId: params.operationId,

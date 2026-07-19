@@ -5,6 +5,10 @@ export type ToolCategory = "read" | "write" | "custom_query" | "custom_mutation"
 export interface AuditContext {
   requestId: string;
   user?: string;
+  /** Pre-derived, bounded owner hash for non-OAuth authenticated runtimes. */
+  ownerHash?: string;
+  /** Fail owner-scoped operation access when neither user nor ownerHash exists. */
+  ownerIdentityRequired?: boolean;
   mcpEnabled: boolean;
   writeToolsEnabled: boolean;
   customMutationEnabled: boolean;
@@ -133,6 +137,8 @@ export function runWithAuditContext<T>(
     {
       requestId: context.requestId ?? generatedRequestId(),
       user: context.user,
+      ownerHash: context.ownerHash,
+      ownerIdentityRequired: context.ownerIdentityRequired,
       mcpEnabled: context.mcpEnabled ?? flags.mcpEnabled,
       writeToolsEnabled: context.writeToolsEnabled ?? flags.writeToolsEnabled,
       customMutationEnabled:

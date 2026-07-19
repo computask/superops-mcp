@@ -3080,19 +3080,32 @@ async function applyApprovedTriageAction(params: {
     return result;
   } catch (error) {
     if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
-    result.finalOutcome = isRateLimitError(error) ? "Failed" : "Failed";
-    result.failureStage = isRateLimitError(error)
+    const rateLimited = isRateLimitError(error);
+    result.finalOutcome = "Failed";
+    result.failureStage = rateLimited
       ? "rateLimit"
       : result.writeMethod === "createTicketNote" ? "createTicketNote" : "write";
     result.failureReason = safeErrorMessage(error);
-    result.partialWrite = result.writeAttempted || result.noteAdded;
+    if (rateLimited) {
+      const rateLimit = rateLimitRetryMetadata(error);
+      result.rateLimitRetryAfterMs = rateLimit.delayMs;
+      result.rateLimitConclusiveRejection = rateLimit.conclusiveRejection;
+      // NoteWriteStarted remains the durable mutation boundary. A reliable
+      // rejection permits only a later re-read/dedupe/revalidation cycle; an
+      // ambiguous transport or upstream failure remains possible-write truth.
+      result.partialWrite = !rateLimit.conclusiveRejection &&
+        (result.writeAttempted || result.noteAdded);
+    } else {
+      result.partialWrite = result.writeAttempted || result.noteAdded;
+    }
     return result;
   }
 }
 
 function applyResultToContinuationOutcome(
   result: ApplyTriagePlanResult,
-  stage: OperationItemState["stage"] = triageStageForResult(result)
+  stage: OperationItemState["stage"] = triageStageForResult(result),
+  priorObservedMutationResult?: OperationItemState["observedMutationResult"]
 ): ContinuationItemOutcome {
   const rateLimitReschedule = result.failureStage === "rateLimit" &&
     result.rateLimitConclusiveRejection === true;
@@ -3119,7 +3132,9 @@ function applyResultToContinuationOutcome(
     observedMutationResult: rateLimitReschedule
       ? "Rejected"
       : result.verified
-        ? "VerifiedApplied"
+        ? priorObservedMutationResult === "Rejected" && !result.writeAttempted
+          ? "Rejected"
+          : "VerifiedApplied"
         : ambiguousMutation ? "Ambiguous" : undefined,
     partialWrite: result.partialWrite,
     verified: result.verified,
@@ -3455,6 +3470,8 @@ function createApplyTriageContinuationAdapter(
             await checkpoint({
               stage,
               mutationType,
+              mutationStartStage: mutationStarted ? stage as
+                "WriteStarted" | "ResolutionWriteStarted" | "NoteWriteStarted" : undefined,
               writeAttempted: nextWriteAttempted,
               writeMayHaveSucceeded: nextWriteMayHaveSucceeded,
               reliableResponseReceived: nextReliableResponseReceived,
@@ -3525,7 +3542,10 @@ function createApplyTriageContinuationAdapter(
           ? "ResolutionVerified"
           : "Verifying";
         try {
-          if (durableWriteMayHaveSucceeded) {
+          // Verification after a dedupe proves the approved target exists, but
+          // it does not change a reliably rejected mutation into an applied one.
+          // A genuine retry first advances Rejected -> Ambiguous -> Accepted.
+          if (durableWriteMayHaveSucceeded && observedMutationResult !== "Rejected") {
             observedMutationResult = "VerifiedApplied";
           }
           await checkpoint({
@@ -3591,7 +3611,11 @@ function createApplyTriageContinuationAdapter(
             }),
           };
 
-      const outcome = applyResultToContinuationOutcome(applied.result, applied.stage);
+      const outcome = applyResultToContinuationOutcome(
+        applied.result,
+        applied.stage,
+        observedMutationResult
+      );
       outcome.retryCount = typeof applied.retryCount === "number"
         ? applied.retryCount
         : (claim.item.retryCount ?? 0) +
@@ -4744,7 +4768,7 @@ export function getTicketsTools(): DomainTools {
             });
 
             try {
-              const existing = await store.get(operationId);
+              const existing = await store.get(operationId, ownerHash);
               if (existing) {
                 if (existing.ownerHash !== ownerHash ||
                     existing.originalRequestHash !== initialRecord.originalRequestHash) {
@@ -4797,7 +4821,7 @@ export function getTicketsTools(): DomainTools {
               continuationError = safeErrorMessage(error);
             }
 
-            let finalRecord = (await store.get(operationId)) ?? initialRecord;
+            let finalRecord = (await store.get(operationId, ownerHash)) ?? initialRecord;
             let continuationScheduling: Record<string, unknown> | undefined;
             const continuationRequired = continuation?.continuationRequired ??
               finalRecord.pendingItems.length > 0;

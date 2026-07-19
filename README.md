@@ -147,6 +147,8 @@ Token rotation plan:
 - `superops_operations_get` - Read durable status and compact results for one operation ID
 - `superops_operations_results` - List recent durable operation results visible to the caller
 
+Operation status is fail-closed and owner-scoped. Direct OAuth uses the authenticated OAuth user. Gateway mode derives a stable caller/tenant owner hash from the normalized SuperOps tenant and a fingerprint of the presented API credential; raw API/bearer tokens are never persisted or returned. Recent results come from a bounded owner-local Durable Object index and expose fixed-field redacted summaries only.
+
 ### Clients Domain
 
 - `superops_clients_list` - List clients with filters

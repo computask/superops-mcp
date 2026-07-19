@@ -65,6 +65,45 @@ function record(overrides: Partial<OperationLedgerRecord> = {}): OperationLedger
   };
 }
 
+function ownerScopedDurableNamespace() {
+  const valuesByName = new Map<string, Map<string, unknown>>();
+  const ledgers = new Map<string, SuperOpsOperationLedger>();
+  const valuesFor = (name: string) => {
+    let values = valuesByName.get(name);
+    if (!values) {
+      values = new Map<string, unknown>();
+      valuesByName.set(name, values);
+    }
+    return values;
+  };
+  const namespace = {
+    idFromName: (name: string) => name,
+    get: (id: unknown) => {
+      const name = String(id);
+      let ledger = ledgers.get(name);
+      if (!ledger) {
+        const values = valuesFor(name);
+        ledger = new SuperOpsOperationLedger({
+          storage: {
+            get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+            put: async (key: string | Record<string, unknown>, value?: unknown) => {
+              if (typeof key === "string") values.set(key, value);
+              else for (const [entryKey, entryValue] of Object.entries(key)) values.set(entryKey, entryValue);
+            },
+            delete: async (key: string) => values.delete(key),
+            list: async <T = unknown>(options?: { prefix?: string }) => new Map(
+              [...values.entries()].filter(([key]) => !options?.prefix || key.startsWith(options.prefix))
+            ) as Map<string, T>,
+          },
+        });
+        ledgers.set(name, ledger);
+      }
+      return { fetch: (request: Request) => ledger!.fetch(request) };
+    },
+  };
+  return { namespace, valuesFor };
+}
+
 describe("operation store", () => {
   it("persists and lists operation records in the local store", async () => {
     await runWithOperationStore({}, async () => {
@@ -80,8 +119,93 @@ describe("operation store", () => {
     });
   });
 
+  it("lists real owner-scoped Durable Object operations through a bounded redacted index", async () => {
+    const durable = ownerScopedDurableNamespace();
+    const ownerHash = stableHash("owner@example.com");
+    const otherOwnerHash = stableHash("other@example.com");
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+      const store = getOperationStore();
+      await store.put(record({
+        operationId: "recent-a-1",
+        ownerHash,
+        updatedAt: "2026-07-18T00:00:02.000Z",
+        summary: { failureReason: "Authorization: Bearer secret-owner-token" },
+      }));
+      await store.put(record({
+        operationId: "recent-a-2",
+        ownerHash,
+        updatedAt: "2026-07-18T00:00:03.000Z",
+      }));
+      await store.put(record({ operationId: "recent-b-1", ownerHash: otherOwnerHash }));
+
+      const recent = await store.list(ownerHash);
+      expect(recent.map((entry) => entry.operationId)).toEqual(["recent-a-2", "recent-a-1"]);
+      expect(await store.list(otherOwnerHash)).toEqual([
+        expect.objectContaining({ operationId: "recent-b-1" }),
+      ]);
+      const serialized = JSON.stringify(recent);
+      expect(serialized).not.toContain("ownerHash");
+      expect(serialized).not.toContain("secret-owner-token");
+      expect(serialized).not.toContain("summary");
+      expect(serialized).not.toContain("results");
+      await expect(store.get("recent-a-1", ownerHash)).resolves.toMatchObject({
+        operationId: "recent-a-1",
+      });
+      await expect(store.get("recent-a-1", otherOwnerHash)).resolves.toBeUndefined();
+
+      await store.put(record({
+        operationId: "recent-expired",
+        ownerHash,
+        state: "Completed",
+        expiresAt: "2000-01-01T00:00:00.000Z",
+        itemStates: {
+          "57400": record().itemStates["57400"],
+          "57401": {
+            ...record().itemStates["57401"],
+            stage: "Completed",
+            outcome: "Updated",
+            writeAttempted: true,
+            writeMayHaveSucceeded: true,
+            verificationState: "Verified",
+          },
+        },
+      }));
+      await store.put(record({ operationId: "recent-deleted", ownerHash }));
+      durable.valuesFor("owner:" + ownerHash).delete("op:recent-deleted");
+      const retained = await store.list(ownerHash);
+      expect(retained.map((entry) => entry.operationId)).not.toContain("recent-expired");
+      expect(retained.map((entry) => entry.operationId)).not.toContain("recent-deleted");
+
+      for (let index = 0; index < 55; index += 1) {
+        await store.put(record({
+          operationId: `bounded-${index}`,
+          ownerHash,
+          updatedAt: new Date(Date.parse("2026-07-18T01:00:00.000Z") + index).toISOString(),
+        }));
+      }
+      const ownerValues = durable.valuesFor("owner:" + ownerHash);
+      const indexEntries = [...ownerValues.entries()].filter(([key]) => key.startsWith("recent:"));
+      expect(indexEntries).toHaveLength(50);
+      expect(new TextEncoder().encode(JSON.stringify(indexEntries)).byteLength).toBeLessThanOrEqual(50 * 1024);
+      const boundedResults = await store.list(ownerHash);
+      expect(boundedResults.length).toBeLessThanOrEqual(20);
+      expect(new TextEncoder().encode(JSON.stringify(boundedResults)).byteLength).toBeLessThanOrEqual(128 * 1024);
+
+      const duplicate = record({
+        operationId: "bounded-54",
+        ownerHash,
+        updatedAt: "2026-07-18T02:00:00.000Z",
+      });
+      await store.put(duplicate);
+      await store.put(duplicate);
+      expect([...ownerValues.keys()].filter((key) => key === "recent:bounded-54")).toHaveLength(1);
+    });
+  });
+
   it("returns a compact result view without sensitive operational internals", () => {
-    const view = operationResultView(record());
+    const view = operationResultView(record({
+      terminalFailureReason: "Authorization: Bearer public-result-secret",
+    }));
 
     expect(view).toMatchObject({
       operationId: "op-1",
@@ -92,6 +216,7 @@ describe("operation store", () => {
     });
     expect(JSON.stringify(view)).not.toContain("originalRequestHash");
     expect(JSON.stringify(view)).not.toContain("idempotencyKey");
+    expect(JSON.stringify(view)).not.toContain("public-result-secret");
   });
 
   it("derives public category totals from item states rather than a caller summary", () => {
@@ -629,6 +754,13 @@ describe("operation store", () => {
           operationId: "op-schedule",
           ownerHash: stableHash("other@example.com"),
           reason: "wrong owner",
+        })
+      ).rejects.toThrow(/not visible/);
+      await expect(
+        store.scheduleContinuation({
+          operationId: "missing-schedule",
+          ownerHash,
+          reason: "missing operation",
         })
       ).rejects.toThrow(/not visible/);
     });

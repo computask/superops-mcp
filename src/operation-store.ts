@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { getAuditContext } from "./audit.js";
+import { getAuditContext, sanitizeText } from "./audit.js";
 import { recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
 
 export type OperationState =
@@ -103,6 +103,7 @@ export interface OperationItemState {
   partialWrite: boolean;
   ambiguousWrite?: boolean;
   mutationType?: "update" | "resolution" | "note" | "resolveFallback";
+  mutationStartStage?: "WriteStarted" | "ResolutionWriteStarted" | "NoteWriteStarted";
   reliableResponseReceived?: boolean;
   observedMutationResult?: "Accepted" | "Rejected" | "VerifiedApplied" | "Ambiguous";
   canonicalTargetHash?: string;
@@ -241,8 +242,8 @@ export interface OperationScheduleContinuationParams {
 
 export interface OperationStore {
   put(record: OperationLedgerRecord, options?: OperationPutOptions): Promise<void>;
-  get(operationId: string): Promise<OperationLedgerRecord | undefined>;
-  list(ownerHash: string): Promise<OperationLedgerRecord[]>;
+  get(operationId: string, ownerHash?: string): Promise<OperationLedgerRecord | undefined>;
+  list(ownerHash: string): Promise<Record<string, unknown>[]>;
   getApprovedPrivateNote(
     operationId: string,
     ownerHash: string,
@@ -300,6 +301,18 @@ const memoryApprovedPrivateNotes = new Map<string, ApprovedPrivateNoteContent>()
 const MAX_OPERATION_ITEMS = 500;
 const MAX_SERIALIZED_OPERATION_BYTES = 512 * 1024;
 const MAX_APPROVED_PRIVATE_NOTE_BYTES = 128 * 1024;
+const MAX_RECENT_OPERATION_INDEX_ENTRIES = 50;
+const MAX_RECENT_OPERATION_RESULTS = 20;
+const MAX_RECENT_OPERATION_OUTPUT_BYTES = 128 * 1024;
+
+interface RecentOperationIndexEntry {
+  version: 1;
+  operationId: string;
+  ownerHash: string;
+  updatedAt: string;
+  expiresAt: string;
+  state: OperationState;
+}
 
 interface StoredApprovedPrivateNote {
   version: 1;
@@ -333,6 +346,32 @@ function serializedBytes(value: unknown): number {
 
 function approvedPrivateNoteKey(operationId: string, itemKey: string): string {
   return "private-note:" + operationId + ":" + itemKey;
+}
+
+function recentOperationKey(operationId: string): string {
+  return "recent:" + operationId;
+}
+
+function recentOperationEntry(record: OperationLedgerRecord): RecentOperationIndexEntry {
+  return {
+    version: 1,
+    operationId: record.operationId,
+    ownerHash: record.ownerHash,
+    updatedAt: record.updatedAt,
+    expiresAt: record.expiresAt,
+    state: record.state,
+  };
+}
+
+function isRecentOperationIndexEntry(value: unknown): value is RecentOperationIndexEntry {
+  if (!isRecordObject(value)) return false;
+  return value.version === 1 &&
+    typeof value.operationId === "string" && Boolean(value.operationId) &&
+    typeof value.ownerHash === "string" && Boolean(value.ownerHash) &&
+    typeof value.updatedAt === "string" && Number.isFinite(Date.parse(value.updatedAt)) &&
+    typeof value.expiresAt === "string" && Number.isFinite(Date.parse(value.expiresAt)) &&
+    VALID_OPERATION_STATES.has(value.state as OperationState) &&
+    serializedBytes(value) <= 1024;
 }
 
 function validateApprovedPrivateNotes(
@@ -665,11 +704,13 @@ function isLeaseActive(lease: OperationLease | undefined, now: string): boolean 
   return Boolean(lease && lease.expiresAt > now);
 }
 
+function isTerminalOperationState(state: OperationState): boolean {
+  return state === "Completed" || state === "CompletedWithFailures" ||
+    state === "Failed" || state === "Cancelled";
+}
+
 function isTerminalOperation(record: OperationLedgerRecord): boolean {
-  return record.state === "Completed" ||
-    record.state === "CompletedWithFailures" ||
-    record.state === "Failed" ||
-    record.state === "Cancelled";
+  return isTerminalOperationState(record.state);
 }
 
 /**
@@ -1080,17 +1121,18 @@ class MemoryOperationStore implements OperationStore {
     }
   }
 
-  async get(operationId: string): Promise<OperationLedgerRecord | undefined> {
+  async get(operationId: string, ownerHash?: string): Promise<OperationLedgerRecord | undefined> {
     const record = memoryRecords.get(operationId);
     if (record && isExpiredTerminalOperation(record)) {
       memoryRecords.delete(operationId);
       deleteMemoryApprovedPrivateNotes(operationId);
       return undefined;
     }
+    if (record && ownerHash && record.ownerHash !== ownerHash) return undefined;
     return record ? cloneRecord(record) : undefined;
   }
 
-  async list(ownerHash: string): Promise<OperationLedgerRecord[]> {
+  async list(ownerHash: string): Promise<Record<string, unknown>[]> {
     for (const [operationId, record] of memoryRecords) {
       if (isExpiredTerminalOperation(record)) {
         memoryRecords.delete(operationId);
@@ -1100,7 +1142,8 @@ class MemoryOperationStore implements OperationStore {
     return [...memoryRecords.values()]
       .filter((record) => record.ownerHash === ownerHash)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-      .map(cloneRecord);
+      .slice(0, MAX_RECENT_OPERATION_RESULTS)
+      .map(operationRecentView);
   }
 
   async getApprovedPrivateNote(
@@ -1109,7 +1152,7 @@ class MemoryOperationStore implements OperationStore {
     itemKey: string,
     fingerprint: string
   ): Promise<string | undefined> {
-    const record = await this.get(operationId);
+    const record = await this.get(operationId, ownerHash);
     if (!record) return undefined;
     assertRecordOwner(record, ownerHash);
     if (record.itemStates[itemKey]?.noteFingerprint !== fingerprint) return undefined;
@@ -1128,8 +1171,10 @@ class MemoryOperationStore implements OperationStore {
     ownerHash: string,
     updater: (record: OperationLedgerRecord) => OperationLedgerRecord
   ): Promise<OperationLedgerRecord> {
-    const existing = await this.get(operationId);
-    if (!existing) throw new Error(`Operation not found: ${operationId}`);
+    const existing = await this.get(operationId, ownerHash);
+    if (!existing) {
+      throw new Error("Operation was not found or is not visible to this caller.");
+    }
     assertRecordOwner(existing, ownerHash);
     const updated = startTerminalRetention(
       existing,
@@ -1143,7 +1188,7 @@ class MemoryOperationStore implements OperationStore {
   }
 
   async claimNextItem(params: OperationClaimNextParams): Promise<OperationItemClaim | undefined> {
-    const existing = await this.get(params.operationId);
+    const existing = await this.get(params.operationId, params.ownerHash);
     if (!existing) return undefined;
     assertRecordOwner(existing, params.ownerHash);
     const { record, claim } = claimNextItemInRecord(cloneRecord(existing), params);
@@ -1185,10 +1230,22 @@ class MemoryOperationStore implements OperationStore {
 }
 
 class DurableObjectOperationStore implements OperationStore {
+  private readonly legacyOperationIds = new Set<string>();
+
   constructor(private readonly namespace: DurableObjectNamespace) {}
 
-  private stub(operationId = "operations") {
+  private stub(ownerHash: string) {
+    return this.namespace.get(this.namespace.idFromName("owner:" + ownerHash));
+  }
+
+  private legacyStub(operationId: string) {
     return this.namespace.get(this.namespace.idFromName(operationId));
+  }
+
+  private operationStub(operationId: string, ownerHash: string) {
+    return this.legacyOperationIds.has(operationId)
+      ? this.legacyStub(operationId)
+      : this.stub(ownerHash);
   }
 
   async put(record: OperationLedgerRecord, options?: OperationPutOptions): Promise<void> {
@@ -1196,7 +1253,7 @@ class DurableObjectOperationStore implements OperationStore {
     validateApprovedPrivateNotes(record, options?.approvedPrivateNotes);
     const response = await operationStoreFetch(
       "operationStore.put",
-      this.stub(record.operationId),
+      this.operationStub(record.operationId, record.ownerHash),
       new Request(`https://operation.local/operations/${record.operationId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -1211,34 +1268,49 @@ class DurableObjectOperationStore implements OperationStore {
     }
   }
 
-  async get(operationId: string): Promise<OperationLedgerRecord | undefined> {
-    const response = await operationStoreFetch(
+  async get(operationId: string, ownerHash?: string): Promise<OperationLedgerRecord | undefined> {
+    let response = await operationStoreFetch(
       "operationStore.get",
-      this.stub(operationId),
+      ownerHash ? this.stub(ownerHash) : this.legacyStub(operationId),
       new Request(`https://operation.local/operations/${operationId}`)
     );
+    // Existing operation-derived records remain readable and continue in their
+    // original instance. New records are always owner-scoped.
+    if (response.status === 404 && ownerHash) {
+      response = await operationStoreFetch(
+        "operationStore.getLegacy",
+        this.legacyStub(operationId),
+        new Request(`https://operation.local/operations/${operationId}`)
+      );
+      if (response.ok) this.legacyOperationIds.add(operationId);
+    }
     if (response.status === 404) return undefined;
     if (!response.ok) {
       throw new Error(`Operation store get failed: ${response.status}`);
     }
     const record = await response.json();
     assertOperationRecord(record);
+    if (ownerHash && record.ownerHash !== ownerHash) return undefined;
     return record;
   }
 
-  async list(ownerHash: string): Promise<OperationLedgerRecord[]> {
+  async list(ownerHash: string): Promise<Record<string, unknown>[]> {
     const response = await operationStoreFetch(
       "operationStore.list",
-      this.stub("operations"),
+      this.stub(ownerHash),
       new Request(`https://operation.local/operations?ownerHash=${ownerHash}`)
     );
     if (!response.ok) {
       throw new Error(`Operation store list failed: ${response.status}`);
     }
-    const records = await response.json();
-    if (!Array.isArray(records)) throw new MalformedStoredOperationError();
-    records.forEach(assertOperationRecord);
-    return records;
+    const results = await response.json();
+    if (!Array.isArray(results) || serializedBytes(results) > MAX_RECENT_OPERATION_OUTPUT_BYTES) {
+      throw new MalformedStoredOperationError("Recent operation results are malformed or exceed bounds.");
+    }
+    if (results.some((result) => !isRecordObject(result) || "ownerHash" in result)) {
+      throw new MalformedStoredOperationError("Recent operation results are not redacted.");
+    }
+    return results as Record<string, unknown>[];
   }
 
   async update(
@@ -1246,8 +1318,10 @@ class DurableObjectOperationStore implements OperationStore {
     ownerHash: string,
     updater: (record: OperationLedgerRecord) => OperationLedgerRecord
   ): Promise<OperationLedgerRecord> {
-    const existing = await this.get(operationId);
-    if (!existing) throw new Error(`Operation not found: ${operationId}`);
+    const existing = await this.get(operationId, ownerHash);
+    if (!existing) {
+      throw new Error("Operation was not found or is not visible to this caller.");
+    }
     assertRecordOwner(existing, ownerHash);
     const updated = startTerminalRetention(
       existing,
@@ -1263,9 +1337,9 @@ class DurableObjectOperationStore implements OperationStore {
     itemKey: string,
     fingerprint: string
   ): Promise<string | undefined> {
-    const response = await operationStoreFetch(
+    let response = await operationStoreFetch(
       "operationStore.getApprovedPrivateNote",
-      this.stub(operationId),
+      this.operationStub(operationId, ownerHash),
       new Request(
         "https://operation.local/operations/" + operationId +
           "/approved-private-note/" + encodeURIComponent(itemKey),
@@ -1276,6 +1350,21 @@ class DurableObjectOperationStore implements OperationStore {
         }
       )
     );
+    if (response.status === 404) {
+      response = await operationStoreFetch(
+        "operationStore.getApprovedPrivateNoteLegacy",
+        this.legacyStub(operationId),
+        new Request(
+          "https://operation.local/operations/" + operationId +
+            "/approved-private-note/" + encodeURIComponent(itemKey),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ownerHash, fingerprint }),
+          }
+        )
+      );
+    }
     if (response.status === 404) return undefined;
     if (!response.ok) {
       throw new Error("Approved private-note recovery failed: " + response.status);
@@ -1287,7 +1376,7 @@ class DurableObjectOperationStore implements OperationStore {
   async claimNextItem(params: OperationClaimNextParams): Promise<OperationItemClaim | undefined> {
     const response = await operationStoreFetch(
       "operationStore.claimNextItem",
-      this.stub(params.operationId),
+      this.operationStub(params.operationId, params.ownerHash),
       new Request(`https://operation.local/operations/${params.operationId}/claim-next`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1302,7 +1391,7 @@ class DurableObjectOperationStore implements OperationStore {
   async completeItem(params: OperationCompleteItemParams): Promise<OperationLedgerRecord> {
     const response = await operationStoreFetch(
       "operationStore.completeItem",
-      this.stub(params.operationId),
+      this.operationStub(params.operationId, params.ownerHash),
       new Request(`https://operation.local/operations/${params.operationId}/complete-item`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1316,7 +1405,7 @@ class DurableObjectOperationStore implements OperationStore {
   async checkpointItem(params: OperationCheckpointItemParams): Promise<OperationLedgerRecord> {
     const response = await operationStoreFetch(
       "operationStore.checkpointItem",
-      this.stub(params.operationId),
+      this.operationStub(params.operationId, params.ownerHash),
       new Request(`https://operation.local/operations/${params.operationId}/checkpoint-item`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1330,7 +1419,7 @@ class DurableObjectOperationStore implements OperationStore {
   async scheduleContinuation(params: OperationScheduleContinuationParams): Promise<OperationLedgerRecord> {
     const response = await operationStoreFetch(
       "operationStore.scheduleContinuation",
-      this.stub(params.operationId),
+      this.operationStub(params.operationId, params.ownerHash),
       new Request(`https://operation.local/operations/${params.operationId}/schedule-continuation`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1346,7 +1435,7 @@ class DurableObjectOperationStore implements OperationStore {
   ): Promise<OperationLedgerRecord> {
     const response = await operationStoreFetch(
       "operationStore.terminalizeContinuationFailure",
-      this.stub(params.operationId),
+      this.operationStub(params.operationId, params.ownerHash),
       new Request(
         "https://operation.local/operations/" + params.operationId + "/terminalize-continuation",
         {
@@ -1404,6 +1493,12 @@ export function getOperationStore(): OperationStore {
 
 export function currentOwnerHash(): string {
   const context = getAuditContext();
+  // Preserve the established direct-OAuth identity derivation.
+  if (context.user) return stableHash(context.user);
+  if (context.ownerHash) return context.ownerHash;
+  if (context.ownerIdentityRequired) {
+    throw new Error("Authenticated owner identity is unavailable.");
+  }
   return stableHash(context.user ?? "anonymous");
 }
 
@@ -1415,6 +1510,46 @@ export function stableHash(value: unknown): string {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+async function cryptographicOwnerHash(value: Record<string, unknown>): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify(value))
+  );
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export async function gatewayOwnerHash(credentials: {
+  apiToken: string;
+  subdomain: string;
+  region?: "us" | "eu";
+}): Promise<string> {
+  const credentialFingerprint = await cryptographicOwnerHash({
+    version: 1,
+    apiToken: credentials.apiToken,
+  });
+  return cryptographicOwnerHash({
+    version: 1,
+    authMode: "gateway",
+    region: credentials.region ?? "us",
+    tenant: credentials.subdomain.trim().toLowerCase(),
+    credentialFingerprint,
+  });
+}
+
+export function envTenantOwnerHash(credentials: {
+  subdomain: string;
+  region?: "us" | "eu";
+}): Promise<string> {
+  return cryptographicOwnerHash({
+    version: 1,
+    authMode: "env",
+    region: credentials.region ?? "us",
+    tenant: credentials.subdomain.trim().toLowerCase(),
+  });
 }
 
 export function normalizedNoteFingerprint(value: string | undefined): string | undefined {
@@ -1489,7 +1624,7 @@ export function operationTotals(record: OperationLedgerRecord): Record<string, n
 }
 
 export function operationResultView(record: OperationLedgerRecord): Record<string, unknown> {
-  return {
+  return redactPublicOperationValue({
     operationId: record.operationId,
     toolName: record.toolName,
     state: record.state,
@@ -1512,6 +1647,44 @@ export function operationResultView(record: OperationLedgerRecord): Record<strin
     totals: operationTotals(record),
     summary: record.summary,
     results: record.compactResults,
+  }) as Record<string, unknown>;
+}
+
+function redactPublicOperationValue(value: unknown, depth = 0): unknown {
+  if (depth > 8) return "[redacted]";
+  if (typeof value === "string") return sanitizeText(value);
+  if (Array.isArray(value)) {
+    return value.slice(0, MAX_OPERATION_ITEMS).map((entry) =>
+      redactPublicOperationValue(entry, depth + 1)
+    );
+  }
+  if (!isRecordObject(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !FORBIDDEN_PERSISTED_CONTENT_KEYS.has(key.toLowerCase()))
+      .map(([key, child]) => [key, redactPublicOperationValue(child, depth + 1)])
+  );
+}
+
+function operationRecentView(record: OperationLedgerRecord): Record<string, unknown> {
+  return {
+    operationId: sanitizeText(record.operationId),
+    toolName: sanitizeText(record.toolName),
+    state: record.state,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    completedCount: record.completedItems.length,
+    pendingCount: record.pendingItems.length,
+    failedCount: record.failedItems.length,
+    skippedCount: record.skippedItems.length,
+    unattemptedCount: record.unattemptedItems.length,
+    partialWriteCount: record.partialWriteCount,
+    ambiguousWriteCount: record.ambiguousWriteCount,
+    staleCount: record.staleItems?.length ?? 0,
+    waitingForRateLimitCount: record.rateLimitedItems.length,
+    nextEligibleTime: record.nextEligibleTime,
+    continuationCount: record.continuationCount,
+    totals: operationTotals(record),
   };
 }
 
@@ -1552,30 +1725,58 @@ export class SuperOpsOperationLedger {
     }
   }
 
+  private async maintainRecentIndex(record: OperationLedgerRecord): Promise<void> {
+    const indexKey = recentOperationKey(record.operationId);
+    if (isExpiredTerminalOperation(record)) {
+      await this.state.storage.delete(indexKey);
+    } else {
+      await this.state.storage.put(indexKey, recentOperationEntry(record));
+    }
+
+    const indexed = await this.state.storage.list<RecentOperationIndexEntry>({
+      prefix: "recent:",
+    });
+    const retained: Array<[string, RecentOperationIndexEntry]> = [];
+    for (const [key, entry] of indexed) {
+      if (!key.startsWith("recent:")) continue;
+      if (!isRecentOperationIndexEntry(entry) ||
+          (isTerminalOperationState(entry.state) && Date.parse(entry.expiresAt) <= Date.now())) {
+        await this.state.storage.delete(key);
+      } else {
+        retained.push([key, entry]);
+      }
+    }
+    retained.sort((a, b) => b[1].updatedAt.localeCompare(a[1].updatedAt));
+    for (const [key] of retained.slice(MAX_RECENT_OPERATION_INDEX_ENTRIES)) {
+      await this.state.storage.delete(key);
+    }
+  }
+
   private async persistRecord(
     record: OperationLedgerRecord,
     approvedPrivateNotes: ApprovedPrivateNoteContent[] = []
   ): Promise<void> {
     if (approvedPrivateNotes.length === 0) {
       await this.state.storage.put("op:" + record.operationId, record);
-      return;
+    } else {
+      const secret = this.env.SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY?.trim();
+      if (!secret) {
+        throw new PrivateNoteEncryptionUnavailableError();
+      }
+      const encrypted = await Promise.all(approvedPrivateNotes.map(async (note) => ({
+        key: approvedPrivateNoteKey(record.operationId, note.itemKey),
+        value: await encryptApprovedPrivateNote(secret, record.operationId, note),
+      })));
+      const entries: Record<string, unknown> = {
+        ["op:" + record.operationId]: record,
+      };
+      for (const note of encrypted) entries[note.key] = note.value;
+      const atomicPut = this.state.storage.put as unknown as (
+        values: Record<string, unknown>
+      ) => Promise<void>;
+      await atomicPut.call(this.state.storage, entries);
     }
-    const secret = this.env.SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY?.trim();
-    if (!secret) {
-      throw new PrivateNoteEncryptionUnavailableError();
-    }
-    const encrypted = await Promise.all(approvedPrivateNotes.map(async (note) => ({
-      key: approvedPrivateNoteKey(record.operationId, note.itemKey),
-      value: await encryptApprovedPrivateNote(secret, record.operationId, note),
-    })));
-    const entries: Record<string, unknown> = {
-      ["op:" + record.operationId]: record,
-    };
-    for (const note of encrypted) entries[note.key] = note.value;
-    const atomicPut = this.state.storage.put as unknown as (
-      values: Record<string, unknown>
-    ) => Promise<void>;
-    await atomicPut.call(this.state.storage, entries);
+    await this.maintainRecentIndex(record);
   }
 
   private terminalizeSchedulingFailure(
@@ -1664,8 +1865,10 @@ export class SuperOpsOperationLedger {
     const now = new Date().toISOString();
     let nextAlarmAt: number | undefined;
     for (const [key, record] of records) {
+      if (!key.startsWith("op:")) continue;
       if (isExpiredTerminalOperation(record, now)) {
         await this.state.storage.delete(key);
+        await this.state.storage.delete(recentOperationKey(record.operationId));
         await this.deleteApprovedPrivateNotes(this.state.storage, record.operationId);
       } else if (!isTerminalOperation(record)) {
         const normalized = startTerminalRetention(
@@ -1674,7 +1877,7 @@ export class SuperOpsOperationLedger {
           now
         );
         if (isTerminalOperation(normalized)) {
-          await this.state.storage.put(key, normalized);
+          await this.persistRecord(normalized);
           await this.deleteApprovedPrivateNotes(this.state.storage, record.operationId);
         }
         const alarmAt = Date.parse(
@@ -1762,6 +1965,7 @@ export class SuperOpsOperationLedger {
       }
       if (record && isExpiredTerminalOperation(record)) {
         await this.state.storage.delete(key);
+        await this.state.storage.delete(recentOperationKey(record.operationId));
         await this.deleteApprovedPrivateNotes(this.state.storage, record.operationId);
         return json({ error: "Not found" }, 404);
       }
@@ -1807,6 +2011,8 @@ export class SuperOpsOperationLedger {
       }
       if (isExpiredTerminalOperation(record)) {
         await this.state.storage.delete(key);
+        await this.state.storage.delete(recentOperationKey(record.operationId));
+        await this.deleteApprovedPrivateNotes(this.state.storage, record.operationId);
         return json({ error: "Not found" }, 404);
       }
 
@@ -1815,7 +2021,7 @@ export class SuperOpsOperationLedger {
         assertRecordOwner(record, params.ownerHash);
         const claimed = claimNextItemInRecord(cloneRecord(record), params);
         const retainedRecord = startTerminalRetention(record, claimed.record);
-        await this.state.storage.put(key, retainedRecord);
+        await this.persistRecord(retainedRecord);
         await this.setRecordAlarm(retainedRecord);
         return claimed.claim ? json(claimed.claim) : new Response(null, { status: 204 });
       }
@@ -1827,7 +2033,7 @@ export class SuperOpsOperationLedger {
           record,
           applyItemPatch(cloneRecord(record), params)
         );
-        await this.state.storage.put(key, updated);
+        await this.persistRecord(updated);
         if (isTerminalOperation(updated)) {
           await this.deleteApprovedPrivateNotes(this.state.storage, operationId);
         }
@@ -1842,7 +2048,7 @@ export class SuperOpsOperationLedger {
           record,
           applyItemCheckpoint(cloneRecord(record), params)
         );
-        await this.state.storage.put(key, updated);
+        await this.persistRecord(updated);
         await this.setRecordAlarm(updated);
         return json(updated);
       }
@@ -1865,7 +2071,7 @@ export class SuperOpsOperationLedger {
           record,
           await this.scheduleDurableWake(updated)
         );
-        await this.state.storage.put(key, scheduled);
+        await this.persistRecord(scheduled);
         if (isTerminalOperation(scheduled)) {
           await this.deleteApprovedPrivateNotes(this.state.storage, operationId);
         }
@@ -1881,7 +2087,7 @@ export class SuperOpsOperationLedger {
           terminalizeContinuationFailureInRecord(cloneRecord(record), params),
           params.now ?? nowIso()
         );
-        await this.state.storage.put(key, terminal);
+        await this.persistRecord(terminal);
         await this.deleteApprovedPrivateNotes(this.state.storage, operationId);
         await this.setRecordAlarm(terminal);
         return json(terminal);
@@ -1890,26 +2096,44 @@ export class SuperOpsOperationLedger {
 
     if (request.method === "GET" && url.pathname === "/operations") {
       const ownerHash = url.searchParams.get("ownerHash");
-      const records = await this.state.storage.list<OperationLedgerRecord>({
-        prefix: "op:",
+      if (!ownerHash) return json({ error: "ownerHash is required" }, 400);
+      const indexed = await this.state.storage.list<RecentOperationIndexEntry>({
+        prefix: "recent:",
       });
       const retained: OperationLedgerRecord[] = [];
-      for (const [key, record] of records) {
+      for (const [indexKey, entry] of indexed) {
+        if (!indexKey.startsWith("recent:")) continue;
+        if (!isRecentOperationIndexEntry(entry)) {
+          await this.state.storage.delete(indexKey);
+          continue;
+        }
+        if (entry.ownerHash !== ownerHash) continue;
+        const key = "op:" + entry.operationId;
+        const record = await this.state.storage.get<OperationLedgerRecord>(key);
+        if (!record) {
+          await this.state.storage.delete(indexKey);
+          continue;
+        }
         try {
           assertOperationRecord(record);
         } catch {
           continue;
         }
+        if (record.ownerHash !== ownerHash) continue;
         if (isExpiredTerminalOperation(record)) {
           await this.state.storage.delete(key);
+          await this.state.storage.delete(indexKey);
           await this.deleteApprovedPrivateNotes(this.state.storage, record.operationId);
         } else {
           retained.push(record);
         }
       }
-      const filtered = retained.filter((record) => !ownerHash || record.ownerHash === ownerHash);
-      filtered.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      return json(filtered.slice(0, 50));
+      retained.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      const results = retained.slice(0, MAX_RECENT_OPERATION_RESULTS).map(operationRecentView);
+      while (results.length > 0 && serializedBytes(results) > MAX_RECENT_OPERATION_OUTPUT_BYTES) {
+        results.pop();
+      }
+      return json(results);
     }
 
     return json({ error: "Not found" }, 404);

@@ -33,7 +33,7 @@ vi.mock("../client.js", () => ({
   },
 }));
 
-import { getClient } from "../client.js";
+import { getClient, SuperOpsError, SuperOpsHttpError } from "../client.js";
 import { getTicketsTools, resumeApplyTriageOperation } from "./tickets.js";
 import {
   getExecutionState,
@@ -3428,6 +3428,198 @@ describe("Tickets Domain", () => {
       outcome: "Updated",
     });
     expect(JSON.stringify(finalRecord)).not.toContain(noteBody);
+  });
+
+  it.each([
+    ["http-429", () => new SuperOpsHttpError("rate limited", 429, "Too Many Requests", 0)],
+    ["graphql-throttle", () => new SuperOpsError("GraphQL throttled", "THROTTLED", 0)],
+  ])("durably reschedules a conclusively rejected private note for %s and revalidates before retry", async (
+    throttleKind,
+    throttleError
+  ) => {
+    const noteBody = "Approved throttled private note";
+    const domain = getTicketsTools();
+    const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () => domain.handleCall("superops_tickets_apply_triage_plan", {
+        batchId: `private-note-throttle-${throttleKind}`,
+        expectedCandidateTicketNumbers: ["57400", "57401"],
+        actions: [{ ticketNumber: "57401", contentVerified: true, action: "addNote", note: noteBody }],
+      })
+    ));
+    const operationId = JSON.parse(initial.content[0].text).operation.operationId as string;
+    const stored = await getOperationStore().get(operationId);
+    if (!stored) throw new Error("missing private-note throttle operation");
+
+    const events: string[] = [];
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        events.push("revalidate-list");
+        return { getTicketList: { tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } };
+      }
+      if (query.includes("getTicketNoteList")) {
+        events.push("dedupe-notes");
+        return { getTicketNoteList: [] };
+      }
+      events.push("revalidate-ticket");
+      return { getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" } };
+    });
+    let acceptedPrivateNotes = 0;
+    mockClient.mutate
+      .mockImplementationOnce(async () => {
+        events.push("note-throttled");
+        throw throttleError();
+      })
+      .mockImplementationOnce(async (_mutation: string, variables: { input: { privacyType: string } }) => {
+        events.push("note-accepted");
+        expect(variables.input.privacyType).toBe("PRIVATE");
+        acceptedPrivateNotes += 1;
+        return { createTicketNote: { noteId: "note-accepted", privacyType: "PRIVATE" } };
+      });
+
+    await runWithExecutionConfig({}, () =>
+      runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        resumeApplyTriageOperation({ operationId, ownerHash: stored.ownerHash, leaseOwner: "note-throttle-1" })
+      )
+    );
+    const rescheduled = await getOperationStore().get(operationId);
+    expect(rescheduled?.itemStates["57401"]).toMatchObject({
+      stage: "RateLimitedRescheduled",
+      mutationType: "note",
+      mutationStartStage: "NoteWriteStarted",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      reliableResponseReceived: true,
+      observedMutationResult: "Rejected",
+      partialWrite: false,
+      nextEligibleTime: expect.any(String),
+    });
+    expect(rescheduled?.itemStates["57401"].rateLimit).toMatchObject({ attempts: 1 });
+
+    await runWithExecutionConfig({}, () =>
+      runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        resumeApplyTriageOperation({ operationId, ownerHash: stored.ownerHash, leaseOwner: "note-throttle-2" })
+      )
+    );
+    const secondMutation = events.indexOf("note-accepted");
+    const eventsBeforeRetry = events.slice(events.indexOf("note-throttled") + 1, secondMutation);
+    expect(eventsBeforeRetry).toEqual(expect.arrayContaining([
+      "revalidate-list", "revalidate-ticket", "dedupe-notes",
+    ]));
+    expect(acceptedPrivateNotes).toBe(1);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(mockClient.mutate.mock.calls.every(([, variables]) =>
+      variables.input.privacyType === "PRIVATE"
+    )).toBe(true);
+  });
+
+  it("does not reschedule or replay an ambiguous private-note failure", async () => {
+    const domain = getTicketsTools();
+    await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () => domain.handleCall("superops_tickets_apply_triage_plan", {
+        batchId: "private-note-ambiguous",
+        expectedCandidateTicketNumbers: ["57400", "57401"],
+        actions: [{ ticketNumber: "57401", contentVerified: true, action: "addNote", note: "Ambiguous private note" }],
+      })
+    ));
+    const stored = await getOperationStore().get("private-note-ambiguous");
+    if (!stored) throw new Error("missing ambiguous private-note operation");
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) return { getTicketList: {
+        tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+      } };
+      if (query.includes("getTicketNoteList")) return { getTicketNoteList: [] };
+      return { getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" } };
+    });
+    mockClient.mutate.mockRejectedValueOnce(new Error("network response lost after note write"));
+
+    await runWithExecutionConfig({}, () =>
+      runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        resumeApplyTriageOperation({
+          operationId: "private-note-ambiguous",
+          ownerHash: stored.ownerHash,
+          leaseOwner: "note-ambiguous",
+        })
+      )
+    );
+    const finalRecord = await getOperationStore().get("private-note-ambiguous");
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "AmbiguousWriteUnresolved",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: true,
+    });
+    expect(finalRecord?.itemStates["57401"].nextEligibleTime).toBeUndefined();
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("dedupes a matching private note before a resumed conclusive-throttle retry", async () => {
+    const noteBody = "Appeared during durable wait";
+    const domain = getTicketsTools();
+    await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () => domain.handleCall("superops_tickets_apply_triage_plan", {
+        batchId: "private-note-dedupe-after-throttle",
+        expectedCandidateTicketNumbers: ["57400", "57401"],
+        actions: [{ ticketNumber: "57401", contentVerified: true, action: "addNote", note: noteBody }],
+      })
+    ));
+    const stored = await getOperationStore().get("private-note-dedupe-after-throttle");
+    if (!stored) throw new Error("missing private-note dedupe operation");
+    let noteNowExists = false;
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) return { getTicketList: {
+        tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+      } };
+      if (query.includes("getTicketNoteList")) return { getTicketNoteList: noteNowExists
+        ? [{ noteId: "existing-note", content: noteBody, privacyType: "PRIVATE" }]
+        : [] };
+      return { getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" } };
+    });
+    mockClient.mutate.mockRejectedValueOnce(
+      new SuperOpsHttpError("rate limited", 429, "Too Many Requests", 0)
+    );
+
+    await runWithExecutionConfig({}, () => runWithExecutionContext(
+      "superops_tickets_apply_triage_plan",
+      () => resumeApplyTriageOperation({
+        operationId: "private-note-dedupe-after-throttle",
+        ownerHash: stored.ownerHash,
+        leaseOwner: "note-dedupe-1",
+      })
+    ));
+    noteNowExists = true;
+    await runWithExecutionConfig({}, () => runWithExecutionContext(
+      "superops_tickets_apply_triage_plan",
+      () => resumeApplyTriageOperation({
+        operationId: "private-note-dedupe-after-throttle",
+        ownerHash: stored.ownerHash,
+        leaseOwner: "note-dedupe-2",
+      })
+    ));
+
+    const finalRecord = await getOperationStore().get("private-note-dedupe-after-throttle");
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      outcome: "Updated",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      reliableResponseReceived: true,
+      observedMutationResult: "Rejected",
+      verificationState: "Verified",
+      partialWrite: false,
+    });
+    expect(finalRecord?.compactResults).toContainEqual(expect.objectContaining({
+      ticketNumber: "57401",
+      finalOutcome: "Updated",
+      writeAttempted: true,
+      noteDeduped: true,
+    }));
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(mockClient.mutate.mock.calls[0][1].input.privacyType).toBe("PRIVATE");
   });
 
   it("rejects public-note continuation without writing", async () => {

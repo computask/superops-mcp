@@ -376,8 +376,9 @@ async function executeToolCall(
     if (!operationId) {
       return errorResult("operationId is required.");
     }
-    const record = await getOperationStore().get(operationId);
-    if (!record || record.ownerHash !== currentOwnerHash()) {
+    const ownerHash = currentOwnerHash();
+    const record = await getOperationStore().get(operationId, ownerHash);
+    if (!record || record.ownerHash !== ownerHash) {
       return errorResult("Operation was not found or is not visible to this caller.");
     }
     return {
@@ -391,7 +392,7 @@ async function executeToolCall(
       content: [
         {
           type: "text",
-          text: JSON.stringify(records.map(operationResultView), null, 2),
+          text: JSON.stringify(records, null, 2),
         },
       ],
     };
