@@ -77,8 +77,24 @@ describe("Technicians Domain", () => {
     );
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("first");
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
-    expect(result.content[0].text).toContain("John Doe");
-    expect(result.content[0].text).not.toContain("Jane Doe");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.userList.map((tech: { userId: string }) => tech.userId)).toEqual(["tech-1"]);
+    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 50, hasMore: false, totalCount: 1 });
+    expect(parsed.readMetadata).toMatchObject({
+      complete: true,
+      truncated: false,
+      completeness: "known",
+      returnedCount: 1,
+      upstreamReturnedCount: 2,
+      upstreamTotalCount: 2,
+      upstreamHasMore: false,
+      filtering: {
+        applied: true,
+        fields: ["teamId"],
+        upstreamReturnedCount: 2,
+        filteredOutCount: 1,
+      },
+    });
   });
 
   it("uses documented technician fields", async () => {
@@ -162,8 +178,17 @@ describe("Technicians Domain", () => {
     );
     expect(mockClient.query.mock.calls[0][0]).not.toContain("getTechGroupList");
     expect(mockClient.query.mock.calls[0]).toHaveLength(1);
-    expect(result.content[0].text).toContain("Support Team");
-    expect(result.content[0].text).not.toContain("Projects Team");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.groups.map((group: { groupId: string }) => group.groupId)).toEqual(["group-1"]);
+    expect(parsed.readMetadata).toMatchObject({
+      complete: false,
+      truncated: true,
+      truncationReason: "recordLimit",
+      completeness: "partial",
+      returnedCount: 1,
+      upstreamTotalCount: 2,
+      filtering: { applied: false, fields: [] },
+    });
   });
 
   it("handles unknown tools and API errors", async () => {

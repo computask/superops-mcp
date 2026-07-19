@@ -238,6 +238,89 @@ function applyPatchFilters(
   });
 }
 
+function filteredListInfo(
+  listInfo: ListInfo,
+  returnedCount: number,
+  filterFields: string[]
+): ListInfo {
+  if (filterFields.length === 0) return listInfo;
+  if (listInfo.hasMore === false) {
+    return {
+      page: listInfo.page,
+      pageSize: listInfo.pageSize,
+      hasMore: false,
+      totalCount: returnedCount,
+    };
+  }
+  return { page: listInfo.page, pageSize: listInfo.pageSize };
+}
+
+function readMetadata(params: {
+  listInfo: ListInfo;
+  returnedCount: number;
+  upstreamReturnedCount: number;
+  filterFields: string[];
+}) {
+  const complete = params.listInfo.hasMore === false;
+  const truncated = params.listInfo.hasMore === true;
+  const nextPage =
+    truncated && typeof params.listInfo.page === "number"
+      ? params.listInfo.page + 1
+      : undefined;
+
+  return {
+    complete,
+    truncated,
+    truncationReason: truncated ? "upstreamHasMore" : undefined,
+    continuation: truncated
+      ? { nextPage, pageSize: params.listInfo.pageSize }
+      : undefined,
+    returnedCount: params.returnedCount,
+    upstreamReturnedCount: params.upstreamReturnedCount,
+    upstreamTotalCount: params.listInfo.totalCount,
+    upstreamHasMore: params.listInfo.hasMore,
+    completeness: complete ? "known" : truncated ? "partial" : "unknown",
+    filtering: {
+      applied: params.filterFields.length > 0,
+      fields: params.filterFields,
+      upstreamReturnedCount:
+        params.filterFields.length > 0 ? params.upstreamReturnedCount : undefined,
+      filteredOutCount:
+        params.filterFields.length > 0
+          ? params.upstreamReturnedCount - params.returnedCount
+          : undefined,
+    },
+  };
+}
+
+function activeFields(fields: Record<string, unknown>): string[] {
+  return Object.entries(fields)
+    .filter(([, value]) =>
+      Array.isArray(value) ? value.length > 0 : value !== undefined && value !== ""
+    )
+    .map(([key]) => key);
+}
+
+function listResult<T extends Record<string, unknown>, K extends keyof T & string>(
+  list: T & { listInfo: ListInfo },
+  key: K,
+  items: T[K] extends unknown[] ? T[K] : never,
+  upstreamCount: number,
+  filterFields: string[]
+) {
+  return {
+    ...list,
+    [key]: items,
+    listInfo: filteredListInfo(list.listInfo, (items as unknown[]).length, filterFields),
+    readMetadata: readMetadata({
+      listInfo: list.listInfo,
+      returnedCount: (items as unknown[]).length,
+      upstreamReturnedCount: upstreamCount,
+      filterFields,
+    }),
+  };
+}
+
 export function getAssetsTools(): DomainTools {
   return {
     tools: [
@@ -358,16 +441,28 @@ export function getAssetsTools(): DomainTools {
               // SuperOps documents per-list condition operators and attributes.
               input: pageInput(params.max, 100, params.page),
             });
-            response.getAssetList.assets = applyAssetFilters(
-              response.getAssetList.assets,
-              params
-            );
+            const filters = {
+              status: params.status,
+              platform: params.platform,
+              clientId: params.clientId,
+            };
+            const assets = applyAssetFilters(response.getAssetList.assets, filters);
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getAssetList, null, 2),
+                  text: JSON.stringify(
+                    listResult(
+                      response.getAssetList,
+                      "assets",
+                      assets,
+                      response.getAssetList.assets.length,
+                      activeFields(filters)
+                    ),
+                    null,
+                    2
+                  ),
                 },
               ],
             };
@@ -403,7 +498,7 @@ export function getAssetsTools(): DomainTools {
                 listInfo: pageInput(params.max, 100),
               },
             });
-            response.getAssetSoftwareList.assetSoftwares = applySoftwareSearch(
+            const assetSoftwares = applySoftwareSearch(
               response.getAssetSoftwareList.assetSoftwares,
               params.search
             );
@@ -412,7 +507,17 @@ export function getAssetsTools(): DomainTools {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getAssetSoftwareList, null, 2),
+                  text: JSON.stringify(
+                    listResult(
+                      response.getAssetSoftwareList,
+                      "assetSoftwares",
+                      assetSoftwares,
+                      response.getAssetSoftwareList.assetSoftwares.length,
+                      activeFields({ search: params.search })
+                    ),
+                    null,
+                    2
+                  ),
                 },
               ],
             };
@@ -433,16 +538,27 @@ export function getAssetsTools(): DomainTools {
                 listInfo: pageInput(undefined, 100),
               },
             });
-            response.getAssetPatchDetails.assetPatches = applyPatchFilters(
+            const filters = { status: params.status, severity: params.severity };
+            const assetPatches = applyPatchFilters(
               response.getAssetPatchDetails.assetPatches,
-              params
+              filters
             );
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getAssetPatchDetails, null, 2),
+                  text: JSON.stringify(
+                    listResult(
+                      response.getAssetPatchDetails,
+                      "assetPatches",
+                      assetPatches,
+                      response.getAssetPatchDetails.assetPatches.length,
+                      activeFields(filters)
+                    ),
+                    null,
+                    2
+                  ),
                 },
               ],
             };

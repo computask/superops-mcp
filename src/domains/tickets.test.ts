@@ -495,6 +495,55 @@ describe("Tickets Domain", () => {
     expect(mockClient.query).toHaveBeenCalledTimes(1);
   });
 
+  it("returns partial historical records when execution budget stops pagination", async () => {
+    const domain = getTicketsTools();
+    mockClient.query.mockImplementation(async () => {
+      const started = recordTypedSubrequestStart({ type: "paginationRead" });
+      recordSubrequestFinish(started, 200, true);
+      return {
+        getTicketList: {
+          tickets: [
+            {
+              ticketId: "1",
+              displayId: "1",
+              subject: "Inside",
+              createdTime: "2026-07-01T10:00:00Z",
+            },
+          ],
+          listInfo: { page: 1, pageSize: 100, hasMore: true, totalCount: 10 },
+        },
+      };
+    });
+
+    const result = await runWithExecutionConfig(
+      {
+        SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "2",
+        SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "1",
+        SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+      },
+      () =>
+        runWithExecutionContext("superops_tickets_query", () =>
+          domain.handleCall("superops_tickets_query", {
+            createdFrom: "2026-07-01T00:00:00Z",
+            createdTo: "2026-07-02T00:00:00Z",
+          })
+        )
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).not.toBe(true);
+    expect(parsed.records.map((ticket: { ticketId: string }) => ticket.ticketId)).toEqual(["1"]);
+    expect(parsed.pagination).toMatchObject({
+      complete: false,
+      truncated: true,
+      nextPage: 2,
+      stopReason: "executionBudgetExhausted",
+      recordsReturned: 1,
+    });
+    expect(parsed.errors[0]).toMatchObject({ errorType: "budget", retryable: true, attempts: 0 });
+    expect(mockClient.query).toHaveBeenCalledTimes(1);
+  });
+
   it("applies confirmed server filters separately from local reporting filters", async () => {
     mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "1", displayId: "1", subject: "Email", createdTime: "2026-07-01T10:00:00Z", status: "New Calls", source: "Email", category: "1. Support request", requestType: "Incident", priority: "High", client: { accountId: "c1", name: "Example" }, technician: { userId: "t1", name: "Engineer" } }, { ticketId: "2", displayId: "2", subject: "Portal", createdTime: "2026-07-01T09:00:00Z", status: "New Calls", source: "Portal", category: "2. Change request", requestType: "Service Request", priority: "Low", client: { accountId: "c2", name: "Other" }, technician: { userId: "t2", name: "Other Engineer" } }, { ticketId: "old", displayId: "old", subject: "Old", createdTime: "2026-06-30T23:00:00Z", status: "New Calls" }], listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 3 } } });
 

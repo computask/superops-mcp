@@ -112,6 +112,91 @@ function applyClientFilters(
   });
 }
 
+function appliedClientFilterFields(filters: {
+  status?: string;
+  stage?: string;
+  query?: string;
+}): string[] {
+  return [
+    filters.status ? "status" : undefined,
+    filters.stage ? "stage" : undefined,
+    filters.query ? "query" : undefined,
+  ].filter((field): field is string => Boolean(field));
+}
+
+function filteredListInfo(
+  listInfo: ListInfo,
+  returnedCount: number,
+  filterFields: string[]
+): ListInfo {
+  if (filterFields.length === 0) return listInfo;
+  if (listInfo.hasMore === false) {
+    return {
+      page: listInfo.page,
+      pageSize: listInfo.pageSize,
+      hasMore: false,
+      totalCount: returnedCount,
+    };
+  }
+  return { page: listInfo.page, pageSize: listInfo.pageSize };
+}
+
+function readMetadata(params: {
+  listInfo: ListInfo;
+  returnedCount: number;
+  upstreamReturnedCount: number;
+  filterFields: string[];
+}) {
+  const complete = params.listInfo.hasMore === false;
+  const truncated = params.listInfo.hasMore === true;
+  const nextPage =
+    truncated && typeof params.listInfo.page === "number"
+      ? params.listInfo.page + 1
+      : undefined;
+
+  return {
+    complete,
+    truncated,
+    truncationReason: truncated ? "upstreamHasMore" : undefined,
+    continuation: truncated
+      ? { nextPage, pageSize: params.listInfo.pageSize }
+      : undefined,
+    returnedCount: params.returnedCount,
+    upstreamReturnedCount: params.upstreamReturnedCount,
+    upstreamTotalCount: params.listInfo.totalCount,
+    upstreamHasMore: params.listInfo.hasMore,
+    completeness: complete ? "known" : truncated ? "partial" : "unknown",
+    filtering: {
+      applied: params.filterFields.length > 0,
+      fields: params.filterFields,
+      upstreamReturnedCount:
+        params.filterFields.length > 0 ? params.upstreamReturnedCount : undefined,
+      filteredOutCount:
+        params.filterFields.length > 0
+          ? params.upstreamReturnedCount - params.returnedCount
+          : undefined,
+    },
+  };
+}
+
+function listResult(
+  list: ListClientsResponse["getClientList"],
+  clients: Client[],
+  filterFields: string[]
+) {
+  return {
+    ...list,
+    clients,
+    listInfo: filteredListInfo(list.listInfo, clients.length, filterFields),
+    readMetadata: readMetadata({
+      listInfo: list.listInfo,
+      returnedCount: clients.length,
+      upstreamReturnedCount: list.clients.length,
+      filterFields,
+    }),
+  };
+}
+
 export function getClientsTools(): DomainTools {
   return {
     tools: [
@@ -210,15 +295,21 @@ export function getClientsTools(): DomainTools {
                     input: pageInput(params.max, 50, params.page),
                   }
                 );
-                searchResponse.getClientList.clients = applyClientFilters(
-                  searchResponse.getClientList.clients,
-                  { query: searchTerm }
-                );
+                const filters = { query: searchTerm };
+                const clients = applyClientFilters(searchResponse.getClientList.clients, filters);
                 return {
                   content: [
                     {
                       type: "text",
-                      text: JSON.stringify(searchResponse.getClientList, null, 2),
+                      text: JSON.stringify(
+                        listResult(
+                          searchResponse.getClientList,
+                          clients,
+                          appliedClientFilterFields(filters)
+                        ),
+                        null,
+                        2
+                      ),
                     },
                   ],
                 };
@@ -230,16 +321,22 @@ export function getClientsTools(): DomainTools {
               // SuperOps documents per-list condition operators and attributes.
               input: pageInput(params.max, 50, params.page),
             });
-            response.getClientList.clients = applyClientFilters(
-              response.getClientList.clients,
-              { status: params.status, stage: params.stage }
-            );
+            const filters = { status: params.status, stage: params.stage };
+            const clients = applyClientFilters(response.getClientList.clients, filters);
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getClientList, null, 2),
+                  text: JSON.stringify(
+                    listResult(
+                      response.getClientList,
+                      clients,
+                      appliedClientFilterFields(filters)
+                    ),
+                    null,
+                    2
+                  ),
                 },
               ],
             };
@@ -273,16 +370,22 @@ export function getClientsTools(): DomainTools {
                 pageSize: Math.min(params.max ?? 20, 100),
               },
             });
-            response.getClientList.clients = applyClientFilters(
-              response.getClientList.clients,
-              { query: params.query }
-            );
+            const filters = { query: params.query };
+            const clients = applyClientFilters(response.getClientList.clients, filters);
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getClientList, null, 2),
+                  text: JSON.stringify(
+                    listResult(
+                      response.getClientList,
+                      clients,
+                      appliedClientFilterFields(filters)
+                    ),
+                    null,
+                    2
+                  ),
                 },
               ],
             };

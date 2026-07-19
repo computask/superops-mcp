@@ -80,8 +80,24 @@ describe("Assets Domain", () => {
     );
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("first");
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
-    expect(result.content[0].text).toContain("DESKTOP-001");
-    expect(result.content[0].text).not.toContain("MAC-001");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.assets.map((asset: { assetId: string }) => asset.assetId)).toEqual(["1"]);
+    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 100, hasMore: false, totalCount: 1 });
+    expect(parsed.readMetadata).toMatchObject({
+      complete: true,
+      truncated: false,
+      completeness: "known",
+      returnedCount: 1,
+      upstreamReturnedCount: 2,
+      upstreamTotalCount: 2,
+      upstreamHasMore: false,
+      filtering: {
+        applied: true,
+        fields: ["status", "platform", "clientId"],
+        upstreamReturnedCount: 2,
+        filteredOutCount: 1,
+      },
+    });
   });
 
   it("uses documented asset fields", async () => {
@@ -102,6 +118,7 @@ describe("Assets Domain", () => {
       expect.stringContaining("getAsset"),
       { input: { assetId: "asset-123" } }
     );
+
     const queryArg = mockClient.query.mock.calls[0][0];
     expect(queryArg).toContain("hostName");
     expect(queryArg).toContain("lastCommunicatedTime");
@@ -190,6 +207,7 @@ describe("Assets Domain", () => {
         },
       }
     );
+
     const queryArg = mockClient.query.mock.calls[0][0];
     expect(queryArg).toContain("assetPatches");
     expect(queryArg).toContain("patchDetail");

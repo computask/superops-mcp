@@ -122,6 +122,95 @@ function applyTechnicianFilters(
   });
 }
 
+function filteredListInfo(
+  listInfo: ListInfo,
+  returnedCount: number,
+  filterFields: string[]
+): ListInfo {
+  if (filterFields.length === 0) return listInfo;
+  if (listInfo.hasMore === false) {
+    return {
+      page: listInfo.page,
+      pageSize: listInfo.pageSize,
+      hasMore: false,
+      totalCount: returnedCount,
+    };
+  }
+  return { page: listInfo.page, pageSize: listInfo.pageSize };
+}
+
+function readMetadata(params: {
+  listInfo: ListInfo;
+  returnedCount: number;
+  upstreamReturnedCount: number;
+  filterFields: string[];
+}) {
+  const complete = params.listInfo.hasMore === false;
+  const truncated = params.listInfo.hasMore === true;
+  const nextPage =
+    truncated && typeof params.listInfo.page === "number"
+      ? params.listInfo.page + 1
+      : undefined;
+
+  return {
+    complete,
+    truncated,
+    truncationReason: truncated ? "upstreamHasMore" : undefined,
+    continuation: truncated
+      ? { nextPage, pageSize: params.listInfo.pageSize }
+      : undefined,
+    returnedCount: params.returnedCount,
+    upstreamReturnedCount: params.upstreamReturnedCount,
+    upstreamTotalCount: params.listInfo.totalCount,
+    upstreamHasMore: params.listInfo.hasMore,
+    completeness: complete ? "known" : truncated ? "partial" : "unknown",
+    filtering: {
+      applied: params.filterFields.length > 0,
+      fields: params.filterFields,
+      upstreamReturnedCount:
+        params.filterFields.length > 0 ? params.upstreamReturnedCount : undefined,
+      filteredOutCount:
+        params.filterFields.length > 0
+          ? params.upstreamReturnedCount - params.returnedCount
+          : undefined,
+    },
+  };
+}
+
+function listResult(
+  list: ListTechniciansResponse["getTechnicianList"],
+  userList: Technician[],
+  filterFields: string[]
+) {
+  return {
+    ...list,
+    userList,
+    listInfo: filteredListInfo(list.listInfo, userList.length, filterFields),
+    readMetadata: readMetadata({
+      listInfo: list.listInfo,
+      returnedCount: userList.length,
+      upstreamReturnedCount: list.userList.length,
+      filterFields,
+    }),
+  };
+}
+
+function groupReadMetadata(totalAvailable: number, returnedCount: number, requestedLimit: number) {
+  const truncated = returnedCount < totalAvailable;
+  return {
+    complete: !truncated,
+    truncated,
+    truncationReason: truncated ? "recordLimit" : undefined,
+    continuation: undefined,
+    returnedCount,
+    upstreamReturnedCount: totalAvailable,
+    upstreamTotalCount: totalAvailable,
+    completeness: truncated ? "partial" : "known",
+    limit: { requested: requestedLimit, effective: returnedCount },
+    filtering: { applied: false, fields: [] },
+  };
+}
+
 export function getTechniciansTools(): DomainTools {
   return {
     tools: [
@@ -205,16 +294,25 @@ export function getTechniciansTools(): DomainTools {
                 input: pageInput(params.max, params.page),
               }
             );
-            response.getTechnicianList.userList = applyTechnicianFilters(
+            const filters = { teamId: params.teamId };
+            const userList = applyTechnicianFilters(
               response.getTechnicianList.userList,
-              { teamId: params.teamId }
+              filters
             );
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.getTechnicianList, null, 2),
+                  text: JSON.stringify(
+                    listResult(
+                      response.getTechnicianList,
+                      userList,
+                      filters.teamId ? ["teamId"] : []
+                    ),
+                    null,
+                    2
+                  ),
                 },
               ],
             };
@@ -256,16 +354,25 @@ export function getTechniciansTools(): DomainTools {
             const params = args as { max?: number };
 
             const response = await client.query<ListTechGroupsResponse>(LIST_TECH_GROUPS_QUERY);
-            const groups = response.getTechnicianGroupList.slice(
-              0,
-              Math.min(params.max ?? 50, 500)
-            );
+            const requestedLimit = Math.min(params.max ?? 50, 500);
+            const groups = response.getTechnicianGroupList.slice(0, requestedLimit);
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(groups, null, 2),
+                  text: JSON.stringify(
+                    {
+                      groups,
+                      readMetadata: groupReadMetadata(
+                        response.getTechnicianGroupList.length,
+                        groups.length,
+                        requestedLimit
+                      ),
+                    },
+                    null,
+                    2
+                  ),
                 },
               ],
             };

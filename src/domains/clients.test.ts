@@ -65,8 +65,24 @@ describe("Clients Domain", () => {
     );
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("first");
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
-    expect(result.content[0].text).toContain("Active Client");
-    expect(result.content[0].text).not.toContain("Inactive Client");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.clients.map((client: { accountId: string }) => client.accountId)).toEqual(["1"]);
+    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 50, hasMore: false, totalCount: 1 });
+    expect(parsed.readMetadata).toMatchObject({
+      complete: true,
+      truncated: false,
+      completeness: "known",
+      returnedCount: 1,
+      upstreamReturnedCount: 2,
+      upstreamTotalCount: 2,
+      upstreamHasMore: false,
+      filtering: {
+        applied: true,
+        fields: ["status"],
+        upstreamReturnedCount: 2,
+        filteredOutCount: 1,
+      },
+    });
   });
 
   it("caps list pageSize at 500", async () => {
@@ -78,8 +94,17 @@ describe("Clients Domain", () => {
     });
 
     const domain = getClientsTools();
-    await domain.handleCall("superops_clients_list", { max: 1000, page: 3 });
+    const result = await domain.handleCall("superops_clients_list", { max: 1000, page: 3 });
+    const parsed = JSON.parse(result.content[0].text);
 
+    expect(parsed.readMetadata).toMatchObject({
+      complete: true,
+      truncated: false,
+      completeness: "known",
+      returnedCount: 0,
+      upstreamTotalCount: 0,
+      filtering: { applied: false, fields: [] },
+    });
     expect(mockClient.query).toHaveBeenCalledWith(
       expect.any(String),
       { input: { page: 3, pageSize: 500 } }
@@ -127,8 +152,13 @@ describe("Clients Domain", () => {
       expect.any(String),
       { input: { page: 1, pageSize: 20 } }
     );
-    expect(result.content[0].text).toContain("Acme Corp");
-    expect(result.content[0].text).not.toContain("Other Corp");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.clients.map((client: { accountId: string }) => client.accountId)).toEqual(["1"]);
+    expect(parsed.readMetadata.filtering).toMatchObject({
+      applied: true,
+      fields: ["query"],
+      filteredOutCount: 1,
+    });
   });
 
   it("uses only documented client fields in built-in queries", async () => {

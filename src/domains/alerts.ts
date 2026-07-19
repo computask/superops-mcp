@@ -388,21 +388,74 @@ function applyClientFilters(
   });
 }
 
-function clearUnreliableListInfo(
+function filteredListInfo(
   listInfo: ListInfo,
-  appliedClientFilters: boolean
+  returnedCount: number,
+  filterFields: string[]
 ): ListInfo {
-  if (!appliedClientFilters) return listInfo;
+  if (filterFields.length === 0) return listInfo;
+  if (listInfo.hasMore === false) {
+    return {
+      page: listInfo.page,
+      pageSize: listInfo.pageSize,
+      hasMore: false,
+      totalCount: returnedCount,
+    };
+  }
   return {
     page: listInfo.page,
     pageSize: listInfo.pageSize,
   };
 }
 
+function readMetadata(params: {
+  listInfo: ListInfo;
+  returnedCount: number;
+  upstreamReturnedCount: number;
+  filterFields: string[];
+}) {
+  const complete = params.listInfo.hasMore === false;
+  const truncated = params.listInfo.hasMore === true;
+  const nextPage =
+    truncated && typeof params.listInfo.page === "number"
+      ? params.listInfo.page + 1
+      : undefined;
+
+  return {
+    complete,
+    truncated,
+    truncationReason: truncated ? "upstreamHasMore" : undefined,
+    continuation: truncated
+      ? { nextPage, pageSize: params.listInfo.pageSize }
+      : undefined,
+    returnedCount: params.returnedCount,
+    upstreamReturnedCount: params.upstreamReturnedCount,
+    upstreamTotalCount: params.listInfo.totalCount,
+    upstreamHasMore: params.listInfo.hasMore,
+    completeness: complete ? "known" : truncated ? "partial" : "unknown",
+    filtering: {
+      applied: params.filterFields.length > 0,
+      fields: params.filterFields,
+      upstreamReturnedCount:
+        params.filterFields.length > 0 ? params.upstreamReturnedCount : undefined,
+      filteredOutCount:
+        params.filterFields.length > 0
+          ? params.upstreamReturnedCount - params.returnedCount
+          : undefined,
+    },
+  };
+}
+
+function activeFilterFields(filters: Record<string, unknown>): string[] {
+  return Object.entries(filters)
+    .filter(([, value]) => value !== undefined && value !== "")
+    .map(([key]) => key);
+}
+
 async function queryAlertList(
   client: SuperOpsClientInstance,
   params: AlertListParams
-): Promise<{ alerts: NormalizedAlert[]; listInfo: ListInfo; input: ListInfoInput }> {
+): Promise<{ alerts: NormalizedAlert[]; listInfo: ListInfo; readMetadata: ReturnType<typeof readMetadata>; input: ListInfoInput }> {
   const built = buildAlertListInput(params);
   if (built.error || !built.input) {
     throw new AlertValidationError(built.error ?? "Invalid alert list input.");
@@ -413,11 +466,17 @@ async function queryAlertList(
   });
   const normalized = normalizeAlerts(response.getAlertList.alerts ?? []);
   const filtered = applyClientFilters(normalized, built.clientFilters);
-  const clientFiltered = Boolean(built.clientFilters.severity || built.clientFilters.assetId);
+  const filterFields = activeFilterFields(built.clientFilters);
 
   return {
     alerts: filtered,
-    listInfo: clearUnreliableListInfo(response.getAlertList.listInfo, clientFiltered),
+    listInfo: filteredListInfo(response.getAlertList.listInfo, filtered.length, filterFields),
+    readMetadata: readMetadata({
+      listInfo: response.getAlertList.listInfo,
+      returnedCount: filtered.length,
+      upstreamReturnedCount: normalized.length,
+      filterFields,
+    }),
     input: built.input,
   };
 }
@@ -425,7 +484,7 @@ async function queryAlertList(
 async function queryAlertsForAsset(
   client: SuperOpsClientInstance,
   params: AlertListParams & { assetId: string }
-): Promise<{ alerts: NormalizedAlert[]; listInfo: ListInfo; input: unknown }> {
+): Promise<{ alerts: NormalizedAlert[]; listInfo: ListInfo; readMetadata: ReturnType<typeof readMetadata>; input: unknown }> {
   const built = buildAssetAlertsInput(params);
   if (built.error || !built.input) {
     throw new AlertValidationError(built.error ?? "Invalid asset alert input.");
@@ -436,9 +495,16 @@ async function queryAlertsForAsset(
       GET_ALERTS_FOR_ASSET_QUERY,
       { input: built.input }
     );
+    const alerts = normalizeAlerts(response.getAlertsForAsset.alerts ?? []);
     return {
-      alerts: normalizeAlerts(response.getAlertsForAsset.alerts ?? []),
+      alerts,
       listInfo: response.getAlertsForAsset.listInfo,
+      readMetadata: readMetadata({
+        listInfo: response.getAlertsForAsset.listInfo,
+        returnedCount: alerts.length,
+        upstreamReturnedCount: alerts.length,
+        filterFields: [],
+      }),
       input: built.input,
     };
   } catch (error) {
@@ -457,12 +523,18 @@ async function queryAlertsForAsset(
       { input: fallbackInput }
     );
     const status = stringValue((condition as { value?: unknown }).value);
-    const alerts = applyClientFilters(normalizeAlerts(response.getAlertsForAsset.alerts ?? []), {
-      status,
-    });
+    const normalized = normalizeAlerts(response.getAlertsForAsset.alerts ?? []);
+    const alerts = applyClientFilters(normalized, { status });
+    const filterFields = status ? ["status"] : [];
     return {
       alerts,
-      listInfo: clearUnreliableListInfo(response.getAlertsForAsset.listInfo, Boolean(status)),
+      listInfo: filteredListInfo(response.getAlertsForAsset.listInfo, alerts.length, filterFields),
+      readMetadata: readMetadata({
+        listInfo: response.getAlertsForAsset.listInfo,
+        returnedCount: alerts.length,
+        upstreamReturnedCount: normalized.length,
+        filterFields,
+      }),
       input: fallbackInput,
     };
   }
@@ -752,7 +824,7 @@ export function getAlertsTools(): DomainTools {
         switch (name) {
           case "superops_alerts_list": {
             const result = await queryAlertList(client, args as AlertListParams);
-            return textResult({ alerts: result.alerts, listInfo: result.listInfo });
+            return textResult({ alerts: result.alerts, listInfo: result.listInfo, readMetadata: result.readMetadata });
           }
 
           case "superops_alerts_get": {
@@ -777,7 +849,7 @@ export function getAlertsTools(): DomainTools {
               ...params,
               assetId,
             });
-            return textResult({ alerts: result.alerts, listInfo: result.listInfo });
+            return textResult({ alerts: result.alerts, listInfo: result.listInfo, readMetadata: result.readMetadata });
           }
 
           case "superops_alerts_resolve": {
@@ -908,6 +980,7 @@ export function getAlertsTools(): DomainTools {
             );
             return textResult({
               totalAlertsInspected: result.alerts.length,
+              readMetadata: result.readMetadata,
               countsBySeverity: countBy(result.alerts, "severity"),
               countsByClientName: countBy(result.alerts, "clientName"),
               countsByPolicyName: countBy(result.alerts, "policyName"),
