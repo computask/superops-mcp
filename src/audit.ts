@@ -64,6 +64,10 @@ const HIGH_RISK_WRITE_TOOLS = new Set([
   "superops_custom_mutation",
 ]);
 
+const REVIEWED_DURABLE_WRITE_TOOLS = new Set([
+  "superops_tickets_apply_triage_plan",
+]);
+
 const RUNTIME_CONTEXT = new AsyncLocalStorage<AuditContext>();
 
 const SECRET_PATTERNS: RegExp[] = [
@@ -100,8 +104,8 @@ export function runtimeFlagsFromEnv(env: {
 > {
   return {
     mcpEnabled: enabledFlag(env.MCP_ENABLED, true),
-    writeToolsEnabled: enabledFlag(env.ENABLE_WRITE_TOOLS, true),
-    customMutationEnabled: enabledFlag(env.ENABLE_CUSTOM_MUTATION, true),
+    writeToolsEnabled: enabledFlag(env.ENABLE_WRITE_TOOLS, false),
+    customMutationEnabled: enabledFlag(env.ENABLE_CUSTOM_MUTATION, false),
   };
 }
 
@@ -181,8 +185,12 @@ export function blockedToolReason(name: string): string | undefined {
     return "MCP tool execution is disabled by MCP_ENABLED=false.";
   }
 
-  if (!context.writeToolsEnabled && classification.category === "write") {
-    return "Write-capable ticket tools are disabled by ENABLE_WRITE_TOOLS=false.";
+  if (
+    !context.writeToolsEnabled &&
+    classification.category === "write" &&
+    !REVIEWED_DURABLE_WRITE_TOOLS.has(name)
+  ) {
+    return "Unreviewed synchronous write tools are disabled by ENABLE_WRITE_TOOLS=false.";
   }
 
   if (!context.customMutationEnabled && name === "superops_custom_mutation") {

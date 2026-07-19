@@ -461,4 +461,39 @@ describe("Alerts Domain", () => {
     expect(result.content[0].text).toContain("GraphQL failed");
     expect(result.content[0].text).not.toContain("secret");
   });
+
+  it("preserves an accepted-write contract when alert verification fails", async () => {
+    mockClient.mutate.mockResolvedValueOnce({
+      createAlert: { id: "alert-accepted", message: "Disk alert" },
+    });
+    mockClient.query.mockRejectedValue(new Error("verification unavailable"));
+    const result = await getAlertsTools().handleCall("superops_alerts_create", {
+      assetId: "asset-1", message: "Disk alert",
+    });
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      reliableResponseReceived: true,
+      replaySafe: false,
+      classification: "AcceptedSynchronousWriteFollowupFailed",
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a conservative ambiguity contract for failed synchronous alert writes", async () => {
+    mockClient.mutate.mockRejectedValueOnce(new Error("network response lost"));
+    const result = await getAlertsTools().handleCall("superops_alerts_create", {
+      assetId: "asset-1", message: "Disk alert",
+    });
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      reliableResponseReceived: false,
+      replaySafe: false,
+      classification: "AmbiguousSynchronousWrite",
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
 });

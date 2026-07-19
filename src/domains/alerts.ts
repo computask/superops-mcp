@@ -703,6 +703,8 @@ export function getAlertsTools(): DomainTools {
 
     async handleCall(name, args) {
       const client = getClient();
+      let synchronousWriteAttempted = false;
+      let synchronousWriteAccepted = false;
 
       try {
         switch (name) {
@@ -749,7 +751,9 @@ export function getAlertsTools(): DomainTools {
               });
             }
 
+            synchronousWriteAttempted = true;
             const resolved = await resolveAlerts(client, ids);
+            synchronousWriteAccepted = true;
             const verification: Record<string, unknown> | undefined =
               params.verify === false ? undefined : {};
             if (verification) {
@@ -771,6 +775,9 @@ export function getAlertsTools(): DomainTools {
               requestedIds: ids,
               resolved,
               verification,
+              writeAttempted: true,
+              writeMayHaveSucceeded: true,
+              reliableResponseReceived: true,
             });
           }
 
@@ -797,13 +804,18 @@ export function getAlertsTools(): DomainTools {
               return textResult({ dryRun: true, wouldCreate: input });
             }
 
+            synchronousWriteAttempted = true;
             const alert = await createAlert(client, input);
+            synchronousWriteAccepted = true;
             const verification = params.verify === false
               ? undefined
               : alert.id
                 ? await findAlertById(client, alert.id)
                 : undefined;
-            return textResult({ dryRun: false, alert, verification });
+            return textResult({
+              dryRun: false, alert, verification,
+              writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true,
+            });
           }
 
           case "superops_alerts_summary": {
@@ -836,6 +848,21 @@ export function getAlertsTools(): DomainTools {
       } catch (error) {
         if (error instanceof AlertValidationError) {
           return errorResult(error.message);
+        }
+        if (name === "superops_alerts_resolve" || name === "superops_alerts_create") {
+          return {
+            content: [{ type: "text", text: JSON.stringify({
+              error: alertErrorMessage(error),
+              writeAttempted: synchronousWriteAttempted,
+              writeMayHaveSucceeded: synchronousWriteAttempted,
+              reliableResponseReceived: synchronousWriteAccepted,
+              replaySafe: !synchronousWriteAttempted,
+              classification: synchronousWriteAccepted
+                ? "AcceptedSynchronousWriteFollowupFailed"
+                : synchronousWriteAttempted ? "AmbiguousSynchronousWrite" : "FailedBeforeWrite",
+            }, null, 2) }],
+            isError: true,
+          };
         }
         return {
           content: [{ type: "text", text: `Error: ${alertErrorMessage(error)}` }],

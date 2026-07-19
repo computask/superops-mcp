@@ -25,6 +25,13 @@ export interface ExecutionConfigInput {
   SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO?: string;
   SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS?: string;
   SUPEROPS_EXECUTION_MAX_DURATION_MS?: string;
+  SUPEROPS_EXECUTION_REQUEST_TIMEOUT_MS?: string;
+  SUPEROPS_EXECUTION_CPU_GUARD_MS?: string;
+  SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT?: string;
+  SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_ATTEMPTS?: string;
+  SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_DURATION_MS?: string;
+  SUPEROPS_EXECUTION_MAX_DURABLE_SINGLE_WAIT_MS?: string;
+  SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS?: string;
   SUPEROPS_EXECUTION_VERIFICATION_MODE?: string;
   SUPEROPS_OPERATION_RETENTION_SECONDS?: string;
   SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS?: string;
@@ -45,6 +52,13 @@ export interface ExecutionConfig {
   backoffJitterRatio: number;
   safeRemainingTimeMs: number;
   maxDurationMs: number;
+  requestTimeoutMs: number;
+  cpuGuardMs: number;
+  maxContinuationCount: number;
+  maxDurableRetryAttempts: number;
+  maxDurableRetryDurationMs: number;
+  maxDurableSingleWaitMs: number;
+  maxSchedulingAttempts: number;
   verificationMode: "mutationResponse" | "verifyReads";
   operationRetentionSeconds: number;
   operationMaxLifetimeSeconds: number;
@@ -78,6 +92,7 @@ export interface ExecutionState {
   toolName: string;
   startedAt: string;
   startedMs: number;
+  startedHighResolutionMs: number;
   finishedAt?: string;
   finishReason?: string;
   subrequests: number;
@@ -109,6 +124,13 @@ const DEFAULT_CONFIG: ExecutionConfig = {
   backoffJitterRatio: 0.2,
   safeRemainingTimeMs: 5_000,
   maxDurationMs: 25_000,
+  requestTimeoutMs: 10_000,
+  cpuGuardMs: 20_000,
+  maxContinuationCount: 100,
+  maxDurableRetryAttempts: 10,
+  maxDurableRetryDurationMs: 3_600_000,
+  maxDurableSingleWaitMs: 900_000,
+  maxSchedulingAttempts: 8,
   verificationMode: "verifyReads",
   operationRetentionSeconds: 86_400,
   operationMaxLifetimeSeconds: 21_600,
@@ -159,6 +181,32 @@ export class ExecutionTimeoutBudgetExceededError extends Error {
   }
 }
 
+export class ExecutionCpuBudgetExceededError extends Error {
+  readonly operationId: string;
+  readonly invocationId: string;
+  readonly retrySafe = true;
+
+  constructor(state: ExecutionState) {
+    const elapsed = (globalThis.performance?.now?.() ?? Date.now()) - state.startedHighResolutionMs;
+    super(`Cooperative CPU guard reached before next unit of work. Monotonic elapsed ${Math.round(elapsed)}ms/${state.config.cpuGuardMs}ms.`);
+    this.name = "ExecutionCpuBudgetExceededError";
+    this.operationId = state.operationId;
+    this.invocationId = state.invocationId;
+  }
+}
+
+export function classifyCloudflarePlatformLimit(
+  error: unknown
+): "CloudflareSubrequestLimit" | "CloudflareCpuLimit" | undefined {
+  const candidate = error as { name?: unknown; message?: unknown; code?: unknown } | null;
+  const text = `${String(candidate?.name ?? "")} ${String(candidate?.code ?? "")} ${String(candidate?.message ?? error ?? "")}`;
+  if (/too many subrequests|subrequest limit|subrequest quota/i.test(text)) {
+    return "CloudflareSubrequestLimit";
+  }
+  if (/cpu time limit|exceeded cpu|cpu limit|error\s*1102/i.test(text)) {
+    return "CloudflareCpuLimit";
+  }
+}
 function integer(value: string | undefined, fallback: number, min: number, max: number): number {
   const parsed = value === undefined ? NaN : Number(value);
   if (!Number.isFinite(parsed)) return fallback;
@@ -262,6 +310,30 @@ export function executionConfigFromEnv(
       1,
       300_000
     ),
+    requestTimeoutMs: integer(
+      merged("SUPEROPS_EXECUTION_REQUEST_TIMEOUT_MS"),
+      DEFAULT_CONFIG.requestTimeoutMs,
+      1,
+      120_000
+    ),
+    cpuGuardMs: integer(
+      merged("SUPEROPS_EXECUTION_CPU_GUARD_MS"), DEFAULT_CONFIG.cpuGuardMs, 1, 300_000
+    ),
+    maxContinuationCount: integer(
+      merged("SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT"), DEFAULT_CONFIG.maxContinuationCount, 1, 10_000
+    ),
+    maxDurableRetryAttempts: integer(
+      merged("SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_ATTEMPTS"), DEFAULT_CONFIG.maxDurableRetryAttempts, 1, 1_000
+    ),
+    maxDurableRetryDurationMs: integer(
+      merged("SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_DURATION_MS"), DEFAULT_CONFIG.maxDurableRetryDurationMs, 1, 86_400_000
+    ),
+    maxDurableSingleWaitMs: integer(
+      merged("SUPEROPS_EXECUTION_MAX_DURABLE_SINGLE_WAIT_MS"), DEFAULT_CONFIG.maxDurableSingleWaitMs, 1, 86_400_000
+    ),
+    maxSchedulingAttempts: integer(
+      merged("SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS"), DEFAULT_CONFIG.maxSchedulingAttempts, 1, 100
+    ),
     verificationMode,
     operationRetentionSeconds: integer(
       merged("SUPEROPS_OPERATION_RETENTION_SECONDS"),
@@ -304,6 +376,7 @@ export function runWithExecutionContext<T>(
     toolName,
     startedAt: new Date().toISOString(),
     startedMs: Date.now(),
+    startedHighResolutionMs: globalThis.performance?.now?.() ?? Date.now(),
     subrequests: 0,
     completedItems: 0,
     remainingItems: 0,
@@ -353,13 +426,20 @@ export function hasExecutionBudgetFor(estimatedRequired = 1): boolean {
   const effectiveLimit = state.config.subrequestBudget - state.config.subrequestSafetyMargin;
   if (state.subrequests + estimatedRequired > effectiveLimit) return false;
   const elapsed = Date.now() - state.startedMs;
-  return elapsed + state.config.safeRemainingTimeMs < state.config.maxDurationMs;
+  const monotonicElapsed = (globalThis.performance?.now?.() ?? Date.now()) - state.startedHighResolutionMs;
+  return elapsed + state.config.safeRemainingTimeMs < state.config.maxDurationMs &&
+    monotonicElapsed < state.config.cpuGuardMs;
 }
 
 export function assertExecutionBudget(estimatedRequired = 1): void {
   const state = getExecutionState();
   if (!state) return;
   const effectiveLimit = state.config.subrequestBudget - state.config.subrequestSafetyMargin;
+  const monotonicElapsed = (globalThis.performance?.now?.() ?? Date.now()) - state.startedHighResolutionMs;
+  if (monotonicElapsed >= state.config.cpuGuardMs) {
+    state.terminationReason = "cooperativeCpuGuard";
+    throw new ExecutionCpuBudgetExceededError(state);
+  }
   if (state.subrequests + estimatedRequired > effectiveLimit) {
     state.terminationReason = "subrequestBudget";
     throw new ExecutionBudgetExceededError(state, estimatedRequired);
@@ -426,6 +506,11 @@ export function recordTypedSubrequestStart(params: {
   if (state.subrequests + 1 > effectiveLimit) {
     state.terminationReason = "subrequestBudget";
     throw new ExecutionBudgetExceededError(state, 1);
+  }
+  const monotonicElapsed = (globalThis.performance?.now?.() ?? Date.now()) - state.startedHighResolutionMs;
+  if (monotonicElapsed >= state.config.cpuGuardMs) {
+    state.terminationReason = "cooperativeCpuGuard";
+    throw new ExecutionCpuBudgetExceededError(state);
   }
   const elapsed = Date.now() - state.startedMs;
   if (elapsed + state.config.safeRemainingTimeMs >= state.config.maxDurationMs) {

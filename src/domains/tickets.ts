@@ -25,13 +25,13 @@ import {
   type HistoricalTicketReportParams,
 } from "./ticket-reporting.js";
 import {
+  assertExecutionBudget,
+  classifyCloudflarePlatformLimit,
   executionDiagnostics,
-  getExecutionConfig,
-  hasExecutionBudgetFor,
-  markExecutionItem,
-  withExecutionItem,
   ExecutionBudgetExceededError,
+  ExecutionCpuBudgetExceededError,
   ExecutionTimeoutBudgetExceededError,
+  getExecutionConfig,
 } from "../execution.js";
 import {
   runOperationContinuation,
@@ -567,13 +567,16 @@ interface TriagePlanAction {
   ticketNumber: string;
   expectedTicketId?: string;
   expectedSubject?: string;
+  expectedSubjectHash?: string;
   expectedClient?: string;
+  expectedClientHash?: string;
   expectedStatus?: string;
   expectedUpdatedTime?: string;
   contentVerified?: boolean;
   action: TriagePlanActionType;
   reason?: string;
   note?: string;
+  noteFingerprint?: string;
   isPublicNote?: boolean;
   target?: TicketClassificationParams & {
     techGroupName?: string;
@@ -1576,13 +1579,14 @@ function formatValidOptionValues(values: string[]): string {
 }
 
 function structuredValidationResult(
-  failure: StructuredValidationFailure
+  failure: StructuredValidationFailure,
+  writeContract: Record<string, unknown> = {}
 ): {
   content: { type: "text"; text: string }[];
   isError: true;
 } {
   return {
-    content: [{ type: "text", text: JSON.stringify(failure, null, 2) }],
+    content: [{ type: "text", text: JSON.stringify({ ...failure, ...writeContract }, null, 2) }],
     isError: true,
   };
 }
@@ -1602,6 +1606,16 @@ function validationFailure(params?: {
   };
 }
 
+
+function isReliableSynchronousMutationRejection(error: unknown): boolean {
+  if (error instanceof SuperOpsHttpError) {
+    return error.status >= 400 && error.status < 500;
+  }
+  if (error instanceof SuperOpsError) {
+    return /THROTTL|VALIDATION|BAD_USER_INPUT|UNAUTHENTICATED|FORBIDDEN/i.test(error.code ?? "");
+  }
+  return false;
+}
 
 function mandatoryValidationFields(error: unknown): string[] {
   const message = error instanceof Error ? error.message : String(error);
@@ -2185,16 +2199,22 @@ function validateExpectedTicket(
       reason: `Expected ticketId ${action.expectedTicketId}, got ${ticket.ticketId}.`,
     };
   }
-  if (action.expectedSubject && ticket.subject !== action.expectedSubject) {
+  if (
+    (action.expectedSubject && ticket.subject !== action.expectedSubject) ||
+    (action.expectedSubjectHash && stableHash(ticket.subject) !== action.expectedSubjectHash)
+  ) {
     return {
       stage: "validateSubject",
-      reason: `Expected subject ${JSON.stringify(action.expectedSubject)}, got ${JSON.stringify(ticket.subject)}.`,
+      reason: "Ticket subject no longer matches the approved snapshot identity.",
     };
   }
-  if (action.expectedClient && ticketClientName(ticket) !== action.expectedClient) {
+  if (
+    (action.expectedClient && ticketClientName(ticket) !== action.expectedClient) ||
+    (action.expectedClientHash && stableHash(ticketClientName(ticket)) !== action.expectedClientHash)
+  ) {
     return {
       stage: "validateClient",
-      reason: `Expected client ${JSON.stringify(action.expectedClient)}, got ${JSON.stringify(ticketClientName(ticket))}.`,
+      reason: "Ticket client no longer matches the approved snapshot identity.",
     };
   }
   if (action.expectedStatus && ticket.status !== action.expectedStatus) {
@@ -2216,20 +2236,28 @@ function validateExpectedTicket(
   }
 }
 
+async function existingNoteMatchesFingerprint(
+  client: SuperOpsClientInstance,
+  ticketId: string,
+  fingerprint: string | undefined
+): Promise<boolean> {
+  if (!fingerprint) return false;
+  const notes = await getTicketNotes(client, ticketId);
+  // Continuation recovery is deliberately private-note only. A public note with
+  // identical text is neither evidence that the approved private note was
+  // written nor a reason to skip its private write.
+  return notes.some(
+    (existing) => existing.privacyType === "PRIVATE" &&
+      normalizedNoteFingerprint(existing.content) === fingerprint
+  );
+}
+
 async function existingNoteMatches(
   client: SuperOpsClientInstance,
   ticketId: string,
   note: string
 ): Promise<boolean> {
-  const notes = await getTicketNotes(client, ticketId);
-  const fingerprint = normalizedNoteFingerprint(note);
-  // Continuation recovery is deliberately private-note only. A public note with
-  // identical text is neither evidence that the approved private note was
-  // written nor a reason to skip its private write.
-  return Boolean(fingerprint) && notes.some(
-    (existing) => existing.privacyType === "PRIVATE" &&
-      normalizedNoteFingerprint(existing.content) === fingerprint
-  );
+  return existingNoteMatchesFingerprint(client, ticketId, normalizedNoteFingerprint(note));
 }
 
 async function addNoteForPlan(params: {
@@ -2239,17 +2267,26 @@ async function addNoteForPlan(params: {
   isPublic?: boolean;
   dedupe: boolean;
   result: ApplyTriagePlanResult;
+  beforeCheck?: () => Promise<void>;
   beforeCreate?: () => Promise<void>;
+  afterCreate?: (note: TicketNote) => Promise<void>;
 }): Promise<void> {
   if (typeof params.note !== "string" || params.note.trim().length === 0) {
     return;
   }
+  await params.beforeCheck?.();
   if (params.dedupe && await existingNoteMatches(params.client, params.ticketId, params.note)) {
     params.result.noteDeduped = true;
     return;
   }
   await params.beforeCreate?.();
-  await createTicketNote(params.client, params.ticketId, params.note, params.isPublic ?? false);
+  const created = await createTicketNote(
+    params.client,
+    params.ticketId,
+    params.note,
+    params.isPublic ?? false
+  );
+  await params.afterCreate?.(created);
   params.result.noteAdded = true;
 }
 
@@ -2440,15 +2477,22 @@ async function mutateTicketUpdate(
 }
 
 /**
- * A continuation must not turn a failed durable mutation-start checkpoint into
- * an ambiguous write. The checkpoint occurs before any outbound mutation, so
- * its failure has to reach the continuation runner unchanged.
+ * A durable checkpoint failure must reach the continuation runner unchanged.
+ * The last acknowledged ledger stage remains authoritative whether the failure
+ * occurred before mutation, after a reliable response, or after verification.
  */
-class MutationStartCheckpointError extends Error {
+class DurableCheckpointError extends Error {
   constructor(cause: unknown) {
-    super(`Mutation-start checkpoint failed: ${safeErrorMessage(cause)}`);
-    this.name = "MutationStartCheckpointError";
+    super(`Durable checkpoint failed: ${safeErrorMessage(cause)}`);
+    this.name = "DurableCheckpointError";
   }
+}
+
+function isExecutionStopError(error: unknown): boolean {
+  return error instanceof ExecutionBudgetExceededError ||
+    error instanceof ExecutionTimeoutBudgetExceededError ||
+    error instanceof ExecutionCpuBudgetExceededError ||
+    classifyCloudflarePlatformLimit(error) !== undefined;
 }
 
 function triageStageForResult(result: ApplyTriagePlanResult): OperationItemState["stage"] {
@@ -2495,6 +2539,7 @@ function compactApplyResult(result: ApplyTriagePlanResult): Record<string, unkno
     attemptedState: result.attemptedState,
     observedFinalState: result.observedFinalState,
     verifiedState: result.verifiedState,
+    finalState: result.finalState,
   };
 }
 
@@ -2511,14 +2556,19 @@ function serializableApplyTriageRequest(
       ? request.actions.map((action) => ({
           ticketNumber: normaliseTicketNumber(action.ticketNumber),
           expectedTicketId: action.expectedTicketId,
-          expectedSubject: action.expectedSubject,
-          expectedClient: action.expectedClient,
+          expectedSubjectHash: action.expectedSubject
+            ? stableHash(action.expectedSubject)
+            : action.expectedSubjectHash,
+          expectedClientHash: action.expectedClient
+            ? stableHash(action.expectedClient)
+            : action.expectedClientHash,
           expectedStatus: action.expectedStatus,
           expectedUpdatedTime: action.expectedUpdatedTime,
           contentVerified: action.contentVerified,
           action: action.action,
-          reason: action.reason,
-          note: action.note,
+          noteFingerprint: action.note
+            ? normalizedNoteFingerprint(action.note)
+            : action.noteFingerprint,
           isPublicNote: action.isPublicNote,
           target: action.target ? { ...action.target } : undefined,
           allowResolveFullFallbackToUpdate: action.allowResolveFullFallbackToUpdate,
@@ -2581,7 +2631,7 @@ function buildApplyTriageLedgerRecord(params: {
     params.expected.map((ticketNumber) => {
       const result = params.results.find((item) => item.ticketNumber === ticketNumber);
       const action = params.actionsByTicket.get(ticketNumber);
-      const stage = result ? triageStageForResult(result) : "Pending";
+      const stage = result ? triageStageForResult(result) : "Unattempted";
       const state: OperationItemState = {
         itemKey: ticketNumber,
         stage,
@@ -2590,7 +2640,26 @@ function buildApplyTriageLedgerRecord(params: {
         writeAttempted: result?.writeAttempted ?? false,
         writeMayHaveSucceeded: Boolean(result?.partialWrite),
         partialWrite: result?.partialWrite ?? false,
-        noteFingerprint: normalizedNoteFingerprint(action?.note),
+        mutationType: action?.action === "resolve"
+          ? "resolution"
+          : action?.action === "addNote"
+            ? "note"
+            : action?.action === "update"
+              ? "update"
+              : undefined,
+        reliableResponseReceived: result?.writeAttempted ? result.partialWrite === false : undefined,
+        observedMutationResult: result?.writeAttempted
+          ? result.partialWrite ? "Ambiguous" : "Accepted"
+          : undefined,
+        canonicalTargetHash: action
+          ? stableHash({ action: action.action, target: action.target, ticketNumber })
+          : undefined,
+        noteFingerprint: normalizedNoteFingerprint(action?.note) ?? action?.noteFingerprint,
+        fallbackAllowed: action?.allowResolveFullFallbackToUpdate ??
+          params.request.allowResolveFullFallbackToUpdate ?? false,
+        fallbackAttempted: result?.fallbackAttempted ?? false,
+        fallbackApplied: result?.fallbackResult === "Updated",
+        fallbackVerified: result?.fallbackResult === "Updated" && result?.verified === true,
         verificationState: result?.verified
           ? "Verified"
           : result?.writeAttempted
@@ -2626,7 +2695,10 @@ function buildApplyTriageLedgerRecord(params: {
           result.failureStage === "executionBudget")
     )
     .map((result) => result.ticketNumber);
-  const terminalFailure = params.continuationRequired
+  const pendingExists = params.expected.some(
+    (ticketNumber) => !params.results.some((result) => result.ticketNumber === ticketNumber)
+  ) || unattemptedItems.length > 0;
+  const terminalFailure = params.continuationRequired || pendingExists
     ? "Continuation required before all expected items were processed."
     : undefined;
 
@@ -2652,7 +2724,9 @@ function buildApplyTriageLedgerRecord(params: {
       verify: params.request.verify ?? true,
     }),
     operationRequest: serializableApplyTriageRequest(params.request, params.expected),
-    state: params.continuationRequired ? "ContinuationRequired" : "Completed",
+    state: pendingExists
+      ? params.continuationRequired ? "ContinuationRequired" : "Running"
+      : "Completed",
     expectedItems: params.expected,
     currentItem: params.results.at(-1)?.ticketNumber,
     completedItems,
@@ -2676,7 +2750,7 @@ function buildApplyTriageLedgerRecord(params: {
     rateLimitedItems: params.results
       .filter((result) => result.failureStage === "rateLimit")
       .map((result) => result.ticketNumber),
-    continuationCount: params.continuationRequired ? 1 : 0,
+    continuationCount: 0,
     terminalFailureReason: terminalFailure,
   };
 }
@@ -2695,22 +2769,41 @@ function summarizeApplyResults(results: ApplyTriagePlanResult[]) {
   };
 }
 
-function executionStoppedApplyResult(
-  ticketNumber: string,
-  action: TriagePlanAction | undefined,
-  reason: string,
-  outcome: TriageFinalOutcome = "NotAttemptedExecutionStopped"
-): ApplyTriagePlanResult {
-  const result = baseApplyResult(ticketNumber, action);
-  result.finalOutcome = outcome;
-  result.failureStage = "executionBudget";
-  result.failureReason = reason;
-  return result;
-}
-
-function isExecutionBudgetError(error: unknown): boolean {
-  return error instanceof ExecutionBudgetExceededError ||
-    error instanceof ExecutionTimeoutBudgetExceededError;
+function completeApplyResultsFromLedger(
+  record: OperationLedgerRecord,
+  expected: string[],
+  actionsByTicket: Map<string, TriagePlanAction>
+): ApplyTriagePlanResult[] {
+  const compactByTicket = new Map(
+    record.compactResults.flatMap((value) => {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+      const result = value as Partial<ApplyTriagePlanResult>;
+      return typeof result.ticketNumber === "string"
+        ? [[result.ticketNumber, result as ApplyTriagePlanResult] as const]
+        : [];
+    })
+  );
+  return expected.map((ticketNumber) => {
+    const compact = compactByTicket.get(ticketNumber);
+    if (compact) return compact;
+    const item = record.itemStates[ticketNumber];
+    const pending = record.pendingItems.includes(ticketNumber);
+    return {
+      ticketNumber,
+      requestedAction: actionsByTicket.get(ticketNumber)?.action,
+      finalOutcome: pending ? "NotAttemptedExecutionStopped" : "Failed",
+      failureStage: pending ? "executionBudget" : "continuation",
+      failureReason: item?.failureReason ?? (pending
+        ? "The durable operation has not attempted this item yet."
+        : "The item reached a terminal ledger state without a compact result."),
+      writeAttempted: item?.writeAttempted ?? false,
+      noteAdded: Boolean(item?.createdNoteId),
+      noteDeduped: false,
+      fallbackAttempted: item?.fallbackAttempted ?? false,
+      partialWrite: item?.partialWrite ?? false,
+      verified: item?.verificationState === "Verified",
+    };
+  });
 }
 
 async function applyApprovedTriageAction(params: {
@@ -2723,7 +2816,15 @@ async function applyApprovedTriageAction(params: {
   allowResolveFullFallbackToUpdate: boolean;
   allowWriteIfUpdatedTimeChanged: boolean;
   allowWriteWithoutVerifiedContent: boolean;
-  beforeMutation?: (mutationType: "update" | "resolution" | "note") => Promise<void>;
+  beforeNoteCheck?: () => Promise<void>;
+  beforeMutation?: (
+    mutationType: "update" | "resolution" | "note" | "resolveFallback"
+  ) => Promise<void>;
+  afterMutation?: (
+    mutationType: "update" | "resolution" | "note" | "resolveFallback",
+    observed: { ticketId?: string; noteId?: string }
+  ) => Promise<void>;
+  afterVerification?: (mutationType: "update" | "resolution" | "note") => Promise<void>;
 }): Promise<ApplyTriagePlanResult> {
   const { client, ticketNumber, action } = params;
   if (!action) {
@@ -2747,6 +2848,7 @@ async function applyApprovedTriageAction(params: {
   try {
     ticket = await getTicketByInternalId(client, resolved.ticketId);
   } catch (error) {
+    if (isExecutionStopError(error)) throw error;
     const result = baseApplyResult(ticketNumber, action);
     result.finalOutcome = "NotFound";
     result.failureStage = "readMetadata";
@@ -2804,7 +2906,6 @@ async function applyApprovedTriageAction(params: {
 
   try {
     if (action.action === "addNote") {
-      result.writeAttempted = true;
       result.writeMethod = "createTicketNote";
       await addNoteForPlan({
         client,
@@ -2813,7 +2914,15 @@ async function applyApprovedTriageAction(params: {
         isPublic: action.isPublicNote,
         dedupe: params.dedupeNotes,
         result,
-        beforeCreate: () => params.beforeMutation?.("note") ?? Promise.resolve(),
+        beforeCheck: params.beforeNoteCheck,
+        beforeCreate: async () => {
+          await (params.beforeMutation?.("note") ?? Promise.resolve());
+          result.writeAttempted = true;
+        },
+        afterCreate: (note) => params.afterMutation?.("note", {
+          ticketId: ticket.ticketId,
+          noteId: note.noteId,
+        }) ?? Promise.resolve(),
       });
       result.finalOutcome = "Updated";
       if (params.verify) {
@@ -2823,7 +2932,9 @@ async function applyApprovedTriageAction(params: {
           result.observedFinalState = result.finalState;
           result.verifiedState = result.finalState;
           result.verified = true;
+          await params.afterVerification?.("note");
         } catch (error) {
+          if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
           result.finalOutcome = "Failed";
           result.partialWrite = result.writeAttempted || result.noteAdded;
           result.failureStage = "verify";
@@ -2842,14 +2953,19 @@ async function applyApprovedTriageAction(params: {
         return result;
       }
 
-      result.writeAttempted = true;
       result.attemptedState = updateInput as Record<string, unknown>;
       result.writeMethod = action.action === "resolve" ? "resolve_full" : "update";
       try {
-        await params.beforeMutation?.(action.action === "resolve" ? "resolution" : "update");
-        await mutateTicketUpdate(client, updateInput as Record<string, unknown>);
+        const mutationType = action.action === "resolve" ? "resolution" : "update";
+        await params.beforeMutation?.(mutationType);
+        result.writeAttempted = true;
+        const mutationResult = await mutateTicketUpdate(
+          client,
+          updateInput as Record<string, unknown>
+        );
+        await params.afterMutation?.(mutationType, { ticketId: mutationResult.ticketId });
       } catch (error) {
-        if (error instanceof MutationStartCheckpointError) throw error;
+        if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
         if (isRateLimitError(error)) {
           const rateLimit = rateLimitRetryMetadata(error);
           result.finalOutcome = "Failed";
@@ -2865,20 +2981,40 @@ async function applyApprovedTriageAction(params: {
         }
         const fallbackAllowed = action.allowResolveFullFallbackToUpdate ?? params.allowResolveFullFallbackToUpdate;
         if (action.action === "resolve" && fallbackAllowed && isSuperOpsInternalError(error)) {
-          result.fallbackAttempted = true;
           result.failureStage = "resolve_full";
           result.failureReason = safeErrorMessage(error);
+          // A 5xx response is ambiguous. Re-read before considering the legacy
+          // update fallback: an already-visible target proves the first write
+          // succeeded, while any changed updatedTime makes replay unsafe.
           const reread = await getTicketByInternalId(client, ticket.ticketId);
-          const rereadFailure = validateExpectedTicket(ticketNumber, action, reread, true);
-          if (rereadFailure) {
-            result.finalOutcome = "Blocked";
-            result.fallbackResult = rereadFailure.reason;
-            result.partialWrite = result.writeAttempted || result.noteAdded;
+          if (targetAppliedToTicket(action, reread)) {
+            result.fallbackResult = "Not required; intended resolution is already visible.";
+            await params.afterVerification?.("resolution");
+          } else if (reread.updatedTime !== ticket.updatedTime) {
+            result.finalOutcome = "SkippedChangedSinceSnapshot";
+            result.fallbackResult = "Ticket changed after the ambiguous resolution response; fallback was not attempted.";
+            result.partialWrite = true;
             return result;
+          } else {
+            const rereadFailure = validateExpectedTicket(ticketNumber, action, reread, true);
+            if (rereadFailure) {
+              result.finalOutcome = "Blocked";
+              result.fallbackResult = rereadFailure.reason;
+              result.partialWrite = true;
+              return result;
+            }
+            result.fallbackAttempted = true;
+            await params.beforeMutation?.("resolveFallback");
+            const fallbackResult = await mutateTicketUpdate(
+              client,
+              updateInput as Record<string, unknown>
+            );
+            await params.afterMutation?.("resolveFallback", {
+              ticketId: fallbackResult.ticketId,
+            });
+            result.writeMethod = "update_fallback";
+            result.fallbackResult = "Updated";
           }
-          await mutateTicketUpdate(client, updateInput as Record<string, unknown>);
-          result.writeMethod = "update_fallback";
-          result.fallbackResult = "Updated";
         } else {
           result.finalOutcome = "Failed";
           result.failureStage = action.action === "resolve" ? "resolve_full" : "update";
@@ -2891,6 +3027,7 @@ async function applyApprovedTriageAction(params: {
       try {
         verified = await getTicketByInternalId(client, ticket.ticketId);
       } catch (error) {
+        if (isExecutionStopError(error)) throw error;
         result.finalOutcome = "Failed";
         result.partialWrite = true;
         result.failureStage = "verifyFinalState";
@@ -2910,6 +3047,7 @@ async function applyApprovedTriageAction(params: {
       }
       result.verified = true;
       result.verifiedState = result.finalState;
+      await params.afterVerification?.(action.action === "resolve" ? "resolution" : "update");
 
       try {
         await addNoteForPlan({
@@ -2919,10 +3057,18 @@ async function applyApprovedTriageAction(params: {
           isPublic: action.isPublicNote,
           dedupe: params.dedupeNotes,
           result,
-        beforeCreate: () => params.beforeMutation?.("note") ?? Promise.resolve(),
+          beforeCheck: params.beforeNoteCheck,
+          beforeCreate: async () => {
+            await (params.beforeMutation?.("note") ?? Promise.resolve());
+            result.writeAttempted = true;
+          },
+          afterCreate: (note) => params.afterMutation?.("note", {
+            ticketId: ticket.ticketId,
+            noteId: note.noteId,
+          }) ?? Promise.resolve(),
         });
       } catch (error) {
-        if (error instanceof MutationStartCheckpointError) throw error;
+        if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
         result.finalOutcome = "Failed";
         result.failureStage = "createTicketNote";
         result.failureReason = safeErrorMessage(error);
@@ -2933,7 +3079,7 @@ async function applyApprovedTriageAction(params: {
     }
     return result;
   } catch (error) {
-    if (error instanceof MutationStartCheckpointError) throw error;
+    if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
     result.finalOutcome = isRateLimitError(error) ? "Failed" : "Failed";
     result.failureStage = isRateLimitError(error)
       ? "rateLimit"
@@ -2955,13 +3101,26 @@ function applyResultToContinuationOutcome(
     result.failureStage === "createTicketNote" || result.failureStage === "write"
   );
   const persistedStage = ambiguousMutation
-    ? result.failureStage === "createTicketNote" ? "NoteWriteAmbiguous" : "WriteAmbiguous"
+    ? result.failureStage === "createTicketNote"
+      ? "NoteWriteAmbiguous"
+      : result.failureStage === "resolve_full"
+        ? "ResolutionWriteAmbiguous"
+        : "WriteAmbiguous"
     : stage;
   return {
     stage: rateLimitReschedule ? "RateLimitedRescheduled" : persistedStage,
     outcome: rateLimitReschedule ? "SuperOpsRateLimitRescheduled" : result.finalOutcome,
     writeAttempted: result.writeAttempted,
+    // A durable mutation-start checkpoint remains conservative even when the
+    // response is a conclusive throttle; the reliable rejection marker is what
+    // authorises a checked retry without moving this boolean backwards.
     writeMayHaveSucceeded: result.writeAttempted || result.partialWrite,
+    reliableResponseReceived: rateLimitReschedule ? true : undefined,
+    observedMutationResult: rateLimitReschedule
+      ? "Rejected"
+      : result.verified
+        ? "VerifiedApplied"
+        : ambiguousMutation ? "Ambiguous" : undefined,
     partialWrite: result.partialWrite,
     verified: result.verified,
     rateLimited: rateLimitReschedule,
@@ -3013,10 +3172,19 @@ async function ambiguityCheckedTriageResult(params: {
   action: TriagePlanAction;
   applyParams: ApplyTriagePlanParams;
   previousRetryCount: number;
-  beforeMutation?: (mutationType: "update" | "resolution" | "note") => Promise<void>;
+  ambiguityStage: OperationItemState["stage"];
+  beforeNoteCheck?: () => Promise<void>;
+  beforeMutation?: (
+    mutationType: "update" | "resolution" | "note" | "resolveFallback"
+  ) => Promise<void>;
+  afterMutation?: (
+    mutationType: "update" | "resolution" | "note" | "resolveFallback",
+    observed: { ticketId?: string; noteId?: string }
+  ) => Promise<void>;
+  afterVerification?: (mutationType: "update" | "resolution" | "note") => Promise<void>;
 }): Promise<{ result: ApplyTriagePlanResult; stage?: OperationItemState["stage"]; retryCount?: number }> {
   const { client, ticketNumber, action, applyParams } = params;
-  if (action.isPublicNote === true && typeof action.note === "string" && action.note.trim()) {
+  if (action.isPublicNote === true && Boolean(action.noteFingerprint ?? normalizedNoteFingerprint(action.note))) {
     return { result: publicNoteBlockedResult(ticketNumber, action) };
   }
 
@@ -3030,11 +3198,16 @@ async function ambiguityCheckedTriageResult(params: {
   }
 
   const ticket = await getTicketByInternalId(client, resolved.ticketId);
-  if (action.action === "addNote") {
+  if (
+    action.action === "addNote" ||
+    params.ambiguityStage === "NoteWriteStarted" ||
+    params.ambiguityStage === "NoteWriteAmbiguous"
+  ) {
     const result = baseApplyResult(ticketNumber, action, ticket);
     result.writeAttempted = true;
     result.writeMethod = "createTicketNote";
-    if (typeof action.note === "string" && await existingNoteMatches(client, ticket.ticketId, action.note)) {
+    const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
+    if (await existingNoteMatchesFingerprint(client, ticket.ticketId, fingerprint)) {
       result.noteDeduped = true;
       result.finalOutcome = "Updated";
       result.verified = true;
@@ -3075,6 +3248,7 @@ async function ambiguityCheckedTriageResult(params: {
     result.observedFinalState = result.finalState;
     result.verifiedState = result.finalState;
     result.verified = true;
+    await params.afterVerification?.(action.action === "resolve" ? "resolution" : "update");
 
     try {
       await addNoteForPlan({
@@ -3084,7 +3258,15 @@ async function ambiguityCheckedTriageResult(params: {
         isPublic: false,
         dedupe: applyParams.dedupeNotes ?? true,
         result,
-        beforeCreate: () => params.beforeMutation?.("note") ?? Promise.resolve(),
+        beforeCheck: params.beforeNoteCheck,
+        beforeCreate: async () => {
+          await (params.beforeMutation?.("note") ?? Promise.resolve());
+          result.writeAttempted = true;
+        },
+        afterCreate: (note) => params.afterMutation?.("note", {
+          ticketId: ticket.ticketId,
+          noteId: note.noteId,
+        }) ?? Promise.resolve(),
       });
     } catch (error) {
       result.finalOutcome = "Failed";
@@ -3111,7 +3293,8 @@ async function ambiguityCheckedTriageResult(params: {
 }
 
 function createApplyTriageContinuationAdapter(
-  client: SuperOpsClientInstance
+  client: SuperOpsClientInstance,
+  liveParams?: ApplyTriagePlanParams
 ): OperationContinuationAdapter {
   return {
     toolName: "superops_tickets_apply_triage_plan",
@@ -3120,7 +3303,22 @@ function createApplyTriageContinuationAdapter(
       const action = actionByTicketFromApplyParams(storedParams ?? {}).get(itemKey);
       if (!action) return 2;
       if (action.action === "leave" || action.action === "skip") return 3;
-      return storedParams?.verify === false ? 5 : 8;
+      if (action.action === "addNote") {
+        const validationAndDedupeReads = 2 + (storedParams?.dedupeNotes === false ? 0 : 1);
+        const postMutationVerification = storedParams?.verify === false ? 0 : 2;
+        return validationAndDedupeReads + 5 + postMutationVerification;
+      }
+      const target = action.target ?? {};
+      const optionLookup = action.action === "resolve" ||
+        [target.priority, target.impact, target.urgency, target.resolutionCode,
+          target.cause, target.subcategory].some(Boolean) ? 1 : 0;
+      const clientLookup = target.clientName && !target.clientId ? 1 : 0;
+      const techGroupLookup = target.techGroupName ? 1 : 0;
+      const validationReads = 2 + optionLookup + clientLookup + techGroupLookup;
+      // Each read retry is separately budget-checked by SuperOpsClient. This
+      // estimate reserves the required first attempt; the mutation hook then
+      // reserves all required checkpoints, one write, and one read-back.
+      return validationReads + 8;
     },
     async processItem({ record, claim, checkpoint }) {
       const storedParams = operationRequestApplyTriageParams(record.operationRequest);
@@ -3144,41 +3342,210 @@ function createApplyTriageContinuationAdapter(
         };
       }
 
-      const action = actionByTicketFromApplyParams(storedParams).get(claim.itemKey);
-      if (action?.isPublicNote === true && typeof action.note === "string" && action.note.trim()) {
+      const action = actionByTicketFromApplyParams(liveParams ?? {}).get(claim.itemKey) ??
+        actionByTicketFromApplyParams(storedParams).get(claim.itemKey);
+      if (action?.isPublicNote === true && Boolean(action.noteFingerprint ?? normalizedNoteFingerprint(action.note))) {
         return applyResultToContinuationOutcome(publicNoteBlockedResult(claim.itemKey, action));
+      }
+      if (
+        action?.noteFingerprint && !action.note && !claim.item.createdNoteId &&
+        claim.item.stage !== "NoteAdded" &&
+        claim.item.stage !== "NoteWriteStarted" &&
+        claim.item.stage !== "NoteWriteAmbiguous"
+      ) {
+        const possiblePriorWrite = claim.item.writeMayHaveSucceeded && claim.item.observedMutationResult !== "Rejected";
+        return {
+          stage: possiblePriorWrite ? "FailedAfterPartialWrite" : "FailedBeforeWrite",
+          outcome: "ApprovedNoteContentUnavailable",
+          writeAttempted: claim.item.writeAttempted,
+          writeMayHaveSucceeded: claim.item.writeMayHaveSucceeded,
+          partialWrite: possiblePriorWrite,
+          failureReason: "The approved private-note body is intentionally not persisted; this item cannot create it after process loss.",
+          errorClass: possiblePriorWrite ? "ContinuationFailure" : "ValidationFailure",
+          result: {
+            ticketNumber: claim.itemKey,
+            finalOutcome: "Failed",
+            failureStage: "noteContentUnavailable",
+            failureReason: "Approved private-note content is unavailable to the resumed invocation.",
+            writeAttempted: claim.item.writeAttempted,
+            partialWrite: possiblePriorWrite,
+          },
+        };
       }
 
       let checkpointStage = claim.item.stage;
-      const beforeMutation = async (mutationType: "update" | "resolution" | "note") => {
+      let reliableResponseReceived = claim.item.reliableResponseReceived === true;
+      let observedMutationResult = claim.item.observedMutationResult;
+      let durableWriteAttempted = claim.item.writeAttempted === true;
+      let durableWriteMayHaveSucceeded = claim.item.writeMayHaveSucceeded === true;
+      let fallbackAttempted = claim.item.fallbackAttempted === true;
+      let fallbackApplied = claim.item.fallbackApplied === true;
+      const canonicalTargetHash = stableHash({
+        ticketNumber: claim.itemKey,
+        action: action?.action,
+        target: action?.target,
+        noteFingerprint: action?.noteFingerprint ?? normalizedNoteFingerprint(action?.note),
+      });
+      const beforeNoteCheck = async () => {
+        if (checkpointStage === "NoteChecked") return;
         try {
-          const stages = mutationType === "note"
-            ? checkpointStage === "WriteStarted" || checkpointStage === "WriteAmbiguous" || checkpointStage === "FieldsUpdated" || checkpointStage === "StatusUpdated"
-              ? ["NoteChecked", "NoteWriteStarted"] as const
-              : ["Validated", "WriteNotStarted", "WriteStarted", "NoteChecked", "NoteWriteStarted"] as const
-            : ["Validated", "WriteNotStarted", "WriteStarted"] as const;
+          await checkpoint({
+            stage: "NoteChecked",
+            mutationType: "note",
+            writeAttempted: durableWriteAttempted,
+            writeMayHaveSucceeded: durableWriteMayHaveSucceeded,
+            reliableResponseReceived,
+            observedMutationResult,
+            canonicalTargetHash,
+            noteFingerprint: action?.noteFingerprint ?? normalizedNoteFingerprint(action?.note),
+            fallbackAllowed: action?.allowResolveFullFallbackToUpdate ??
+              storedParams.allowResolveFullFallbackToUpdate ?? false,
+            fallbackAttempted,
+            fallbackApplied,
+            partialWrite: claim.item.partialWrite,
+            verificationState: "Pending",
+          });
+          checkpointStage = "NoteChecked";
+        } catch (error) {
+          throw new DurableCheckpointError(error);
+        }
+      };
+      const beforeMutation = async (
+        mutationType: "update" | "resolution" | "note" | "resolveFallback"
+      ) => {
+        const checkpointCount = mutationType === "note" ? 2 : mutationType === "resolveFallback" ? 1 : 3;
+        const verificationReserve = mutationType === "note"
+          ? (storedParams.verify === false ? 0 : 2)
+          : 2;
+        // Reserve the start checkpoint(s), one write, accepted-response
+        // checkpoint, required read-back/checkpoint, and final ledger commit.
+        // If this does not fit, no mutation-start checkpoint or write occurs.
+        assertExecutionBudget(checkpointCount + 1 + 1 + verificationReserve + 1);
+        try {
+          const stages: OperationItemState["stage"][] = mutationType === "note"
+            ? ["NoteChecked", "NoteWriteStarted"]
+            : mutationType === "resolution"
+              ? ["Validated", "ResolutionValidated", "ResolutionWriteStarted"]
+              : mutationType === "resolveFallback"
+                ? ["ResolutionWriteStarted"]
+                : ["Validated", "WriteNotStarted", "WriteStarted"];
           for (const stage of stages) {
-            if (stage === checkpointStage) continue;
+            if (stage === checkpointStage && mutationType !== "resolveFallback") continue;
+            const mutationStarted = stage === "WriteStarted" ||
+              stage === "ResolutionWriteStarted" || stage === "NoteWriteStarted";
+            const nextWriteAttempted = durableWriteAttempted || mutationStarted;
+            const nextWriteMayHaveSucceeded = durableWriteMayHaveSucceeded || mutationStarted;
+            const nextReliableResponseReceived = mutationStarted
+              ? false
+              : reliableResponseReceived;
+            const nextObservedMutationResult = mutationStarted
+              ? "Ambiguous"
+              : observedMutationResult;
             await checkpoint({
               stage,
-              writeAttempted: true,
-              writeMayHaveSucceeded: true,
-              partialWrite: false,
+              mutationType,
+              writeAttempted: nextWriteAttempted,
+              writeMayHaveSucceeded: nextWriteMayHaveSucceeded,
+              reliableResponseReceived: nextReliableResponseReceived,
+              observedMutationResult: nextObservedMutationResult,
+              canonicalTargetHash,
+              noteFingerprint: action?.noteFingerprint ?? normalizedNoteFingerprint(action?.note),
+              fallbackAllowed: action?.allowResolveFullFallbackToUpdate ??
+                storedParams.allowResolveFullFallbackToUpdate ?? false,
+              fallbackAttempted: fallbackAttempted || mutationType === "resolveFallback",
+              partialWrite: claim.item.partialWrite,
               verificationState: "Pending",
               attemptCount: (claim.item.attemptCount ?? 0) + 1,
             });
             checkpointStage = stage;
+            durableWriteAttempted = nextWriteAttempted;
+            durableWriteMayHaveSucceeded = nextWriteMayHaveSucceeded;
+            reliableResponseReceived = nextReliableResponseReceived;
+            observedMutationResult = nextObservedMutationResult;
+            if (mutationType === "resolveFallback") fallbackAttempted = true;
           }
         } catch (error) {
-          throw new MutationStartCheckpointError(error);
+          throw new DurableCheckpointError(error);
+        }
+      };
+      const afterMutation = async (
+        mutationType: "update" | "resolution" | "note" | "resolveFallback",
+        observed: { ticketId?: string; noteId?: string }
+      ) => {
+        const stage: OperationItemState["stage"] = mutationType === "note"
+          ? "NoteAdded"
+          : mutationType === "resolution" || mutationType === "resolveFallback"
+            ? "ResolutionWriteSucceeded"
+            : "FieldsUpdated";
+        try {
+          durableWriteAttempted = true;
+          durableWriteMayHaveSucceeded = true;
+          reliableResponseReceived = true;
+          observedMutationResult = "Accepted";
+          await checkpoint({
+            stage,
+            mutationType,
+            writeAttempted: true,
+            writeMayHaveSucceeded: true,
+            reliableResponseReceived: true,
+            observedMutationResult: "Accepted",
+            canonicalTargetHash,
+            createdNoteId: observed.noteId,
+            fallbackAllowed: action?.allowResolveFullFallbackToUpdate ??
+              storedParams.allowResolveFullFallbackToUpdate ?? false,
+            fallbackAttempted: fallbackAttempted || mutationType === "resolveFallback",
+            fallbackApplied: mutationType === "resolveFallback" || fallbackApplied,
+            partialWrite: claim.item.partialWrite,
+            verificationState: "Pending",
+          });
+          checkpointStage = stage;
+          if (mutationType === "resolveFallback") {
+            fallbackAttempted = true;
+            fallbackApplied = true;
+          }
+        } catch (error) {
+          throw new DurableCheckpointError(error);
+        }
+      };
+      const afterVerification = async (
+        mutationType: "update" | "resolution" | "note"
+      ) => {
+        const stage: OperationItemState["stage"] = mutationType === "resolution"
+          ? "ResolutionVerified"
+          : "Verifying";
+        try {
+          if (durableWriteMayHaveSucceeded) {
+            observedMutationResult = "VerifiedApplied";
+          }
+          await checkpoint({
+            stage,
+            mutationType,
+            writeAttempted: durableWriteAttempted,
+            writeMayHaveSucceeded: durableWriteMayHaveSucceeded,
+            reliableResponseReceived,
+            observedMutationResult,
+            canonicalTargetHash,
+            fallbackAllowed: claim.item.fallbackAllowed,
+            fallbackAttempted,
+            fallbackApplied,
+            fallbackVerified: fallbackApplied ? true : claim.item.fallbackVerified,
+            partialWrite: false,
+            verificationState: "Verified",
+          });
+          checkpointStage = stage;
+        } catch (error) {
+          throw new DurableCheckpointError(error);
         }
       };
       const shouldResolveAmbiguity =
         claim.item.stage === "WriteStarted" ||
         claim.item.stage === "WriteAmbiguous" ||
+        claim.item.stage === "ResolutionWriteStarted" ||
+        claim.item.stage === "ResolutionWriteAmbiguous" ||
         claim.item.stage === "NoteWriteStarted" ||
         claim.item.stage === "NoteWriteAmbiguous" ||
-        claim.item.writeMayHaveSucceeded === true;
+        (claim.item.writeMayHaveSucceeded === true &&
+          claim.item.observedMutationResult !== "Rejected");
       const applied = shouldResolveAmbiguity && action
         ? await ambiguityCheckedTriageResult({
             client,
@@ -3186,7 +3553,11 @@ function createApplyTriageContinuationAdapter(
             action,
             applyParams: storedParams,
             previousRetryCount: claim.item.retryCount,
+            ambiguityStage: claim.item.stage,
+            beforeNoteCheck,
             beforeMutation,
+            afterMutation,
+            afterVerification,
           })
         : {
             result: await applyApprovedTriageAction({
@@ -3202,14 +3573,18 @@ function createApplyTriageContinuationAdapter(
                 storedParams.allowWriteIfUpdatedTimeChanged ?? false,
               allowWriteWithoutVerifiedContent:
                 storedParams.allowWriteWithoutVerifiedContent ?? false,
+              beforeNoteCheck,
               beforeMutation,
+              afterMutation,
+              afterVerification,
             }),
           };
 
       const outcome = applyResultToContinuationOutcome(applied.result, applied.stage);
-      if (typeof applied.retryCount === "number") {
-        outcome.retryCount = applied.retryCount;
-      }
+      outcome.retryCount = typeof applied.retryCount === "number"
+        ? applied.retryCount
+        : (claim.item.retryCount ?? 0) +
+          (claim.item.observedMutationResult === "Rejected" ? 1 : 0);
       return outcome;
     },
   };
@@ -3893,6 +4268,8 @@ export function getTicketsTools(): DomainTools {
 
     async handleCall(name, args) {
       const client = getClient();
+      let synchronousWriteAttempted = false;
+      let synchronousWriteAccepted = false;
 
       try {
         switch (name) {
@@ -4336,188 +4713,108 @@ export function getTicketsTools(): DomainTools {
               }
             }
 
-            const results: ApplyTriagePlanResult[] = [];
-            const executionConfig = getExecutionConfig();
-            const estimatedCallsPerTriageItem = params.verify === false ? 5 : 8;
-            let stopped = false;
-            let executionStopped = false;
-
-            for (let index = 0; index < expected.length; index += 1) {
-              const ticketNumber = expected[index];
-              const action = actionByTicket.get(ticketNumber);
-              const remainingAfterThis = expected.length - index - 1;
-
-              if (stopped) {
-                const skipped = baseApplyResult(ticketNumber, action);
-                skipped.finalOutcome = "Skipped";
-                skipped.failureStage = "stopOnFirstFailure";
-                skipped.failureReason = "Processing stopped after an earlier failure.";
-                results.push(skipped);
-                markExecutionItem({ completed: true, remainingItems: remainingAfterThis });
-                continue;
-              }
-
-              if (
-                index >= executionConfig.maxItemsPerBatch ||
-                !hasExecutionBudgetFor(estimatedCallsPerTriageItem)
-              ) {
-                executionStopped = true;
-                const reason = index >= executionConfig.maxItemsPerBatch
-                  ? `Configured maxItemsPerBatch ${executionConfig.maxItemsPerBatch} reached before processing this ticket.`
-                  : "Execution stopped before starting this ticket because the remaining invocation budget cannot safely cover the estimated read/write/verification calls.";
-                for (let pendingIndex = index; pendingIndex < expected.length; pendingIndex += 1) {
-                  const pendingTicketNumber = expected[pendingIndex];
-                  results.push(
-                    executionStoppedApplyResult(
-                      pendingTicketNumber,
-                      actionByTicket.get(pendingTicketNumber),
-                      reason,
-                      pendingIndex === index ? "FailedBeforeProcessing" : "NotAttemptedExecutionStopped"
-                    )
-                  );
-                }
-                markExecutionItem({ remainingItems: expected.length - index });
-                break;
-              }
-
-              let result: ApplyTriagePlanResult;
-              try {
-                result = await withExecutionItem(ticketNumber, () =>
-                  applyApprovedTriageAction({
-                    client,
-                    ticketNumber,
-                    action,
-                    dryRun: params.dryRun ?? false,
-                    verify: params.verify ?? true,
-                    dedupeNotes: params.dedupeNotes ?? true,
-                    allowResolveFullFallbackToUpdate:
-                      params.allowResolveFullFallbackToUpdate ?? false,
-                    allowWriteIfUpdatedTimeChanged:
-                      params.allowWriteIfUpdatedTimeChanged ?? false,
-                    allowWriteWithoutVerifiedContent:
-                      params.allowWriteWithoutVerifiedContent ?? false,
-                  })
-                );
-              } catch (error) {
-                const reason = safeErrorMessage(error);
-                result = executionStoppedApplyResult(
-                  ticketNumber,
-                  action,
-                  reason,
-                  isExecutionBudgetError(error) ? "FailedBeforeProcessing" : "Failed"
-                );
-                if (!isExecutionBudgetError(error)) {
-                  result.failureStage = "unexpected";
-                }
-                executionStopped = isExecutionBudgetError(error);
-              }
-
-              results.push(result);
-              markExecutionItem({
-                completed: true,
-                remainingItems: remainingAfterThis,
-                partialWrite: result.partialWrite,
-                stale: result.finalOutcome === "SkippedChangedSinceSnapshot",
-                verificationFailure: result.failureStage === "verifyFinalState" ||
-                  result.failureStage === "verify",
-              });
-
-              if (executionStopped) {
-                for (let pendingIndex = index + 1; pendingIndex < expected.length; pendingIndex += 1) {
-                  const pendingTicketNumber = expected[pendingIndex];
-                  results.push(
-                    executionStoppedApplyResult(
-                      pendingTicketNumber,
-                      actionByTicket.get(pendingTicketNumber),
-                      "Execution stopped after the previous item before the remaining tickets were attempted."
-                    )
-                  );
-                }
-                markExecutionItem({ remainingItems: expected.length - index - 1 });
-                break;
-              }
-
-              if (
-                params.stopOnFirstFailure &&
-                [
-                  "Blocked",
-                  "Failed",
-                  "NotFound",
-                  "SkippedChangedSinceSnapshot",
-                  "FailedBeforeProcessing",
-                ].includes(result.finalOutcome)
-              ) {
-                stopped = true;
-              }
+            if (expected.length > 500) {
+              return errorResult("A durable triage operation may contain at most 500 items.");
+            }
+            if (new Set(expected).size !== expected.length) {
+              return errorResult("expectedCandidateTicketNumbers must not contain duplicates.");
             }
 
-            const summary = summarizeApplyResults(results);
-            const diagnostics = executionDiagnostics();
-            const operationId =
-              params.batchId ??
-              (diagnostics?.operationId as string | undefined) ??
-              `triage-${Date.now()}`;
-            let operationPersisted = false;
-            let operationStoreError: string | undefined;
-            let continuationScheduling: Record<string, unknown> | undefined;
+            const diagnosticsBefore = executionDiagnostics();
+            const operationId = params.batchId ??
+              (diagnosticsBefore?.operationId as string | undefined) ?? `triage-${Date.now()}`;
+            const ownerHash = currentOwnerHash();
+            const store = getOperationStore();
+            const initialSummary = summarizeApplyResults([]);
+            const initialRecord = buildApplyTriageLedgerRecord({
+              operationId, request: params, expected, results: [],
+              actionsByTicket: actionByTicket, continuationRequired: false,
+              summary: initialSummary,
+            });
+
             try {
-              await getOperationStore().put(
-                buildApplyTriageLedgerRecord({
-                  operationId,
-                  request: params,
-                  expected,
-                  results,
-                  actionsByTicket: actionByTicket,
-                  continuationRequired: executionStopped,
-                  summary,
-                })
-              );
-              operationPersisted = true;
+              const existing = await store.get(operationId);
+              if (existing) {
+                if (existing.ownerHash !== ownerHash ||
+                    existing.originalRequestHash !== initialRecord.originalRequestHash) {
+                  return errorResult("The requested operation ID already exists with different ownership or approved input.");
+                }
+              } else {
+                // No initial mutation is permitted until this write is acknowledged.
+                await store.put(initialRecord);
+              }
             } catch (error) {
-              operationStoreError = safeErrorMessage(error);
-            }
-
-            if (executionStopped && operationPersisted) {
-              const scheduled = await scheduleApplyTriageContinuation(
-                operationId,
-                currentOwnerHash()
-              );
-              continuationScheduling = {
-                attempted: true,
-                scheduled: scheduled.scheduled,
-                status: scheduled.status,
-                error: scheduled.scheduled ? undefined : scheduled.reason,
-                mechanism: "serviceBinding",
+              return {
+                content: [{ type: "text", text: JSON.stringify({
+                  operation: { operationId, complete: false, continuationRequired: false,
+                    persisted: false, errorClass: "OperationStoreFailure",
+                    writeAttempted: false, writeMayHaveSucceeded: false,
+                    storeError: safeErrorMessage(error) },
+                  initialCandidateCount: expected.length,
+                  expectedCandidateTicketNumbers: expected,
+                  results: [], summary: initialSummary,
+                  execution: executionDiagnostics(),
+                }, null, 2) }], isError: true,
               };
             }
 
+            let continuation;
+            let continuationError: string | undefined;
+            try {
+              continuation = await runOperationContinuation({
+                operationId, ownerHash,
+                adapter: createApplyTriageContinuationAdapter(client, params),
+                leaseOwner: String(diagnosticsBefore?.invocationId ?? `initial-${Date.now()}`),
+              });
+            } catch (error) {
+              continuationError = safeErrorMessage(error);
+            }
+
+            let finalRecord = (await store.get(operationId)) ?? initialRecord;
+            let continuationScheduling: Record<string, unknown> | undefined;
+            const continuationRequired = continuation?.continuationRequired ??
+              finalRecord.pendingItems.length > 0;
+            if (continuationRequired && !finalRecord.nextEligibleTime) {
+              const scheduled = await scheduleApplyTriageContinuation(operationId, ownerHash);
+              continuationScheduling = { attempted: true, scheduled: scheduled.scheduled,
+                status: scheduled.status, error: scheduled.scheduled ? undefined : scheduled.reason,
+                mechanism: "serviceBinding" };
+              try {
+                finalRecord = await store.update(operationId, ownerHash, (record) => ({
+                  ...record, schedulingAttempted: true,
+                  schedulingSucceeded: scheduled.scheduled,
+                  schedulingError: scheduled.scheduled ? undefined : scheduled.reason,
+                  schedulingAttemptCount: (record.schedulingAttemptCount ?? 0) + 1,
+                }));
+              } catch (error) {
+                continuationError ??= safeErrorMessage(error);
+              }
+            }
+
+            const results = completeApplyResultsFromLedger(finalRecord, expected, actionByTicket);
+            const summary = summarizeApplyResults(results);
+            try {
+              finalRecord = await store.update(operationId, ownerHash, (record) => ({ ...record, summary }));
+            } catch (error) {
+              continuationError ??= safeErrorMessage(error);
+            }
+            const complete = finalRecord.state === "Completed" ||
+              finalRecord.state === "CompletedWithFailures" ||
+              finalRecord.state === "Failed" || finalRecord.state === "Cancelled";
+
             return {
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify(
-                    {
-                      batchId: params.batchId,
-                      operation: {
-                        operationId,
-                        idempotencyKey: params.batchId ?? operationId,
-                        complete: !executionStopped,
-                        continuationRequired: executionStopped,
-                        persisted: operationPersisted,
-                        storeError: operationStoreError,
-                        continuationScheduling,
-                      },
-                      initialCandidateCount: expected.length,
-                      expectedCandidateTicketNumbers: expected,
-                      results,
-                      summary,
-                      execution: diagnostics,
-                    },
-                    null,
-                    2
-                  ),
-                },
-              ],
+              content: [{ type: "text", text: JSON.stringify({
+                batchId: params.batchId,
+                operation: { operationId, idempotencyKey: params.batchId ?? operationId,
+                  complete, continuationRequired: !complete, persisted: true,
+                  storeError: continuationError, continuationScheduling, state: finalRecord.state,
+                  writeAttempted: Object.values(finalRecord.itemStates).some((item) => item.writeAttempted),
+                  writeMayHaveSucceeded: Object.values(finalRecord.itemStates).some((item) => item.writeMayHaveSucceeded) },
+                initialCandidateCount: expected.length,
+                expectedCandidateTicketNumbers: expected,
+                results, summary, execution: executionDiagnostics(),
+              }, null, 2) }],
+              isError: Boolean(continuationError),
             };
           }
           case "superops_tickets_conversation_list": {
@@ -4582,16 +4879,18 @@ export function getTicketsTools(): DomainTools {
             // TODO: Map requesterEmail and techGroupName only after IDs can be
             // resolved safely to ClientUserIdentifierInput and TechnicianGroupIdentifierInput.
 
+            synchronousWriteAttempted = true;
             const response = await client.mutate<CreateTicketResponse>(
               CREATE_TICKET_MUTATION,
               { input }
             );
+            synchronousWriteAccepted = true;
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.createTicket, null, 2),
+                  text: JSON.stringify({ result: response.createTicket, writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true }, null, 2),
                 },
               ],
             };
@@ -4754,20 +5053,24 @@ export function getTicketsTools(): DomainTools {
 
             let createdNote: TicketNote | undefined;
             if (typeof params.note === "string" && params.note.trim().length > 0) {
+              synchronousWriteAttempted = true;
               createdNote = await createTicketNote(
                 client,
                 resolvedTicket.ticketId,
                 params.note,
                 params.isPublicNote ?? false
               );
+              synchronousWriteAccepted = true;
             }
 
             let updateResponse: UpdateTicketResponse;
             try {
+              synchronousWriteAttempted = true;
               updateResponse = await client.mutate<UpdateTicketResponse>(
                 UPDATE_TICKET_MUTATION,
                 { input: updateInput }
               );
+              synchronousWriteAccepted = true;
             } catch (error) {
               const requiredFields = mandatoryValidationFields(error);
               const message = requiredFields.length > 0
@@ -4783,6 +5086,13 @@ export function getTicketsTools(): DomainTools {
                       text: JSON.stringify(
                         {
                           partialFailure: true,
+                          writeAttempted: true,
+                          writeMayHaveSucceeded: true,
+                          reliableResponseReceived: isReliableSynchronousMutationRejection(error),
+                          replaySafe: false,
+                          classification: isReliableSynchronousMutationRejection(error)
+                            ? "PartialWriteThenRejectedUpdate"
+                            : "PartialWriteThenAmbiguousUpdate",
                           ticketId: resolvedTicket.ticketId,
                           noteAdded: {
                             noteId: createdNote.noteId,
@@ -4809,7 +5119,14 @@ export function getTicketsTools(): DomainTools {
                       optionFields,
                       RESOLVED_REQUIRED_OPTION_FIELDS
                     ),
-                  })
+                  }),
+                  {
+                    writeAttempted: true,
+                    writeMayHaveSucceeded: false,
+                    reliableResponseReceived: true,
+                    replaySafe: true,
+                    classification: "RejectedSynchronousWrite",
+                  }
                 );
               }
 
@@ -4822,16 +5139,21 @@ export function getTicketsTools(): DomainTools {
                   {
                     type: "text",
                     text: JSON.stringify(
-                      createdNote
-                        ? {
-                            noteAdded: {
-                              noteId: createdNote.noteId,
-                              addedOn: createdNote.addedOn,
-                              privacyType: createdNote.privacyType,
-                            },
-                            update: updateResponse.updateTicket,
-                          }
-                        : updateResponse.updateTicket,
+                      {
+                        result: createdNote
+                          ? {
+                              noteAdded: {
+                                noteId: createdNote.noteId,
+                                addedOn: createdNote.addedOn,
+                                privacyType: createdNote.privacyType,
+                              },
+                              update: updateResponse.updateTicket,
+                            }
+                          : updateResponse.updateTicket,
+                        writeAttempted: true,
+                        writeMayHaveSucceeded: true,
+                        reliableResponseReceived: true,
+                      },
                       null,
                       2
                     ),
@@ -4853,7 +5175,12 @@ export function getTicketsTools(): DomainTools {
                 {
                   type: "text",
                   text: JSON.stringify(
-                    ticketSummary(verifiedTicket, latestNotes[0] ?? createdNote),
+                    {
+                      result: ticketSummary(verifiedTicket, latestNotes[0] ?? createdNote),
+                      writeAttempted: true,
+                      writeMayHaveSucceeded: true,
+                      reliableResponseReceived: true,
+                    },
                     null,
                     2
                   ),
@@ -4910,16 +5237,18 @@ export function getTicketsTools(): DomainTools {
             // TODO: Map techGroupName and resolution only after a documented
             // name-to-ID lookup or resolution-code workflow is available.
 
+            synchronousWriteAttempted = true;
             const response = await client.mutate<UpdateTicketResponse>(
               UPDATE_TICKET_MUTATION,
               { input }
             );
+            synchronousWriteAccepted = true;
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.updateTicket, null, 2),
+                  text: JSON.stringify({ result: response.updateTicket, writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true }, null, 2),
                 },
               ],
             };
@@ -4932,6 +5261,7 @@ export function getTicketsTools(): DomainTools {
               isPublic?: boolean;
             };
 
+            synchronousWriteAttempted = true;
             const response = await client.mutate<AddNoteResponse>(ADD_TICKET_NOTE_MUTATION, {
               input: {
                 ticket: { ticketId: params.ticketId },
@@ -4939,12 +5269,13 @@ export function getTicketsTools(): DomainTools {
                 privacyType: params.isPublic ? "PUBLIC" : "PRIVATE",
               },
             });
+            synchronousWriteAccepted = true;
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.createTicketNote, null, 2),
+                  text: JSON.stringify({ result: response.createTicketNote, writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true }, null, 2),
                 },
               ],
             };
@@ -4959,6 +5290,7 @@ export function getTicketsTools(): DomainTools {
               billable?: boolean;
             };
 
+            synchronousWriteAttempted = true;
             const response = await client.mutate<AddTimeEntryResponse>(
               ADD_TIME_ENTRY_MUTATION,
               {
@@ -4976,12 +5308,13 @@ export function getTicketsTools(): DomainTools {
                 ],
               }
             );
+            synchronousWriteAccepted = true;
 
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify(response.createWorklogEntries, null, 2),
+                  text: JSON.stringify({ result: response.createWorklogEntries, writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true }, null, 2),
                 },
               ],
             };
@@ -4995,6 +5328,29 @@ export function getTicketsTools(): DomainTools {
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        const synchronousWriteTools = new Set([
+          "superops_tickets_create", "superops_tickets_resolve_full",
+          "superops_tickets_update", "superops_tickets_add_note", "superops_tickets_log_time",
+        ]);
+        if (synchronousWriteTools.has(name)) {
+          const reliablyRejected = synchronousWriteAttempted &&
+            !synchronousWriteAccepted && isReliableSynchronousMutationRejection(error);
+          return {
+            content: [{ type: "text", text: JSON.stringify({
+              error: message,
+              writeAttempted: synchronousWriteAttempted,
+              writeMayHaveSucceeded: synchronousWriteAttempted && !reliablyRejected,
+              reliableResponseReceived: synchronousWriteAccepted || reliablyRejected,
+              replaySafe: reliablyRejected || !synchronousWriteAttempted,
+              classification: synchronousWriteAccepted
+                ? "AcceptedSynchronousWriteFollowupFailed"
+                : reliablyRejected
+                  ? "RejectedSynchronousWrite"
+                  : synchronousWriteAttempted ? "AmbiguousSynchronousWrite" : "FailedBeforeWrite",
+            }, null, 2) }],
+            isError: true,
+          };
+        }
         return {
           content: [{ type: "text", text: `Error: ${message}` }],
           isError: true,

@@ -82,11 +82,11 @@ mechanism rather than committing it to this file.
 - MCP endpoint: `https://<your-mcp-host>/mcp`
 - Health endpoint: `https://<your-mcp-host>/health`
 - Required non-secret vars: `AUTH_MODE=env`, `SUPEROPS_SUBDOMAIN=computaskltd`, `SUPEROPS_REGION=us`, `LOG_LEVEL=warn`
-- Optional non-secret safety vars: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=true`, `ENABLE_CUSTOM_MUTATION=true`
-- Execution-budget vars: `SUPEROPS_EXECUTION_SUBREQUEST_BUDGET`, `SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN`, `SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH`, `SUPEROPS_EXECUTION_MAX_PAGINATION_DEPTH`, `SUPEROPS_EXECUTION_MAX_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_WRITE_RETRY_ATTEMPTS`, `SUPEROPS_EXECUTION_MAX_RETRY_DURATION_MS`, `SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS`, `SUPEROPS_EXECUTION_BACKOFF_BASE_DELAY_MS`, `SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO`, `SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS`, `SUPEROPS_EXECUTION_MAX_DURATION_MS`, `SUPEROPS_OPERATION_RETENTION_SECONDS`, `SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS`
+- Non-secret safety defaults: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=false`, `ENABLE_CUSTOM_MUTATION=false`, `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=false`
+- Execution controls additionally include per-request timeout, CPU guard, continuation/retry/delay/scheduling ceilings, retention, and maximum operation lifetime. The exact committed values are in `wrangler.json` and are described in the continuation runbook.
 - Required secrets: the SuperOps API token Worker secret, plus any OAuth/session secrets required by the deployed auth provider
 - Never commit: API token values, OAuth access/refresh tokens, bearer tokens, Cloudflare service token values, client secrets, private keys, or full request headers
-- Durable operation status uses the `SUPEROPS_OPERATION_LEDGER` Durable Object binding declared in `wrangler.json`. Delayed rate-limit wake-ups remain disabled unless both `SUPEROPS_CONTINUATION_ENABLED=true` and `SUPEROPS_DURABLE_RETRY_ENABLED=true`; they also require the existing internal service binding and `SUPEROPS_INTERNAL_CONTINUATION_TOKEN` secret. Do not reuse `OAUTH_KV` for operation state.
+- Durable operation status uses `SUPEROPS_OPERATION_LEDGER`. Long rate-limit waits use the `SUPEROPS_CONTINUATION_WORKFLOW` binding; immediate delivery and Workflow wake delivery use the internal service binding/token. Both continuation flags default false. Durable Object alarms are cleanup-only. Do not reuse `OAUTH_KV` for operation state.
 
 Safe local validation:
 
@@ -105,15 +105,7 @@ Safe deployed smoke tools:
 - `superops_assets_list`
 - `superops_technicians_list`
 
-Write-capable tools remain enabled by default:
-
-- `superops_tickets_create`
-- `superops_tickets_update`
-- `superops_tickets_add_note`
-- `superops_tickets_log_time`
-- `superops_alerts_create`
-- `superops_alerts_resolve`
-- `superops_custom_mutation`
+Unreviewed synchronous write tools and custom mutation are blocked by default. The reviewed durable `superops_tickets_apply_triage_plan` remains available, as do read and operation-status tools. Direct ticket writes, alert writes, and `superops_custom_mutation` require an explicit reviewed override and retain only their conservative synchronous ambiguity contract.
 
 `superops_custom_mutation` is the highest-risk tool because it accepts custom
 GraphQL mutation text. Audit logs record only safe metadata for custom GraphQL:
@@ -132,7 +124,7 @@ a sanitised error summary on failure.
 Emergency disable process:
 
 - Set `MCP_ENABLED=false` to stop MCP tool execution.
-- Set `ENABLE_WRITE_TOOLS=false` to block ticket write tools.
+- `ENABLE_WRITE_TOOLS=false` blocks unreviewed synchronous ticket and alert writes; the reviewed durable apply-triage path remains available. Use `MCP_ENABLED=false` for an all-tool emergency stop.
 - Set `ENABLE_CUSTOM_MUTATION=false` to block custom GraphQL mutations.
 - Re-run the deployment pipeline after changing Worker vars, then verify `/health` and `superops_status`.
 
@@ -371,10 +363,8 @@ Recommended flow:
 1. Call `superops_tickets_triage_snapshot` for `status: ["New Calls"]`.
 2. Analyse only the fixed snapshot returned by that call.
 3. Present a pre-write proposed action table for user approval.
-4. After approval, use the existing individual write tools such as
-   `superops_tickets_resolve_full`, `superops_tickets_update`, or
-   `superops_tickets_add_note`.
-5. Report the final outcome for every ticket from the snapshot.
+4. After approval, submit the fixed candidates and approved actions to durable `superops_tickets_apply_triage_plan`.
+5. Inspect the authoritative operation result until every fixed candidate is terminal, then report every outcome.
 
 The pre-write approval table should include every proposed write or intentional
 non-write. Suggested columns: ticket number, subject, client, evidence summary,
@@ -387,7 +377,7 @@ change was made. Each ticket must have one final outcome from: `Resolved`,
 `Not Found`. Do not omit tickets because they were skipped, blocked, failed, not
 found, or left unchanged.
 
-When individual writes are used after approval, report failures explicitly with
+If a separately reviewed synchronous write is used, report failures explicitly with
 the ticket number, requested action, failure stage, and whether any partial write
 occurred. If a ticket changed or disappeared after the snapshot, keep it in the
 final table and mark it as `Blocked`, `Failed`, or `Not Found` as appropriate.
@@ -419,8 +409,9 @@ Supported actions are `resolve`, `update`, `addNote`, `leave`, and `skip`.
 When `dedupeNotes=true`, existing notes are checked before adding a note, and a
 matching note is not duplicated. Resolve actions use the controlled resolve path;
 if SuperOps returns an internal server error and fallback is explicitly allowed,
-the tool re-reads metadata and attempts one update fallback. It does not fallback
-for validation failures.
+the tool re-reads metadata. It attempts one update fallback only when the intended
+resolution is absent and `updatedTime` is unchanged. A visible resolution, changed
+`updatedTime`, ambiguous read, or validation failure blocks fallback.
 
 Update and resolve actions are always re-read before success is reported. Every requested target field must match the final state; otherwise the outcome is `Failed` with `failureStage: "verifyFinalState"` and `partialWrite: true`. Private notes are added only after that verification succeeds. Note dedupe trims text, collapses whitespace, and compares case-insensitively.
 
@@ -436,9 +427,7 @@ and a durable `operationId` when the operation ledger is available. This is an
 observable incomplete state, not background success. A SuperOps triage continuation
 adapter is implemented for pending apply-plan items and uses the same validation,
 stale-data, note-deduplication, mutation and verification helpers as the synchronous
-path. Automatic fresh-invocation scheduling is disabled by default and requires
-`SUPEROPS_CONTINUATION_ENABLED=true`, `SUPEROPS_CONTINUATION_SERVICE`, and the
-`SUPEROPS_INTERNAL_CONTINUATION_TOKEN` secret. Long Retry-After wake-ups additionally require `SUPEROPS_DURABLE_RETRY_ENABLED=true`: the operation ledger retains the exact item stage and schedules a Durable Object alarm with compact operation identity only. Alarm delivery is at-least-once, so the resumed adapter must reclaim the item, re-read it, and revalidate identity/updated time before acting. Mutation-capable stages persist `WriteStarted`/`WriteAmbiguous` or `NoteWriteStarted`/`NoteWriteAmbiguous` before and after uncertain writes; a lost response is verified rather than blindly retried. Use `superops_operations_get` to inspect the stored compact result. The audit record is high-risk write metadata only: batch ID,
+path. Automatic fresh-invocation scheduling is disabled by default and requires both continuation flags, the internal service binding/token, and the Workflow binding for long waits. Long Retry-After values use a durable Workflow sleep with compact identity only; Durable Object alarms are retention cleanup only. The resumed adapter must reclaim the item, re-read it, and revalidate identity/`updatedTime`. Update, resolution, and note lifecycles persist `WriteStarted`, `ResolutionWriteStarted`, or `NoteWriteStarted` before mutation and persist `FieldsUpdated`, `ResolutionWriteSucceeded`/`ResolutionVerified`, or `NoteAdded` immediately after reliable success. A created note ID is retained, but the note body is never persisted. Ambiguity is verified rather than blindly retried. Use `superops_operations_get` to inspect the authoritative compact result. The audit record is high-risk write metadata only: batch ID,
 candidate count, ticket numbers, action types, dry-run/verify flags, and fallback
 allowance. It does not audit raw ticket content or full note bodies.
 Example safe retrieval call:
@@ -661,4 +650,4 @@ For issues and feature requests, please visit the [GitHub repository](https://gi
 
 ### Deterministic continuation acceptance harness
 
-Run `npm run test:continuation-harness` to execute only `src/continuation-mixed-fault-harness.test.ts`. The fixed seed is `0x5eed250`; it processes exactly 250 mocked tickets through the real apply-triage continuation adapter. Its required assertions are 250 expected and accounted items, zero duplicate successful updates/resolutions/private notes, and zero invocations over the configured request threshold. It is a no-network test and is required evidence before enabling durable continuation outside staging.
+Run `npm run test:continuation-harness` to execute only `src/continuation-mixed-fault-harness.test.ts`. The fixed seed is `0x5eed250`; it processes exactly 250 mocked tickets through the real apply-triage continuation adapter. Its required assertions are 250 expected and accounted items, zero duplicate successful updates/resolutions/private notes, zero invocations over each invocation's configured effective request budget, terminal/unaccounted/update/resolution/note-only/skip/retry/wait counters, and a durable wait longer than one request lifetime. It is a no-network test and is required evidence before enabling durable continuation outside staging.

@@ -304,7 +304,7 @@ describe("Custom Domain", () => {
       expect(parsed.bulkUpdateTickets.updatedCount).toBe(5);
     });
 
-    it("returns raw GraphQL response for mutations", async () => {
+    it("returns the GraphQL response with an explicit write contract", async () => {
       const mockResponse = {
         createEntity: {
           id: "new-123",
@@ -319,7 +319,14 @@ describe("Custom Domain", () => {
       });
 
       const parsed = JSON.parse(result.content[0].text);
-      expect(parsed).toEqual(mockResponse);
+      expect(parsed).toMatchObject({
+        ...mockResponse,
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+        reliableResponseReceived: true,
+        replaySafe: false,
+        failureClassification: null,
+      });
     });
   });
 
@@ -362,7 +369,7 @@ describe("Custom Domain", () => {
     });
 
     it("marks a reliable GraphQL rejection as not accepted without retrying", async () => {
-      const rejection = Object.assign(new Error("Validation failed"), { name: "SuperOpsError" });
+      const rejection = Object.assign(new Error("Validation failed"), { name: "SuperOpsError", code: "VALIDATION_ERROR" });
       mockClient.mutate.mockRejectedValue(rejection);
 
       const result = await getCustomTools().handleCall("superops_custom_mutation", {
@@ -375,6 +382,9 @@ describe("Custom Domain", () => {
         writeAttempted: true,
         writeMayHaveSucceeded: false,
         partialWrite: false,
+        reliableResponseReceived: true,
+        replaySafe: true,
+        classification: "RejectedSynchronousWrite",
         retryable: false,
       });
       expect(mockClient.mutate).toHaveBeenCalledTimes(1);
@@ -566,6 +576,49 @@ describe("Custom Domain", () => {
         expect.any(String),
         { ids: ["1", "2", "3"] }
       );
+    });
+  });
+
+  describe("bounded custom execution", () => {
+    it("rejects oversized documents and variables before calling SuperOps", async () => {
+      const domain = getCustomTools();
+      const document = await domain.handleCall("superops_custom_query", {
+        query: "query Q { ok } #" + "x".repeat(70 * 1024),
+      });
+      const variables = await domain.handleCall("superops_custom_query", {
+        query: "query Q($input: String!) { ok }",
+        variables: { input: "x".repeat(140 * 1024) },
+      });
+      expect(document.isError).toBe(true);
+      expect(variables.isError).toBe(true);
+      expect(mockClient.query).not.toHaveBeenCalled();
+    });
+
+    it("omits an oversized custom response instead of returning it", async () => {
+      mockClient.query.mockResolvedValue({ payload: "x".repeat(1024 * 1024 + 1) });
+      const result = await getCustomTools().handleCall("superops_custom_query", {
+        query: "query Q { payload }",
+      });
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text)).toMatchObject({
+        responseOmitted: true,
+        maxBytes: 1024 * 1024,
+      });
+    });
+
+    it("preserves the safe write contract when an accepted mutation response is oversized", async () => {
+      mockClient.mutate.mockResolvedValue({ payload: "x".repeat(1024 * 1024 + 1) });
+      const result = await getCustomTools().handleCall("superops_custom_mutation", {
+        mutation: "mutation M { payload }",
+      });
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0].text)).toMatchObject({
+        responseOmitted: true,
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+        reliableResponseReceived: true,
+        replaySafe: false,
+      });
     });
   });
 });

@@ -19,6 +19,11 @@ export type OperationItemStage =
   | "WriteStarted"
   | "WriteAmbiguous"
   | "FieldsUpdated"
+  | "ResolutionValidated"
+  | "ResolutionWriteStarted"
+  | "ResolutionWriteSucceeded"
+  | "ResolutionWriteAmbiguous"
+  | "ResolutionVerified"
   | "StatusUpdated"
   | "NoteChecked"
   | "NoteWriteStarted"
@@ -44,6 +49,8 @@ export type OperationItemStage =
 export type OperationErrorClass =
   | "SuperOpsRateLimit"
   | "CloudflareSubrequestBudget"
+  | "CloudflareConfiguredBudgetReached"
+  | "CloudflareSubrequestLimit"
   | "CloudflareExecutionTimeout"
   | "CloudflareCpuLimit"
   | "UpstreamNetworkFailure"
@@ -54,8 +61,12 @@ export type OperationErrorClass =
   | "StaleData"
   | "VerificationMismatch"
   | "AmbiguousWrite"
+  | "RateLimitExceeded"
   | "ContinuationFailure"
-  | "OperationStoreFailure";
+  | "ContinuationSchedulingFailure"
+  | "ContinuationExecutionFailure"
+  | "OperationStoreFailure"
+  | "MalformedStoredOperation";
 
 export interface OperationLease {
   leaseId: string;
@@ -69,8 +80,14 @@ export interface OperationRateLimitState {
   attempts: number;
   retryAfterSupplied: boolean;
   parsedDelayMs?: number;
+  cappedDelayMs?: number;
   appliedDelayMs?: number;
+  actualDelayMs?: number;
+  scheduledAt?: string;
+  firstThrottledAt?: string;
+  totalRetryDurationMs?: number;
   totalElapsedMs?: number;
+  nextEligibleAt?: string;
   continuedInAnotherInvocation: boolean;
   writeAttempted: boolean;
   finalResult?: string;
@@ -85,7 +102,16 @@ export interface OperationItemState {
   writeMayHaveSucceeded: boolean;
   partialWrite: boolean;
   ambiguousWrite?: boolean;
+  mutationType?: "update" | "resolution" | "note" | "resolveFallback";
+  reliableResponseReceived?: boolean;
+  observedMutationResult?: "Accepted" | "Rejected" | "VerifiedApplied" | "Ambiguous";
+  canonicalTargetHash?: string;
   noteFingerprint?: string;
+  createdNoteId?: string;
+  fallbackAllowed?: boolean;
+  fallbackAttempted?: boolean;
+  fallbackApplied?: boolean;
+  fallbackVerified?: boolean;
   verificationState?: "NotRequired" | "Pending" | "Verified" | "Failed";
   retryCount: number;
   attemptCount?: number;
@@ -134,11 +160,16 @@ export interface OperationLedgerRecord {
   currentLease?: OperationLease;
   workflowId?: string;
   /** Compact durable-wake metadata; no caller credentials or request content. */
-  continuationMechanism?: "durableObjectAlarm";
+  continuationMechanism?: "workflow";
   continuationInstanceId?: string;
   schedulingAttempted?: boolean;
   schedulingSucceeded?: boolean;
   schedulingError?: string;
+  schedulingAttemptCount?: number;
+  wakeAttemptCount?: number;
+  wakeDeliveryCount?: number;
+  lastWakeAttemptAt?: string;
+  lastWakeSucceededAt?: string;
   lastInvocationId?: string;
   staleItems?: string[];
 }
@@ -216,10 +247,12 @@ interface DurableObjectState {
 }
 
 interface DurableContinuationEnv {
-  SUPEROPS_CONTINUATION_SERVICE?: unknown;
-  SUPEROPS_INTERNAL_CONTINUATION_TOKEN?: string;
+  SUPEROPS_CONTINUATION_WORKFLOW?: {
+    createBatch(options: Array<{ id: string; params: Record<string, unknown> }>): Promise<Array<{ id: string }>>;
+  };
   SUPEROPS_CONTINUATION_ENABLED?: string;
   SUPEROPS_DURABLE_RETRY_ENABLED?: string;
+  SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS?: string;
 }
 
 export interface OperationStoreEnv {
@@ -228,7 +261,191 @@ export interface OperationStoreEnv {
 
 const STORE_CONTEXT = new AsyncLocalStorage<OperationStore>();
 const memoryRecords = new Map<string, OperationLedgerRecord>();
+const MAX_OPERATION_ITEMS = 500;
+const MAX_SERIALIZED_OPERATION_BYTES = 512 * 1024;
 
+export class MalformedStoredOperationError extends Error {
+  constructor(message = "Stored operation is malformed or exceeds configured bounds.") {
+    super(message);
+    this.name = "MalformedStoredOperationError";
+  }
+}
+
+function serializedBytes(value: unknown): number {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+const FORBIDDEN_PERSISTED_CONTENT_KEYS = new Set([
+  "note",
+  "content",
+  "description",
+  "conversation",
+  "messagebody",
+  "attachmentbody",
+]);
+const VALID_OPERATION_STATES = new Set<OperationState>([
+  "Running",
+  "ContinuationRequired",
+  "Rescheduled",
+  "Completed",
+  "CompletedWithFailures",
+  "Failed",
+  "Cancelled",
+]);
+const VALID_OPERATION_ITEM_STAGES = new Set<OperationItemStage>([
+  "Pending",
+  "Validating",
+  "Validated",
+  "WriteNotStarted",
+  "WriteStarted",
+  "WriteAmbiguous",
+  "FieldsUpdated",
+  "ResolutionValidated",
+  "ResolutionWriteStarted",
+  "ResolutionWriteSucceeded",
+  "ResolutionWriteAmbiguous",
+  "ResolutionVerified",
+  "StatusUpdated",
+  "NoteChecked",
+  "NoteWriteStarted",
+  "NoteWriteAmbiguous",
+  "NoteAdded",
+  "Verifying",
+  "Completed",
+  "CompletedAfterRetry",
+  "CompletedAfterAmbiguousWriteVerification",
+  "AmbiguousWriteUnresolved",
+  "Stale",
+  "Skipped",
+  "FailedBeforeWrite",
+  "FailedAfterPartialWrite",
+  "RateLimited",
+  "RateLimitedRetrying",
+  "RateLimitedRescheduled",
+  "RateLimitExceeded",
+  "StaleAfterRateLimitWait",
+  "Rescheduled",
+  "Unattempted",
+]);
+
+function containsForbiddenPersistedContent(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsForbiddenPersistedContent);
+  if (typeof value !== "object" || value === null) return false;
+  return Object.entries(value as Record<string, unknown>).some(([key, child]) =>
+    FORBIDDEN_PERSISTED_CONTENT_KEYS.has(key.toLowerCase()) ||
+    containsForbiddenPersistedContent(child)
+  );
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFiniteNonnegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function assertStringArray(value: unknown, field: string): asserts value is string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry)) {
+    throw new MalformedStoredOperationError(`Operation ${field} must contain nonempty strings.`);
+  }
+}
+
+function assertOperationRecord(value: unknown): asserts value is OperationLedgerRecord {
+  if (!isRecordObject(value)) throw new MalformedStoredOperationError();
+  const record = value as Partial<OperationLedgerRecord>;
+  if (
+    record.responseVersion !== 1 ||
+    typeof record.operationId !== "string" || !record.operationId ||
+    typeof record.toolName !== "string" || !record.toolName ||
+    typeof record.ownerHash !== "string" || !record.ownerHash ||
+    typeof record.originalRequestHash !== "string" || !record.originalRequestHash ||
+    !VALID_OPERATION_STATES.has(record.state as OperationState) ||
+    !isRecordObject(record.itemStates) ||
+    !isRecordObject(record.summary) ||
+    !Array.isArray(record.compactResults)
+  ) {
+    throw new MalformedStoredOperationError();
+  }
+
+  for (const [field, candidate] of [
+    ["expectedItems", record.expectedItems],
+    ["completedItems", record.completedItems],
+    ["failedItems", record.failedItems],
+    ["skippedItems", record.skippedItems],
+    ["unattemptedItems", record.unattemptedItems],
+    ["pendingItems", record.pendingItems],
+    ["rateLimitedItems", record.rateLimitedItems],
+  ] as const) assertStringArray(candidate, field);
+
+  for (const [field, candidate] of [
+    ["createdAt", record.createdAt],
+    ["updatedAt", record.updatedAt],
+    ["expiresAt", record.expiresAt],
+  ] as const) {
+    if (typeof candidate !== "string" || !Number.isFinite(Date.parse(candidate))) {
+      throw new MalformedStoredOperationError(`Operation ${field} is invalid.`);
+    }
+  }
+  if (record.maxOperationLifetimeAt !== undefined &&
+      (typeof record.maxOperationLifetimeAt !== "string" || !Number.isFinite(Date.parse(record.maxOperationLifetimeAt)))) {
+    throw new MalformedStoredOperationError("Operation maxOperationLifetimeAt is invalid.");
+  }
+
+  const expectedItems = record.expectedItems as string[];
+  if (expectedItems.length > MAX_OPERATION_ITEMS) {
+    throw new MalformedStoredOperationError(`Operation exceeds the ${MAX_OPERATION_ITEMS}-item limit.`);
+  }
+  if (new Set(expectedItems).size !== expectedItems.length) {
+    throw new MalformedStoredOperationError("Operation contains duplicate expected item IDs.");
+  }
+  if (record.compactResults.length > expectedItems.length) {
+    throw new MalformedStoredOperationError("Operation contains too many compact results.");
+  }
+
+  const expected = new Set(expectedItems);
+  const itemStateKeys = Object.keys(record.itemStates);
+  if (itemStateKeys.length !== expected.size || itemStateKeys.some((itemKey) => !expected.has(itemKey))) {
+    throw new MalformedStoredOperationError("Operation item states do not exactly cover expected items.");
+  }
+  for (const itemKey of expectedItems) {
+    const item = record.itemStates[itemKey];
+    if (
+      !isRecordObject(item) ||
+      item.itemKey !== itemKey ||
+      typeof item.idempotencyKey !== "string" || !item.idempotencyKey ||
+      !VALID_OPERATION_ITEM_STAGES.has(item.stage as OperationItemStage) ||
+      typeof item.writeAttempted !== "boolean" ||
+      typeof item.writeMayHaveSucceeded !== "boolean" ||
+      typeof item.partialWrite !== "boolean" ||
+      !isFiniteNonnegativeInteger(item.retryCount)
+    ) {
+      throw new MalformedStoredOperationError(`Operation item state is invalid: ${itemKey}.`);
+    }
+  }
+
+  for (const [field, candidate] of [
+    ["partialWriteCount", record.partialWriteCount],
+    ["ambiguousWriteCount", record.ambiguousWriteCount],
+    ["continuationCount", record.continuationCount],
+  ] as const) {
+    if (!isFiniteNonnegativeInteger(candidate)) {
+      throw new MalformedStoredOperationError(`Operation ${field} is invalid.`);
+    }
+  }
+  if (containsForbiddenPersistedContent(record)) {
+    throw new MalformedStoredOperationError("Operation contains prohibited customer content.");
+  }
+  if (serializedBytes(record) > MAX_SERIALIZED_OPERATION_BYTES) {
+    throw new MalformedStoredOperationError(
+      `Operation exceeds the ${MAX_SERIALIZED_OPERATION_BYTES}-byte serialized limit.`
+    );
+  }
+}
 const TERMINAL_STAGES = new Set<OperationItemStage>([
   "Completed",
   "CompletedAfterRetry",
@@ -292,13 +509,44 @@ function isTerminalOperation(record: OperationLedgerRecord): boolean {
  * Retention applies only after an operation has reached a terminal state. In
  * particular, an overdue non-terminal record is retained so that a possible
  * write is never discarded before it can be reconciled by the continuation
- * adapter. `expiresAt` is set from the configured retention period when the
- * ledger is created.
+ * adapter. While an operation is active, `expiresAt` preserves the configured
+ * retention duration. The expiry is restarted when the operation first
+ * becomes terminal so a long-running operation cannot immediately lose its
+ * final or possible-write evidence.
  */
 function isExpiredTerminalOperation(record: OperationLedgerRecord, now = nowIso()): boolean {
   return isTerminalOperation(record) &&
     Number.isFinite(Date.parse(record.expiresAt)) &&
     Date.parse(record.expiresAt) <= Date.parse(now);
+}
+
+const DEFAULT_TERMINAL_RETENTION_MS = 86_400_000;
+const MIN_TERMINAL_RETENTION_MS = 60_000;
+const MAX_TERMINAL_RETENTION_MS = 31_536_000_000;
+
+function terminalRetentionDurationMs(record: OperationLedgerRecord): number {
+  const configuredDuration = Date.parse(record.expiresAt) - Date.parse(record.createdAt);
+  if (!Number.isFinite(configuredDuration) || configuredDuration <= 0) {
+    return DEFAULT_TERMINAL_RETENTION_MS;
+  }
+  return Math.min(
+    MAX_TERMINAL_RETENTION_MS,
+    Math.max(MIN_TERMINAL_RETENTION_MS, configuredDuration)
+  );
+}
+
+function startTerminalRetention(
+  previous: OperationLedgerRecord,
+  next: OperationLedgerRecord,
+  now = nowIso()
+): OperationLedgerRecord {
+  if (isTerminalOperation(previous) || !isTerminalOperation(next)) return next;
+  return {
+    ...next,
+    expiresAt: new Date(
+      Date.parse(now) + terminalRetentionDurationMs(previous)
+    ).toISOString(),
+  };
 }
 
 /** A retained operation is not necessarily still authorised to write. */
@@ -331,24 +579,29 @@ function assertRecordOwner(record: OperationLedgerRecord, ownerHash: string): vo
   }
 }
 const EXPLICIT_STAGE_TRANSITIONS: Partial<Record<OperationItemStage, ReadonlySet<OperationItemStage>>> = {
-  Pending: new Set(["Validating", "Validated", "WriteNotStarted", "Rescheduled", "RateLimitedRescheduled"]),
-  Unattempted: new Set(["Validating", "Validated", "WriteNotStarted", "Rescheduled", "RateLimitedRescheduled"]),
+  Pending: new Set(["Validating", "Validated", "WriteNotStarted", "NoteChecked", "Rescheduled", "RateLimitedRescheduled"]),
+  Unattempted: new Set(["Validating", "Validated", "WriteNotStarted", "NoteChecked", "Rescheduled", "RateLimitedRescheduled"]),
   Validating: new Set(["Validated", "WriteNotStarted"]),
-  Validated: new Set(["WriteNotStarted", "WriteStarted", "Verifying"]),
+  Validated: new Set(["WriteNotStarted", "WriteStarted", "ResolutionValidated", "ResolutionWriteStarted", "Verifying"]),
   WriteNotStarted: new Set(["WriteStarted", "Verifying"]),
-  WriteStarted: new Set(["FieldsUpdated", "StatusUpdated", "NoteChecked", "NoteWriteStarted", "Verifying", "WriteAmbiguous", "RateLimitedRescheduled"]),
-  WriteAmbiguous: new Set(["FieldsUpdated", "StatusUpdated", "NoteChecked", "Verifying"]),
-  FieldsUpdated: new Set(["StatusUpdated", "NoteChecked", "Verifying"]),
+  WriteStarted: new Set(["FieldsUpdated", "StatusUpdated", "ResolutionValidated", "ResolutionWriteStarted", "NoteChecked", "NoteWriteStarted", "Verifying", "WriteAmbiguous", "RateLimitedRescheduled"]),
+  WriteAmbiguous: new Set(["Verifying"]),
+  FieldsUpdated: new Set(["StatusUpdated", "ResolutionValidated", "ResolutionWriteStarted", "NoteChecked", "Verifying"]),
+  ResolutionValidated: new Set(["ResolutionWriteStarted", "Verifying"]),
+  ResolutionWriteStarted: new Set(["ResolutionWriteSucceeded", "ResolutionWriteAmbiguous", "ResolutionVerified", "RateLimitedRescheduled"]),
+  ResolutionWriteSucceeded: new Set(["ResolutionVerified", "NoteChecked", "NoteWriteStarted", "Verifying"]),
+  ResolutionWriteAmbiguous: new Set(["ResolutionVerified", "Verifying"]),
+  ResolutionVerified: new Set(["NoteChecked", "NoteWriteStarted", "Verifying"]),
   StatusUpdated: new Set(["NoteChecked", "Verifying"]),
   NoteChecked: new Set(["NoteWriteStarted", "NoteAdded", "Verifying"]),
   NoteWriteStarted: new Set(["NoteAdded", "NoteWriteAmbiguous", "Verifying", "RateLimitedRescheduled"]),
-  NoteWriteAmbiguous: new Set(["NoteAdded", "Verifying"]),
+  NoteWriteAmbiguous: new Set(["Verifying"]),
   NoteAdded: new Set(["Verifying"]),
-  Verifying: new Set(),
+  Verifying: new Set(["NoteChecked"]),
   RateLimited: new Set(["RateLimitedRetrying", "RateLimitedRescheduled"]),
   RateLimitedRetrying: new Set(["RateLimitedRescheduled"]),
-  RateLimitedRescheduled: new Set(["Validating", "Validated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "Verifying"]),
-  Rescheduled: new Set(["Validating", "Validated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "Verifying"]),
+  RateLimitedRescheduled: new Set(["Validating", "Validated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "ResolutionValidated", "ResolutionWriteStarted", "NoteChecked", "NoteWriteStarted", "Verifying"]),
+  Rescheduled: new Set(["Validating", "Validated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "NoteChecked", "Verifying"]),
 };
 
 function assertTransition(current: OperationItemStage, next: OperationItemStage): void {
@@ -406,7 +659,7 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
       continue;
     }
     if (item.partialWrite) partialWriteCount += 1;
-    if (item.ambiguousWrite || item.stage === "WriteAmbiguous" || item.stage === "AmbiguousWriteUnresolved") {
+    if (item.ambiguousWrite || item.stage === "WriteAmbiguous" || item.stage === "ResolutionWriteAmbiguous" || item.stage === "AmbiguousWriteUnresolved") {
       ambiguousWriteCount += 1;
     }
     if (RATE_LIMIT_STAGES.has(item.stage)) rateLimited.push(itemKey);
@@ -446,6 +699,8 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
       next.state = hasFailureClassOutcome ? "CompletedWithFailures" : "Completed";
       delete next.nextEligibleTime;
       delete next.currentLease;
+    } else if (next.state === "Completed" || next.state === "CompletedWithFailures") {
+      next.state = next.nextEligibleTime ? "Rescheduled" : "Running";
     }
   }
 
@@ -460,6 +715,9 @@ function claimNextItemInRecord(
   const now = params.now ?? nowIso();
   record = expireOperationLifetime(record, now);
   if (isTerminalOperation(record)) return { record };
+  if (Object.values(record.itemStates).some((item) => isLeaseActive(item.lease, now))) {
+    return { record: normalizeOperationRecord(record) };
+  }
   const itemKey = record.expectedItems.find((key) => {
     const item = record.itemStates[key];
     if (!item || TERMINAL_STAGES.has(item.stage)) return false;
@@ -520,15 +778,21 @@ function applyItemPatch(
   if (current.writeMayHaveSucceeded && params.patch.writeMayHaveSucceeded === false) {
     throw new Error(`Operation item writeMayHaveSucceeded cannot be reset without verification: ${params.itemKey}`);
   }
+  const definedPatch = Object.fromEntries(
+    Object.entries(params.patch).filter(([, value]) => value !== undefined)
+  ) as typeof params.patch;
   const item: OperationItemState = {
     ...current,
-    ...params.patch,
+    ...definedPatch,
     itemKey: current.itemKey,
     idempotencyKey: current.idempotencyKey,
     completedAt: TERMINAL_STAGES.has(params.patch.stage) ? nowIso() : current.completedAt,
   };
   delete item.lease;
   record.itemStates[params.itemKey] = item;
+  if (record.currentLease?.leaseId === current.lease?.leaseId) {
+    record.currentLease = undefined;
+  }
 
   if (params.result !== undefined) {
     const compactKey = itemResultKey(params.result) ?? params.itemKey;
@@ -559,8 +823,11 @@ function applyItemCheckpoint(
   if (current.writeMayHaveSucceeded && params.patch.writeMayHaveSucceeded === false) {
     throw new Error(`Operation item writeMayHaveSucceeded cannot be reset: ${params.itemKey}`);
   }
+  const definedPatch = Object.fromEntries(
+    Object.entries(params.patch).filter(([, value]) => value !== undefined)
+  ) as typeof params.patch;
   record.itemStates[params.itemKey] = {
-    ...current, ...params.patch, itemKey: current.itemKey,
+    ...current, ...definedPatch, itemKey: current.itemKey,
     idempotencyKey: current.idempotencyKey, lease: current.lease,
   };
   record.currentItem = params.itemKey;
@@ -570,7 +837,10 @@ function applyItemCheckpoint(
 
 class MemoryOperationStore implements OperationStore {
   async put(record: OperationLedgerRecord): Promise<void> {
-    memoryRecords.set(record.operationId, normalizeOperationRecord(record));
+    assertOperationRecord(record);
+    const normalized = startTerminalRetention(record, normalizeOperationRecord(record));
+    assertOperationRecord(normalized);
+    memoryRecords.set(record.operationId, normalized);
   }
 
   async get(operationId: string): Promise<OperationLedgerRecord | undefined> {
@@ -600,8 +870,12 @@ class MemoryOperationStore implements OperationStore {
     const existing = await this.get(operationId);
     if (!existing) throw new Error(`Operation not found: ${operationId}`);
     assertRecordOwner(existing, ownerHash);
-    const updated = normalizeOperationRecord(updater(cloneRecord(existing)));
+    const updated = startTerminalRetention(
+      existing,
+      normalizeOperationRecord(updater(cloneRecord(existing)))
+    );
     updated.updatedAt = nowIso();
+    assertOperationRecord(updated);
     memoryRecords.set(operationId, updated);
     return cloneRecord(updated);
   }
@@ -611,7 +885,8 @@ class MemoryOperationStore implements OperationStore {
     if (!existing) return undefined;
     assertRecordOwner(existing, params.ownerHash);
     const { record, claim } = claimNextItemInRecord(cloneRecord(existing), params);
-    memoryRecords.set(params.operationId, record);
+    const retainedRecord = startTerminalRetention(existing, record);
+    memoryRecords.set(params.operationId, retainedRecord);
     return claim;
   }
 
@@ -647,6 +922,7 @@ class DurableObjectOperationStore implements OperationStore {
   }
 
   async put(record: OperationLedgerRecord): Promise<void> {
+    assertOperationRecord(record);
     const response = await operationStoreFetch(
       "operationStore.put",
       this.stub(record.operationId),
@@ -671,7 +947,9 @@ class DurableObjectOperationStore implements OperationStore {
     if (!response.ok) {
       throw new Error(`Operation store get failed: ${response.status}`);
     }
-    return (await response.json()) as OperationLedgerRecord;
+    const record = await response.json();
+    assertOperationRecord(record);
+    return record;
   }
 
   async list(ownerHash: string): Promise<OperationLedgerRecord[]> {
@@ -683,7 +961,10 @@ class DurableObjectOperationStore implements OperationStore {
     if (!response.ok) {
       throw new Error(`Operation store list failed: ${response.status}`);
     }
-    return (await response.json()) as OperationLedgerRecord[];
+    const records = await response.json();
+    if (!Array.isArray(records)) throw new MalformedStoredOperationError();
+    records.forEach(assertOperationRecord);
+    return records;
   }
 
   async update(
@@ -694,7 +975,10 @@ class DurableObjectOperationStore implements OperationStore {
     const existing = await this.get(operationId);
     if (!existing) throw new Error(`Operation not found: ${operationId}`);
     assertRecordOwner(existing, ownerHash);
-    const updated = normalizeOperationRecord(updater(existing));
+    const updated = startTerminalRetention(
+      existing,
+      normalizeOperationRecord(updater(existing))
+    );
     await this.put(updated);
     return updated;
   }
@@ -853,7 +1137,7 @@ export function operationTotals(record: OperationLedgerRecord): Record<string, n
     if (item.partialWrite) totals.partialWrite += 1;
     if (item.outcome === "Updated") totals.updated += 1;
     if (item.outcome === "Resolved") totals.resolved += 1;
-    if (item.outcome === "Updated" && item.writeAttempted === false) totals.noteOnly += 1;
+    if (item.outcome === "Updated" && item.mutationType === "note") totals.noteOnly += 1;
     if (item.stage === "CompletedAfterRetry") totals.completedAfterRetry += 1;
     if (item.stage === "CompletedAfterAmbiguousWriteVerification") {
       totals.completedAfterAmbiguousVerification += 1;
@@ -912,76 +1196,170 @@ export function operationResultView(record: OperationLedgerRecord): Record<strin
 export class SuperOpsOperationLedger {
   constructor(private readonly state: DurableObjectState, private readonly env: DurableContinuationEnv = {}) {}
 
-  private durableRetryEnabled(): boolean {
-    return this.env.SUPEROPS_CONTINUATION_ENABLED === "true" && this.env.SUPEROPS_DURABLE_RETRY_ENABLED === "true" && typeof this.state.storage.setAlarm === "function";
+  private workflowEnabled(): boolean {
+    return this.env.SUPEROPS_CONTINUATION_ENABLED === "true" &&
+      this.env.SUPEROPS_DURABLE_RETRY_ENABLED === "true" &&
+      typeof this.env.SUPEROPS_CONTINUATION_WORKFLOW?.createBatch === "function";
+  }
+
+  private maxSchedulingAttempts(): number {
+    const parsed = Number(this.env.SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS);
+    return Number.isFinite(parsed) ? Math.min(100, Math.max(1, Math.trunc(parsed))) : 8;
+  }
+
+  private async setRecordAlarm(record: OperationLedgerRecord): Promise<void> {
+    // Alarms are reserved for retention cleanup. Long continuation waits use
+    // Cloudflare Workflows in the pinned runtime, never an alarm wake callback.
+    if (typeof this.state.storage.setAlarm !== "function" || !isTerminalOperation(record)) return;
+    const expiry = Date.parse(record.expiresAt);
+    if (Number.isFinite(expiry)) await this.state.storage.setAlarm(expiry);
+  }
+
+  private terminalizeSchedulingFailure(
+    record: OperationLedgerRecord,
+    reason: string,
+    now: string
+  ): OperationLedgerRecord {
+    const next = cloneRecord(record);
+    for (const itemKey of next.expectedItems) {
+      const item = next.itemStates[itemKey];
+      if (!item || TERMINAL_STAGES.has(item.stage)) continue;
+      const possibleWrite = item.writeMayHaveSucceeded && item.observedMutationResult !== "Rejected";
+      next.itemStates[itemKey] = {
+        ...item,
+        stage: possibleWrite ? "AmbiguousWriteUnresolved" : "FailedBeforeWrite",
+        outcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : "ContinuationSchedulingFailed",
+        ambiguousWrite: possibleWrite || item.ambiguousWrite,
+        partialWrite: possibleWrite || item.partialWrite,
+        errorClass: "ContinuationSchedulingFailure",
+        failureReason: reason,
+        lease: undefined,
+      };
+    }
+    next.currentLease = undefined;
+    next.nextEligibleTime = undefined;
+    next.schedulingAttempted = true;
+    next.schedulingSucceeded = false;
+    next.schedulingError = reason;
+    next.terminalFailureReason = reason;
+    next.updatedAt = now;
+    return normalizeOperationRecord(next);
   }
 
   private async scheduleDurableWake(record: OperationLedgerRecord): Promise<OperationLedgerRecord> {
-    if (!record.nextEligibleTime || !this.durableRetryEnabled()) return record;
-    // Durable Object alarms are persistent. Replaying an identical scheduling
-    // checkpoint must retain the same wake identity without another alarm.
-    if (
-      record.continuationMechanism === "durableObjectAlarm" &&
-      record.continuationInstanceId === record.operationId &&
-      record.schedulingSucceeded === true
-    ) {
-      return record;
-    }
+    if (!record.nextEligibleTime) return record;
+    const now = new Date().toISOString();
     const wakeAt = Date.parse(record.nextEligibleTime);
-    if (!Number.isFinite(wakeAt)) return { ...record, schedulingAttempted: true, schedulingSucceeded: false, schedulingError: "Invalid durable continuation wake time." };
-    try {
-      await this.state.storage.setAlarm!(wakeAt);
-      return { ...record, continuationMechanism: "durableObjectAlarm", continuationInstanceId: record.operationId, schedulingAttempted: true, schedulingSucceeded: true, schedulingError: undefined };
-    } catch (error) {
-      return { ...record, schedulingAttempted: true, schedulingSucceeded: false, schedulingError: error instanceof Error ? error.message : "Durable continuation scheduling failed." };
+    if (!Number.isFinite(wakeAt)) {
+      return this.terminalizeSchedulingFailure(record, "Invalid durable continuation wake time.", now);
     }
+    if (!this.workflowEnabled()) {
+      return this.terminalizeSchedulingFailure(
+        record,
+        "Durable continuation Workflow is disabled or unavailable.",
+        now
+      );
+    }
+
+    const scheduleIdentity = `wf-${stableHash({
+      operationId: record.operationId,
+      continuationCount: record.continuationCount,
+      nextEligibleTime: record.nextEligibleTime,
+    })}`;
+    if (
+      record.continuationMechanism === "workflow" &&
+      record.continuationInstanceId === scheduleIdentity &&
+      record.schedulingSucceeded === true
+    ) return record;
+
+    let attempt = record.schedulingAttemptCount ?? 0;
+    let lastError = "Workflow scheduling failed.";
+    while (attempt < this.maxSchedulingAttempts()) {
+      attempt += 1;
+      try {
+        await this.env.SUPEROPS_CONTINUATION_WORKFLOW!.createBatch([{
+          id: scheduleIdentity,
+          params: {
+            operationId: record.operationId,
+            ownerHash: record.ownerHash,
+            nextEligibleTime: record.nextEligibleTime,
+            scheduleIdentity,
+          },
+        }]);
+        return {
+          ...record,
+          workflowId: scheduleIdentity,
+          continuationMechanism: "workflow",
+          continuationInstanceId: scheduleIdentity,
+          schedulingAttempted: true,
+          schedulingSucceeded: true,
+          schedulingError: undefined,
+          schedulingAttemptCount: attempt,
+        };
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : lastError;
+        if (attempt < this.maxSchedulingAttempts()) {
+          const backoffMs = Math.min(500, 25 * (2 ** (attempt - 1)));
+          await new Promise<void>((resolve) => setTimeout(resolve, backoffMs));
+        }
+      }
+    }
+    return this.terminalizeSchedulingFailure(
+      { ...record, schedulingAttemptCount: attempt },
+      `Workflow scheduling exhausted: ${lastError}`,
+      now
+    );
   }
 
   async alarm(): Promise<void> {
     const records = await this.state.storage.list<OperationLedgerRecord>({ prefix: "op:" });
     const now = new Date().toISOString();
-    const due = [...records.values()].filter((record) => record.continuationMechanism === "durableObjectAlarm" && record.schedulingSucceeded === true && Boolean(record.nextEligibleTime) && record.nextEligibleTime! <= now);
-    for (const record of due) {
-      const service = this.env.SUPEROPS_CONTINUATION_SERVICE as { fetch?: unknown } | undefined;
-      const token = this.env.SUPEROPS_INTERNAL_CONTINUATION_TOKEN?.trim();
-      if (typeof service?.fetch !== "function" || !token) {
-        await this.state.storage.put("op:" + record.operationId, { ...record, schedulingAttempted: true, schedulingSucceeded: false, schedulingError: "Durable continuation service binding is unavailable.", updatedAt: now });
-        continue;
-      }
-      try {
-        const response = await service.fetch(new Request("https://superops-continuation.local/internal/operations/continue", { method: "POST", headers: { "Content-Type": "application/json", "X-SuperOps-Internal-Continuation": token }, body: JSON.stringify({ toolName: "superops_tickets_apply_triage_plan", operationId: record.operationId, ownerHash: record.ownerHash }) }));
-        if (!response.ok) throw new Error("Continuation service rejected durable wake.");
-        // The continuation adapter is the mutation boundary. An alarm is
-        // at-least-once, so retain only a compact delivered marker here; a
-        // duplicate wake has to reclaim the persisted item before it can act.
-        await this.state.storage.put("op:" + record.operationId, {
-          ...record,
-          schedulingAttempted: true,
-          schedulingSucceeded: false,
-          schedulingError: undefined,
-          updatedAt: now,
-        });
-      } catch (error) {
-        // Do not throw: alarm retries must re-enter the persisted claim/checkpoint adapter.
-        await this.state.storage.put("op:" + record.operationId, { ...record, schedulingAttempted: true, schedulingSucceeded: false, schedulingError: error instanceof Error ? error.message : "Durable continuation execution failed.", updatedAt: now });
+    for (const [key, record] of records) {
+      if (isExpiredTerminalOperation(record, now)) {
+        await this.state.storage.delete(key);
+      } else if (isTerminalOperation(record)) {
+        await this.setRecordAlarm(record);
       }
     }
   }
-
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const operationMatch = url.pathname.match(/^\/operations\/([^/]+)$/);
     const operationActionMatch = url.pathname.match(/^\/operations\/([^/]+)\/(claim-next|complete-item|checkpoint-item|schedule-continuation)$/);
 
     if (request.method === "PUT" && operationMatch) {
-      const record = normalizeOperationRecord((await request.json()) as OperationLedgerRecord);
-      await this.state.storage.put(`op:${operationMatch[1]}`, record);
-      return json({ ok: true });
+      try {
+        const candidate = await request.json();
+        assertOperationRecord(candidate);
+        if (candidate.operationId !== operationMatch[1]) {
+          throw new MalformedStoredOperationError("Operation ID does not match its storage key.");
+        }
+        const record = startTerminalRetention(candidate, normalizeOperationRecord(candidate));
+        assertOperationRecord(record);
+        await this.state.storage.put(`op:${operationMatch[1]}`, record);
+        await this.setRecordAlarm(record);
+        return json({ ok: true });
+      } catch (error) {
+        if (error instanceof MalformedStoredOperationError) {
+          return json({ errorClass: "MalformedStoredOperation", error: error.message }, 422);
+        }
+        throw error;
+      }
     }
 
     if (request.method === "GET" && operationMatch) {
       const key = `op:${operationMatch[1]}`;
       const record = await this.state.storage.get<OperationLedgerRecord>(key);
+      if (record) {
+        try {
+          assertOperationRecord(record);
+        } catch (error) {
+          return json({
+            errorClass: "MalformedStoredOperation",
+            error: error instanceof Error ? error.message : "Stored operation is malformed.",
+          }, 500);
+        }
+      }
       if (record && isExpiredTerminalOperation(record)) {
         await this.state.storage.delete(key);
         return json({ error: "Not found" }, 404);
@@ -994,6 +1372,14 @@ export class SuperOpsOperationLedger {
       const key = `op:${operationId}`;
       const record = await this.state.storage.get<OperationLedgerRecord>(key);
       if (!record) return json({ error: "Not found" }, 404);
+      try {
+        assertOperationRecord(record);
+      } catch (error) {
+        return json({
+          errorClass: "MalformedStoredOperation",
+          error: error instanceof Error ? error.message : "Stored operation is malformed.",
+        }, 500);
+      }
       if (isExpiredTerminalOperation(record)) {
         await this.state.storage.delete(key);
         return json({ error: "Not found" }, 404);
@@ -1003,23 +1389,33 @@ export class SuperOpsOperationLedger {
         const params = (await request.json()) as OperationClaimNextParams;
         assertRecordOwner(record, params.ownerHash);
         const claimed = claimNextItemInRecord(cloneRecord(record), params);
-        await this.state.storage.put(key, claimed.record);
+        const retainedRecord = startTerminalRetention(record, claimed.record);
+        await this.state.storage.put(key, retainedRecord);
+        await this.setRecordAlarm(retainedRecord);
         return claimed.claim ? json(claimed.claim) : new Response(null, { status: 204 });
       }
 
       if (action === "complete-item") {
         const params = (await request.json()) as OperationCompleteItemParams;
         assertRecordOwner(record, params.ownerHash);
-        const updated = applyItemPatch(cloneRecord(record), params);
+        const updated = startTerminalRetention(
+          record,
+          applyItemPatch(cloneRecord(record), params)
+        );
         await this.state.storage.put(key, updated);
+        await this.setRecordAlarm(updated);
         return json(updated);
       }
 
       if (action === "checkpoint-item") {
         const params = (await request.json()) as OperationCheckpointItemParams;
         assertRecordOwner(record, params.ownerHash);
-        const updated = applyItemCheckpoint(cloneRecord(record), params);
+        const updated = startTerminalRetention(
+          record,
+          applyItemCheckpoint(cloneRecord(record), params)
+        );
         await this.state.storage.put(key, updated);
+        await this.setRecordAlarm(updated);
         return json(updated);
       }
 
@@ -1037,8 +1433,12 @@ export class SuperOpsOperationLedger {
           continuationCount: alreadyScheduledFor ? record.continuationCount : record.continuationCount + 1,
           updatedAt: nowIso(),
         });
-        const scheduled = await this.scheduleDurableWake(updated);
+        const scheduled = startTerminalRetention(
+          record,
+          await this.scheduleDurableWake(updated)
+        );
         await this.state.storage.put(key, scheduled);
+        await this.setRecordAlarm(scheduled);
         return json(scheduled);
       }
     }
@@ -1050,6 +1450,11 @@ export class SuperOpsOperationLedger {
       });
       const retained: OperationLedgerRecord[] = [];
       for (const [key, record] of records) {
+        try {
+          assertOperationRecord(record);
+        } catch {
+          continue;
+        }
         if (isExpiredTerminalOperation(record)) {
           await this.state.storage.delete(key);
         } else {

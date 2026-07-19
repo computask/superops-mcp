@@ -47,7 +47,8 @@ import {
 import { finishExecution, runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
 import { runWithContinuationScheduler } from "./continuation-scheduler.js";
 import { runWithOperationStore, SuperOpsOperationLedger } from "./operation-store.js";
-export { SuperOpsOperationLedger };
+import { SuperOpsContinuationWorkflow } from "./continuation-workflow.js";
+export { SuperOpsOperationLedger, SuperOpsContinuationWorkflow };
 
 export interface Env {
   SUPEROPS_API_TOKEN?: string;
@@ -61,6 +62,9 @@ export interface Env {
   OAUTH_KV?: unknown;
   OAUTH_PROVIDER?: unknown;
   SUPEROPS_OPERATION_LEDGER?: unknown;
+  SUPEROPS_CONTINUATION_WORKFLOW?: {
+    createBatch(options: Array<{ id: string; params: Record<string, unknown> }>): Promise<Array<{ id: string }>>;
+  };
   SUPEROPS_CONTINUATION_SERVICE?: unknown;
   SUPEROPS_CONTINUATION_ENABLED?: string;
   SUPEROPS_DURABLE_RETRY_ENABLED?: string;
@@ -83,6 +87,13 @@ export interface Env {
   SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO?: string;
   SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS?: string;
   SUPEROPS_EXECUTION_MAX_DURATION_MS?: string;
+  SUPEROPS_EXECUTION_REQUEST_TIMEOUT_MS?: string;
+  SUPEROPS_EXECUTION_CPU_GUARD_MS?: string;
+  SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT?: string;
+  SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_ATTEMPTS?: string;
+  SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_DURATION_MS?: string;
+  SUPEROPS_EXECUTION_MAX_DURABLE_SINGLE_WAIT_MS?: string;
+  SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS?: string;
   SUPEROPS_EXECUTION_VERIFICATION_MODE?: string;
   SUPEROPS_OPERATION_RETENTION_SECONDS?: string;
   SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS?: string;

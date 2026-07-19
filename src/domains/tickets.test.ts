@@ -42,7 +42,7 @@ import {
   runWithExecutionConfig,
   runWithExecutionContext,
 } from "../execution.js";
-import { getOperationStore, stableHash } from "../operation-store.js";
+import { getOperationStore, runWithOperationStore, stableHash } from "../operation-store.js";
 
 const VALID_TICKET_STATUSES = [
   "Worked on",
@@ -2510,6 +2510,43 @@ describe("Tickets Domain", () => {
     });
   });
 
+  it("does not replay a resolution when a lost 5xx response is already visible", async () => {
+    const initialTicket = {
+      ticketId: "ticket-57400", displayId: "57400", subject: "Resolve once",
+      status: "New Calls", updatedTime: "2026-07-18T10:00:00.000Z",
+    };
+    const resolvedTicket = {
+      ...initialTicket, status: "Resolved", updatedTime: "2026-07-18T10:00:01.000Z",
+      ...RESOLVED_CLASSIFICATION,
+    };
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({ getTicket: initialTicket })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({ getTicket: resolvedTicket })
+      .mockResolvedValueOnce({ getTicket: resolvedTicket });
+    mockClient.mutate.mockRejectedValueOnce(new Error("SuperOps internal server error status 500"));
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      allowResolveFullFallbackToUpdate: true,
+      actions: [{
+        ticketNumber: "57400", expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-18T10:00:00.000Z",
+        contentVerified: true, action: "resolve",
+        target: { status: "Resolved", ...RESOLVED_CLASSIFICATION },
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved", fallbackAttempted: false, verified: true,
+      fallbackResult: "Not required; intended resolution is already visible.",
+    });
+  });
   it("marks verification failure as partial write for approved triage updates", async () => {
     mockClient.query
       .mockResolvedValueOnce({
@@ -2897,6 +2934,21 @@ describe("Tickets Domain", () => {
     );
   });
 
+  it("returns a conservative ambiguity contract for failed synchronous ticket writes", async () => {
+    mockClient.mutate.mockRejectedValueOnce(new Error("network response lost"));
+    const result = await getTicketsTools().handleCall("superops_tickets_update", {
+      ticketId: "ticket-123", status: "Awaiting Engineer",
+    });
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      reliableResponseReceived: false,
+      replaySafe: false,
+      classification: "AmbiguousSynchronousWrite",
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
   it("handles unknown tools and API errors", async () => {
     const domain = getTicketsTools();
     const unknown = await domain.handleCall("unknown_tool", {});
@@ -2925,6 +2977,62 @@ describe("Tickets Domain", () => {
     });
     expect(notesResult.isError).toBe(true);
     expect(notesResult.content[0].text).toContain("notes read failed");
+  });
+  it("never mutates when initial durable operation creation fails", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      store.put = vi.fn().mockRejectedValue(new Error("ledger unavailable"));
+      const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+        expectedCandidateTicketNumbers: ["57400"],
+        actions: [{
+          ticketNumber: "57400", contentVerified: true, action: "update",
+          target: { status: "Awaiting Engineer" },
+        }],
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(result.isError).toBe(true);
+      expect(parsed.operation).toMatchObject({
+        persisted: false, errorClass: "OperationStoreFailure",
+        writeAttempted: false, writeMayHaveSucceeded: false,
+      });
+      expect(mockClient.query).not.toHaveBeenCalled();
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not send the first mutation when WriteStarted persistence fails", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" },
+      });
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const checkpoint = store.checkpointItem.bind(store);
+      store.checkpointItem = async (params) => {
+        if (params.patch.stage === "WriteStarted") throw new Error("WriteStarted persistence failed");
+        return checkpoint(params);
+      };
+      const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+        batchId: "checkpoint-failure-before-first-write",
+        expectedCandidateTicketNumbers: ["57400"],
+        actions: [{
+          ticketNumber: "57400", expectedStatus: "New Calls",
+          contentVerified: true, action: "update", target: { status: "Awaiting Engineer" },
+        }],
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      const stored = await store.get("checkpoint-failure-before-first-write");
+      expect(result.isError).toBe(true);
+      expect(parsed.operation).toMatchObject({ writeAttempted: false, writeMayHaveSucceeded: false });
+      expect(stored?.itemStates["57400"]).toMatchObject({
+        stage: "WriteNotStarted", writeAttempted: false, writeMayHaveSucceeded: false,
+      });
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+    });
   });
   it("resumes a pending approved triage update using the real adapter", async () => {
     const domain = getTicketsTools();
@@ -3137,7 +3245,7 @@ describe("Tickets Domain", () => {
     const stored = await getOperationStore().get(operationId);
     if (!stored) throw new Error("missing operation");
     stored.itemStates["57401"] = {
-      ...stored.itemStates["57401"], stage: "WriteStarted",
+      ...stored.itemStates["57401"], stage: "ResolutionWriteAmbiguous", mutationType: "resolution",
       writeAttempted: true, writeMayHaveSucceeded: true, partialWrite: true,
     };
     await getOperationStore().put(stored);
@@ -3175,6 +3283,7 @@ describe("Tickets Domain", () => {
     const operationId = JSON.parse(initial.content[0].text).operation.operationId;
     const stored = await getOperationStore().get(operationId);
     if (!stored) throw new Error("missing operation");
+    expect(JSON.stringify(stored)).not.toContain("Approved private note");
     stored.itemStates["57401"] = {
       ...stored.itemStates["57401"], stage: "NoteWriteStarted",
       writeAttempted: true, writeMayHaveSucceeded: true, partialWrite: true,
@@ -3281,7 +3390,7 @@ describe("Tickets triage execution budget", () => {
     });
     expect(parsed.results[1]).toMatchObject({
       ticketNumber: "57401",
-      finalOutcome: "FailedBeforeProcessing",
+      finalOutcome: "NotAttemptedExecutionStopped",
       failureStage: "executionBudget",
     });
     expect(parsed.results[2]).toMatchObject({
@@ -3385,13 +3494,14 @@ describe("Tickets triage execution budget", () => {
     const subrequestsByInvocation: number[] = [];
     let continuationRequired = true;
     let continuations = 0;
-    while (continuationRequired && continuations < 200) {
+    while (continuationRequired && continuations < 300) {
       continuations += 1;
       await runWithExecutionConfig(
         {
           SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "14",
           SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "2",
           SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+          SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT: "300",
         },
         async () => {
           await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {

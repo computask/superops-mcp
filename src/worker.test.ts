@@ -436,7 +436,19 @@ describe("Cloudflare Worker entrypoint", () => {
       skippedItems: [],
       unattemptedItems: ["57400"],
       pendingItems: ["57400"],
-      itemStates: {},
+      itemStates: {
+        "57400": {
+          itemKey: "57400",
+          stage: "Unattempted",
+          outcome: "NotAttemptedExecutionStopped",
+          idempotencyKey: "worker-item-57400",
+          writeAttempted: false,
+          writeMayHaveSucceeded: false,
+          partialWrite: false,
+          verificationState: "Pending",
+          retryCount: 0,
+        },
+      },
       summary: { unattempted: 1 },
       compactResults: [{ ticketNumber: "57400", finalOutcome: "NotAttemptedExecutionStopped" }],
       partialWriteCount: 0,
@@ -504,6 +516,93 @@ describe("Cloudflare Worker entrypoint", () => {
     );
     expect(forbidden.status).toBe(403);
     await expect(forbidden.json()).resolves.toMatchObject({ error: "Forbidden" });
+
+    const invalidNonempty = await worker.fetch(
+      new Request(`https://${INTERNAL_HOST}/internal/operations/continue`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-SuperOps-Internal-Continuation": "wrong-token",
+        },
+        body: JSON.stringify({
+          toolName: "superops_tickets_apply_triage_plan",
+          operationId: "op-forbidden",
+          ownerHash: stableHash("anonymous"),
+        }),
+      }),
+      {
+        SUPEROPS_API_TOKEN: "test-token",
+        SUPEROPS_SUBDOMAIN: "computaskltd",
+        SUPEROPS_CONTINUATION_ENABLED: "true",
+        SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
+      } as Env
+    );
+    expect(invalidNonempty.status).toBe(403);
+    await expect(invalidNonempty.json()).resolves.toMatchObject({ error: "Forbidden" });
+  });
+
+  it("runs a correct-token continuation through the real internal dispatch", async () => {
+    const ownerHash = stableHash("workflow-owner");
+    await runWithOperationStore({}, async () => {
+      await getOperationStore().put({
+        responseVersion: 1,
+        operationId: "op-correct-token",
+        toolName: "superops_tickets_apply_triage_plan",
+        ownerHash,
+        createdAt: "2026-07-18T00:00:00.000Z",
+        updatedAt: "2026-07-18T00:00:01.000Z",
+        expiresAt: "2999-07-19T00:00:00.000Z",
+        originalRequestHash: stableHash({ operationId: "op-correct-token" }),
+        operationRequest: { kind: "malformed-test-payload" },
+        state: "Running",
+        expectedItems: ["57400"], currentItem: "57400",
+        completedItems: [], failedItems: [], skippedItems: [],
+        unattemptedItems: ["57400"], pendingItems: ["57400"],
+        itemStates: {
+          "57400": {
+            itemKey: "57400", stage: "Pending",
+            idempotencyKey: "item-57400", writeAttempted: false,
+            writeMayHaveSucceeded: false, partialWrite: false, retryCount: 0,
+          },
+        },
+        summary: {}, compactResults: [], partialWriteCount: 0, ambiguousWriteCount: 0,
+        rateLimitedItems: [], continuationCount: 0,
+      });
+    });
+
+    const response = await worker.fetch(
+      new Request(`https://${INTERNAL_HOST}/internal/operations/continue`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-SuperOps-Internal-Continuation": "secret-token",
+        },
+        body: JSON.stringify({
+          toolName: "superops_tickets_apply_triage_plan",
+          operationId: "op-correct-token",
+          ownerHash,
+        }),
+      }),
+      {
+        SUPEROPS_API_TOKEN: "test-token",
+        SUPEROPS_SUBDOMAIN: "computaskltd",
+        SUPEROPS_CONTINUATION_ENABLED: "true",
+        SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
+      } as Env
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      result: { operationId: "op-correct-token", continuationRequired: false },
+    });
+    await runWithOperationStore({}, async () => {
+      await expect(getOperationStore().get("op-correct-token")).resolves.toMatchObject({
+        state: "CompletedWithFailures",
+        itemStates: { "57400": {
+          stage: "FailedBeforeWrite", writeAttempted: false, writeMayHaveSucceeded: false,
+        } },
+      });
+    });
   });
   it("returns a graceful error for a credential-requiring tool when unconfigured", async () => {
     const res = await mcp({
@@ -615,7 +714,7 @@ describe("Cloudflare Worker entrypoint", () => {
         result?: { isError?: boolean; content?: { text?: string }[] };
       };
       expect(body.result?.isError).toBe(true);
-      expect(body.result?.content?.[0]?.text).toContain("ENABLE_WRITE_TOOLS=false");
+      expect(body.result?.content?.[0]?.text).toContain("Unreviewed synchronous write tools");
 
       const records = auditRecords(logSpy);
       expect(records[0]).toMatchObject({

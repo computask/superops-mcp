@@ -1,34 +1,47 @@
 # Continuation Operations Runbook
 
-This runbook covers the checkpointed `superops_tickets_apply_triage_plan` continuation only. It does not turn scheduling into a success signal: inspect `superops_operations_get` and per-item results until every expected item is terminal.
+This runbook covers the checkpointed `superops_tickets_apply_triage_plan` continuation. The operation ledger is authoritative; scheduling or Workflow delivery is never itself a success signal. Inspect `superops_operations_get` until every expected item is terminal.
 
 ## Safety model
 
-The Durable Object is the authority for the operation, owner hash, item claims, checkpoint stage, retry metadata, and compact redacted results. A continuation may be delivered more than once. Before every mutation-capable triage stage the adapter owns a claim, re-reads the ticket, validates identity and `updatedTime`, and persists the mutation checkpoint. A possible-write failure becomes an ambiguity-verification stage; it is never blindly replayed.
+The Durable Object owns operation identity, owner hash, exact candidates, claims, leases, checkpoint stages, retry metadata, and compact redacted results. It is created before the initial adapter performs a SuperOps call. Duplicate delivery is expected and safe only because the adapter must acquire the owner-scoped item lease and reconcile persisted state.
 
-| Surface | Current contract | Durable/resumable |
-| --- | --- | --- |
-| Apply-triage update, resolution, private note | checkpointed, stale-checked, verified where requested; ambiguous writes are read before any replay | Yes |
-| Alert create/resolve | one request, optional final-state verification; no automatic write retry | No |
-| Direct ticket create/update/note/log-time/resolve-full | one request or bounded synchronous workflow; no automatic write retry; may report a partial write where the tool can observe it | No |
-| Custom mutation | opaque request; no retry; possible write returns `AmbiguousWriteUnresolved` | Intentionally no |
+| Surface | Contract | Durable/resumable | Default |
+| --- | --- | --- | --- |
+| Apply-triage update, resolution, private note | Durable pre-mutation and accepted-response checkpoints; stale checks; read-back ambiguity reconciliation | Yes | Available |
+| Direct ticket create/update/note/log-time/resolve-full | Conservative synchronous write-attempt/ambiguity result; no automatic retry | No | Blocked |
+| Alert create/resolve | Conservative synchronous write-attempt/ambiguity result; no automatic retry | No | Blocked |
+| Custom mutation | Bounded opaque mutation; no retry; ambiguous possible write remains unresolved | No | Blocked |
+| Reviewed read and operation-status tools | Bounded read contract | Not applicable | Available |
 
-Direct tools are intentionally synchronous and must not be described as durable continuation support. Before extending a direct write, add a canonical target, mutation-start checkpoint, read-back verification, and an owner-scoped ledger adapter.
+Use durable apply-triage as the primary production write path. Do not enable a synchronous mutation merely to bypass its missing durable adapter.
 
-## Limits and retention
+## Checkpoint lifecycle
 
-`SUPEROPS_CONTINUATION_ENABLED` and `SUPEROPS_DURABLE_RETRY_ENABLED` default to `false`; both must be true before durable alarm scheduling is enabled. A long rate-limit wait persists the exact stage, releases its lease, and schedules one Durable Object alarm per operation. The alarm input/state contains compact operation identifiers only; caller credentials, notes, ticket descriptions, conversations, and attachments are never stored.
+Every expected candidate has a ledger item before processing begins.
 
-- `SUPEROPS_OPERATION_RETENTION_SECONDS` controls terminal record expiry (default 86400).
-- `SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS` caps active operation lifetime (default 21600).
-- Expired terminal records may be removed. Non-terminal and possible-write records are retained so ambiguity evidence is not lost.
-- Maximum item/budget/retry/delay limits are configured by the `SUPEROPS_EXECUTION_*` variables in `wrangler.json`.
+- Update: `Validated` -> `WriteNotStarted` -> `WriteStarted` -> `FieldsUpdated` -> `Verifying` -> terminal.
+- Resolution: `Validated` -> `ResolutionValidated` -> `ResolutionWriteStarted` -> `ResolutionWriteSucceeded` -> `ResolutionVerified` -> optional note stages -> `Verifying` -> terminal.
+- Note: `NoteChecked` -> `NoteWriteStarted` -> `NoteAdded` -> `Verifying` -> terminal.
 
-## External validation
+Mutation-start state is acknowledged before the outbound mutation. Successful response state is acknowledged before later work; `NoteAdded` includes the created note ID. A crash at any possible-write boundary resumes with reconciliation, never a blind replay. Terminal items cannot reopen, write truth cannot move backwards, and stale lease tokens cannot commit.
 
-Run these from the repository root in an unrestricted PowerShell session before any manual commit or deployment:
+## Limits, waits, and retention
+
+Committed defaults keep `ENABLE_WRITE_TOOLS=false`, `ENABLE_CUSTOM_MUTATION=false`, `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=false`, `SUPEROPS_CONTINUATION_ENABLED=false`, and `SUPEROPS_DURABLE_RETRY_ENABLED=false`. The reviewed durable apply-triage tool is allowed by the central policy even while unreviewed synchronous writes are blocked.
+
+Long Retry-After waits use `SuperOpsContinuationWorkflow.step.sleepUntil`. Workflow parameters contain only operation ID, owner hash, eligibility time, and deterministic schedule identity. Credentials and customer content are not Workflow parameters. Durable Object alarms are used only for independent terminal-record expiry.
+
+Configured ceilings include 500 operation items, 512 KiB serialized record size, 25 seconds per invocation, 10 seconds per SuperOps request, 20 seconds cooperative CPU guard, 100 continuations, 10 durable throttle attempts, one hour cumulative durable delay, 15 minutes per durable wait, and 8 Workflow scheduling attempts with exponential backoff capped at 500 ms. Exhaustion produces a terminal classified result rather than an infinite loop.
+
+The `SUPEROPS_OPERATION_RETENTION_SECONDS` window starts when an operation first becomes terminal, so long-running work still retains its final, partial-write, and ambiguity evidence for the full configured period. Active work is bounded separately by `SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS`; non-terminal evidence is not deleted merely because the original creation-time window elapsed.
+
+## Local validation (no external resource change)
+
+Run from the repository root in an unrestricted PowerShell session:
 
 ```powershell
+npm ci
 npm test
 npm run test:continuation-harness
 npm run build
@@ -38,39 +51,52 @@ git diff --check
 git status --short
 git diff --stat
 git diff
-git log --oneline --decorate -20
-git rev-list --count origin/main..HEAD
+node -p "require('./node_modules/wrangler/package.json').version"
+node -e "const fs=require('fs');const Ajv=require('ajv');const schema=JSON.parse(fs.readFileSync('node_modules/wrangler/config-schema.json','utf8'));const config=JSON.parse(fs.readFileSync('wrangler.json','utf8'));if(!new Ajv({allErrors:true,strict:false}).validate(schema,config))process.exit(1)"
+npx wrangler deploy --dry-run --config wrangler.json
 ```
 
-If Wrangler is installed for the pinned project dependencies, perform only a local, non-deploying configuration check:
-
-```powershell
-npx wrangler --version
-npx wrangler dev --test-scheduled
-```
-
-Stop the local Worker after configuration/startup validation. Do not use `wrangler deploy`, `wrangler secret put`, or a live mutation as part of local validation.
+Expected pinned Wrangler version: `4.111.0`. Wrangler 4.111.0 requires Node.js 22 or newer for Wrangler validation commands; the MCP server runtime itself retains its declared Node.js 20-or-newer support. The schema check is non-deploying. `--dry-run` builds and validates without deployment but may create workspace-local `.wrangler` output; remove only artifacts created by that validation after inspecting their exact paths.
 
 ## Staging rollout
 
-These steps change Cloudflare resources and require explicit human approval:
+Every command in this section changes external Cloudflare resources and requires explicit human approval. Use an independently reviewed `wrangler.staging.json` with distinct staging Worker, Workflow, Durable Object migration/binding, routes, vars, and service binding; never point staging at the production ledger.
 
-1. Review the local commits and validation output, then manually approve a push.
-2. Select or create the staging Worker and configure the Durable Object binding/migration represented by `wrangler.json`.
-3. Configure the service binding named `SUPEROPS_CONTINUATION_SERVICE` to the staging Worker.
-4. Set `SUPEROPS_INTERNAL_CONTINUATION_TOKEN` through the Cloudflare secret UI or approved secret-management workflow; never place its value in source or command history.
-5. Deploy with both continuation flags set to `false`.
-6. Smoke-test `superops_status`, `superops_operations_get`, `superops_operations_results`, and one read-only SuperOps tool.
-7. Use mocked/staging-safe tests to exercise a low-budget stop, a short 429, and a long Retry-After durable wake. Confirm the resumed item is re-read and stale changes are skipped.
-8. Run one explicitly approved low-risk write. Verify update, resolution, and note mutation counts are each at most one for their item.
-9. Deliberately enable both flags only after the previous evidence is retained in the operation ledger, then monitor ambiguous, stale, partial-write, and scheduling-failure outcomes.
+```powershell
+# RESOURCE-CHANGING: stores/rotates the staging internal continuation secret.
+npx wrangler secret put SUPEROPS_INTERNAL_CONTINUATION_TOKEN --config wrangler.staging.json
 
-## Production rollout and rollback
+# RESOURCE-CHANGING: deploys the staging Worker, Workflow, bindings, and migrations.
+npx wrangler deploy --config wrangler.staging.json
+```
 
-For production, repeat the staging evidence review, restore conservative limits from the approved configuration, configure the production internal token by approved secret management, verify bindings, and deploy with both continuation flags disabled. Smoke-test read-only tools first. Enable continuation deliberately, run one controlled approved operation, and monitor operation results.
+Deploy initially with both continuation flags false. Smoke-test `/health`, `superops_status`, operation-status tools, and read-only lists. Run the fixed-seed harness outside the restricted sandbox. Then exercise an approved staging-safe low-budget stop, conclusive HTTP 429, GraphQL throttle, wait longer than one request lifetime, stale change during wait, duplicate Workflow delivery, and lost-response update/resolution/note. Confirm all expected items are accounted, no invocation exceeds its configured effective budget, and duplicate successful updates/resolutions/private notes are zero.
 
-For rollback, disable both continuation flags first. Do not delete the Durable Object or its records while retention evidence is required. Neutralise pending alarms by disabling continuation and let the persisted record remain visible; an already delivered alarm still enters the claim/checkpoint adapter and cannot directly replay a mutation. Revert the Worker deployment only after preserving operation IDs/results needed for investigation. Revert Git commits separately if required; no rollback step should erase a partial-write or ambiguity record before retention expiry.
+Only after retaining that evidence may an approved operator set staging `SUPEROPS_CONTINUATION_ENABLED=true` and `SUPEROPS_DURABLE_RETRY_ENABLED=true` and redeploy. Changing vars and redeploying are resource-changing actions.
 
-## ChatGPT direct mutation boundary
+## Production rollout
 
-The ChatGPT direct route derives its default blocklist from the registered tool inventory. Only `superops_tickets_apply_triage_plan` is a reviewed checkpointed mutation workflow. Direct ticket writes (`create`, `update`, `resolve_full`, `add_note`, `log_time`), alert `create`/`resolve`, and `superops_custom_mutation` are synchronous and blocked by default. Read-only tools and `superops_operations_get` / `superops_operations_results` remain available. `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=true` is an explicit disabled-by-default override and must be reviewed before use.
+The following commands change production resources and require a separate explicit approval:
+
+```powershell
+# RESOURCE-CHANGING: stores/rotates the production internal continuation secret.
+npx wrangler secret put SUPEROPS_INTERNAL_CONTINUATION_TOKEN --config wrangler.json
+
+# RESOURCE-CHANGING: deploys the production Worker, Workflow, bindings, and migrations.
+npx wrangler deploy --config wrangler.json
+```
+
+First deploy with both continuation flags false. Smoke-test only read and status tools. Review staging evidence and pending operation inventory. Enabling continuation requires an approved config change plus another approved deploy. Keep synchronous write and custom mutation flags false; use approved fixed-candidate apply-triage for production writes.
+
+## Rollback with pending Workflows and alarms
+
+1. RESOURCE-CHANGING: set both continuation flags false and deploy the configuration.
+2. Do not remove the internal route, token, self service binding, Workflow class/binding, or Durable Object while Workflow instances may still deliver.
+3. Inventory every non-terminal operation ID and retain status/results. A pending Workflow delivery may still arrive, but it must pass token, owner, lease, stale, checkpoint, verification, and dedupe guards.
+4. Allow pending operations to reach a reviewed terminal result or investigate them manually. Do not fabricate completion and do not delete ambiguity evidence.
+5. Keep cleanup-only Durable Object alarms and the ledger binding until retained terminal records expire.
+6. Only after no pending operation depends on the old code may an approved operator deploy a previous Worker version. Git reversion and Cloudflare deployment are separate actions.
+
+## External validation still required
+
+A restricted environment may deny Vitest/Vite/Wrangler esbuild child processes with `spawn EPERM`. That is an environment limitation, not a passing test result. Run the full tests, dedicated harness, and Wrangler dry-run in an unrestricted environment before staging. No live SuperOps mutation is part of local validation.

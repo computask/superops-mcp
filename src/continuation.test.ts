@@ -424,4 +424,59 @@ describe("durable continuation runner", () => {
 
     expect(resumedItems).toBe(1);
   });
+
+  it("terminates repeated durable throttling as RateLimitExceeded at the configured ceiling", async () => {
+    const ownerHash = stableHash("rate-limit-owner");
+    let attempts = 0;
+    const adapter: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      estimateItemSubrequests: () => 1,
+      async processItem() {
+        attempts += 1;
+        countedRequest("write");
+        return {
+          stage: "RateLimitedRescheduled",
+          outcome: "SuperOpsRateLimitRescheduled",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          reliableResponseReceived: true,
+          observedMutationResult: "Rejected",
+          partialWrite: false,
+          rateLimited: true,
+          nextEligibleTime: new Date(Date.now() + 1).toISOString(),
+          retryCount: attempts - 1,
+          errorClass: "SuperOpsRateLimit",
+        };
+      },
+    };
+
+    await runWithOperationStore({}, async () => {
+      await getOperationStore().put(ledgerRecord({
+        operationId: "op-rate-exhausted", ownerHash, itemKeys: ["ticket-rate"],
+      }));
+      for (let invocation = 0; invocation < 3; invocation += 1) {
+        await runWithExecutionConfig({
+          SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_ATTEMPTS: "2",
+          SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_DURATION_MS: "60000",
+          SUPEROPS_EXECUTION_MAX_DURABLE_SINGLE_WAIT_MS: "10",
+        }, async () => runWithExecutionContext("test_batch_tool", () =>
+          runOperationContinuation({
+            operationId: "op-rate-exhausted", ownerHash, adapter,
+            leaseOwner: `rate-${invocation}`, now: "2999-01-01T00:00:00.000Z",
+          })
+        ));
+      }
+      await expect(getOperationStore().get("op-rate-exhausted")).resolves.toMatchObject({
+        state: "CompletedWithFailures",
+        itemStates: {
+          "ticket-rate": {
+            stage: "RateLimitExceeded", errorClass: "RateLimitExceeded",
+            writeAttempted: true, writeMayHaveSucceeded: true,
+            rateLimit: { attempts: 3, firstThrottledAt: expect.any(String), actualDelayMs: expect.any(Number) },
+          },
+        },
+      });
+    });
+    expect(attempts).toBe(3);
+  });
 });

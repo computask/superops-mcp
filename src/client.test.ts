@@ -298,4 +298,35 @@ describe("SuperOpsClient rate-limit handling", () => {
     ).rejects.toMatchObject({ name: "SuperOpsHttpError", retryAfter: 60 });
     expect(delayedFetch).toHaveBeenCalledTimes(1);
   });
+
+  it("aborts an actually hung SuperOps request and retries only within the read bound", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn((_url: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          signal?.addEventListener("abort", () => {
+            reject(Object.assign(new Error("aborted by request timeout"), { name: "AbortError" }));
+          }, { once: true });
+        })
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new SuperOpsClient({ apiToken: "secret-token", subdomain: "example" });
+      const request = runWithExecutionConfig(
+        {
+          SUPEROPS_EXECUTION_REQUEST_TIMEOUT_MS: "5",
+          SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "1",
+          SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0",
+        },
+        () => runWithExecutionContext("superops_custom_query", () => client.query("query Hung { ok }"))
+      );
+      const rejection = expect(request).rejects.toMatchObject({ name: "SuperOpsTimeoutError" });
+      await vi.advanceTimersByTimeAsync(5);
+      await rejection;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect((fetchMock.mock.calls[0][1] as RequestInit).signal).toBeInstanceOf(AbortSignal);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

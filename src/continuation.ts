@@ -1,6 +1,9 @@
 import {
   ExecutionBudgetExceededError,
   ExecutionTimeoutBudgetExceededError,
+  ExecutionCpuBudgetExceededError,
+  classifyCloudflarePlatformLimit,
+  getExecutionConfig,
   hasExecutionBudgetFor,
   markExecutionItem,
   withExecutionItem,
@@ -35,6 +38,8 @@ export interface ContinuationItemOutcome {
   result?: unknown;
   rateLimited?: boolean;
   errorClass?: OperationCompleteItemParams["patch"]["errorClass"];
+  reliableResponseReceived?: boolean;
+  observedMutationResult?: "Accepted" | "Rejected" | "VerifiedApplied" | "Ambiguous";
 }
 
 export interface OperationContinuationAdapter {
@@ -65,7 +70,7 @@ export interface RunOperationContinuationResult {
   view: Record<string, unknown>;
 }
 
-const DEFAULT_LEASE_MS = 60_000;
+const DEFAULT_LEASE_MS = 180_000;
 
 export async function runOperationContinuation(
   params: RunOperationContinuationParams
@@ -84,12 +89,49 @@ export async function runOperationContinuation(
     );
   }
 
+  const continuationConfig = getExecutionConfig();
+  if (record.continuationCount >= continuationConfig.maxContinuationCount && record.pendingItems.length > 0) {
+    record = await store.update(params.operationId, params.ownerHash, (current) => {
+      const next = { ...current, itemStates: { ...current.itemStates } };
+      for (const itemKey of current.pendingItems) {
+        const item = current.itemStates[itemKey];
+        if (!item) continue;
+        const possibleWrite = item.writeMayHaveSucceeded && item.observedMutationResult !== "Rejected";
+        next.itemStates[itemKey] = {
+          ...item,
+          stage: possibleWrite ? "AmbiguousWriteUnresolved" : "FailedBeforeWrite",
+          outcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : "ContinuationLimitExceeded",
+          ambiguousWrite: possibleWrite || item.ambiguousWrite,
+          partialWrite: possibleWrite || item.partialWrite,
+          errorClass: "ContinuationFailure",
+          failureReason: "Maximum continuation count reached.",
+          lease: undefined,
+        };
+      }
+      next.state = "CompletedWithFailures";
+      next.nextEligibleTime = undefined;
+      next.currentLease = undefined;
+      next.terminalFailureReason = "Maximum continuation count reached.";
+      return next;
+    });
+    return continuationResult(record, false, "ContinuationLimitExceeded");
+  }
+
   const now = params.now ?? new Date().toISOString();
   if (record.nextEligibleTime && record.nextEligibleTime > now) {
     return continuationResult(record, true, "NotEligibleYet");
   }
 
+  let processedThisInvocation = 0;
   for (;;) {
+    if (processedThisInvocation >= getExecutionConfig().maxItemsPerBatch) {
+      record = await store.scheduleContinuation({
+        operationId: params.operationId,
+        ownerHash: params.ownerHash,
+        reason: "ContinuationRequiredMaxItemsPerBatch",
+      });
+      return continuationResult(record, true, "ContinuationRequiredMaxItemsPerBatch");
+    }
     if (!hasExecutionBudgetFor(2)) {
       record = await store.scheduleContinuation({
         operationId: params.operationId,
@@ -122,13 +164,19 @@ export async function runOperationContinuation(
         claim.item.writeMayHaveSucceeded === true;
       const noteWrite = claim.item.stage === "NoteWriteStarted" ||
         claim.item.stage === "NoteWriteAmbiguous";
+      const resolutionWrite = claim.item.stage === "ResolutionWriteStarted" ||
+        claim.item.stage === "ResolutionWriteAmbiguous";
       const mutationBoundary = claim.item.stage === "WriteStarted" ||
-        claim.item.stage === "WriteAmbiguous" || noteWrite;
+        claim.item.stage === "WriteAmbiguous" || resolutionWrite || noteWrite;
       // Only an in-flight mutation boundary becomes explicitly ambiguous.
       // A later durable stage (for example FieldsUpdated) already records a
       // reliable response and must retain that exact progress instead.
       const stage = mutationBoundary
-        ? noteWrite ? "NoteWriteAmbiguous" : "WriteAmbiguous"
+        ? noteWrite
+          ? "NoteWriteAmbiguous"
+          : resolutionWrite
+            ? "ResolutionWriteAmbiguous"
+            : "WriteAmbiguous"
         : hasPriorWrite ? claim.item.stage : "Rescheduled";
       record = await store.completeItem({
         operationId: params.operationId,
@@ -144,7 +192,7 @@ export async function runOperationContinuation(
           writeMayHaveSucceeded: claim.item.writeMayHaveSucceeded,
           partialWrite: claim.item.partialWrite === true,
           verificationState: "Pending",
-          errorClass: mutationBoundary ? "CloudflareSubrequestBudget" : undefined,
+          errorClass: mutationBoundary ? "CloudflareConfiguredBudgetReached" : undefined,
           failureReason: mutationBoundary
             ? "Execution budget was insufficient to reconcile a possible write."
             : undefined,
@@ -186,65 +234,125 @@ export async function runOperationContinuation(
           }),
         })
       );
+      const config = getExecutionConfig();
+      const priorRate = claim.item.rateLimit;
+      const rateAttempts = outcome.rateLimited ? (priorRate?.attempts ?? 0) + 1 : 0;
+      const firstThrottledAt = priorRate?.firstThrottledAt ?? (outcome.rateLimited ? new Date().toISOString() : undefined);
+      const rateObservedAtMs = Date.now();
+      const rateObservedAt = new Date(rateObservedAtMs).toISOString();
+      const previousActualDelayMs = priorRate?.scheduledAt
+        ? Math.max(0, rateObservedAtMs - Date.parse(priorRate.scheduledAt))
+        : priorRate?.actualDelayMs;
+      const requestedDelayMs = outcome.nextEligibleTime
+        ? Math.max(0, Date.parse(outcome.nextEligibleTime) - rateObservedAtMs)
+        : 0;
+      const cappedDelayMs = Math.min(requestedDelayMs, config.maxDurableSingleWaitMs);
+      const totalRetryDurationMs = (priorRate?.totalRetryDurationMs ?? 0) + cappedDelayMs;
+      const durableRetryExhausted = outcome.rateLimited && (
+        rateAttempts > config.maxDurableRetryAttempts ||
+        totalRetryDurationMs > config.maxDurableRetryDurationMs ||
+        record.continuationCount >= config.maxContinuationCount
+      );
+      const effectiveOutcome: ContinuationItemOutcome = durableRetryExhausted
+        ? {
+            ...outcome,
+            stage: "RateLimitExceeded",
+            outcome: "RateLimitExceeded",
+            nextEligibleTime: undefined,
+            rateLimited: false,
+            errorClass: "RateLimitExceeded",
+            failureReason: "Durable rate-limit retry ceiling was reached.",
+          }
+        : outcome;
+      if (outcome.rateLimited && outcome.nextEligibleTime && cappedDelayMs !== requestedDelayMs) {
+        effectiveOutcome.nextEligibleTime = new Date(Date.now() + cappedDelayMs).toISOString();
+      }
       record = await store.completeItem({
         operationId: params.operationId,
         ownerHash: params.ownerHash,
         itemKey: claim.itemKey,
         leaseId: claim.lease.leaseId,
         patch: {
-          stage: outcome.stage,
-          outcome: outcome.outcome,
-          writeAttempted: outcome.writeAttempted,
-          writeMayHaveSucceeded: outcome.writeMayHaveSucceeded,
-          partialWrite: outcome.partialWrite,
-          verificationState: outcome.verified
+          stage: effectiveOutcome.stage,
+          outcome: effectiveOutcome.outcome,
+          writeAttempted: effectiveOutcome.writeAttempted,
+          writeMayHaveSucceeded: effectiveOutcome.writeMayHaveSucceeded,
+          partialWrite: effectiveOutcome.partialWrite,
+          verificationState: effectiveOutcome.verified
             ? "Verified"
-            : outcome.verificationFailed
+            : effectiveOutcome.verificationFailed
               ? "Failed"
               : undefined,
-          retryCount: outcome.retryCount,
-          nextEligibleTime: outcome.nextEligibleTime,
-          failureReason: outcome.failureReason,
-          errorClass: outcome.errorClass,
+          retryCount: effectiveOutcome.retryCount,
+          nextEligibleTime: effectiveOutcome.nextEligibleTime,
+          failureReason: effectiveOutcome.failureReason,
+          errorClass: effectiveOutcome.errorClass,
+          reliableResponseReceived: effectiveOutcome.reliableResponseReceived,
+          observedMutationResult: effectiveOutcome.observedMutationResult,
           rateLimit: outcome.rateLimited
             ? {
-                attempts: Math.max(1, outcome.retryCount ?? 1),
-                retryAfterSupplied: Boolean(outcome.nextEligibleTime),
-                continuedInAnotherInvocation: outcome.stage === "RateLimitedRescheduled",
-                writeAttempted: outcome.writeAttempted,
-                finalResult: outcome.outcome,
+                attempts: rateAttempts,
+                parsedDelayMs: requestedDelayMs,
+                cappedDelayMs,
+                appliedDelayMs: cappedDelayMs,
+                actualDelayMs: previousActualDelayMs,
+                scheduledAt: rateObservedAt,
+                firstThrottledAt,
+                totalRetryDurationMs,
+                totalElapsedMs: firstThrottledAt ? rateObservedAtMs - Date.parse(firstThrottledAt) : undefined,
+                nextEligibleAt: effectiveOutcome.nextEligibleTime,
+                retryAfterSupplied: Boolean(effectiveOutcome.nextEligibleTime),
+                continuedInAnotherInvocation: effectiveOutcome.stage === "RateLimitedRescheduled",
+                writeAttempted: effectiveOutcome.writeAttempted,
+                finalResult: effectiveOutcome.outcome,
               }
-            : undefined,
+            : priorRate
+              ? {
+                  ...priorRate,
+                  actualDelayMs: previousActualDelayMs,
+                  totalElapsedMs: priorRate.firstThrottledAt
+                    ? rateObservedAtMs - Date.parse(priorRate.firstThrottledAt)
+                    : priorRate.totalElapsedMs,
+                  continuedInAnotherInvocation: true,
+                  finalResult: effectiveOutcome.outcome,
+                }
+              : undefined,
         },
-        result: outcome.result ?? {
+        result: effectiveOutcome.result ?? {
           itemKey: claim.itemKey,
-          finalOutcome: outcome.outcome,
-          writeAttempted: outcome.writeAttempted,
-          partialWrite: outcome.partialWrite,
-          verified: Boolean(outcome.verified),
+          finalOutcome: effectiveOutcome.outcome,
+          writeAttempted: effectiveOutcome.writeAttempted,
+          partialWrite: effectiveOutcome.partialWrite,
+          verified: Boolean(effectiveOutcome.verified),
         },
       });
+      processedThisInvocation += 1;
       markExecutionItem({
-        completed: outcome.stage.startsWith("Completed") || outcome.stage === "Completed",
+        completed: effectiveOutcome.stage.startsWith("Completed") || effectiveOutcome.stage === "Completed" ||
+          effectiveOutcome.stage === "RateLimitExceeded",
         remainingItems: record.pendingItems.length + record.unattemptedItems.length,
-        partialWrite: outcome.partialWrite,
-        stale: outcome.stale,
-        verificationFailure: outcome.verificationFailed,
+        partialWrite: effectiveOutcome.partialWrite,
+        stale: effectiveOutcome.stale,
+        verificationFailure: effectiveOutcome.verificationFailed,
       });
 
-      if (outcome.stage === "RateLimitedRescheduled" || outcome.nextEligibleTime) {
+      if (effectiveOutcome.stage === "RateLimitedRescheduled" || effectiveOutcome.nextEligibleTime) {
         record = await store.scheduleContinuation({
           operationId: params.operationId,
           ownerHash: params.ownerHash,
-          reason: outcome.outcome,
-          nextEligibleTime: outcome.nextEligibleTime,
+          reason: effectiveOutcome.outcome,
+          nextEligibleTime: effectiveOutcome.nextEligibleTime,
         });
-        return continuationResult(record, true, outcome.outcome);
+        return continuationResult(record, true, effectiveOutcome.outcome);
       }
     } catch (error) {
+      const caughtError = error instanceof Error ? error : new Error(String(error));
+      const platformLimit = classifyCloudflarePlatformLimit(caughtError);
       if (
-        error instanceof ExecutionBudgetExceededError ||
-        error instanceof ExecutionTimeoutBudgetExceededError
+        caughtError instanceof ExecutionBudgetExceededError ||
+        caughtError instanceof ExecutionTimeoutBudgetExceededError ||
+        caughtError instanceof ExecutionCpuBudgetExceededError ||
+        platformLimit !== undefined
       ) {
         // The adapter may have durably crossed a mutation-start boundary before
         // a later read or write consumed the last available subrequest. Read
@@ -252,36 +360,51 @@ export async function runOperationContinuation(
         // that item as an ordinary reschedule would both erase the checkpoint
         // and permit a duplicate write on the next invocation.
         const currentItem = (await store.get(params.operationId))?.itemStates[claim.itemKey];
-        const possibleWrite = currentItem?.writeAttempted === true ||
+        const hasPriorWrite = currentItem?.writeAttempted === true ||
           currentItem?.writeMayHaveSucceeded === true;
+        const possibleWrite = currentItem?.writeMayHaveSucceeded === true &&
+          currentItem.observedMutationResult !== "Rejected";
         const noteWrite = currentItem?.stage === "NoteWriteStarted" ||
           currentItem?.stage === "NoteWriteAmbiguous";
+        const resolutionWrite = currentItem?.stage === "ResolutionWriteStarted" ||
+          currentItem?.stage === "ResolutionWriteAmbiguous";
+        const mutationBoundary = currentItem?.stage === "WriteStarted" ||
+          currentItem?.stage === "WriteAmbiguous" || resolutionWrite || noteWrite;
+        const preservedStage = currentItem?.stage ?? "Rescheduled";
         record = await store.completeItem({
           operationId: params.operationId,
           ownerHash: params.ownerHash,
           itemKey: claim.itemKey,
           leaseId: claim.lease.leaseId,
           patch: {
-            stage: possibleWrite
-              ? noteWrite ? "NoteWriteAmbiguous" : "WriteAmbiguous"
-              : "Rescheduled",
-            outcome: possibleWrite
+            stage: mutationBoundary
+              ? noteWrite
+                ? "NoteWriteAmbiguous"
+                : resolutionWrite
+                  ? "ResolutionWriteAmbiguous"
+                  : "WriteAmbiguous"
+              : hasPriorWrite ? preservedStage : "Rescheduled",
+            outcome: mutationBoundary
               ? "AmbiguousWriteRequiresVerification"
-              : error instanceof ExecutionBudgetExceededError
+              : caughtError instanceof ExecutionBudgetExceededError
                 ? "CloudflareSubrequestBudgetReached"
-                : "CloudflareExecutionTimeout",
-            writeAttempted: possibleWrite || currentItem?.writeAttempted === true,
-            writeMayHaveSucceeded: possibleWrite || currentItem?.writeMayHaveSucceeded === true,
+                : caughtError instanceof ExecutionCpuBudgetExceededError
+                  ? "CloudflareCpuLimit"
+                  : platformLimit ?? "CloudflareExecutionTimeout",
+            writeAttempted: currentItem?.writeAttempted === true,
+            writeMayHaveSucceeded: currentItem?.writeMayHaveSucceeded === true,
             partialWrite: possibleWrite || currentItem?.partialWrite === true,
             verificationState: "Pending",
-            errorClass: error instanceof ExecutionBudgetExceededError
-              ? "CloudflareSubrequestBudget"
-              : "CloudflareExecutionTimeout",
-            failureReason: possibleWrite
-              ? `Execution stopped after a mutation-start checkpoint: ${error.message}`
-              : error.message,
+            errorClass: caughtError instanceof ExecutionBudgetExceededError
+              ? "CloudflareConfiguredBudgetReached"
+              : caughtError instanceof ExecutionCpuBudgetExceededError
+                ? "CloudflareCpuLimit"
+                : platformLimit ?? "CloudflareExecutionTimeout",
+            failureReason: mutationBoundary
+              ? `Execution stopped after a mutation-start checkpoint: ${caughtError.message}`
+              : caughtError.message,
           },
-          result: possibleWrite
+          result: mutationBoundary
             ? {
                 itemKey: claim.itemKey,
                 finalOutcome: "AmbiguousWriteRequiresVerification",
@@ -293,9 +416,9 @@ export async function runOperationContinuation(
         record = await store.scheduleContinuation({
           operationId: params.operationId,
           ownerHash: params.ownerHash,
-          reason: error.name,
+          reason: caughtError.name,
         });
-        return continuationResult(record, true, error.name);
+        return continuationResult(record, true, caughtError.name);
       }
       throw error;
     }

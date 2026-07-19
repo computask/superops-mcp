@@ -1,7 +1,7 @@
 {
   "name": "superops-mcp",
   "main": "src/worker.ts",
-  "compatibility_date": "2026-02-01",
+  "compatibility_date": "2026-07-18",
   "compatibility_flags": [
     "nodejs_compat",
     "global_fetch_strictly_public"
@@ -21,15 +21,15 @@
     "SUPEROPS_REGION": "us",
     "LOG_LEVEL": "warn",
     "MCP_ENABLED": "true",
-    "ENABLE_WRITE_TOOLS": "true",
-    "ENABLE_CUSTOM_MUTATION": "true",
+    "ENABLE_WRITE_TOOLS": "false",
+    "ENABLE_CUSTOM_MUTATION": "false",
     "CHATGPT_MCP_HOST": "superops-mcp-chatgpt-direct.taskgroup.co.uk",
     "CHATGPT_MCP_RESOURCE": "https://superops-mcp-chatgpt-direct.taskgroup.co.uk/mcp",
     "CHATGPT_OAUTH_SCOPES": "superops.read",
     "CHATGPT_AUTH_ALLOWED_EMAIL": "sam@computask.co.uk",
     "CHATGPT_AUTH_ACCESS_ISSUER": "https://super-bar-5ae4.cloudflareaccess.com",
     "CHATGPT_AUTH_ACCESS_AUD": "9e9e3c95cfb18bbfacfd7e8cc0ceb1a971fc61a382d4c839780f32f18cde1bf2",
-    "CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS": "true",
+    "CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS": "false",
     "SUPEROPS_EXECUTION_SUBREQUEST_BUDGET": "45",
     "SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN": "8",
     "SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH": "25",
@@ -41,12 +41,19 @@
     "SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO": "0.2",
     "SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS": "5000",
     "SUPEROPS_EXECUTION_MAX_DURATION_MS": "25000",
+    "SUPEROPS_EXECUTION_REQUEST_TIMEOUT_MS": "10000",
     "SUPEROPS_EXECUTION_VERIFICATION_MODE": "verifyReads",
     "SUPEROPS_OPERATION_RETENTION_SECONDS": "86400",
     "SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS": "21600",
     "SUPEROPS_EXECUTION_CONCURRENCY": "1",
     "SUPEROPS_CONTINUATION_ENABLED": "false",
-    "SUPEROPS_DURABLE_RETRY_ENABLED": "false"
+    "SUPEROPS_DURABLE_RETRY_ENABLED": "false",
+    "SUPEROPS_EXECUTION_CPU_GUARD_MS": "20000",
+    "SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT": "100",
+    "SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_ATTEMPTS": "10",
+    "SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_DURATION_MS": "3600000",
+    "SUPEROPS_EXECUTION_MAX_DURABLE_SINGLE_WAIT_MS": "900000",
+    "SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS": "8"
   },
   "durable_objects": {
     "bindings": [
@@ -66,6 +73,14 @@
     {
       "binding": "SUPEROPS_CONTINUATION_SERVICE",
       "service": "superops-mcp"
+    }
+  ],
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "workflows": [
+    {
+      "name": "superops-triage-continuation",
+      "binding": "SUPEROPS_CONTINUATION_WORKFLOW",
+      "class_name": "SuperOpsContinuationWorkflow"
     }
   ]
 }

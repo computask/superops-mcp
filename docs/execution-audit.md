@@ -1,138 +1,112 @@
 # SuperOps MCP Execution Safety Verification
 
-Verification date: 2026-07-18.
+Verification date: 2026-07-18. Final conformance repair cycle 1.
 
-## Root Cause
+## Root cause and repaired boundary
 
-The original `superops_tickets_apply_triage_plan` failure was consistent with too many SuperOps GraphQL POSTs inside one Cloudflare Worker invocation. A single ticket could consume calls for display-id lookup, safe ticket read, metadata validation, duplicate-note read, mutation, fallback mutation, and verification. The previous implementation did not proactively stop before the invocation-level subrequest ceiling and did not persist or return a complete per-ticket ledger after a mid-batch failure.
+The original multi-ticket failure was consistent with exhausting a Cloudflare invocation subrequest budget after some SuperOps mutations. Sleeping in that invocation cannot reset its limits. Upstream HTTP 429/GraphQL throttling is separate and may require a wait longer than one request lifetime.
 
-Waiting inside the same Worker invocation would not reset the Cloudflare invocation subrequest limit. SuperOps HTTP/GraphQL throttling is a separate upstream condition and is now classified separately in the client retry path.
+The repaired production path makes the complete fixed-candidate operation durable before the first SuperOps call, stops before unsafe units of work, checkpoints mutation start before every write, checkpoints reliable success immediately, and resumes only from the authoritative item stage under an owner-scoped lease. Possible successful writes are read back and are never blindly replayed.
 
-## Implementation Matrix
+## Implementation status
 
-| Requirement | Implemented | Partial | Missing | Evidence | Test evidence | Risk | Recommended action |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Complete outbound-call inventory | Yes |  |  | This document, `rg fetch/client.query/client.mutate` scan | Manual scan | Inventory can drift as tools are added | Keep this doc updated with every new tool |
-| Central SuperOps outbound instrumentation | Yes |  |  | `src/client.ts`, `src/execution.ts` | `src/client.test.ts` | Calls through mocked domain clients are not counted in unit tests | Prefer integration tests for accounting |
-| Internal Durable Object fetch accounting | Yes |  |  | `src/operation-store.ts`, `recordTypedSubrequestStart(...allowSafetyMargin)` | Typecheck; worker status tests use memory store | DO calls consume reserved margin and can still fail near a hard platform limit | Keep safety margin conservative |
-| Configurable subrequest budget and safety margin | Yes |  |  | `src/execution.ts`, `wrangler.json` vars | `src/client.test.ts`, `src/domains/tickets.test.ts` | Defaults assume current Workers limits indirectly | Tune in staging before production writes |
-| Per-operation and per-item accounting | Yes |  |  | `executionDiagnostics()`, `withExecutionItem()` | Client and triage tests | Some non-ticket tools do not set item keys | Add item keys to future batch paths |
-| Structured budget-exhaustion outcomes | Yes |  |  | `ExecutionBudgetExceededError`, triage result mapping | Triage budget test | Direct simple tools still return standard errors | Accept for single-call tools |
-| Bounded ticket pagination | Yes |  |  | `src/domains/ticket-reporting.ts`, ticket list pages | Existing reporting tests | `tickets_list` is a single requested page | Keep max-page caps low |
-| Bounded alert verification | Yes |  |  | `src/domains/alerts.ts` sequential verification | Alert tests | Batch resolve can partially mutate upstream before verification | Return verification diagnostics |
-| Complete per-ticket triage results after stop | Yes |  |  | `src/domains/tickets.ts` apply plan result assembly | Triage budget/partial-write tests | Automatic scheduling disabled by default | Use operation status tools to inspect partials |
-| Explicit unprocessed outcomes | Yes |  |  | `NotAttemptedExecutionStopped`, durable unattempted items | Triage budget test | None known for apply plan | Extend same model to future batch writes |
-| Honest `partialWrite` reporting | Yes for triage and resolve-full | Partial for all writes |  | `src/domains/tickets.ts` | Existing partial-write tests | Direct one-off create/update/note tools can still fail after mutation without durable stage detail | Move direct writes into common mutation result wrapper |
-| HTTP 429 detection and `Retry-After` parsing | Yes |  |  | `src/client.ts`, `src/continuation.ts` | `src/client.test.ts`, `src/continuation.test.ts` | Immediate waits are capped; durable wake is apply-triage only | Keep maximum delay/lifetime caps conservative |
-| GraphQL throttling detection | Yes |  |  | `isGraphQLRateLimit()` in `src/client.ts` | `src/client.test.ts` | Message matching can miss vendor-specific shapes | Add cases when real SuperOps shapes are observed |
-| Read retry safety | Yes |  |  | `SuperOpsClient.query()` read retry loop | `src/client.test.ts` | Pagination page retry is central per request, not durable per page | Add per-page resume for very deep reads if needed |
-| Write retry safety | Yes by restraint | Partial |  | Writes default to one attempt; no blind retry | `src/client.test.ts` | Ambiguous write resolution is implemented in triage paths but not central for all writes | Do not raise write retries without idempotency/verification wrapper |
-| Durable operation state | Yes for triage | Partial for whole-MCP write integration |  | `src/operation-store.ts`, `wrangler.json`, triage persistence | `src/operation-store.test.ts`, `src/continuation.test.ts`, `src/domains/tickets.test.ts`, worker status test | Apply-triage persists approved action snapshots; other write tools still use immediate contracts | Integrate one write tool at a time with a verified adapter |
-| Fresh-invocation continuation | Yes for apply-triage when enabled |  |  | `src/continuation.ts`, `src/continuation-scheduler.ts`, `src/operation-store.ts`, `src/worker.ts` | continuation, operation-store, and triage tests | Durable Object alarm delivery is at-least-once; state/claim adapter remains authoritative | Keep both continuation flags disabled until staging evidence exists |
-| Operation status tools | Yes |  |  | `superops_operations_get`, `superops_operations_results` | `src/worker.test.ts` | Read-only only; no resume/cancel | Add resume only when item processor is safe |
-| Load/fault harness | Yes |  | Fixed-seed 250-item real apply-triage adapter harness; mocked transport only | `src/continuation-mixed-fault-harness.test.ts` | Update, resolution, private note, validation/stale, 429 durable wait, 5xx/network ambiguity, lost responses, owner/lease, store/scheduler and budget faults | No live SuperOps calls | Run `npm run test:continuation-harness` before enabling production continuation |
+| Requirement | Production implementation | Direct evidence |
+| --- | --- | --- |
+| Configured subrequest/time/CPU guard | `src/execution.ts` separates configured budget, request timeout, cooperative CPU guard, and recognized Cloudflare hard-limit classes. | `src/execution.test.ts`, continuation tests |
+| Real request timeout and bounded reads | Every `SuperOpsClient` request uses `AbortController`; timeout is a retryable read-network class within attempt/duration ceilings. Writes remain one attempt. | `src/client.test.ts` |
+| Complete durable operation before work | Public apply-triage persists all expected items and zero/initial results before it enters the real adapter; store failure returns no-write truth. | ticket store-failure and first-checkpoint tests |
+| Mutation checkpoints | Update, resolution, and note use acknowledged start/success stages; created note ID is checkpointed before later work. | ticket and mixed-fault tests |
+| Ambiguity and fallback | Possible-write state is monotonic; accepted lost responses are read back; resolution fallback requires absent target plus unchanged `updatedTime`. | accepted-resolution-lost-response and ambiguity tests |
+| Durable wait | Pinned Wrangler `4.111.0` Workflow binding uses `step.sleepUntil`; DO alarms are retention cleanup only. | workflow and operation-store tests |
+| Retry ceilings | Continuation, durable attempt/duration/single-wait, scheduling, request, and lifetime ceilings terminalize honestly. | continuation and store tests |
+| Terminal retention | The configured retention duration restarts when an active operation first becomes terminal; creation-time expiry never erases newly terminal evidence. | memory and Durable Object operation-store tests |
+| Ledger safety | 500-item and 512-KiB limits, exact item coverage, shape/timestamp validation, forbidden-content scan, redacted compact results. | operation-store tests |
+| Default tool policy | Unreviewed synchronous writes, custom mutation, and direct-route mutations are false by default; durable apply-triage, reads, and status remain. Guards precede credential/client initialization. | audit/worker tests and `wrangler.json` |
+| Fixed-seed acceptance harness | Exactly 250 items through public apply-triage and real resume adapter with mocked SuperOps transport only. | `src/continuation-mixed-fault-harness.test.ts` |
 
-## Outbound Call Inventory
+## Outbound call inventory
 
-All SuperOps API calls use `SuperOpsClient` and one GraphQL POST endpoint: `https://api.superops.ai/msp` or `https://euapi.superops.ai/msp`. The operation ledger uses a Cloudflare Durable Object binding when configured; that internal `stub.fetch()` is now counted as a custom subrequest.
+All standard SuperOps traffic is one GraphQL POST per client attempt to the US or EU `/msp` endpoint. A “read retries” worst case is the configured read-attempt ceiling (default 3 total attempts). Writes are one outbound attempt unless an adapter has durable, conclusive evidence that the previous write was rejected.
 
-| Tool / operation | Source | GraphQL operation or action | Expected calls | Worst case | Pagination / retry / verification | Partial write risk | Resumable |
-| --- | --- | --- | ---: | ---: | --- | --- | --- |
-| `superops_status` | `src/mcp-server.ts` | none | 0 | 0 | none | No | N/A |
-| `superops_test_connection` | `src/mcp-server.ts` | simple query | 1 | read retries | central read retry | No | No |
-| `superops_operations_get` | `src/mcp-server.ts` | Durable Object get | 0 memory / 1 DO | 1 | no retry | No | N/A |
-| `superops_operations_results` | `src/mcp-server.ts` | Durable Object list | 0 memory / 1 DO | 1 | no retry | No | N/A |
-| `superops_clients_list` | `src/domains/clients.ts` | `getClientList` | 1 | read retries | single page | No | No |
-| `superops_clients_get` | `src/domains/clients.ts` | `getClient` | 1 | read retries | none | No | No |
-| `superops_clients_search` | `src/domains/clients.ts` | `getClientList` | 1 | read retries | local filter | No | No |
-| `superops_assets_list` | `src/domains/assets.ts` | `getAssetList` | 1 | read retries | single page | No | No |
-| `superops_assets_get` | `src/domains/assets.ts` | `getAsset` | 1 | read retries | none | No | No |
-| `superops_assets_software` | `src/domains/assets.ts` | software list | 1 | read retries | single page | No | No |
-| `superops_assets_patches` | `src/domains/assets.ts` | patch details | 1 | read retries | single page | No | No |
-| `superops_technicians_list` | `src/domains/technicians.ts` | `getTechnicianList` | 1 | read retries | single page | No | No |
-| `superops_technicians_get` | `src/domains/technicians.ts` | `getTechnicianList` | 1 | read retries | first page of 500 | No | No |
-| `superops_technicians_groups` | `src/domains/technicians.ts` | `getTechnicianGroupList` | 1 | read retries | none | No | No |
-| `superops_alerts_list` | `src/domains/alerts.ts` | `getAlertList` | 1 | read retries | requested page | No | No |
-| `superops_alerts_get` | `src/domains/alerts.ts` | `getAlertList` | 1 | 12 plus retries | exact lookup plus capped fallback scan | No | No |
-| `superops_alerts_for_asset` | `src/domains/alerts.ts` | `getAlertsForAsset` | 1 | 2 plus retries | fallback without status condition | No | No |
-| `superops_alerts_resolve` | `src/domains/alerts.ts` | `resolveAlerts`, `getAlertList` | 1 + verification | 1 + 12 per alert plus retries | sequential verification | Yes | No |
-| `superops_alerts_create` | `src/domains/alerts.ts` | `createAlert`, `getAlertList` | 1-2 | 13 plus retries | optional verification | Yes | No |
-| `superops_custom_query` | `src/domains/custom.ts` | caller supplied query | 1 | read retries | no schema-level page cap | No | No |
-| `superops_custom_mutation` | `src/domains/custom.ts` | caller supplied mutation | 1 | 1 by default | no automatic write retry; reliable rejection is distinguished from uncertain transport outcome | Yes | Intentionally no |
-| `superops_tickets_list` | `src/domains/tickets.ts` | `getTicketList` | 1 | read retries | requested page | No | No |
-| `superops_tickets_recent` | `src/domains/tickets.ts` | `getTicketList`, optional content reads | 1 | 1 + 2 per capped ticket plus retries | content capped to 10 tickets | No | No |
-| `superops_tickets_query` | `src/domains/ticket-reporting.ts` | `getTicketList` | pages | capped pages plus retries | sequential pagination, no completeness claim when capped | No | No |
-| `superops_tickets_created_between` | `src/domains/ticket-reporting.ts` | `getTicketList` | pages | capped pages plus retries | same query engine | No | No |
-| `superops_tickets_report` | `src/domains/ticket-reporting.ts` | `getTicketList` | pages | capped pages plus retries | same query engine | No | No |
-| `superops_tickets_get` | `src/domains/tickets.ts` | `getTicket` | 1 | read retries | none | No | No |
-| `superops_tickets_get_by_number` | `src/domains/tickets.ts` | lookup then `getTicket` | 2 | 2 plus retries | no pagination beyond lookup page | No | No |
-| `superops_tickets_get_safe_by_number` | `src/domains/tickets.ts` | lookup, ticket, optional notes/conversations | 2 | 4 plus retries | optional sections report unavailable content | No | No |
-| `superops_tickets_triage_snapshot` | `src/domains/tickets.ts` | list plus safe content | 1 | 1 + 2 per candidate plus retries | candidate/content caps | No | No |
-| `superops_tickets_apply_triage_plan` | `src/domains/tickets.ts` | read/validate/dedupe/mutate/verify/fallback | 0 to many | bounded by item/budget stops plus retries | per-ticket budget estimate before starting next item | Yes | Ledger only |
-| `superops_tickets_conversation_list` | `src/domains/tickets.ts` | conversation list | 1 | read retries | single request | No | No |
-| `superops_tickets_notes_list` | `src/domains/tickets.ts` | note list | 1 | read retries | single request | No | No |
-| `superops_tickets_field_options` | `src/domains/tickets.ts` | `getFields` | 1 | read retries | single request | No | No |
-| `superops_tickets_create` | `src/domains/tickets.ts` | `createTicket` | 1 | 1 | no write retry | Yes | No |
-| `superops_tickets_resolve_full` | `src/domains/tickets.ts` | lookup/read/metadata/note/update/verify | 2-6 | 8+ | optional verification/fallback validation | Yes | No |
-| `superops_tickets_update` | `src/domains/tickets.ts` | `getFields`, `updateTicket` | 1-2 | 2 | metadata validation | Yes | No |
-| `superops_tickets_add_note` | `src/domains/tickets.ts` | `createTicketNote` | 1 | 1 | no direct dedupe | Yes | No |
-| `superops_tickets_log_time` | `src/domains/tickets.ts` | worklog mutation | 1 | 1 | no verification | Yes | No |
+| Tool or runtime operation | Normal calls | Worst-case bound / rule | Resumable |
+| --- | ---: | --- | --- |
+| Status/navigation | 0 | 0 | N/A |
+| `superops_test_connection` | 1 read | 3 attempts | No |
+| Operation get/list | 1 DO fetch | 1 per call | N/A |
+| Client list/get/search | 1 read | 3 attempts | No |
+| Asset list/get/software/patches | 1 read | 3 attempts | No |
+| Technician list/get/groups | 1 read | 3 attempts | No |
+| Alert list/for-asset | 1 read | for-asset fallback: 2 reads, each within retry bound | No |
+| Alert get | 1 read | exact lookup plus at most 11 fallback pages; each read within retry bound | No |
+| Alert create | 1 write + optional verification | one write; verification lookup bounded as alert get | No |
+| Alert resolve | 1 write + optional per-alert verification | one batch write; each requested verification bounded as alert get | No |
+| Custom query | 1 read | query document 64 KiB, variables 128 KiB, response 1 MiB, read retry bound; caller query shape is otherwise opaque | No |
+| Custom mutation | 1 write | one attempt; same request/response size bounds; ambiguous response is non-resumable | No |
+| Ticket list/get/conversation/notes/fields | 1 read | read retry bound | No |
+| Ticket get by number | 2 reads | 6 total attempts | No |
+| Ticket safe get | 2 base reads | at most 4 logical reads, each within retry bound | No |
+| Ticket recent | 1 list | plus at most 2 content reads for each of at most 10 tickets | No |
+| Triage snapshot | 1 list | plus at most 2 safe-content reads per bounded candidate | No |
+| Historical query/created-between/report | sequential pages | `maxPages` and `maxRecords`; each page within retry bound; never concurrent | No |
+| Direct ticket create/note/log-time | 1 write | one attempt | No |
+| Direct ticket update | validation read + write | at most 2 logical calls; one write | No |
+| Direct resolve-full | lookup/read/metadata/note/update/verify | bounded synchronous path; a note followed by failed update reports partial write and is never blindly repeated | No |
+| Durable apply-triage | per-item validation/dedupe/write/verification | one Worker invocation can consume at most 45 counted outbound calls; normal work stops before 37 and reserves 8 for ledger persistence. It also stops at 25 items. No item starts unless its estimated first-attempt unit fits, and every mutation hook rechecks capacity for its start/accepted checkpoints, outbound write, required read-back, and final ledger commit. | Yes |
+| Immediate continuation delivery | 1 self service-binding fetch | one delivery attempt by the scheduler; route rechecks token and ledger | Yes |
+| Schedule long wait | 1 Workflow `createBatch` | deterministic identity, at most 8 creation attempts with exponential backoff capped at 500 ms | Yes |
+| Workflow wake attempt | 3 DO calls + 1 service fetch before success accounting | repeated service failure: at most 8 Workflow step attempts (32 internal calls); successful attempt adds 3 DO calls, for at most 35 internal calls across the step | Yes |
+| Terminal retention alarm | DO storage list/delete/setAlarm | no SuperOps or service-binding call; cleanup-only | N/A |
 
-## Before and After Subrequest Counts
+The maximum normal counted calls in an MCP invocation are therefore 37 with the committed 45/8 configuration. The dedicated harness uses 37 for its initial invocation and 12 for each deliberately constrained continuation invocation, and checks each invocation against its own effective budget.
 
-- Before: `apply_triage_plan` could grow approximately linearly with ticket count and hidden per-ticket stages; no proactive stop or durable status existed.
-- After: default configured budget is 45 with safety margin 8. Normal SuperOps work stops before 37 counted subrequests. Durable ledger persistence may consume reserved margin so partial outcomes can be stored.
-- Safe batch size depends on requested stages. With the current default, practical synchronous triage batches should stay below 25 items and much lower when actions require note dedupe, fallback, and verification.
+## Mutation classification
 
-## Rate-Limit Handling
+- Durable: `superops_tickets_apply_triage_plan`. Primary production write path; mutation type, target hash, note fingerprint/ID, response observation, fallback, checkpoint, and verification state are authoritative.
+- Safe synchronous but blocked by default: direct ticket and alert mutations. Successful/rejected/ambiguous returns expose `writeAttempted`, `writeMayHaveSucceeded`, reliable-response state, replay safety, and classification. They are not automatically replayed.
+- Opaque and blocked by default: `superops_custom_mutation`. It is bounded but cannot derive a canonical verification target.
+- Read-only: standard reads and operation-status tools. They remain available.
 
-`src/client.ts` now distinguishes:
+## Rate-limit and execution taxonomy
 
-- HTTP 429 and Retry-After seconds/date.
-- Rate-limit reset headers: `X-RateLimit-Reset`, `RateLimit-Reset`, `X-Rate-Limit-Reset`.
-- GraphQL throttling codes/messages without treating all GraphQL errors as throttling.
-- HTTP 5xx, network failures, malformed responses, and authentication/validation errors.
+The client distinguishes HTTP 429, reset headers, structured GraphQL throttling, HTTP 5xx, authentication/validation GraphQL rejection, malformed response, network failure, and request timeout. Continuation additionally distinguishes configured subrequest stop, platform subrequest signature, configured execution timeout, cooperative CPU guard/platform CPU signature, rate-limit exhaustion, scheduling failure, Workflow delivery failure, operation-store failure, malformed stored operation, stale data, verification mismatch, and ambiguous write.
 
-Reads use bounded retry attempts. Writes do not retry by default, even if `SUPEROPS_EXECUTION_MAX_WRITE_RETRY_ATTEMPTS` is raised, because `shouldRetrySuperOpsRequest()` returns false for writes. That is intentional until a specific write path proves idempotency or verifies current state after an ambiguous response.
+Durable rate state records attempt count, first-throttled time, parsed/capped/applied/actual delay, accumulated retry duration/elapsed time, next eligibility, whether another invocation is required, and final result. A conclusive throttle marks the mutation response rejected and may be retried later. An inconclusive possible write remains ambiguous and is reconciled instead. Exhaustion becomes terminal `RateLimitExceeded`.
 
-## Implemented Changes
+## Durable record and checkpoint inventory
 
-- `src/execution.ts`: invocation IDs, operation IDs, configurable budget, safety margin, elapsed-time checks, per-item stats, request classification, retry counters, structured diagnostics.
-- `src/client.ts`: central HTTP/GraphQL rate-limit detection, bounded read retries, Retry-After parsing, no blind write retries.
-- `src/operation-store.ts`: SQLite Durable Object compatible operation ledger plus memory fallback for local tests; owner-scoped claim, complete and continuation scheduling primitives.
-- `src/continuation.ts`: generic budget-aware continuation runner for exact unfinished-item resume.
-- `src/continuation-scheduler.ts`: disabled-by-default service-binding scheduler for immediate fresh Worker invocations.
-- `src/operation-store.ts`: optional Durable Object alarm wake path for long Retry-After delays; it stores only operation identity/owner hash and re-enters the internal continuation adapter.
-- `src/domains/tickets.ts`: apply-triage continuation adapter that reuses synchronous safety helpers.
-- `src/mcp-server.ts`: read-only `superops_operations_get` and `superops_operations_results` tools.
-- `src/worker.ts` and `wrangler.json`: operation-store binding wiring.
-- `src/domains/tickets.ts`: triage result ledger persistence and durable classification of completed, skipped, failed, pending and unattempted items.
-- Tests added for rate limits, operation store, operation status tools, and triage ledger persistence.
+The record contains no note body or customer message content. The approved request snapshot stores fixed candidates, action type, canonical target hashes, expected metadata hashes, and note fingerprints. Runtime-only plaintext required for the current invocation is not serialized. A later process that lacks a pending note body fails safely before write unless the persisted note stage can be reconciled from its fingerprint/created note identity.
 
-## Known Limitations
+Required stages:
 
-- Apply-triage continuation is implemented but automatic scheduling is disabled by default. Without `SUPEROPS_CONTINUATION_ENABLED=true` and the internal service binding/token, the MCP still returns and persists `ContinuationRequired` for manual/status inspection.
-- Operation ledger state is implemented for `superops_tickets_apply_triage_plan`; other mutating tools still rely on immediate return contracts.
-- Direct one-off mutations cannot be fully idempotent without either SuperOps idempotency support or per-tool verification wrappers.
-- Custom GraphQL tools remain intentionally broad. They are budgeted and instrumented at the client layer but cannot be statically call-counted from schema alone. An opaque custom mutation is intentionally non-resumable: a possible-write error is returned as `AmbiguousWriteUnresolved`, never automatically retried, because the tool cannot safely derive a canonical verification target.
-- The dedicated fixed-seed mixed-fault harness is `src/continuation-mixed-fault-harness.test.ts`. It drives exactly 250 items through `superops_tickets_apply_triage_plan` plus `resumeApplyTriageOperation`, mocking only the SuperOps transport. It asserts authoritative expected/accounted/terminal counters, zero duplicate successful update/resolution/private-note mutations, and no invocation over the configured 12-request safety threshold. It includes validation and stale outcomes, 429 durable rescheduling, 5xx/network ambiguity, accepted writes with lost responses, expired lease recovery, wrong-owner rejection, injected operation-store and continuation-scheduling failures, and fresh-budget continuation. It does not call live SuperOps.
+- Update: `Validated`, `WriteNotStarted`, `WriteStarted`, `FieldsUpdated`, `Verifying`, terminal.
+- Resolution: `ResolutionValidated`, `ResolutionWriteStarted`, `ResolutionWriteSucceeded`, `ResolutionVerified`, optional note stages, `Verifying`, terminal.
+- Note: `NoteChecked`, `NoteWriteStarted`, `NoteAdded`, `Verifying`, terminal.
 
-## Audit Conclusions and Remaining Local Work
+The store rejects broad transition weakening. Terminal stages cannot reopen; write truth cannot regress. Exhausted durable Workflow scheduling terminalizes unfinished items without erasing possible-write truth. An initial store failure stops before every SuperOps call and returns explicit no-write truth; disabled immediate delivery remains non-terminal and reconcilable by re-invoking the same operation ID.
 
-The central client is the sole SuperOps GraphQL transport and records every standard read/write request. Its deterministic coverage includes HTTP 429 with Retry-After seconds and HTTP dates, reset-header throttling, structured GraphQL throttling, false-positive GraphQL validation messages, HTTP 5xx, network and abort-style timeout failures, retry exhaustion, retry accounting, and restraint on write retries. Long Retry-After values that cannot fit the configured in-invocation duration are surfaced with their parsed delay so the checkpointed apply-triage adapter can schedule its durable wake rather than sleeping or replaying a write.
+## Fixed-seed mixed-fault harness
 
-The mutation inventory above is complete. The safety implementation is intentionally tiered:
+Seed `0x5eed250` creates exactly 250 expected items and drives the public apply entrypoint plus `resumeApplyTriageOperation`, mocking only the SuperOps transport. It injects reliable HTTP and GraphQL throttles, accepted update/resolution/note with lost responses, ambiguous 5xx/network failures, stale changes during a long wait, validation failure, no-action and explicit skip, wrong owner, duplicate wake, expired-lease reclaim, stale lease token, checkpoint acknowledgement loss, scheduling failure, malformed record, and constrained fresh budgets.
 
-- Apply-triage is the only multi-item durable mutation workflow. It owns mutation-start checkpoints, stale checks, ambiguity reads, private-note fingerprint recovery, long-wait scheduling, and owner-scoped status.
-- Alert and direct ticket writes are centrally budgeted and never blindly retried. They remain synchronous; where a final-state verification exists, they return that result, but they do not have a per-write durable checkpoint/continuation adapter.
-- Opaque custom mutations are explicitly non-resumable. A transport-style possible write is returned as `AmbiguousWriteUnresolved`; a reliable rejection is `WriteRejected`.
+Mandatory counters include expected, accounted, terminal, unaccounted, updated, resolved, note-only, skipped, completed, failed, stale, validation failure, ambiguity, partial write, rate reschedules, retries, continuation invocations, durable waits, maximum durable wait, maximum calls per invocation, over-budget invocations, duplicate writes by type, scheduling/store failures, and malformed records. Assertions require 250 expected/accounted/terminal, unaccounted zero, duplicate update/resolution/private note zero, no invocation over its effective budget, and a durable wait longer than 25 seconds.
 
-Therefore whole-MCP durable recovery remains deliberately limited to apply-triage. On the ChatGPT direct route, the registry-derived policy blocks these synchronous mutations by default: `superops_tickets_create`, `superops_tickets_update`, `superops_tickets_resolve_full`, `superops_tickets_add_note`, `superops_tickets_log_time`, `superops_alerts_create`, `superops_alerts_resolve`, and `superops_custom_mutation`. The reviewed durable `superops_tickets_apply_triage_plan`, all read-only tools, and operation-status tools remain available. Set `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=true` only after an explicit deployment review; it is disabled by default.
+A second real-adapter crash matrix covers 28 deterministic before/after checkpoint failures spanning every update, resolution, and private-note boundary. It uses the public apply entrypoint with mocked SuperOps transport, verifies the last acknowledged durable stage, and asserts that each scenario performs at most one outbound mutation.
 
-## Read-only Audit
+## Configuration and external validation
 
-The inventory's read-only tools are bounded as follows: single-page list tools cap caller page size; ticket reporting uses sequential capped pagination with local post-filtering and explicit truncation/completeness metadata; alert ID fallback has a fixed page limit; recent/triage safe-content enrichment is capped; and all standard reads use central bounded retry accounting. Read-only custom GraphQL remains caller-defined and cannot be statically guaranteed to paginate or cap its response; treat it as an advanced operator tool rather than a safe reporting primitive. No standard report retrieves ticket descriptions, conversation bodies, note bodies, or attachment bodies unless an explicitly requested safe-retrieval tool does so under its caps.
+`package.json` and the lockfile pin Wrangler `4.111.0`, whose CLI validation requires Node.js 22 or newer. `wrangler.json` validates against that installed package’s `config-schema.json`, declares the Workflow/DO/service bindings, and sets all write/continuation overrides false. In this restricted repair environment, typecheck, build, lint, JSON schema validation, version inspection, and `git diff --check` pass. Vitest and Wrangler’s esbuild build path are not runnable here because Windows child-process creation fails with `spawn EPERM`; that is not counted as passing evidence.
 
-## Deployment Boundary
+Before any staging change, run in an unrestricted environment:
 
-No deployment was performed. Before staging or production, provision the Durable Object binding declared in `wrangler.json`, validate with `wrangler dev`, run `npm test`, `npm run build`, and perform low-budget dry-run triage tests. Do not repurpose `OAUTH_KV` for operation state.
+```powershell
+npm ci
+npm test
+npm run test:continuation-harness
+npm run build
+npm run typecheck
+npm run lint
+git diff --check
+npx wrangler deploy --dry-run --config wrangler.json
+```
+
+Exact approved staging/production resource-changing commands and pending-Workflow rollback rules are in `docs/continuation-operations.md`. No commit, push, deployment, provisioning, secret creation, or live SuperOps mutation was performed in this repair cycle.

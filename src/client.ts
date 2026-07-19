@@ -94,6 +94,11 @@ export class SuperOpsClient {
     retryCount: number
   ): Promise<T> {
     const subrequest = recordSubrequestStart(query, retryCount);
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new SuperOpsTimeoutError("SuperOps request timed out.")),
+      getExecutionConfig().requestTimeoutMs
+    );
     let response: Response;
     try {
       response = await fetch(this.endpoint, {
@@ -104,12 +109,21 @@ export class SuperOpsClient {
           CustomerSubDomain: this.subdomain,
         },
         body: JSON.stringify({ query, variables }),
+        signal: controller.signal,
       });
     } catch (error) {
-      recordSubrequestFinish(subrequest, "networkError", false);
-      throw new SuperOpsNetworkError(
-        error instanceof Error ? error.message : String(error)
-      );
+      const timedOut = controller.signal.aborted ||
+        (error instanceof Error && error.name === "AbortError");
+      recordSubrequestFinish(subrequest, timedOut ? "requestTimeout" : "networkError", false);
+      throw timedOut
+        ? new SuperOpsTimeoutError(
+            error instanceof Error ? error.message : "SuperOps request timed out."
+          )
+        : new SuperOpsNetworkError(
+            error instanceof Error ? error.message : String(error)
+          );
+    } finally {
+      clearTimeout(timeout);
     }
 
     recordSubrequestFinish(subrequest, response.status, response.ok);
@@ -205,6 +219,13 @@ export class SuperOpsNetworkError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "SuperOpsNetworkError";
+  }
+}
+
+export class SuperOpsTimeoutError extends SuperOpsNetworkError {
+  constructor(message: string) {
+    super(message);
+    this.name = "SuperOpsTimeoutError";
   }
 }
 
