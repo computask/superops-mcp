@@ -287,69 +287,76 @@ export async function runOperationContinuation(
       if (outcome.rateLimited && outcome.nextEligibleTime && cappedDelayMs !== requestedDelayMs) {
         effectiveOutcome.nextEligibleTime = new Date(Date.now() + cappedDelayMs).toISOString();
       }
-      record = await store.completeItem({
-        operationId: params.operationId,
-        ownerHash: params.ownerHash,
-        itemKey: claim.itemKey,
-        leaseId: claim.lease.leaseId,
-        patch: {
-          stage: effectiveOutcome.stage,
-          outcome: effectiveOutcome.outcome,
-          writeAttempted: effectiveOutcome.writeAttempted,
-          writeMayHaveSucceeded: effectiveOutcome.writeMayHaveSucceeded,
-          partialWrite: effectiveOutcome.partialWrite,
-          verificationState: effectiveOutcome.verified
-            ? "Verified"
-            : effectiveOutcome.verificationFailed
-              ? "Failed"
-              : undefined,
-          retryCount: effectiveOutcome.retryCount,
-          nextEligibleTime: effectiveOutcome.nextEligibleTime,
-          failureReason: effectiveOutcome.failureReason,
-          errorClass: effectiveOutcome.errorClass,
-          reliableResponseReceived: effectiveOutcome.reliableResponseReceived,
-          observedMutationResult: effectiveOutcome.observedMutationResult,
-          rateLimit: outcome.rateLimited
-            ? {
-                endpoint: effectiveOutcome.retryEndpoint ?? "SuperOps GraphQL /msp",
-                operationName: effectiveOutcome.retryOperationName ?? (claim.item.mutationType === "note" ? "CreateTicketNote" : "UpdateTicket"),
-                source: effectiveOutcome.retryDelaySource ?? (effectiveOutcome.retryAfterSupplied ? "retry-after" : "backoff"),
-                attempts: rateAttempts,
-                suppliedDelayMs: effectiveOutcome.suppliedDelayMs,
-                parsedDelayMs: requestedDelayMs,
-                cappedDelayMs,
-                appliedDelayMs: cappedDelayMs,
-                actualDelayMs: previousActualDelayMs,
-                scheduledAt: rateObservedAt,
-                firstThrottledAt,
-                totalRetryDurationMs,
-                totalElapsedMs: firstThrottledAt ? rateObservedAtMs - Date.parse(firstThrottledAt) : undefined,
-                nextEligibleAt: effectiveOutcome.nextEligibleTime,
-                retryAfterSupplied: effectiveOutcome.retryAfterSupplied ?? Boolean(effectiveOutcome.nextEligibleTime),
-                continuedInAnotherInvocation: effectiveOutcome.stage === "RateLimitedRescheduled",
-                writeAttempted: effectiveOutcome.writeAttempted,
-                finalResult: effectiveOutcome.outcome,
-              }
-            : priorRate
+      try {
+        record = await store.completeItem({
+          operationId: params.operationId,
+          ownerHash: params.ownerHash,
+          itemKey: claim.itemKey,
+          leaseId: claim.lease.leaseId,
+          patch: {
+            stage: effectiveOutcome.stage,
+            outcome: effectiveOutcome.outcome,
+            writeAttempted: effectiveOutcome.writeAttempted,
+            writeMayHaveSucceeded: effectiveOutcome.writeMayHaveSucceeded,
+            partialWrite: effectiveOutcome.partialWrite,
+            verificationState: effectiveOutcome.verified
+              ? "Verified"
+              : effectiveOutcome.verificationFailed
+                ? "Failed"
+                : undefined,
+            retryCount: effectiveOutcome.retryCount,
+            nextEligibleTime: effectiveOutcome.nextEligibleTime,
+            failureReason: effectiveOutcome.failureReason,
+            errorClass: effectiveOutcome.errorClass,
+            reliableResponseReceived: effectiveOutcome.reliableResponseReceived,
+            observedMutationResult: effectiveOutcome.observedMutationResult,
+            rateLimit: outcome.rateLimited
               ? {
-                  ...priorRate,
+                  endpoint: effectiveOutcome.retryEndpoint ?? "SuperOps GraphQL /msp",
+                  operationName: effectiveOutcome.retryOperationName ?? (claim.item.mutationType === "note" ? "CreateTicketNote" : "UpdateTicket"),
+                  source: effectiveOutcome.retryDelaySource ?? (effectiveOutcome.retryAfterSupplied ? "retry-after" : "backoff"),
+                  attempts: rateAttempts,
+                  suppliedDelayMs: effectiveOutcome.suppliedDelayMs,
+                  parsedDelayMs: requestedDelayMs,
+                  cappedDelayMs,
+                  appliedDelayMs: cappedDelayMs,
                   actualDelayMs: previousActualDelayMs,
-                  totalElapsedMs: priorRate.firstThrottledAt
-                    ? rateObservedAtMs - Date.parse(priorRate.firstThrottledAt)
-                    : priorRate.totalElapsedMs,
-                  continuedInAnotherInvocation: true,
+                  scheduledAt: rateObservedAt,
+                  firstThrottledAt,
+                  totalRetryDurationMs,
+                  totalElapsedMs: firstThrottledAt ? rateObservedAtMs - Date.parse(firstThrottledAt) : undefined,
+                  nextEligibleAt: effectiveOutcome.nextEligibleTime,
+                  retryAfterSupplied: effectiveOutcome.retryAfterSupplied ?? Boolean(effectiveOutcome.nextEligibleTime),
+                  continuedInAnotherInvocation: effectiveOutcome.stage === "RateLimitedRescheduled",
+                  writeAttempted: effectiveOutcome.writeAttempted,
                   finalResult: effectiveOutcome.outcome,
                 }
-              : undefined,
-        },
-        result: effectiveOutcome.result ?? {
-          itemKey: claim.itemKey,
-          finalOutcome: effectiveOutcome.outcome,
-          writeAttempted: effectiveOutcome.writeAttempted,
-          partialWrite: effectiveOutcome.partialWrite,
-          verified: Boolean(effectiveOutcome.verified),
-        },
-      });
+              : priorRate
+                ? {
+                    ...priorRate,
+                    actualDelayMs: previousActualDelayMs,
+                    totalElapsedMs: priorRate.firstThrottledAt
+                      ? rateObservedAtMs - Date.parse(priorRate.firstThrottledAt)
+                      : priorRate.totalElapsedMs,
+                    continuedInAnotherInvocation: true,
+                    finalResult: effectiveOutcome.outcome,
+                  }
+                : undefined,
+          },
+          result: effectiveOutcome.result ?? {
+            itemKey: claim.itemKey,
+            finalOutcome: effectiveOutcome.outcome,
+            writeAttempted: effectiveOutcome.writeAttempted,
+            partialWrite: effectiveOutcome.partialWrite,
+            verified: Boolean(effectiveOutcome.verified),
+          },
+        });
+      } catch (error) {
+        if (typeof error === "object" && error !== null) {
+          (error as { conservativeOutcome?: ContinuationItemOutcome }).conservativeOutcome = effectiveOutcome;
+        }
+        throw error;
+      }
       processedThisInvocation += 1;
       markExecutionItem({
         completed: effectiveOutcome.stage.startsWith("Completed") || effectiveOutcome.stage === "Completed" ||

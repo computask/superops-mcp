@@ -1813,6 +1813,45 @@ describe("Tickets Domain", () => {
     expect(result.content[0].text).toContain('"displayId": "57100"');
   });
 
+  it("reports partial write when resolve_full verification does not match the requested target", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57100",
+          displayId: "57100",
+          subject: "Sales email",
+          status: "New Calls",
+          priority: "Very Low",
+          impact: "Low",
+          urgency: "Low",
+          category: "7. Sales call",
+          subcategory: "No Action Needed",
+          cause: "No Fault Found",
+          resolutionCode: "Permanent Fix",
+        },
+      });
+    mockClient.mutate.mockResolvedValue({
+      updateTicket: { ticketId: "ticket-57100", status: "Resolved" },
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-57100",
+      ...RESOLVED_CLASSIFICATION,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed).toMatchObject({
+      finalOutcome: "VerificationFailed",
+      partialWrite: true,
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+    });
+    expect(parsed.verification.update.mismatches).toEqual([
+      { field: "status", expected: "Resolved", observed: "New Calls" },
+    ]);
+  });
   it("can reuse valid existing resolved-ticket classification values when omitted", async () => {
     mockClient.query
       .mockResolvedValueOnce({
@@ -2524,7 +2563,7 @@ describe("Tickets Domain", () => {
       input: { ticket: { ticketId: "ticket-57400" }, content: "Approved private note", privacyType: "PRIVATE" },
     });
   });
-  it("uses controlled update fallback for approved resolve internal server errors", async () => {
+  it("does not use update fallback for approved resolve internal server errors without conclusive rejection", async () => {
     mockClient.query
       .mockResolvedValueOnce({
         getTicketList: {
@@ -2579,17 +2618,61 @@ describe("Tickets Domain", () => {
     });
     const parsed = JSON.parse(result.content[0].text);
 
-    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
     expect(parsed.results[0]).toMatchObject({
-      finalOutcome: "Resolved",
+      finalOutcome: "Failed",
       writeAttempted: true,
-      writeMethod: "update_fallback",
-      fallbackAttempted: true,
-      fallbackResult: "Updated",
-      verified: true,
+      writeMethod: "resolve_full",
+      fallbackAttempted: false,
+      fallbackResult: "Ambiguous resolution response remains unresolved; fallback was not attempted.",
+      failureStage: "ambiguousWrite",
+      partialWrite: true,
+      verified: false,
     });
   });
 
+  it("does not replay a resolution after a lost response when state is unchanged", async () => {
+    const initialTicket = {
+      ticketId: "ticket-57400", displayId: "57400", subject: "Resolve once",
+      status: "New Calls", updatedTime: "2026-07-18T10:00:00.000Z",
+    };
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({ getTicket: initialTicket })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({ getTicket: initialTicket });
+    mockClient.mutate.mockRejectedValueOnce(new Error("network response lost"));
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      allowResolveFullFallbackToUpdate: true,
+      actions: [{
+        ticketNumber: "57400", expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-18T10:00:00.000Z",
+        contentVerified: true, action: "resolve",
+        target: { status: "Resolved", ...RESOLVED_CLASSIFICATION },
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(parsed.operation).toMatchObject({
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: true,
+      verificationState: "Pending",
+    });
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Failed",
+      failureStage: "ambiguousWrite",
+      fallbackAttempted: false,
+      partialWrite: true,
+      verified: false,
+    });
+  });
   it("does not replay a resolution when a lost 5xx response is already visible", async () => {
     const initialTicket = {
       ticketId: "ticket-57400", displayId: "57400", subject: "Resolve once",
@@ -2606,7 +2689,6 @@ describe("Tickets Domain", () => {
       })
       .mockResolvedValueOnce({ getTicket: initialTicket })
       .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
-      .mockResolvedValueOnce({ getTicket: resolvedTicket })
       .mockResolvedValueOnce({ getTicket: resolvedTicket });
     mockClient.mutate.mockRejectedValueOnce(new Error("SuperOps internal server error status 500"));
 
@@ -2960,6 +3042,9 @@ describe("Tickets Domain", () => {
         privacyType: "PRIVATE",
       },
     });
+    mockClient.query.mockResolvedValue({
+      getTicketNoteList: [{ noteId: "note-123", content: "Private note", privacyType: "PRIVATE" }],
+    });
 
     const domain = getTicketsTools();
     await domain.handleCall("superops_tickets_add_note", {
@@ -3014,6 +3099,78 @@ describe("Tickets Domain", () => {
     );
   });
 
+  it("reports partial write when direct ticket update verification mismatches", async () => {
+    mockClient.mutate.mockResolvedValue({
+      updateTicket: { ticketId: "ticket-123", status: "Resolved" },
+    });
+    mockClient.query.mockResolvedValue({
+      getTicket: { ticketId: "ticket-123", status: "New Calls" },
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_update", {
+      ticketId: "ticket-123",
+      status: "Resolved",
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed).toMatchObject({
+      finalOutcome: "VerificationFailed",
+      partialWrite: true,
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      verification: { verified: false },
+    });
+    expect(parsed.verification.mismatches[0]).toMatchObject({
+      field: "status",
+      expected: "Resolved",
+      observed: "New Calls",
+    });
+  });
+
+  it("reports partial write when direct ticket note verification is unavailable", async () => {
+    mockClient.mutate.mockResolvedValue({
+      createTicketNote: { privacyType: "PRIVATE" },
+    });
+    mockClient.query.mockResolvedValue({ getTicketNoteList: [] });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_add_note", {
+      ticketId: "ticket-123",
+      content: "Private note",
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed).toMatchObject({
+      finalOutcome: "VerificationFailed",
+      partialWrite: true,
+      verification: { performed: true, possible: false, verified: false },
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+    });
+  });
+
+  it("reports clean success when direct ticket update verification matches", async () => {
+    mockClient.mutate.mockResolvedValue({
+      updateTicket: { ticketId: "ticket-123", status: "Resolved" },
+    });
+    mockClient.query.mockResolvedValue({
+      getTicket: { ticketId: "ticket-123", status: "Resolved" },
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_update", {
+      ticketId: "ticket-123",
+      status: "Resolved",
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).not.toBe(true);
+    expect(parsed).toMatchObject({
+      finalOutcome: "Updated",
+      partialWrite: false,
+      verification: { verified: true },
+    });
+  });
   it("returns a conservative ambiguity contract for failed synchronous ticket writes", async () => {
     mockClient.mutate.mockRejectedValueOnce(new Error("network response lost"));
     const result = await getTicketsTools().handleCall("superops_tickets_update", {
@@ -3082,6 +3239,70 @@ describe("Tickets Domain", () => {
     });
   });
 
+  it.each([
+    ["accepted update", {
+      action: { ticketNumber: "57400", contentVerified: true, action: "update", target: { status: "Awaiting Engineer" } },
+      queries: [
+        { getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } },
+        { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
+        { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "Awaiting Engineer" } },
+      ],
+      mutation: { updateTicket: { ticketId: "ticket-57400", status: "Awaiting Engineer" } },
+    }],
+    ["accepted resolution", {
+      action: { ticketNumber: "57400", contentVerified: true, action: "resolve", target: { status: "Resolved", ...RESOLVED_CLASSIFICATION } },
+      queries: [
+        { getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } },
+        { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
+        { getFields: RESOLVED_OPTION_FIELDS },
+        { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "Resolved", ...RESOLVED_CLASSIFICATION } },
+      ],
+      mutation: { updateTicket: { ticketId: "ticket-57400", status: "Resolved" } },
+    }],
+    ["accepted private note", {
+      action: { ticketNumber: "57400", contentVerified: true, action: "addNote", note: "Approved private note" },
+      queries: [
+        { getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } },
+        { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
+        { getTicketNoteList: [] },
+        { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
+      ],
+      mutation: { createTicketNote: { noteId: "note-57400", privacyType: "PRIVATE" } },
+    }],
+  ] as const)("returns a conservative operation-store failure after %s", async (_label, scenario) => {
+    for (const queryResult of scenario.queries) {
+      mockClient.query.mockResolvedValueOnce(queryResult);
+    }
+    mockClient.mutate.mockResolvedValueOnce(scenario.mutation);
+
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const completeItem = store.completeItem.bind(store);
+      store.completeItem = vi.fn(async (params) => {
+        if (params.patch.writeAttempted === true) {
+          throw new Error("ledger complete unavailable after write");
+        }
+        return completeItem(params);
+      });
+
+      const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+        batchId: `post-write-store-failure-${_label.replace(/\s+/g, "-")}`,
+        expectedCandidateTicketNumbers: ["57400"],
+        actions: [scenario.action],
+      });
+      const parsed = JSON.parse(result.content[0].text);
+
+      expect(result.isError).toBe(true);
+      expect(parsed.operation).toMatchObject({
+        persisted: true,
+        errorClass: "OperationStoreFailure",
+        finalReason: "OperationStorePostWriteFailure",
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+      });
+      expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    });
+  });
   it("does not send the first mutation when WriteStarted persistence fails", async () => {
     mockClient.query
       .mockResolvedValueOnce({

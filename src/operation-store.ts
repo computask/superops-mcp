@@ -1266,7 +1266,7 @@ class DurableObjectOperationStore implements OperationStore {
       })
     );
     if (!response.ok) {
-      throw new Error(`Operation store put failed: ${response.status}`);
+      throw await operationStoreFailure(response, "Operation store put failed");
     }
   }
 
@@ -1288,7 +1288,7 @@ class DurableObjectOperationStore implements OperationStore {
     }
     if (response.status === 404) return undefined;
     if (!response.ok) {
-      throw new Error(`Operation store get failed: ${response.status}`);
+      throw await operationStoreFailure(response, "Operation store get failed");
     }
     const record = await response.json();
     assertOperationRecord(record);
@@ -1303,7 +1303,7 @@ class DurableObjectOperationStore implements OperationStore {
       new Request(`https://operation.local/operations?ownerHash=${ownerHash}`)
     );
     if (!response.ok) {
-      throw new Error(`Operation store list failed: ${response.status}`);
+      throw await operationStoreFailure(response, "Operation store list failed");
     }
     const results = await response.json();
     if (!Array.isArray(results) || serializedBytes(results) > MAX_RECENT_OPERATION_OUTPUT_BYTES) {
@@ -1369,7 +1369,7 @@ class DurableObjectOperationStore implements OperationStore {
     }
     if (response.status === 404) return undefined;
     if (!response.ok) {
-      throw new Error("Approved private-note recovery failed: " + response.status);
+      throw await operationStoreFailure(response, "Approved private-note recovery failed");
     }
     const recovered = await response.json() as { content?: unknown };
     return typeof recovered.content === "string" ? recovered.content : undefined;
@@ -1386,7 +1386,7 @@ class DurableObjectOperationStore implements OperationStore {
       })
     );
     if (response.status === 204 || response.status === 404) return undefined;
-    if (!response.ok) throw new Error(`Operation store claim failed: ${response.status}`);
+    if (!response.ok) throw await operationStoreFailure(response, "Operation store claim failed");
     return (await response.json()) as OperationItemClaim;
   }
 
@@ -1400,7 +1400,7 @@ class DurableObjectOperationStore implements OperationStore {
         body: JSON.stringify(params),
       })
     );
-    if (!response.ok) throw new Error(`Operation store complete failed: ${response.status}`);
+    if (!response.ok) throw await operationStoreFailure(response, "Operation store complete failed");
     return (await response.json()) as OperationLedgerRecord;
   }
 
@@ -1414,7 +1414,7 @@ class DurableObjectOperationStore implements OperationStore {
         body: JSON.stringify(params),
       })
     );
-    if (!response.ok) throw new Error(`Operation store checkpoint failed: ${response.status}`);
+    if (!response.ok) throw await operationStoreFailure(response, "Operation store checkpoint failed");
     return (await response.json()) as OperationLedgerRecord;
   }
 
@@ -1428,7 +1428,7 @@ class DurableObjectOperationStore implements OperationStore {
         body: JSON.stringify(params),
       })
     );
-    if (!response.ok) throw new Error(`Operation store schedule failed: ${response.status}`);
+    if (!response.ok) throw await operationStoreFailure(response, "Operation store schedule failed");
     return (await response.json()) as OperationLedgerRecord;
   }
 
@@ -1448,12 +1448,25 @@ class DurableObjectOperationStore implements OperationStore {
       )
     );
     if (!response.ok) {
-      throw new Error("Operation store terminalisation failed: " + response.status);
+      throw await operationStoreFailure(response, "Operation store terminalisation failed");
     }
     return (await response.json()) as OperationLedgerRecord;
   }
 }
 
+async function operationStoreFailure(response: Response, message: string): Promise<Error> {
+  try {
+    const body = await response.clone().json();
+    if (isRecordObject(body) && body.errorClass === "MalformedStoredOperation") {
+      return new MalformedStoredOperationError(
+        typeof body.error === "string" ? body.error : undefined
+      );
+    }
+  } catch {
+    // Fall through to the stable status-based error below.
+  }
+  return new Error(`${message}: ${response.status}`);
+}
 async function operationStoreFetch(
   operationName: string,
   stub: { fetch(request: Request): Promise<Response> },

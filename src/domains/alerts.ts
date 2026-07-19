@@ -20,6 +20,9 @@ const DEFAULT_PAGE_SIZE = 25;
 const MAX_PAGE_SIZE = 500;
 const ALERT_ID_LOOKUP_PAGE_LIMIT = 10;
 const ALERT_ID_LOOKUP_PAGE_SIZE = 100;
+const MAX_SYNCHRONOUS_ALERT_RESOLVE_IDS = 4;
+const MAX_ALERT_RESOLVE_VERIFICATION_READS =
+  MAX_SYNCHRONOUS_ALERT_RESOLVE_IDS * (1 + ALERT_ID_LOOKUP_PAGE_LIMIT);
 const STATUS_EQUALS_OPERATOR = "is";
 const DEFAULT_SORT_BY = "createdTime";
 const DEFAULT_SORT_ORDER = "DESC";
@@ -598,6 +601,41 @@ function verificationResult(alert: NormalizedAlert | undefined) {
   };
 }
 
+function alertResolveVerificationFailed(verification: Record<string, unknown> | undefined): boolean {
+  if (!verification) return false;
+  return Object.values(verification).some((value) => {
+    const item = value as { resolved?: unknown; verificationSkipped?: unknown };
+    return item.resolved !== true || item.verificationSkipped === true;
+  });
+}
+
+function alertCreateVerification(alert: NormalizedAlert, verifiedAlert: NormalizedAlert | undefined) {
+  if (!alert.id) {
+    return {
+      performed: true,
+      possible: false,
+      verified: false,
+      reason: "Mutation response did not include an alert ID for read-back verification.",
+    };
+  }
+  if (!verifiedAlert) {
+    return {
+      performed: true,
+      possible: true,
+      verified: false,
+      alertId: alert.id,
+      reason: "Created alert was not found during verification.",
+    };
+  }
+  return {
+    ...verifiedAlert,
+    performed: true,
+    possible: true,
+    verified: verifiedAlert.id === alert.id,
+    reason: verifiedAlert.id === alert.id ? undefined : "Verified alert ID did not match the mutation response.",
+  };
+}
+
 export function getAlertsTools(): DomainTools {
   return {
     tools: [
@@ -659,7 +697,7 @@ export function getAlertsTools(): DomainTools {
       {
         name: "superops_alerts_resolve",
         description:
-          "Write action: resolve one or more SuperOps alerts by ID. Supports dryRun and optional verification.",
+          "Write action: resolve up to 4 SuperOps alerts by ID synchronously. Supports dryRun and optional verification.",
         inputSchema: {
           type: "object",
           properties: {
@@ -748,10 +786,31 @@ export function getAlertsTools(): DomainTools {
             if (ids.length === 0) {
               return errorResult("At least one alertId or alertIds value is required.");
             }
+            if (ids.length > MAX_SYNCHRONOUS_ALERT_RESOLVE_IDS) {
+              return {
+                ...textResult({
+                  ok: false,
+                  message: `At most ${MAX_SYNCHRONOUS_ALERT_RESOLVE_IDS} alert IDs can be resolved synchronously.`,
+                  requestedCount: ids.length,
+                  maximum: MAX_SYNCHRONOUS_ALERT_RESOLVE_IDS,
+                  writeAttempted: false,
+                  writeMayHaveSucceeded: false,
+                  validation: "TooManyAlertIds",
+                }),
+                isError: true,
+              };
+            }
+            const verificationReadBound = {
+              maxAlertIds: MAX_SYNCHRONOUS_ALERT_RESOLVE_IDS,
+              perAlertMaxReads: 1 + ALERT_ID_LOOKUP_PAGE_LIMIT,
+              maximumReadRequests: MAX_ALERT_RESOLVE_VERIFICATION_READS,
+              exactBound: true,
+            };
             if (params.dryRun === true) {
               return textResult({
                 dryRun: true,
                 wouldResolve: ids.map((id) => ({ id })),
+                verificationReadBound,
               });
             }
 
@@ -774,18 +833,23 @@ export function getAlertsTools(): DomainTools {
                 verification[id] = verificationResult(await findAlertById(client, id));
               }
             }
-            return textResult({
-              dryRun: false,
-              requestedIds: ids,
-              resolved,
-              finalOutcome: "Resolved",
-              partialWrite: false,
-              verification: verification ?? { performed: false, possible: true, verified: null, reason: "verify=false" },
-              writeCount: synchronousWriteCount(1, 1),
-              writeAttempted: true,
-              writeMayHaveSucceeded: true,
-              reliableResponseReceived: true,
-            });
+            const verificationFailed = resolved !== true || alertResolveVerificationFailed(verification);
+            return {
+              ...textResult({
+                dryRun: false,
+                requestedIds: ids,
+                resolved,
+                finalOutcome: verificationFailed ? "VerificationFailed" : "Resolved",
+                partialWrite: verificationFailed,
+                verification: verification ?? { performed: false, possible: true, verified: null, reason: "verify=false" },
+                verificationReadBound,
+                writeCount: synchronousWriteCount(1, 1),
+                writeAttempted: true,
+                writeMayHaveSucceeded: true,
+                reliableResponseReceived: true,
+              }),
+              isError: verificationFailed,
+            };
           }
 
           case "superops_alerts_create": {
@@ -815,19 +879,21 @@ export function getAlertsTools(): DomainTools {
             const alert = await createAlert(client, input);
             synchronousWriteAccepted = true;
             const verification = params.verify === false
-              ? undefined
-              : alert.id
-                ? await findAlertById(client, alert.id)
-                : undefined;
-            return textResult({
-              dryRun: false,
-              alert,
-              finalOutcome: "Created",
-              partialWrite: false,
-              verification: verification ?? { performed: false, possible: Boolean(alert.id), verified: null, reason: "verify=false or mutation response had no alert ID" },
-              writeCount: synchronousWriteCount(1, 1),
-              writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true,
-            });
+              ? { performed: false, possible: Boolean(alert.id), verified: null, reason: "verify=false" }
+              : alertCreateVerification(alert, alert.id ? await findAlertById(client, alert.id) : undefined);
+            const verificationFailed = params.verify !== false && verification.verified !== true;
+            return {
+              ...textResult({
+                dryRun: false,
+                alert,
+                finalOutcome: verificationFailed ? "VerificationFailed" : "Created",
+                partialWrite: verificationFailed,
+                verification,
+                writeCount: synchronousWriteCount(1, 1),
+                writeAttempted: true, writeMayHaveSucceeded: true, reliableResponseReceived: true,
+              }),
+              isError: verificationFailed,
+            };
           }
 
           case "superops_alerts_summary": {

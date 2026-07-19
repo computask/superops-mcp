@@ -313,6 +313,12 @@ describe("Alerts Domain", () => {
     expect(parsed).toEqual({
       dryRun: true,
       wouldResolve: [{ id: "alert-1" }, { id: "alert-2" }],
+      verificationReadBound: {
+        maxAlertIds: 4,
+        perAlertMaxReads: 11,
+        maximumReadRequests: 44,
+        exactBound: true,
+      },
     });
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
@@ -349,6 +355,97 @@ describe("Alerts Domain", () => {
     expect(parsed.verification["alert-2"].resolved).toBe(true);
   });
 
+  it("accepts the maximum synchronous alert resolve batch", async () => {
+    mockClient.mutate.mockResolvedValue({ resolveAlerts: true });
+
+    const result = await getAlertsTools().handleCall("superops_alerts_resolve", {
+      alertIds: ["alert-1", "alert-2", "alert-3", "alert-4"],
+      verify: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).not.toBe(true);
+    expect(parsed.requestedIds).toEqual(["alert-1", "alert-2", "alert-3", "alert-4"]);
+    expect(parsed.verificationReadBound).toMatchObject({
+      maxAlertIds: 4,
+      perAlertMaxReads: 11,
+      maximumReadRequests: 44,
+      exactBound: true,
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects more than the maximum synchronous alert resolve batch before mutation", async () => {
+    const result = await getAlertsTools().handleCall("superops_alerts_resolve", {
+      alertIds: ["alert-1", "alert-2", "alert-3", "alert-4", "alert-5"],
+      verify: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed).toMatchObject({
+      ok: false,
+      validation: "TooManyAlertIds",
+      requestedCount: 5,
+      maximum: 4,
+      writeAttempted: false,
+      writeMayHaveSucceeded: false,
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("reports partial write when alert resolve verification mismatches", async () => {
+    mockClient.mutate.mockResolvedValue({ resolveAlerts: true });
+    mockClient.query.mockResolvedValue({
+      getAlertList: {
+        alerts: [activeAlert({ id: "alert-1", status: "Open" })],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+      },
+    });
+
+    const result = await getAlertsTools().handleCall("superops_alerts_resolve", {
+      alertId: "alert-1",
+      verify: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed).toMatchObject({
+      finalOutcome: "VerificationFailed",
+      partialWrite: true,
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+    });
+    expect(parsed.verification["alert-1"]).toMatchObject({ found: true, resolved: false });
+  });
+
+  it("reports partial write when alert create verification cannot find the alert", async () => {
+    mockClient.mutate.mockResolvedValue({
+      createAlert: activeAlert({ id: "created-alert", message: "Created" }),
+    });
+    mockClient.query.mockResolvedValue({
+      getAlertList: {
+        alerts: [],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 0 },
+      },
+    });
+
+    const result = await getAlertsTools().handleCall("superops_alerts_create", {
+      assetId: "asset-1",
+      message: "Created",
+      verify: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed).toMatchObject({
+      finalOutcome: "VerificationFailed",
+      partialWrite: true,
+      verification: { performed: true, possible: true, verified: false },
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+    });
+  });
   it("validates and dry-runs alert creation", async () => {
     const domain = getAlertsTools();
     const missing = await domain.handleCall("superops_alerts_create", {

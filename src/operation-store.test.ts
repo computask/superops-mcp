@@ -1213,6 +1213,18 @@ describe("operation store", () => {
     });
   });
 
+  it("preserves malformed stored operation classification through the durable store client", async () => {
+    const durable = ownerScopedDurableNamespace();
+    const ownerHash = stableHash("owner@example.com");
+    durable.valuesFor("owner:" + ownerHash).set("op:malformed-client", { operationId: "malformed-client" });
+
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+      const store = getOperationStore();
+      await expect(store.get("malformed-client", ownerHash)).rejects.toMatchObject({
+        name: "MalformedStoredOperationError",
+      });
+    });
+  });
   it("returns a stable malformed-operation error without fabricating state", async () => {
     const values = new Map<string, unknown>([["op:malformed", { operationId: "malformed" }]]);
     const durableObject = new SuperOpsOperationLedger({

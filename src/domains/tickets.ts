@@ -2040,11 +2040,6 @@ async function createTicketNote(
   return response.createTicketNote;
 }
 
-function isSuperOpsInternalError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /internal server error|internal_error|server error|status\s*500/i.test(message);
-}
-
 function isRateLimitError(error: unknown): boolean {
   if (error instanceof SuperOpsHttpError) return error.status === 429;
   if (error instanceof SuperOpsError) {
@@ -2138,6 +2133,18 @@ function noteVerificationResult(notes: TicketNote[], createdNote: TicketNote): R
     noteId: createdId,
     reason: createdId ? undefined : "Mutation response did not include a note ID for read-back verification.",
   };
+}
+function verificationSucceeded(verification: Record<string, unknown>): boolean {
+  return verification.verified === true;
+}
+
+function synchronousVerificationFailureReason(verification: Record<string, unknown>): string {
+  if (typeof verification.reason === "string") return verification.reason;
+  if (Array.isArray(verification.mismatches) && verification.mismatches.length > 0) {
+    return "Verification did not establish the requested final state: " +
+      JSON.stringify(verification.mismatches);
+  }
+  return "Verification did not establish the requested final state.";
 }
 function ticketFinalState(ticket: Ticket): Record<string, unknown> {
   return {
@@ -3044,40 +3051,51 @@ async function applyApprovedTriageAction(params: {
           return result;
         }
         const fallbackAllowed = action.allowResolveFullFallbackToUpdate ?? params.allowResolveFullFallbackToUpdate;
-        if (action.action === "resolve" && fallbackAllowed && isSuperOpsInternalError(error)) {
+        if (action.action === "resolve" && fallbackAllowed &&
+            !isReliableSynchronousMutationRejection(error) && mandatoryValidationFields(error).length === 0) {
           result.failureStage = "resolve_full";
           result.failureReason = safeErrorMessage(error);
-          // A 5xx response is ambiguous. Re-read before considering the legacy
-          // update fallback: an already-visible target proves the first write
-          // succeeded, while any changed updatedTime makes replay unsafe.
-          const reread = await getTicketByInternalId(client, ticket.ticketId);
+          result.writeAttempted = true;
+          result.partialWrite = true;
+          let reread: Ticket;
+          try {
+            reread = await getTicketByInternalId(client, ticket.ticketId);
+          } catch (rereadError) {
+            result.finalOutcome = "Failed";
+            result.failureStage = "ambiguousWrite";
+            result.failureReason = "Ambiguous resolution response could not be reconciled: " +
+              safeErrorMessage(rereadError);
+            result.fallbackResult = "Ambiguous resolution response remains unresolved; fallback was not attempted.";
+            return result;
+          }
           if (targetAppliedToTicket(action, reread)) {
+            result.finalOutcome = "Resolved";
+            result.failureStage = null;
+            result.failureReason = null;
+            result.partialWrite = false;
+            result.finalState = ticketFinalState(reread);
+            result.observedFinalState = result.finalState;
+            result.verifiedState = result.finalState;
+            result.verified = true;
             result.fallbackResult = "Not required; intended resolution is already visible.";
             await params.afterVerification?.("resolution");
+            return result;
           } else if (reread.updatedTime !== ticket.updatedTime) {
             result.finalOutcome = "SkippedChangedSinceSnapshot";
             result.fallbackResult = "Ticket changed after the ambiguous resolution response; fallback was not attempted.";
-            result.partialWrite = true;
             return result;
           } else {
             const rereadFailure = validateExpectedTicket(ticketNumber, action, reread, true);
             if (rereadFailure) {
               result.finalOutcome = "Blocked";
               result.fallbackResult = rereadFailure.reason;
-              result.partialWrite = true;
               return result;
             }
-            result.fallbackAttempted = true;
-            await params.beforeMutation?.("resolveFallback");
-            const fallbackResult = await mutateTicketUpdate(
-              client,
-              updateInput as Record<string, unknown>
-            );
-            await params.afterMutation?.("resolveFallback", {
-              ticketId: fallbackResult.ticketId,
-            });
-            result.writeMethod = "update_fallback";
-            result.fallbackResult = "Updated";
+            result.finalOutcome = "Failed";
+            result.failureStage = "ambiguousWrite";
+            result.failureReason = "Ambiguous resolution response was not observed, but non-acceptance was not conclusively proven.";
+            result.fallbackResult = "Ambiguous resolution response remains unresolved; fallback was not attempted.";
+            return result;
           }
         } else {
           result.finalOutcome = "Failed";
@@ -3178,10 +3196,13 @@ function applyResultToContinuationOutcome(
     result.rateLimitConclusiveRejection === true;
   const ambiguousMutation = result.writeAttempted && result.partialWrite && (
     result.failureStage === "update" || result.failureStage === "resolve_full" ||
-    result.failureStage === "createTicketNote" || result.failureStage === "write"
+    result.failureStage === "createTicketNote" || result.failureStage === "write" ||
+    result.failureStage === "ambiguousWrite"
   );
-  const persistedStage = ambiguousMutation
-    ? result.failureStage === "createTicketNote"
+  const persistedStage = result.failureStage === "ambiguousWrite"
+    ? "AmbiguousWriteUnresolved"
+    : ambiguousMutation
+      ? result.failureStage === "createTicketNote"
       ? "NoteWriteAmbiguous"
       : result.failureStage === "resolve_full"
         ? "ResolutionWriteAmbiguous"
@@ -3189,7 +3210,8 @@ function applyResultToContinuationOutcome(
     : stage;
   return {
     stage: rateLimitReschedule ? "RateLimitedRescheduled" : persistedStage,
-    outcome: rateLimitReschedule ? "SuperOpsRateLimitRescheduled" : result.finalOutcome,
+    outcome: rateLimitReschedule ? "SuperOpsRateLimitRescheduled" :
+      result.failureStage === "ambiguousWrite" ? "AmbiguousWriteUnresolved" : result.finalOutcome,
     writeAttempted: result.writeAttempted,
     // A durable mutation-start checkpoint remains conservative even when the
     // response is a conclusive throttle; the reliable rejection marker is what
@@ -3222,6 +3244,8 @@ function applyResultToContinuationOutcome(
       ? "SuperOpsRateLimit"
       : result.finalOutcome === "SkippedChangedSinceSnapshot"
         ? "StaleData"
+      : result.failureStage === "ambiguousWrite"
+        ? "AmbiguousWrite"
       : result.partialWrite
         ? "VerificationMismatch"
         : undefined,
@@ -4888,6 +4912,7 @@ export function getTicketsTools(): DomainTools {
 
             let continuation;
             let continuationError: string | undefined;
+            let conservativeOutcome: ContinuationItemOutcome | undefined;
             try {
               continuation = await runOperationContinuation({
                 operationId, ownerHash,
@@ -4896,15 +4921,33 @@ export function getTicketsTools(): DomainTools {
               });
             } catch (error) {
               continuationError = safeErrorMessage(error);
+              conservativeOutcome = typeof error === "object" && error !== null
+                ? (error as { conservativeOutcome?: ContinuationItemOutcome }).conservativeOutcome
+                : undefined;
             }
 
-            let finalRecord = (await store.get(operationId, ownerHash)) ?? initialRecord;
+            let finalRecord = initialRecord;
+            let finalRecordReadFailed = false;
+            try {
+              finalRecord = (await store.get(operationId, ownerHash)) ?? initialRecord;
+            } catch (error) {
+              finalRecordReadFailed = true;
+              continuationError ??= safeErrorMessage(error);
+            }
             let continuationScheduling: Record<string, unknown> | undefined;
-            const continuationRequired = continuation?.continuationRequired ??
-              finalRecord.pendingItems.length > 0;
-            if (continuationRequired && !finalRecord.nextEligibleTime) {
-              const scheduled = await scheduleApplyTriageContinuation(operationId, ownerHash);
-              continuationScheduling = { attempted: true, scheduled: scheduled.scheduled,
+            const continuationRequired = (continuation?.continuationRequired ??
+              finalRecord.pendingItems.length > 0) || finalRecordReadFailed || Boolean(conservativeOutcome);
+            if (continuationRequired && !finalRecord.nextEligibleTime && !finalRecordReadFailed && !conservativeOutcome) {
+              let scheduled: Awaited<ReturnType<typeof scheduleApplyTriageContinuation>>;
+              try {
+                scheduled = await scheduleApplyTriageContinuation(operationId, ownerHash);
+              } catch (error) {
+                continuationError ??= safeErrorMessage(error);
+                continuationScheduling = { attempted: true, scheduled: false,
+                  error: safeErrorMessage(error), mechanism: "serviceBinding" };
+                scheduled = { scheduled: false, reason: safeErrorMessage(error) };
+              }
+              continuationScheduling ??= { attempted: true, scheduled: scheduled.scheduled,
                 status: scheduled.status, error: scheduled.scheduled ? undefined : scheduled.reason,
                 mechanism: "serviceBinding" };
               if (scheduled.scheduled) {
@@ -4918,7 +4961,7 @@ export function getTicketsTools(): DomainTools {
                 } catch (error) {
                   continuationError ??= safeErrorMessage(error);
                 }
-              } else {
+              } else if (!continuationScheduling.terminalized) {
                 const reason = scheduled.status
                   ? "Immediate continuation delivery failed with status " + scheduled.status + "."
                   : "Immediate continuation delivery failed or is not configured.";
@@ -4952,13 +4995,32 @@ export function getTicketsTools(): DomainTools {
             const results = completeApplyResultsFromLedger(finalRecord, expected, actionByTicket);
             const summary = summarizeApplyResults(results);
             try {
-              finalRecord = await store.update(operationId, ownerHash, (record) => ({ ...record, summary }));
+              if (!finalRecordReadFailed) {
+                finalRecord = await store.update(operationId, ownerHash, (record) => ({ ...record, summary }));
+              }
             } catch (error) {
               continuationError ??= safeErrorMessage(error);
             }
-            const complete = finalRecord.state === "Completed" ||
+            const complete = !finalRecordReadFailed && (
+              finalRecord.state === "Completed" ||
               finalRecord.state === "CompletedWithFailures" ||
-              finalRecord.state === "Failed" || finalRecord.state === "Cancelled";
+              finalRecord.state === "Failed" || finalRecord.state === "Cancelled"
+            );
+            const durableItems = Object.values(finalRecord.itemStates);
+            const conservativeWriteAttempted = durableItems.some((item) => item.writeAttempted) ||
+              conservativeOutcome?.writeAttempted === true;
+            const conservativeWriteMayHaveSucceeded = durableItems.some((item) => item.writeMayHaveSucceeded) ||
+              conservativeOutcome?.writeMayHaveSucceeded === true || conservativeOutcome?.partialWrite === true;
+            const conservativePartialWrite = durableItems.some((item) => item.partialWrite) ||
+              conservativeOutcome?.partialWrite === true;
+            const conservativeVerificationState = conservativeOutcome?.verified === true
+              ? "Verified"
+              : conservativeOutcome?.verificationFailed === true
+                ? "Failed"
+                : conservativeWriteMayHaveSucceeded ? "Pending" : undefined;
+            const conservativeFinalReason = continuationError
+              ? "OperationStorePostWriteFailure"
+              : conservativeOutcome?.outcome;
 
             return {
               content: [{ type: "text", text: JSON.stringify({
@@ -4966,8 +5028,12 @@ export function getTicketsTools(): DomainTools {
                 operation: { operationId, idempotencyKey: params.batchId ?? operationId,
                   complete, continuationRequired: !complete, persisted: true,
                   storeError: continuationError, continuationScheduling, state: finalRecord.state,
-                  writeAttempted: Object.values(finalRecord.itemStates).some((item) => item.writeAttempted),
-                  writeMayHaveSucceeded: Object.values(finalRecord.itemStates).some((item) => item.writeMayHaveSucceeded) },
+                  errorClass: continuationError ? "OperationStoreFailure" : undefined,
+                  finalReason: conservativeFinalReason,
+                  partialWrite: conservativePartialWrite,
+                  verificationState: conservativeVerificationState,
+                  writeAttempted: conservativeWriteAttempted,
+                  writeMayHaveSucceeded: conservativeWriteMayHaveSucceeded },
                 initialCandidateCount: expected.length,
                 expectedCandidateTicketNumbers: expected,
                 results, summary, execution: executionDiagnostics(),
@@ -5371,6 +5437,24 @@ export function getTicketsTools(): DomainTools {
               ? await getTicketNotes(client, resolvedTicket.ticketId)
               : [];
             const writes = createdNote ? 2 : 1;
+            const updateVerification = verifyDirectTicketUpdate(updateInput, verifiedTicket);
+            const noteVerification = createdNote
+              ? noteVerificationResult(latestNotes, createdNote)
+              : undefined;
+            const verification = {
+              performed: true,
+              possible: true,
+              verified: verificationSucceeded(updateVerification) &&
+                (noteVerification ? verificationSucceeded(noteVerification) : true),
+              update: updateVerification,
+              note: noteVerification,
+            };
+            const verificationFailed = verification.verified !== true;
+            const verificationFailureReason = verificationFailed
+              ? !verificationSucceeded(updateVerification)
+                ? synchronousVerificationFailureReason(updateVerification)
+                : noteVerification ? synchronousVerificationFailureReason(noteVerification) : undefined
+              : undefined;
 
             return {
               content: [
@@ -5379,9 +5463,10 @@ export function getTicketsTools(): DomainTools {
                   text: JSON.stringify(
                     {
                       result: ticketSummary(verifiedTicket, latestNotes[0] ?? createdNote),
-                      finalOutcome: "Updated",
-                      partialWrite: false,
-                      verification: { performed: true, possible: true, verified: true },
+                      finalOutcome: verificationFailed ? "VerificationFailed" : "Updated",
+                      partialWrite: verificationFailed,
+                      verification,
+                      failureReason: verificationFailureReason,
                       writeCount: synchronousWriteCount(writes, writes),
                       writeAttempted: true,
                       writeMayHaveSucceeded: true,
@@ -5393,6 +5478,7 @@ export function getTicketsTools(): DomainTools {
                   ),
                 },
               ],
+              isError: verificationFailed,
             };
           }
 
@@ -5450,6 +5536,10 @@ export function getTicketsTools(): DomainTools {
               { input }
             );
             synchronousWriteAccepted = true;
+            const verification = params.verify === false
+              ? { performed: false, possible: true, verified: null, reason: "verify=false" }
+              : verifyDirectTicketUpdate(input, await getTicketByInternalId(client, params.ticketId));
+            const verificationFailed = params.verify !== false && !verificationSucceeded(verification);
 
             return {
               content: [
@@ -5457,11 +5547,12 @@ export function getTicketsTools(): DomainTools {
                   type: "text",
                   text: JSON.stringify({
                     result: response.updateTicket,
-                    finalOutcome: "Updated",
-                    partialWrite: false,
-                    verification: params.verify === false
-                      ? { performed: false, possible: true, verified: null, reason: "verify=false" }
-                      : verifyDirectTicketUpdate(input, await getTicketByInternalId(client, params.ticketId)),
+                    finalOutcome: verificationFailed ? "VerificationFailed" : "Updated",
+                    partialWrite: verificationFailed,
+                    verification,
+                    failureReason: verificationFailed
+                      ? synchronousVerificationFailureReason(verification)
+                      : undefined,
                     writeCount: synchronousWriteCount(1, 1),
                     writeAttempted: true,
                     writeMayHaveSucceeded: true,
@@ -5470,6 +5561,7 @@ export function getTicketsTools(): DomainTools {
                   }, null, 2),
                 },
               ],
+              isError: verificationFailed,
             };
           }
 
@@ -5490,6 +5582,10 @@ export function getTicketsTools(): DomainTools {
               },
             });
             synchronousWriteAccepted = true;
+            const verification = params.verify === false
+              ? { performed: false, possible: Boolean(response.createTicketNote.noteId), verified: null, reason: "verify=false" }
+              : noteVerificationResult(await getTicketNotes(client, params.ticketId), response.createTicketNote);
+            const verificationFailed = params.verify !== false && !verificationSucceeded(verification);
 
             return {
               content: [
@@ -5501,11 +5597,12 @@ export function getTicketsTools(): DomainTools {
                       addedOn: response.createTicketNote.addedOn,
                       privacyType: response.createTicketNote.privacyType,
                     },
-                    finalOutcome: "NoteAdded",
-                    partialWrite: false,
-                    verification: params.verify === false
-                      ? { performed: false, possible: Boolean(response.createTicketNote.noteId), verified: null, reason: "verify=false" }
-                      : noteVerificationResult(await getTicketNotes(client, params.ticketId), response.createTicketNote),
+                    finalOutcome: verificationFailed ? "VerificationFailed" : "NoteAdded",
+                    partialWrite: verificationFailed,
+                    verification,
+                    failureReason: verificationFailed
+                      ? synchronousVerificationFailureReason(verification)
+                      : undefined,
                     writeCount: synchronousWriteCount(1, 1),
                     writeAttempted: true,
                     writeMayHaveSucceeded: true,
@@ -5514,6 +5611,7 @@ export function getTicketsTools(): DomainTools {
                   }, null, 2),
                 },
               ],
+              isError: verificationFailed,
             };
           }
 
