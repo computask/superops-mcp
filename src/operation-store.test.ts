@@ -8,6 +8,7 @@ import {
   runWithOperationStore,
   stableHash,
   SuperOpsOperationLedger,
+  type OperationItemState,
   type OperationLedgerRecord,
 } from "./operation-store.js";
 
@@ -243,6 +244,92 @@ describe("operation store", () => {
       completedAfterAmbiguousVerification: 1,
       waitingForRateLimit: 1,
       pending: 1,
+    });
+  });
+
+  it("derives operation status totals from reloaded durable item states", async () => {
+    const durable = ownerScopedDurableNamespace();
+    const ownerHash = stableHash("owner@example.com");
+    const base = record().itemStates["57400"];
+    const item = (
+      itemKey: string,
+      overrides: Partial<OperationItemState>
+    ): OperationItemState => ({
+      ...base,
+      itemKey,
+      idempotencyKey: "item-" + itemKey,
+      stage: "Completed",
+      outcome: "Updated",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: false,
+      verificationState: "Verified",
+      retryCount: 0,
+      ...overrides,
+    });
+    const itemStates: Record<string, OperationItemState> = {
+      first: item("first", { attemptCount: 1 }),
+      retry: item("retry", { attemptCount: 2, retryCount: 1, observedMutationResult: "VerifiedApplied" }),
+      validation: item("validation", {
+        stage: "FailedBeforeWrite", outcome: "Blocked", writeAttempted: false,
+        writeMayHaveSucceeded: false, verificationState: "NotRequired", errorClass: "ValidationFailure",
+      }),
+      stale: item("stale", {
+        stage: "Stale", outcome: "SkippedChangedSinceSnapshot", writeAttempted: false,
+        writeMayHaveSucceeded: false, verificationState: "NotRequired", errorClass: "StaleData",
+      }),
+      ambiguous: item("ambiguous", {
+        stage: "AmbiguousWriteUnresolved", outcome: "AmbiguousWriteRequiresReconciliation",
+        partialWrite: true, ambiguousWrite: true, errorClass: "AmbiguousWrite",
+      }),
+      verify: item("verify", {
+        stage: "FailedAfterPartialWrite", outcome: "Failed", partialWrite: true,
+        verificationState: "Failed", errorClass: "VerificationMismatch",
+      }),
+      exhausted: item("exhausted", {
+        stage: "RateLimitExceeded", outcome: "RateLimitExceeded", writeAttempted: false,
+        writeMayHaveSucceeded: false, verificationState: "Pending", errorClass: "RateLimitExceeded",
+      }),
+      waiting: item("waiting", {
+        stage: "RateLimitedRescheduled", outcome: "SuperOpsRateLimitRescheduled",
+        writeMayHaveSucceeded: false, nextEligibleTime: "2026-07-18T00:05:00.000Z",
+        errorClass: "SuperOpsRateLimit",
+      }),
+      unattempted: item("unattempted", {
+        stage: "Unattempted", outcome: "NotAttemptedExecutionStopped", writeAttempted: false,
+        writeMayHaveSucceeded: false, verificationState: "Pending",
+      }),
+    };
+    const expectedItems = Object.keys(itemStates);
+
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+      const store = getOperationStore();
+      await store.put(record({
+        operationId: "op-durable-totals",
+        ownerHash,
+        expectedItems,
+        itemStates,
+        summary: { updated: 999, validationFailed: 999, completedAfterRetry: 999 },
+        completedItems: [], failedItems: [], skippedItems: [], unattemptedItems: [], pendingItems: [],
+      }));
+
+      const reloaded = await store.get("op-durable-totals", ownerHash);
+      if (!reloaded) throw new Error("expected reloaded operation");
+      expect(operationResultView(reloaded).totals).toMatchObject({
+        expected: 9,
+        completed: 2,
+        updated: 2,
+        completedAfterRetry: 1,
+        validationFailed: 1,
+        stale: 1,
+        failed: 4,
+        partialWrite: 2,
+        ambiguousUnresolved: 1,
+        pending: 2,
+        unattempted: 1,
+        waitingForRateLimit: 1,
+        rateLimitExceeded: 1,
+      });
     });
   });
 

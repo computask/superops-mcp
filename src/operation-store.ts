@@ -1622,7 +1622,9 @@ export function operationTotals(record: OperationLedgerRecord): Record<string, n
     if (item.outcome === "Updated") totals.updated += 1;
     if (item.outcome === "Resolved") totals.resolved += 1;
     if (item.outcome === "Updated" && item.mutationType === "note") totals.noteOnly += 1;
-    if (item.stage === "CompletedAfterRetry") totals.completedAfterRetry += 1;
+    if (isTerminalSuccessfulItem(item) && completedAfterDurableRetry(item)) {
+      totals.completedAfterRetry += 1;
+    }
     if (item.stage === "CompletedAfterAmbiguousWriteVerification") {
       totals.completedAfterAmbiguousVerification += 1;
     }
@@ -1648,6 +1650,18 @@ export function operationTotals(record: OperationLedgerRecord): Record<string, n
     }
   }
   return totals;
+}
+
+function isTerminalSuccessfulItem(item: OperationItemState): boolean {
+  return TERMINAL_STAGES.has(item.stage) &&
+    !FAILED_STAGES.has(item.stage) &&
+    !SKIPPED_STAGES.has(item.stage);
+}
+
+function completedAfterDurableRetry(item: OperationItemState): boolean {
+  return item.stage === "CompletedAfterRetry" ||
+    (item.attemptCount ?? 0) > 1 ||
+    (item.retryCount > 0 && item.observedMutationResult !== "Rejected");
 }
 
 export function operationResultView(record: OperationLedgerRecord): Record<string, unknown> {

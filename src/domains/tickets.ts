@@ -2588,6 +2588,23 @@ function triageStageForResult(result: ApplyTriagePlanResult): OperationItemState
   }
 }
 
+function validationErrorClassForApplyResult(
+  result: ApplyTriagePlanResult
+): OperationItemState["errorClass"] | undefined {
+  if (result.writeAttempted || result.partialWrite) return undefined;
+  if (result.finalOutcome === "SkippedChangedSinceSnapshot") return undefined;
+  if (result.failureStage?.startsWith("validate")) return "ValidationFailure";
+  return [
+    "contentVerification",
+    "notePrivacy",
+    "operationPayload",
+    "noteContentUnavailable",
+    "validation",
+  ].includes(result.failureStage ?? "")
+    ? "ValidationFailure"
+    : undefined;
+}
+
 function compactApplyResult(result: ApplyTriagePlanResult): Record<string, unknown> {
   return {
     ticketNumber: result.ticketNumber,
@@ -2736,6 +2753,7 @@ function buildApplyTriageLedgerRecord(params: {
             : "NotRequired",
         retryCount: 0,
         failureReason: result?.failureReason ?? undefined,
+        errorClass: result ? validationErrorClassForApplyResult(result) : undefined,
         updatedTimeExpectation: action?.expectedUpdatedTime,
         targetFields: action?.target ? { ...action.target } : undefined,
       };
@@ -3275,7 +3293,7 @@ function applyResultToContinuationOutcome(
         ? "VerificationMismatch"
       : result.partialWrite
         ? "AmbiguousWrite"
-        : undefined,
+        : validationErrorClassForApplyResult(result),
   };
 }
 

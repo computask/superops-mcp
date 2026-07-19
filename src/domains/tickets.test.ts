@@ -42,7 +42,7 @@ import {
   runWithExecutionConfig,
   runWithExecutionContext,
 } from "../execution.js";
-import { getOperationStore, runWithOperationStore, stableHash } from "../operation-store.js";
+import { getOperationStore, operationResultView, runWithOperationStore, stableHash } from "../operation-store.js";
 import { runWithContinuationScheduler } from "../continuation-scheduler.js";
 
 function withSuccessfulContinuationScheduling<T>(fn: () => T): T {
@@ -2800,6 +2800,13 @@ describe("Tickets Domain", () => {
       partialWrite: true,
       failureStage: "verifyFinalState",
     });
+    const stored = await getOperationStore().get(parsed.operation.operationId);
+    if (!stored) throw new Error("missing verification-failure operation");
+    expect(operationResultView(stored).totals).toMatchObject({
+      failed: 1,
+      partialWrite: 1,
+      validationFailed: 0,
+    });
   });
   it("fails final verification when update reports success but verified state stays New Calls", async () => {
     mockClient.query
@@ -3551,7 +3558,7 @@ describe("Tickets Domain", () => {
         errorClass: "SuperOpsRateLimit",
       });
 
-      await runWithExecutionConfig({}, () => runWithExecutionContext(
+      const resumed = await runWithExecutionConfig({}, () => runWithExecutionContext(
         "superops_tickets_apply_triage_plan",
         () => resumeApplyTriageOperation({
           operationId,
@@ -3561,12 +3568,19 @@ describe("Tickets Domain", () => {
         })
       ));
       const finalRecord = await store.get(operationId, stored.ownerHash);
-      expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      if (!finalRecord) throw new Error("missing final rejection-crash-restart operation");
+      expect(finalRecord.itemStates["57401"]).toMatchObject({
         stage: "Completed",
         observedMutationResult: "VerifiedApplied",
         attemptCount: 2,
         verificationState: "Verified",
       });
+      expect(operationResultView(finalRecord).totals).toMatchObject({
+        completedAfterRetry: 1,
+        updated: 1,
+        validationFailed: 0,
+      });
+      expect(resumed.view.totals).toMatchObject({ completedAfterRetry: 1 });
       expect(mockClient.mutate).toHaveBeenCalledTimes(2);
     });
   });
@@ -3634,11 +3648,17 @@ describe("Tickets Domain", () => {
     });
 
     const finalRecord = await getOperationStore().get(operationId);
-    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+    if (!finalRecord) throw new Error("missing first-attempt operation");
+    expect(finalRecord.itemStates["57401"]).toMatchObject({
       stage: "Completed",
       outcome: "Updated",
       writeAttempted: true,
       verificationState: "Verified",
+    });
+    expect(operationResultView(finalRecord).totals).toMatchObject({
+      completedAfterRetry: 0,
+      updated: 1,
+      validationFailed: 0,
     });
     expect(mockClient.mutate).toHaveBeenCalledTimes(1);
   });
@@ -3729,10 +3749,75 @@ describe("Tickets Domain", () => {
     });
 
     const finalRecord = await getOperationStore().get(operationId);
-    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+    if (!finalRecord) throw new Error("missing stale operation");
+    expect(finalRecord.itemStates["57401"]).toMatchObject({
       stage: "Stale",
       outcome: "SkippedChangedSinceSnapshot",
       writeAttempted: false,
+    });
+    expect(operationResultView(finalRecord).totals).toMatchObject({
+      stale: 1,
+      validationFailed: 0,
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("counts ordinary target validation failures from the reloaded operation", async () => {
+    const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+        batchId: "ordinary-validation-total",
+        expectedCandidateTicketNumbers: ["57400", "57401"],
+        actions: [{
+          ticketNumber: "57401",
+          contentVerified: true,
+          action: "update",
+          target: { status: "Not a SuperOps status" },
+        }],
+      })
+    ));
+    const operationId = JSON.parse(initial.content[0].text).operation.operationId as string;
+    const stored = await getOperationStore().get(operationId);
+    if (!stored) throw new Error("missing ordinary validation operation");
+
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57401",
+          displayId: "57401",
+          status: "New Calls",
+        },
+      });
+
+    await runWithExecutionConfig({}, () => runWithExecutionContext(
+      "superops_tickets_apply_triage_plan",
+      () => resumeApplyTriageOperation({
+        operationId,
+        ownerHash: stored.ownerHash,
+        leaseOwner: "ordinary-validation-worker",
+      })
+    ));
+
+    const finalRecord = await getOperationStore().get(operationId, stored.ownerHash);
+    if (!finalRecord) throw new Error("missing final ordinary validation operation");
+    expect(finalRecord.itemStates["57401"]).toMatchObject({
+      stage: "FailedBeforeWrite",
+      outcome: "Blocked",
+      errorClass: "ValidationFailure",
+      writeAttempted: false,
+    });
+    expect(operationResultView(finalRecord).totals).toMatchObject({
+      failed: 1,
+      validationFailed: 1,
+      stale: 0,
+      ambiguousUnresolved: 0,
+      rateLimitExceeded: 0,
     });
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
@@ -4016,6 +4101,11 @@ describe("Tickets Domain", () => {
       nextEligibleTime: expect.any(String),
     });
     expect(rescheduled?.itemStates["57401"].rateLimit).toMatchObject({ attempts: 1 });
+    if (!rescheduled) throw new Error("missing rate-limited operation");
+    expect(operationResultView(rescheduled).totals).toMatchObject({
+      waitingForRateLimit: 1,
+      validationFailed: 0,
+    });
 
     await runWithExecutionConfig({}, () =>
       runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
@@ -4066,14 +4156,19 @@ describe("Tickets Domain", () => {
       )
     );
     const finalRecord = await getOperationStore().get("private-note-ambiguous");
-    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+    if (!finalRecord) throw new Error("missing ambiguous private-note operation");
+    expect(finalRecord.itemStates["57401"]).toMatchObject({
       stage: "AmbiguousWriteUnresolved",
       writeAttempted: true,
       writeMayHaveSucceeded: true,
       partialWrite: true,
       errorClass: "AmbiguousWrite",
     });
-    expect(finalRecord?.itemStates["57401"].nextEligibleTime).toBeUndefined();
+    expect(finalRecord.itemStates["57401"].nextEligibleTime).toBeUndefined();
+    expect(operationResultView(finalRecord).totals).toMatchObject({
+      ambiguousUnresolved: 1,
+      validationFailed: 0,
+    });
     expect(mockClient.mutate).toHaveBeenCalledTimes(1);
   });
 
