@@ -7,9 +7,6 @@ const DEFAULT_QUERY_MAX_RECORDS = 5000;
 const DEFAULT_QUERY_MAX_PAGES = 100;
 const DEFAULT_REPORT_MAX_RECORDS = 10000;
 const DEFAULT_REPORT_MAX_PAGES = 200;
-const MAX_RETRY_ATTEMPTS = 3;
-const INITIAL_RETRY_DELAY_MS = 100;
-const MAX_RETRY_DELAY_MS = 1000;
 const ISO_DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const IDENTITY_FIELDS = ["ticketId", "displayId", "createdTime"] as const;
 const FIELD_PROFILES = {
@@ -70,19 +67,13 @@ export function validateHistoricalTicketQueryParams(params: HistoricalTicketQuer
   const selection = buildTicketSelection(params);
   return { createdFrom: createdFrom.iso, createdTo: createdTo.iso, createdFromMs: createdFrom.ms, createdToMs: createdTo.ms, ...selection, maxRecords: clampInteger(params.maxRecords, DEFAULT_QUERY_MAX_RECORDS, 1, 50000), maxPages: clampInteger(params.maxPages, DEFAULT_QUERY_MAX_PAGES, 1, 10000), sortOrder: params.sortOrder === "ASC" ? "ASC" : "DESC" };
 }
-export async function fetchTicketPage(client: QueryableClient, input: ListInfoInput, selectionFields: string[], page: number, retryDiagnostics: RetryDiagnostics): Promise<{ response?: TicketListResponse; error?: FetchErrorDiagnostic }> {
+export async function fetchTicketPage(client: QueryableClient, input: ListInfoInput, selectionFields: string[], page: number): Promise<{ response?: TicketListResponse; error?: FetchErrorDiagnostic }> {
   const query = buildTicketListQuery(selectionFields);
-  let attempt = 0; let lastError: unknown;
-  while (attempt < MAX_RETRY_ATTEMPTS) {
-    attempt += 1;
-    try { return { response: await client.query<TicketListResponse>(query, { input }) }; }
-    catch (error) {
-      lastError = error;
-      if (!isRetryable(error) || attempt >= MAX_RETRY_ATTEMPTS) break;
-      const ms = retryDelayMs(error, attempt); retryDiagnostics.retries += 1; retryDiagnostics.retryDelaysMs.push(ms); await delay(ms);
-    }
+  try {
+    return { response: await client.query<TicketListResponse>(query, { input }) };
+  } catch (error) {
+    return { error: { stage: "fetchPage", page, errorType: errorType(error), message: safeErrorMessage(error), retryable: isRetryable(error), attempts: 1 } };
   }
-  return { error: { stage: "fetchPage", page, errorType: errorType(lastError), message: safeErrorMessage(lastError), retryable: isRetryable(lastError), attempts: attempt } };
 }
 export async function fetchTicketsPaginated(client: QueryableClient, params: HistoricalTicketQueryParams): Promise<TicketQueryResult> {
   const effective = validateHistoricalTicketQueryParams(params);
@@ -99,7 +90,7 @@ export async function fetchTicketsPaginated(client: QueryableClient, params: His
     if (!hasExecutionBudgetFor(1)) { errors.push({ stage: "fetchPage", page, errorType: "network", message: "Execution subrequest budget exhausted before fetching the next page.", retryable: true, attempts: 0 }); pagination.complete = false; pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "fetchError"; warnings.push("Execution budget reached before all pages were fetched; results are partial."); break; }
     const input: ListInfoInput = { page, pageSize: CREATED_TIME_REPORT_PAGE_SIZE, sort: buildTicketSort(), condition };
     if (!condition) delete input.condition;
-    const pageResult = await fetchTicketPage(client, input, effective.fetchFields, page, retryDiagnostics);
+    const pageResult = await fetchTicketPage(client, input, effective.fetchFields, page);
     if (pageResult.error) { errors.push(pageResult.error); pagination.complete = false; pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "fetchError"; break; }
     const ticketList = pageResult.response?.getTicketList; const tickets = ticketList?.tickets ?? [];
     pagination.pagesFetched += 1; pagination.apiTotalCount ??= ticketList?.listInfo?.totalCount; pagination.pageSize = Math.min(ticketList?.listInfo?.pageSize ?? CREATED_TIME_REPORT_PAGE_SIZE, CREATED_TIME_REPORT_PAGE_SIZE);
@@ -200,10 +191,8 @@ function isRetryable(error: unknown): boolean {
   if (error instanceof SuperOpsError) { const code = error.code?.toLowerCase() ?? ""; return code.includes("rate") || code.includes("timeout") || code.includes("internal"); }
   const status = typeof error === "object" && error !== null ? (error as { status?: unknown }).status : undefined; return status === 429 || (typeof status === "number" && status >= 500 && status <= 599);
 }
-function retryDelayMs(error: unknown, attempt: number): number { const retryAfter = typeof error === "object" && error !== null ? (error as { retryAfter?: unknown }).retryAfter : undefined; if (typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter >= 0) return Math.min(MAX_RETRY_DELAY_MS, Math.round(retryAfter * 1000)); return Math.min(MAX_RETRY_DELAY_MS, INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1)); }
 function errorType(error: unknown): FetchErrorDiagnostic["errorType"] { if (error instanceof SuperOpsHttpError) { if (error.status === 429) return "rateLimit"; if (error.status >= 500) return "server"; } if (error instanceof SuperOpsError) return "graphql"; const status = typeof error === "object" && error !== null ? (error as { status?: unknown }).status : undefined; if (status === 429) return "rateLimit"; if (typeof status === "number" && status >= 500) return "server"; return "network"; }
 function safeErrorMessage(error: unknown): string { return error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300); }
-function delay(ms: number): Promise<void> { return ms <= 0 ? Promise.resolve() : new Promise((resolve) => setTimeout(resolve, ms)); }
 
 function validateTimezone(timezone: string): void { try { new Intl.DateTimeFormat("en-GB", { timeZone: timezone }).format(new Date()); } catch { throw new Error(`Unsupported IANA timezone: ${timezone}`); } }
 function buildSeries(records: NormalizedReportingTicket[], interval: Interval, timezone: string, includeZeroBuckets: boolean, fromIso: string, toIso: string): { bucketStart: string; bucketEnd: string; count: number }[] {

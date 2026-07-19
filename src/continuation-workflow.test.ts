@@ -25,6 +25,29 @@ function terminalRecord() {
   };
 }
 
+function activeRecord() {
+  return {
+    ...terminalRecord(),
+    operationId: "workflow-exhausted-op",
+    state: "ContinuationRequired" as const,
+    completedItems: [],
+    failedItems: [],
+    pendingItems: ["57400"],
+    unattemptedItems: ["57400"],
+    compactResults: [],
+    itemStates: {
+      "57400": {
+        ...terminalRecord().itemStates["57400"],
+        stage: "Unattempted" as const,
+        outcome: "NotAttemptedExecutionStopped",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+        partialWrite: false,
+      },
+    },
+  };
+}
+
 describe("SuperOps continuation Workflow", () => {
   it("durably sleeps then calls the guarded real continuation route with compact identity", async () => {
     await runWithOperationStore({}, () => getOperationStore().put(terminalRecord()));
@@ -69,5 +92,58 @@ describe("SuperOps continuation Workflow", () => {
     const record = await getOperationStore().get("workflow-op");
     expect(record).toMatchObject({ wakeAttemptCount: 1, wakeDeliveryCount: 1 });
     expect(JSON.stringify(requests)).not.toContain("note");
+  });
+
+  it("records exhausted Workflow delivery as a durable terminal failure", async () => {
+    const initial = activeRecord();
+    await runWithOperationStore({}, () => getOperationStore().put(initial));
+    const workflow = new SuperOpsContinuationWorkflow(undefined, {
+      SUPEROPS_CONTINUATION_SERVICE: {
+        fetch: vi.fn(async () => new Response("unavailable", { status: 503 })),
+      },
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "internal-token",
+    });
+    const step = {
+      sleepUntil: vi.fn(async () => undefined),
+      do: vi.fn(async (
+        _name: string,
+        configOrCallback: unknown,
+        maybeCallback?: () => Promise<unknown>
+      ) => {
+        const callback = typeof configOrCallback === "function"
+          ? configOrCallback as () => Promise<unknown>
+          : maybeCallback!;
+        return callback();
+      }),
+    };
+
+    await expect(workflow.run({
+      payload: {
+        operationId: initial.operationId,
+        ownerHash: initial.ownerHash,
+        nextEligibleTime: "2026-07-18T00:05:00.000Z",
+        scheduleIdentity: "wf-exhausted",
+      },
+      timestamp: new Date(),
+      instanceId: "wf-exhausted",
+      workflowName: "test",
+    }, step)).resolves.toEqual({
+      operationId: initial.operationId,
+      delivered: false,
+    });
+
+    const stored = await getOperationStore().get(initial.operationId);
+    expect(stored).toMatchObject({
+      state: "CompletedWithFailures",
+      wakeDeliveryError: "Workflow continuation delivery retry limit exhausted.",
+      itemStates: {
+        "57400": {
+          stage: "FailedBeforeWrite",
+          outcome: "ContinuationDeliveryFailed",
+          errorClass: "ContinuationExecutionFailure",
+          writeAttempted: false,
+        },
+      },
+    });
   });
 });

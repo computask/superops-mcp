@@ -3342,10 +3342,21 @@ function createApplyTriageContinuationAdapter(
         };
       }
 
-      const action = actionByTicketFromApplyParams(liveParams ?? {}).get(claim.itemKey) ??
+      let action = actionByTicketFromApplyParams(liveParams ?? {}).get(claim.itemKey) ??
         actionByTicketFromApplyParams(storedParams).get(claim.itemKey);
       if (action?.isPublicNote === true && Boolean(action.noteFingerprint ?? normalizedNoteFingerprint(action.note))) {
         return applyResultToContinuationOutcome(publicNoteBlockedResult(claim.itemKey, action));
+      }
+      if (action?.noteFingerprint && !action.note) {
+        const recovered = await getOperationStore().getApprovedPrivateNote(
+          record.operationId,
+          record.ownerHash,
+          claim.itemKey,
+          action.noteFingerprint
+        );
+        if (recovered && normalizedNoteFingerprint(recovered) === action.noteFingerprint) {
+          action = { ...action, note: recovered, isPublicNote: false };
+        }
       }
       if (
         action?.noteFingerprint && !action.note && !claim.item.createdNoteId &&
@@ -4741,7 +4752,23 @@ export function getTicketsTools(): DomainTools {
                 }
               } else {
                 // No initial mutation is permitted until this write is acknowledged.
-                await store.put(initialRecord);
+                const approvedPrivateNotes = [...actionByTicket.values()].flatMap((action) => {
+                  const ticketNumber = normaliseTicketNumber(action.ticketNumber);
+                  const fingerprint = normalizedNoteFingerprint(action.note);
+                  const approved = action.contentVerified === true ||
+                    action.allowWriteWithoutVerifiedContent === true ||
+                    params.allowWriteWithoutVerifiedContent === true;
+                  return ticketNumber && expected.includes(ticketNumber) &&
+                    action.isPublicNote !== true && fingerprint && action.note && approved
+                    ? [{
+                        itemKey: ticketNumber,
+                        fingerprint,
+                        content: action.note,
+                        privacyType: "PRIVATE" as const,
+                      }]
+                    : [];
+                });
+                await store.put(initialRecord, { approvedPrivateNotes });
               }
             } catch (error) {
               return {
@@ -4779,15 +4806,45 @@ export function getTicketsTools(): DomainTools {
               continuationScheduling = { attempted: true, scheduled: scheduled.scheduled,
                 status: scheduled.status, error: scheduled.scheduled ? undefined : scheduled.reason,
                 mechanism: "serviceBinding" };
-              try {
-                finalRecord = await store.update(operationId, ownerHash, (record) => ({
-                  ...record, schedulingAttempted: true,
-                  schedulingSucceeded: scheduled.scheduled,
-                  schedulingError: scheduled.scheduled ? undefined : scheduled.reason,
-                  schedulingAttemptCount: (record.schedulingAttemptCount ?? 0) + 1,
-                }));
-              } catch (error) {
-                continuationError ??= safeErrorMessage(error);
+              if (scheduled.scheduled) {
+                try {
+                  finalRecord = await store.update(operationId, ownerHash, (record) => ({
+                    ...record, schedulingAttempted: true,
+                    schedulingSucceeded: true,
+                    schedulingError: undefined,
+                    schedulingAttemptCount: (record.schedulingAttemptCount ?? 0) + 1,
+                  }));
+                } catch (error) {
+                  continuationError ??= safeErrorMessage(error);
+                }
+              } else {
+                const reason = scheduled.status
+                  ? "Immediate continuation delivery failed with status " + scheduled.status + "."
+                  : "Immediate continuation delivery failed or is not configured.";
+                let terminalizationError: unknown;
+                for (let attempt = 1; attempt <= 3; attempt += 1) {
+                  try {
+                    finalRecord = await store.terminalizeContinuationFailure({
+                      operationId,
+                      ownerHash,
+                      errorClass: "ContinuationSchedulingFailure",
+                      outcome: "ContinuationSchedulingFailed",
+                      reason,
+                      schedulingFailure: true,
+                    });
+                    terminalizationError = undefined;
+                    continuationScheduling.terminalized = true;
+                    break;
+                  } catch (error) {
+                    terminalizationError = error;
+                  }
+                }
+                if (terminalizationError) {
+                  continuationError ??= safeErrorMessage(terminalizationError);
+                  continuationScheduling.terminalized = false;
+                  continuationScheduling.recovery =
+                    "Maximum-lifetime cleanup remains scheduled for durable normalization.";
+                }
               }
             }
 

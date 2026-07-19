@@ -55,7 +55,7 @@ All standard SuperOps traffic is one GraphQL POST per client attempt to the US o
 | Immediate continuation delivery | 1 self service-binding fetch | one delivery attempt by the scheduler; route rechecks token and ledger | Yes |
 | Schedule long wait | 1 Workflow `createBatch` | deterministic identity, at most 8 creation attempts with exponential backoff capped at 500 ms | Yes |
 | Workflow wake attempt | 3 DO calls + 1 service fetch before success accounting | repeated service failure: at most 8 Workflow step attempts (32 internal calls); successful attempt adds 3 DO calls, for at most 35 internal calls across the step | Yes |
-| Terminal retention alarm | DO storage list/delete/setAlarm | no SuperOps or service-binding call; cleanup-only | N/A |
+| Operation cleanup alarm | DO storage list/delete/put/setAlarm | no SuperOps or service-binding call; expires retained terminal records and terminalizes overdue active records | N/A |
 
 The maximum normal counted calls in an MCP invocation are therefore 37 with the committed 45/8 configuration. The dedicated harness uses 37 for its initial invocation and 12 for each deliberately constrained continuation invocation, and checks each invocation against its own effective budget.
 
@@ -82,7 +82,7 @@ Required stages:
 - Resolution: `ResolutionValidated`, `ResolutionWriteStarted`, `ResolutionWriteSucceeded`, `ResolutionVerified`, optional note stages, `Verifying`, terminal.
 - Note: `NoteChecked`, `NoteWriteStarted`, `NoteAdded`, `Verifying`, terminal.
 
-The store rejects broad transition weakening. Terminal stages cannot reopen; write truth cannot regress. Exhausted durable Workflow scheduling terminalizes unfinished items without erasing possible-write truth. An initial store failure stops before every SuperOps call and returns explicit no-write truth; disabled immediate delivery remains non-terminal and reconcilable by re-invoking the same operation ID.
+The store rejects broad transition weakening. Terminal stages cannot reopen; write truth cannot regress. Exhausted durable Workflow scheduling, unavailable immediate delivery, and exhausted Workflow wake delivery terminalize unfinished items without erasing possible-write truth. An initial store failure stops before every SuperOps call and returns explicit no-write truth. Cleanup alarms independently terminalize operations that exceed their maximum lifetime and never call SuperOps.
 
 ## Fixed-seed mixed-fault harness
 

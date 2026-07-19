@@ -512,6 +512,7 @@ describe("Cloudflare Worker entrypoint", () => {
         SUPEROPS_SUBDOMAIN: "computaskltd",
         SUPEROPS_CONTINUATION_ENABLED: "true",
         SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
+        SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY: "distinct-private-note-key",
       } as Env
     );
     expect(forbidden.status).toBe(403);
@@ -522,7 +523,7 @@ describe("Cloudflare Worker entrypoint", () => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-SuperOps-Internal-Continuation": "wrong-token",
+          "X-SuperOps-Internal-Continuation": "distinct-private-note-key",
         },
         body: JSON.stringify({
           toolName: "superops_tickets_apply_triage_plan",
@@ -535,6 +536,7 @@ describe("Cloudflare Worker entrypoint", () => {
         SUPEROPS_SUBDOMAIN: "computaskltd",
         SUPEROPS_CONTINUATION_ENABLED: "true",
         SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
+        SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY: "distinct-private-note-key",
       } as Env
     );
     expect(invalidNonempty.status).toBe(403);
@@ -588,6 +590,7 @@ describe("Cloudflare Worker entrypoint", () => {
         SUPEROPS_SUBDOMAIN: "computaskltd",
         SUPEROPS_CONTINUATION_ENABLED: "true",
         SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
+        SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY: "distinct-private-note-key",
       } as Env
     );
     expect(response.status).toBe(200);

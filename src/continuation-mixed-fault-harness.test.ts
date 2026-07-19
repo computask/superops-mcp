@@ -19,11 +19,22 @@ import { getClient, SuperOpsError, SuperOpsHttpError } from "./client.js";
 import { getExecutionState, recordSubrequestFinish, recordTypedSubrequestStart, runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
 import { getOperationStore, operationTotals, runWithOperationStore } from "./operation-store.js";
 import { getTicketsTools, resumeApplyTriageOperation } from "./domains/tickets.js";
+import { runWithContinuationScheduler } from "./continuation-scheduler.js";
 
 const SEED = 0x5eed250;
 const EXPECTED = 250;
 const MAX_HARNESS_CONTINUATION_INVOCATIONS = EXPECTED * 4;
 const UPDATED = "2026-07-18T10:01:00.000Z";
+
+function withSuccessfulContinuationScheduling<T>(fn: () => T): T {
+  return runWithContinuationScheduler({
+    SUPEROPS_CONTINUATION_ENABLED: "true",
+    SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "harness-internal-token",
+    SUPEROPS_CONTINUATION_SERVICE: {
+      fetch: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    },
+  }, fn);
+}
 
 const resolutionTarget = {
   status: "Resolved", priority: "Very Low", impact: "Low", urgency: "Low",
@@ -203,9 +214,11 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       let initial!: Awaited<ReturnType<typeof domain.handleCall>>;
       await runWithExecutionConfig({ SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "4", SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "45", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8" }, async () => {
         await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
-          initial = await domain.handleCall("superops_tickets_apply_triage_plan", {
-            expectedCandidateTicketNumbers: numbers, actions,
-          });
+          initial = await withSuccessfulContinuationScheduling(() =>
+            domain.handleCall("superops_tickets_apply_triage_plan", {
+              expectedCandidateTicketNumbers: numbers, actions,
+            })
+          );
           callsByInvocation.push({ calls: getExecutionState()?.subrequests ?? 0, effectiveBudget: 37, phase: "initial" });
         });
       });
@@ -472,11 +485,13 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
 
             await runWithExecutionConfig({ SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" }, async () => {
               await runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
-                domain.handleCall("superops_tickets_apply_triage_plan", {
-                  batchId: operationId,
-                  expectedCandidateTicketNumbers: [ticketNumber],
-                  actions: [action],
-                }), operationId
+                withSuccessfulContinuationScheduling(() =>
+                  domain.handleCall("superops_tickets_apply_triage_plan", {
+                    batchId: operationId,
+                    expectedCandidateTicketNumbers: [ticketNumber],
+                    actions: [action],
+                  })
+                ), operationId
               );
             });
 

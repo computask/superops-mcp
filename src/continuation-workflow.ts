@@ -27,10 +27,11 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
     }
 
     await step.sleepUntil("wait-until-next-eligible", new Date(params.nextEligibleTime));
-    await step.do(
-      "deliver-checked-continuation",
-      { retries: { limit: 8, delay: "1 second", backoff: "exponential" }, timeout: "30 seconds" },
-      async () => {
+    try {
+      await step.do(
+        "deliver-checked-continuation",
+        { retries: { limit: 8, delay: "1 second", backoff: "exponential" }, timeout: "30 seconds" },
+        async () => {
         const service = this.env.SUPEROPS_CONTINUATION_SERVICE;
         const token = this.env.SUPEROPS_INTERNAL_CONTINUATION_TOKEN?.trim();
         if (!service || !token) throw new Error("Continuation service binding or token is unavailable.");
@@ -75,8 +76,31 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
             lastWakeSucceededAt: new Date().toISOString(),
           }));
         });
-      }
-    );
+        }
+      );
+    } catch {
+      const reason = "Workflow continuation delivery retry limit exhausted.";
+      await step.do(
+        "record-delivery-exhaustion",
+        { retries: { limit: 3, delay: "1 second", backoff: "exponential" }, timeout: "15 seconds" },
+        async () => {
+          await runWithOperationStore(this.env, async () => {
+            const store = getOperationStore();
+            const record = await store.get(params.operationId);
+            if (!record || record.ownerHash !== params.ownerHash) return;
+            await store.terminalizeContinuationFailure({
+              operationId: params.operationId,
+              ownerHash: params.ownerHash,
+              errorClass: "ContinuationExecutionFailure",
+              outcome: "ContinuationDeliveryFailed",
+              reason,
+              deliveryFailure: true,
+            });
+          });
+        }
+      );
+      return { operationId: params.operationId, delivered: false };
+    }
 
     return { operationId: params.operationId, delivered: true };
   }

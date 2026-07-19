@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   getOperationStore,
+  normalizedNoteFingerprint,
   operationResultView,
   operationTotals,
   runWithOperationStore,
@@ -153,6 +154,164 @@ describe("operation store", () => {
     );
     await expect(list.json()).resolves.toHaveLength(1);
   });
+
+  it("uses only the dedicated key for approved private-note encryption and recovery", async () => {
+    const values = new Map<string, unknown>();
+    const storage = {
+      get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+      put: async (key: string | Record<string, unknown>, value?: unknown) => {
+        if (typeof key === "string") {
+          values.set(key, value);
+        } else {
+          for (const [entryKey, entryValue] of Object.entries(key)) {
+            values.set(entryKey, entryValue);
+          }
+        }
+      },
+      delete: async (key: string) => values.delete(key),
+      list: async <T = unknown>(options?: { prefix?: string }) =>
+        new Map(
+          [...values.entries()].filter(([key]) => !options?.prefix || key.startsWith(options.prefix))
+        ) as Map<string, T>,
+    };
+    const internalContinuationToken = "internal-continuation-auth-test-token";
+    const privateNoteEncryptionKey = "dedicated-private-note-encryption-test-key";
+    const durableObject = new SuperOpsOperationLedger({ storage }, {
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: internalContinuationToken,
+      SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY: privateNoteEncryptionKey,
+    });
+    const noteBody = "Approved durable private note";
+    const fingerprint = normalizedNoteFingerprint(noteBody);
+    if (!fingerprint) throw new Error("expected note fingerprint");
+    const candidate = record({ operationId: "op-private-note" });
+    candidate.itemStates["57401"] = {
+      ...candidate.itemStates["57401"],
+      noteFingerprint: fingerprint,
+    };
+
+    const put = await durableObject.fetch(
+      new Request("https://operation.local/operations/op-private-note", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          record: candidate,
+          approvedPrivateNotes: [{
+            itemKey: "57401",
+            fingerprint,
+            content: noteBody,
+            privacyType: "PRIVATE",
+          }],
+        }),
+      })
+    );
+    const putResponseText = await put.clone().text();
+    expect(put.status, putResponseText).toBe(200);
+    expect(putResponseText).not.toContain(internalContinuationToken);
+    expect(putResponseText).not.toContain(privateNoteEncryptionKey);
+    expect(JSON.stringify([...values.entries()])).not.toContain(noteBody);
+
+    const publicRecord = await durableObject.fetch(
+      new Request("https://operation.local/operations/op-private-note")
+    );
+    const publicRecordText = await publicRecord.clone().text();
+    expect(publicRecordText).not.toContain(noteBody);
+    expect(publicRecordText).not.toContain(internalContinuationToken);
+    expect(publicRecordText).not.toContain(privateNoteEncryptionKey);
+
+    const recoveryRequest = () =>
+      new Request(
+        "https://operation.local/operations/op-private-note/approved-private-note/57401",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ownerHash: candidate.ownerHash,
+            fingerprint,
+          }),
+        }
+      );
+    const recovered = await durableObject.fetch(recoveryRequest());
+    const recoveredBody = await recovered.json();
+    expect(recoveredBody).toEqual({ content: noteBody });
+    expect(JSON.stringify(recoveredBody)).not.toContain(internalContinuationToken);
+    expect(JSON.stringify(recoveredBody)).not.toContain(privateNoteEncryptionKey);
+
+    const internalTokenAsEncryptionKey = new SuperOpsOperationLedger({ storage }, {
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: internalContinuationToken,
+      SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY: internalContinuationToken,
+    });
+    const wrongKeyRecovery = await internalTokenAsEncryptionKey.fetch(recoveryRequest());
+    expect(wrongKeyRecovery.status).toBe(404);
+    const wrongKeyRecoveryText = await wrongKeyRecovery.text();
+    expect(JSON.parse(wrongKeyRecoveryText)).toEqual({ error: "Not found" });
+    expect(wrongKeyRecoveryText).not.toContain(internalContinuationToken);
+    expect(wrongKeyRecoveryText).not.toContain(privateNoteEncryptionKey);
+
+    const missingKeyLedger = new SuperOpsOperationLedger({ storage }, {
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: internalContinuationToken,
+    });
+    const missingKeyRecovery = await missingKeyLedger.fetch(recoveryRequest());
+    expect(missingKeyRecovery.status).toBe(404);
+    const missingKeyRecoveryText = await missingKeyRecovery.text();
+    expect(JSON.parse(missingKeyRecoveryText)).toEqual({ error: "Not found" });
+    expect(missingKeyRecoveryText).not.toContain(internalContinuationToken);
+    expect(missingKeyRecoveryText).not.toContain(privateNoteEncryptionKey);
+  });
+
+  it("fails private-note persistence safely when the dedicated key is missing", async () => {
+    const values = new Map<string, unknown>();
+    const storage = {
+      get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+      put: async (key: string | Record<string, unknown>, value?: unknown) => {
+        if (typeof key === "string") {
+          values.set(key, value);
+        } else {
+          for (const [entryKey, entryValue] of Object.entries(key)) {
+            values.set(entryKey, entryValue);
+          }
+        }
+      },
+      delete: async (key: string) => values.delete(key),
+      list: async <T = unknown>() => values as Map<string, T>,
+    };
+    const internalContinuationToken = "internal-continuation-auth-test-token";
+    const noteBody = "Approved note must never be stored as plaintext";
+    const fingerprint = normalizedNoteFingerprint(noteBody);
+    if (!fingerprint) throw new Error("expected note fingerprint");
+    const candidate = record({ operationId: "op-missing-private-note-key" });
+    candidate.itemStates["57401"] = {
+      ...candidate.itemStates["57401"],
+      noteFingerprint: fingerprint,
+    };
+    const durableObject = new SuperOpsOperationLedger({ storage }, {
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: internalContinuationToken,
+    });
+
+    const response = await durableObject.fetch(
+      new Request("https://operation.local/operations/op-missing-private-note-key", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          record: candidate,
+          approvedPrivateNotes: [{
+            itemKey: "57401",
+            fingerprint,
+            content: noteBody,
+            privacyType: "PRIVATE",
+          }],
+        }),
+      })
+    );
+
+    expect(response.status).toBe(503);
+    const responseText = await response.text();
+    expect(responseText).toContain("PrivateNoteEncryptionUnavailable");
+    expect(responseText).not.toContain(noteBody);
+    expect(responseText).not.toContain(internalContinuationToken);
+    expect(JSON.stringify([...values.entries()])).not.toContain(noteBody);
+    expect(values.size).toBe(0);
+  });
+
   it("claims one unfinished item at a time and rejects terminal rewrites", async () => {
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();
@@ -774,6 +933,58 @@ describe("operation store", () => {
     expect(values.has("op:retained")).toBe(true);
     expect(alarms).toEqual([Date.parse("2999-01-01T00:00:00.000Z")]);
   });
+
+  it("normalizes abandoned operations at maximum lifetime without losing possible-write evidence", async () => {
+    const values = new Map<string, unknown>();
+    const alarms: number[] = [];
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+        setAlarm: async (time: number | Date) => { alarms.push(Number(time)); },
+      },
+    });
+    const abandoned = record({
+      operationId: "abandoned-lifetime",
+      maxOperationLifetimeAt: "2000-01-01T00:00:00.000Z",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+      itemStates: {
+        ...record().itemStates,
+        "57401": {
+          ...record().itemStates["57401"],
+          stage: "WriteStarted",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          ambiguousWrite: true,
+          partialWrite: true,
+          verificationState: "Pending",
+        },
+      },
+    });
+    values.set("op:abandoned-lifetime", abandoned);
+
+    await durableObject.alarm();
+
+    expect(values.get("op:abandoned-lifetime")).toMatchObject({
+      state: "CompletedWithFailures",
+      terminalFailureReason: "Operation maximum lifetime exceeded.",
+      ambiguousWriteCount: 1,
+      partialWriteCount: 1,
+      itemStates: {
+        "57401": {
+          stage: "AmbiguousWriteUnresolved",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          ambiguousWrite: true,
+          partialWrite: true,
+        },
+      },
+    });
+    expect(alarms.at(-1)).toBeGreaterThan(Date.now());
+  });
+
   it("retains active operations but removes terminal records only after retention expires", async () => {
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();

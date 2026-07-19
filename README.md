@@ -84,9 +84,9 @@ mechanism rather than committing it to this file.
 - Required non-secret vars: `AUTH_MODE=env`, `SUPEROPS_SUBDOMAIN=computaskltd`, `SUPEROPS_REGION=us`, `LOG_LEVEL=warn`
 - Non-secret safety defaults: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=false`, `ENABLE_CUSTOM_MUTATION=false`, `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=false`
 - Execution controls additionally include per-request timeout, CPU guard, continuation/retry/delay/scheduling ceilings, retention, and maximum operation lifetime. The exact committed values are in `wrangler.json` and are described in the continuation runbook.
-- Required secrets: the SuperOps API token Worker secret, plus any OAuth/session secrets required by the deployed auth provider
+- Required secrets: the SuperOps API token Worker secret, plus any OAuth/session secrets required by the deployed auth provider. SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY is also required when durable approved private-note recovery is enabled; store it as a Cloudflare secret and keep it distinct from SUPEROPS_INTERNAL_CONTINUATION_TOKEN.
 - Never commit: API token values, OAuth access/refresh tokens, bearer tokens, Cloudflare service token values, client secrets, private keys, or full request headers
-- Durable operation status uses `SUPEROPS_OPERATION_LEDGER`. Long rate-limit waits use the `SUPEROPS_CONTINUATION_WORKFLOW` binding; immediate delivery and Workflow wake delivery use the internal service binding/token. Both continuation flags default false. Durable Object alarms are cleanup-only. Do not reuse `OAUTH_KV` for operation state.
+- Durable operation status uses `SUPEROPS_OPERATION_LEDGER`. Long rate-limit waits use the `SUPEROPS_CONTINUATION_WORKFLOW` binding; immediate delivery and Workflow wake delivery use the internal service binding/token. Both continuation flags default false. Durable Object alarms are cleanup-only: they enforce maximum operation lifetime and retention without performing SuperOps mutations. Do not reuse `OAUTH_KV` for operation state.
 
 Safe local validation:
 

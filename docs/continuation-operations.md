@@ -30,7 +30,7 @@ Mutation-start state is acknowledged before the outbound mutation. Successful re
 
 Committed defaults keep `ENABLE_WRITE_TOOLS=false`, `ENABLE_CUSTOM_MUTATION=false`, `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=false`, `SUPEROPS_CONTINUATION_ENABLED=false`, and `SUPEROPS_DURABLE_RETRY_ENABLED=false`. The reviewed durable apply-triage tool is allowed by the central policy even while unreviewed synchronous writes are blocked.
 
-Long Retry-After waits use `SuperOpsContinuationWorkflow.step.sleepUntil`. Workflow parameters contain only operation ID, owner hash, eligibility time, and deterministic schedule identity. Credentials and customer content are not Workflow parameters. Durable Object alarms are used only for independent terminal-record expiry.
+Long Retry-After waits use `SuperOpsContinuationWorkflow.step.sleepUntil`. Workflow parameters contain only operation ID, owner hash, eligibility time, and deterministic schedule identity. Credentials and customer content are not Workflow parameters. Durable Object alarms independently enforce maximum operation lifetime and terminal-record expiry; they never execute SuperOps mutations.
 
 Configured ceilings include 500 operation items, 512 KiB serialized record size, 25 seconds per invocation, 10 seconds per SuperOps request, 20 seconds cooperative CPU guard, 100 continuations, 10 durable throttle attempts, one hour cumulative durable delay, 15 minutes per durable wait, and 8 Workflow scheduling attempts with exponential backoff capped at 500 ms. Exhaustion produces a terminal classified result rather than an infinite loop.
 
@@ -60,11 +60,16 @@ Expected pinned Wrangler version: `4.111.0`. Wrangler 4.111.0 requires Node.js 2
 
 ## Staging rollout
 
+Durable approved private-note recovery requires SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY as a Cloudflare secret. Generate and manage it independently from SUPEROPS_INTERNAL_CONTINUATION_TOKEN; neither value belongs in Wrangler configuration or source control.
+
 Every command in this section changes external Cloudflare resources and requires explicit human approval. Use an independently reviewed `wrangler.staging.json` with distinct staging Worker, Workflow, Durable Object migration/binding, routes, vars, and service binding; never point staging at the production ledger.
 
 ```powershell
 # RESOURCE-CHANGING: stores/rotates the staging internal continuation secret.
 npx wrangler secret put SUPEROPS_INTERNAL_CONTINUATION_TOKEN --config wrangler.staging.json
+
+# RESOURCE-CHANGING: stores/rotates the distinct staging private-note encryption secret.
+npx wrangler secret put SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY --config wrangler.staging.json
 
 # RESOURCE-CHANGING: deploys the staging Worker, Workflow, bindings, and migrations.
 npx wrangler deploy --config wrangler.staging.json
@@ -81,6 +86,9 @@ The following commands change production resources and require a separate explic
 ```powershell
 # RESOURCE-CHANGING: stores/rotates the production internal continuation secret.
 npx wrangler secret put SUPEROPS_INTERNAL_CONTINUATION_TOKEN --config wrangler.json
+
+# RESOURCE-CHANGING: stores/rotates the distinct production private-note encryption secret.
+npx wrangler secret put SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY --config wrangler.json
 
 # RESOURCE-CHANGING: deploys the production Worker, Workflow, bindings, and migrations.
 npx wrangler deploy --config wrangler.json
