@@ -106,6 +106,25 @@ class Seeded {
 
 type TicketState = { ticketId: string; displayId: string; status: string; updatedTime: string; notes: Array<{ noteId: string; content: string; privacyType: string }> };
 
+const TERMINAL_ITEM_STAGES = new Set([
+  "Completed",
+  "CompletedAfterRetry",
+  "CompletedAfterAmbiguousWriteVerification",
+  "AmbiguousWriteUnresolved",
+  "Stale",
+  "Skipped",
+  "FailedBeforeWrite",
+  "FailedAfterPartialWrite",
+  "RateLimitExceeded",
+  "StaleAfterRateLimitWait",
+]);
+
+const MUTATION_START_STAGES = new Set([
+  "WriteStarted",
+  "ResolutionWriteStarted",
+  "NoteWriteStarted",
+]);
+
 describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", () => {
   afterEach(() => { vi.clearAllMocks(); vi.unstubAllGlobals(); });
 
@@ -452,6 +471,26 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       // unresolved; neither a 5xx nor a network loss is blindly replayed.
       expect(mutationCounts.get(String(fiveHundredCandidate.ticketNumber))).toBe(1);
       expect(mutationCounts.get(String(networkCandidate.ticketNumber))).toBe(1);
+      const itemFor = (action: Record<string, unknown>) => finalRecord.itemStates[String(action.ticketNumber)];
+      for (const action of [
+        updateCandidate, resolveCandidate, noteCandidate, rateLimitCandidate,
+        graphQlThrottleCandidate, fiveHundredCandidate, networkCandidate,
+      ]) {
+        const item = itemFor(action);
+        const actualMutations = mutationCounts.get(String(action.ticketNumber)) ?? 0;
+        expect(item.attemptCount ?? 0).toBe(actualMutations);
+        expect(item.writeAttempted).toBe(actualMutations > 0);
+        expect(item.writeMayHaveSucceeded).toBe(actualMutations > 0 && item.observedMutationResult !== "Rejected");
+      }
+      expect(itemFor(rateLimitCandidate).retryCount).toBe(1);
+      expect(itemFor(graphQlThrottleCandidate).retryCount).toBe(1);
+      expect(itemFor(rateLimitCandidate).rateLimit?.attempts).toBe(1);
+      expect(itemFor(graphQlThrottleCandidate).rateLimit?.attempts).toBe(1);
+      expect(itemFor(fiveHundredCandidate).stage).toBe("AmbiguousWriteUnresolved");
+      expect(itemFor(networkCandidate).stage).toBe("AmbiguousWriteUnresolved");
+      expect(itemFor(staleDuringWaitCandidate).stage).toBe("Stale");
+      expect(mutationCounts.get(String(staleDuringWaitCandidate.ticketNumber))).toBeUndefined();
+      expect(tickets.get(String(noteCandidate.ticketNumber))?.notes).toHaveLength(1);
       expect(checkpointStages.get(String(updateCandidate.ticketNumber))).toContain("WriteStarted");
       expect(checkpointStages.get(String(resolveCandidate.ticketNumber))).toContain("ResolutionWriteStarted");
       expect(checkpointStages.get(String(noteCandidate.ticketNumber))).toContain("NoteWriteStarted");
@@ -466,7 +505,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
     });
   }, LARGE_HARNESS_TIMEOUT_MS);
 
-  it("terminates before and after every real update, resolution, and note checkpoint", async () => {
+  it("restarts before and after every real update, resolution, and note checkpoint through the production adapter", async () => {
     const checkpointLifecycles = {
       update: [
         ["Validated", "Unattempted"],
@@ -511,6 +550,17 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
               notes: [],
             };
             let mutationCount = 0;
+            let verificationReadCount = 0;
+            const applyExternalMutation = (input: Record<string, unknown>) => {
+              mutationCount += 1;
+              if (actionType === "addNote") {
+                const noteId = `note-${ticketNumber}-${mutationCount}`;
+                ticket.notes.push({ noteId, content: String(input.content ?? ""), privacyType: "PRIVATE" });
+                return graphQlData({ createTicketNote: { noteId, privacyType: "PRIVATE" } });
+              }
+              Object.assign(ticket, input, { updatedTime: UPDATED });
+              return graphQlData({ updateTicket: { ticketId: ticket.ticketId, status: ticket.status } });
+            };
             vi.stubGlobal("fetch", vi.fn(async (_input: unknown, init?: RequestInit) => {
               const { query, variables } = jsonBody(init);
               const input = variables?.input ?? {};
@@ -519,16 +569,8 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
               }
               if (query.includes("getTicketNoteList")) return graphQlData({ getTicketNoteList: ticket.notes });
               if (query.includes("getFields")) return graphQlData({ getFields: fields() });
-              if (query.includes("mutation")) {
-                mutationCount += 1;
-                if (query.includes("createTicketNote")) {
-                  const noteId = `note-${ticketNumber}`;
-                  ticket.notes.push({ noteId, content: String(input.content ?? ""), privacyType: "PRIVATE" });
-                  return graphQlData({ createTicketNote: { noteId, privacyType: "PRIVATE" } });
-                }
-                Object.assign(ticket, input, { updatedTime: UPDATED });
-                return graphQlData({ updateTicket: { ticketId: ticket.ticketId, status: ticket.status } });
-              }
+              if (query.includes("mutation")) return applyExternalMutation(input);
+              verificationReadCount += 1;
               return graphQlData({ getTicket: { ...ticket } });
             }));
 
@@ -540,6 +582,14 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
                   throw new Error(`crash-boundary before ${actionType}:${checkpointStage}`);
                 }
                 await originalCheckpoint(params);
+                if (MUTATION_START_STAGES.has(checkpointStage)) {
+                  const mutationInput = actionType === "addNote"
+                    ? { ticketId: ticket.ticketId, content: `checkpoint note ${ticketNumber}` }
+                    : actionType === "resolve"
+                      ? { ticket: { ticketId: ticket.ticketId }, ...resolutionTarget }
+                      : { ticket: { ticketId: ticket.ticketId }, status: "Awaiting Engineer" };
+                  applyExternalMutation(mutationInput);
+                }
                 throw new Error(`crash-boundary after ${actionType}:${checkpointStage}`);
               }
               return originalCheckpoint(params);
@@ -570,18 +620,175 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
               );
             });
 
-            const record = await store.get(operationId);
+            const crashedRecord = await store.get(operationId);
             expect(injected, `${actionType}:${checkpointStage}:${timing} was not reached`).toBe(true);
-            expect(record?.itemStates[ticketNumber].stage).toBe(
-              timing === "after" ? checkpointStage : priorStage
+            const crashedItem = crashedRecord?.itemStates[ticketNumber];
+            expect(crashedItem?.stage).toBe(timing === "after" ? checkpointStage : priorStage);
+            expect(crashedItem?.writeAttempted).toBe(Boolean(
+              crashedItem?.writeAttempted || MUTATION_START_STAGES.has(crashedItem?.stage ?? "")
+            ));
+            expect(crashedItem?.writeMayHaveSucceeded).toBe(Boolean(
+              crashedItem?.writeMayHaveSucceeded || MUTATION_START_STAGES.has(crashedItem?.stage ?? "")
+            ));
+            expect(mutationCount).toBe((crashedItem?.attemptCount ?? 0));
+
+            store.checkpointItem = originalCheckpoint;
+            const preRestartMutationCount = mutationCount;
+            const preRestartVerificationReads = verificationReadCount;
+            const preRestartNotes = ticket.notes.length;
+
+const existingLeaseExpiry =
+  crashedItem?.lease?.expiresAt ??
+  crashedRecord?.currentLease?.expiresAt;
+
+const claimAtMs = existingLeaseExpiry
+  ? Date.parse(existingLeaseExpiry) + 1
+  : Date.parse(crashedRecord!.updatedAt) + 1;
+
+expect(Number.isFinite(claimAtMs)).toBe(true);
+
+if (crashedRecord?.maxOperationLifetimeAt) {
+  expect(claimAtMs).toBeLessThan(
+    Date.parse(crashedRecord.maxOperationLifetimeAt)
+  );
+}
+
+const claimAt = new Date(claimAtMs).toISOString();
+const duplicateLeaseMs = 10;
+const duplicateDeliveryAt = new Date(claimAtMs + 1).toISOString();
+const restartBaseMs = claimAtMs + duplicateLeaseMs + 1;
+
+if (crashedRecord?.maxOperationLifetimeAt) {
+  expect(restartBaseMs + 3_000).toBeLessThan(
+    Date.parse(crashedRecord.maxOperationLifetimeAt)
+  );
+}
+const activeLease = await store.claimNextItem({
+  operationId,
+  ownerHash: crashedRecord!.ownerHash,
+  leaseOwner: `active-${scenarioIndex}`,
+leaseMs: duplicateLeaseMs,
+  now: claimAt,
+});
+
+expect(activeLease?.itemKey).toBe(ticketNumber);
+
+await runWithExecutionConfig(
+  {
+    SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "40",
+    SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "4",
+  },
+  async () => {
+    await runWithExecutionContext(
+      "superops_tickets_apply_triage_plan",
+      () =>
+        runWithHarnessCredentials(() =>
+          resumeApplyTriageOperation({
+            operationId,
+            ownerHash: crashedRecord!.ownerHash,
+            leaseOwner: `duplicate-active-${scenarioIndex}`,
+            leaseMs: 1,
+            now: duplicateDeliveryAt,
+          })
+        ),
+      operationId
+    );
+  }
+);
+            expect(mutationCount).toBe(preRestartMutationCount);
+            expect(ticket.notes.length).toBe(preRestartNotes);
+
+            let continuationRequired = true;
+            for (let resumeIndex = 0; continuationRequired && resumeIndex < 4; resumeIndex += 1) {
+              await runWithExecutionConfig({ SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "40", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "4" }, async () => {
+                await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
+                  const result = await runWithHarnessCredentials(() => resumeApplyTriageOperation({
+                    operationId,
+                    ownerHash: crashedRecord!.ownerHash,
+                    leaseOwner: `restart-${scenarioIndex}-${resumeIndex}`,
+                    leaseMs: 1,
+now: new Date(
+  restartBaseMs + resumeIndex * 1000
+).toISOString(),                  }));
+                  continuationRequired = result.continuationRequired;
+                }, operationId);
+              });
+              const reloaded = await store.get(operationId);
+              const item = reloaded?.itemStates[ticketNumber];
+              if (continuationRequired) {
+                expect(reloaded?.nextEligibleTime ?? item?.nextEligibleTime, `${operationId} stranded without a scheduled continuation`).toBeDefined();
+              }
+            }
+
+            const terminalRecord = await store.get(operationId);
+            const terminalItem = terminalRecord?.itemStates[ticketNumber];
+            if (!terminalRecord || !terminalItem) throw new Error(`missing terminal item for ${operationId}`);
+            expect(continuationRequired, `${operationId} did not reach a terminal state`).toBe(false);
+            expect(TERMINAL_ITEM_STAGES.has(terminalItem.stage)).toBe(true);
+const expectedTerminalState = "Completed";
+
+if (terminalRecord.state !== expectedTerminalState) {
+  throw new Error(
+    `Unexpected terminal state:\n${JSON.stringify(
+      {
+        operationId,
+        actionType,
+        checkpointStage,
+        timing,
+        expectedTerminalState,
+        terminalState: terminalRecord.state,
+        terminalItem,
+        failedItems: terminalRecord.failedItems,
+        summary: terminalRecord.summary,
+      },
+      null,
+      2
+    )}`
+  );
+}            expect(terminalRecord.state).toBe(actionType === "resolve" ? "Completed" : "Completed");
+            expect(terminalRecord.pendingItems).toEqual([]);
+            expect(terminalRecord.unattemptedItems).toEqual([]);
+            expect(terminalRecord.nextEligibleTime).toBeUndefined();
+            expect(terminalItem.writeAttempted).toBe((crashedItem?.writeAttempted ?? false) || mutationCount > 0);
+            expect(terminalItem.writeMayHaveSucceeded).toBe((crashedItem?.writeMayHaveSucceeded ?? false) || mutationCount > 0);
+            expect(terminalItem.attemptCount ?? 0).toBe(mutationCount);
+            expect(verificationReadCount).toBeGreaterThan(preRestartVerificationReads);
+            expect(terminalItem.verificationState).toBe("Verified");
+            expect(terminalItem.observedMutationResult).toBe("VerifiedApplied");
+            expect(terminalItem.stage).toBe(
+              preRestartMutationCount > 0
+                ? "CompletedAfterAmbiguousWriteVerification"
+                : "Completed"
             );
-            const postMutationStages = actionType === "update"
-              ? new Set(["FieldsUpdated", "Verifying"])
-              : actionType === "resolve"
-                ? new Set(["ResolutionWriteSucceeded", "ResolutionVerified"])
-                : new Set(["NoteAdded", "Verifying"]);
-            expect(mutationCount).toBe(postMutationStages.has(checkpointStage) ? 1 : 0);
-            expect(mutationCount).toBeLessThanOrEqual(1);
+            expect(terminalItem.outcome).toBe(actionType === "resolve" ? "Resolved" : "Updated");
+            if (actionType === "addNote") expect(ticket.notes).toHaveLength(1);
+
+            const mutationCountBeforeTerminalDuplicates = mutationCount;
+            const notesBeforeTerminalDuplicates = ticket.notes.length;
+            await runWithExecutionConfig({ SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "40", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "4" }, async () => {
+              await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
+                await Promise.all([
+                  runWithHarnessCredentials(() => resumeApplyTriageOperation({
+                    operationId,
+                    ownerHash: crashedRecord!.ownerHash,
+                    leaseOwner: `terminal-duplicate-a-${scenarioIndex}`,
+                    leaseMs: 1,
+                    now: "2099-01-01T00:03:00.000Z",
+                  })),
+                  runWithHarnessCredentials(() => resumeApplyTriageOperation({
+                    operationId,
+                    ownerHash: crashedRecord!.ownerHash,
+                    leaseOwner: `terminal-duplicate-b-${scenarioIndex}`,
+                    leaseMs: 1,
+                    now: "2099-01-01T00:03:00.000Z",
+                  })),
+                ]);
+              }, operationId);
+            });
+            const afterDuplicateRecord = await store.get(operationId);
+            expect(afterDuplicateRecord?.itemStates[ticketNumber].stage).toBe(terminalItem.stage);
+            expect(mutationCount).toBe(mutationCountBeforeTerminalDuplicates);
+            expect(ticket.notes.length).toBe(notesBeforeTerminalDuplicates);
           }
         }
       }

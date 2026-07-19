@@ -3600,8 +3600,15 @@ function createApplyTriageContinuationAdapter(
               : mutationType === "resolveFallback"
                 ? ["ResolutionWriteStarted"]
                 : ["Validated", "WriteNotStarted", "WriteStarted"];
-          for (const stage of stages) {
-            if (stage === checkpointStage && mutationType !== "resolveFallback") continue;
+const completedStageIndex = mutationType === "resolveFallback"
+  ? -1
+  : stages.indexOf(checkpointStage);
+
+const remainingStages = completedStageIndex >= 0
+  ? stages.slice(completedStageIndex + 1)
+  : stages;
+
+for (const stage of remainingStages) {
             const mutationStarted = stage === "WriteStarted" ||
               stage === "ResolutionWriteStarted" || stage === "NoteWriteStarted";
             const nextWriteAttempted = durableWriteAttempted || mutationStarted;
