@@ -16,17 +16,17 @@ The repaired production path makes the complete fixed-candidate operation durabl
 | Real request timeout and bounded reads | Every `SuperOpsClient` request uses `AbortController`; timeout is a retryable read-network class within attempt/duration ceilings. Writes remain one attempt. | `src/client.test.ts` |
 | Complete durable operation before work | Public apply-triage persists all expected items and zero/initial results before it enters the real adapter; store failure returns no-write truth. | ticket store-failure and first-checkpoint tests |
 | Mutation checkpoints | Update, resolution, and note use acknowledged start/success stages; created note ID is checkpointed before later work. | ticket and mixed-fault tests |
-| Ambiguity and fallback | Possible-write state is monotonic; accepted lost responses are read back; resolution fallback requires absent target plus unchanged `updatedTime`. | accepted-resolution-lost-response and ambiguity tests |
-| Durable wait | Pinned Wrangler `4.111.0` Workflow binding uses `step.sleepUntil`; DO alarms are retention cleanup only. | workflow and operation-store tests |
+| Ambiguity and fallback | Possible-write state is monotonic. Accepted lost responses are reconciled by read-back without replay. Retry or fallback requires a durable, conclusive non-acceptance checkpoint; an unchanged read after a timeout, network failure, HTTP 5xx, or lost response is not proof of rejection. | accepted-resolution-lost-response, conclusive-rejection restart, and ambiguity tests |
+| Durable wait and Workflow accounting | Pinned Wrangler `4.111.0` Workflow binding uses `step.sleepUntil`; DO alarms are retention cleanup only. Every Workflow delivery creates a fresh execution-accounting context, and store, SuperOps, verification, scheduling, and `createBatch` calls use the central accounting path. | workflow, execution, client, and operation-store tests |
 | Retry ceilings | Continuation, durable attempt/duration/single-wait, scheduling, request, and lifetime ceilings terminalize honestly. | continuation and store tests |
 | Terminal retention | The configured retention duration restarts when an active operation first becomes terminal; creation-time expiry never erases newly terminal evidence. | memory and Durable Object operation-store tests |
 | Ledger safety | 500-item and 512-KiB limits, exact item coverage, shape/timestamp validation, forbidden-content scan, redacted compact results. | operation-store tests |
 | Default tool policy | Unreviewed synchronous writes, custom mutation, and direct-route mutations are false by default; durable apply-triage, reads, and status remain. Guards precede credential/client initialization. | audit/worker tests and `wrangler.json` |
-| Fixed-seed acceptance harness | Exactly 250 items through public apply-triage and real resume adapter with mocked SuperOps transport only. | `src/continuation-mixed-fault-harness.test.ts` |
+| Fixed-seed acceptance harness | Exactly 250 items pass through public apply-triage and the real resume adapter with mocked SuperOps transport only. The checkpoint matrix terminates before and after every update, resolution, and private-note checkpoint, restarts through the production adapter, tests duplicate delivery under an active lease, and proves successful mutations are not repeated. | `src/continuation-mixed-fault-harness.test.ts` |
 
 ## Outbound call inventory
 
-All standard SuperOps traffic is one GraphQL POST per client attempt to the US or EU `/msp` endpoint. A “read retries” worst case is the configured read-attempt ceiling (default 3 total attempts). Writes are one outbound attempt unless an adapter has durable, conclusive evidence that the previous write was rejected.
+All standard SuperOps traffic is one GraphQL POST per client attempt to the US or EU `/msp` endpoint. A “read retries” worst case is the configured read-attempt ceiling, which defaults to three total attempts. Writes are one outbound attempt unless the durable adapter has conclusive evidence that the previous write was rejected.
 
 | Tool or runtime operation | Normal calls | Worst-case bound / rule | Resumable |
 | --- | ---: | --- | --- |
@@ -158,7 +158,7 @@ Read retry diagnostics now include `source`, `retryAfterSupplied`, `suppliedDela
 
 ### Synchronous mutation contract
 
-Every synchronous write response, including rejected and ambiguous failures, reports write attempt truth, `writeMayHaveSucceeded`, reliable-response state, replay safety, classification/final outcome, and write count. Direct ticket and alert writes perform read-back verification where the tool has a bounded final-state target; `superops_tickets_log_time` and `superops_custom_mutation` explicitly report why verification is not locally derivable.
+Every synchronous write response, including rejected and ambiguous failures, reports write-attempt truth, `writeMayHaveSucceeded`, reliable-response state, replay safety, classification, final outcome, verification state, partial-write truth, and write count. Direct ticket and alert writes perform read-back verification where a bounded final-state target exists and do not report clean success when that verification fails or is inconclusive. `superops_tickets_log_time` and `superops_custom_mutation` explicitly report why verification is not locally derivable.
 
 ### Repository milestone evidence
 
