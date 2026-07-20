@@ -248,6 +248,52 @@ describe("operation store", () => {
     });
   });
 
+  it("clears stale continuation failure text only after clean completion", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const staleReason = "Continuation required before all expected items were processed.";
+      await store.put(record({
+        operationId: "op-clean-complete",
+        state: "ContinuationRequired",
+        expectedItems: ["57400"],
+        completedItems: [],
+        failedItems: [],
+        skippedItems: [],
+        unattemptedItems: [],
+        pendingItems: ["57400"],
+        itemStates: { "57400": record().itemStates["57400"] },
+        compactResults: [{ ticketNumber: "57400", finalOutcome: "Updated" }],
+        terminalFailureReason: staleReason,
+      }));
+      await expect(store.get("op-clean-complete")).resolves.toMatchObject({
+        state: "Completed",
+        pendingItems: [],
+      });
+      const completed = await store.get("op-clean-complete");
+      expect(completed?.terminalFailureReason).toBeUndefined();
+
+      await store.put(record({
+        operationId: "op-still-incomplete",
+        terminalFailureReason: staleReason,
+      }));
+      await expect(store.get("op-still-incomplete")).resolves.toMatchObject({
+        state: "ContinuationRequired",
+        pendingItems: ["57401"],
+        terminalFailureReason: staleReason,
+      });
+
+      await store.put(record({
+        operationId: "op-terminal-failed",
+        state: "Failed",
+        expiresAt: "2999-01-01T00:00:00.000Z",
+        terminalFailureReason: "Immediate continuation delivery failed or is not configured.",
+      }));
+      await expect(store.get("op-terminal-failed")).resolves.toMatchObject({
+        state: "Failed",
+        terminalFailureReason: "Immediate continuation delivery failed or is not configured.",
+      });
+    });
+  });
   it("derives operation status totals from reloaded durable item states", async () => {
     const durable = ownerScopedDurableNamespace();
     const ownerHash = stableHash("owner@example.com");

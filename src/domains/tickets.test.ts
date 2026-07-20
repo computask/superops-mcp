@@ -2479,7 +2479,7 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
-  it("dry-runs approved triage updates without writing", async () => {
+  it("dry-runs approved triage updates without writing and reports requested state separately from observed state", async () => {
     mockClient.query
       .mockResolvedValueOnce({
         getTicketList: {
@@ -2493,6 +2493,7 @@ describe("Tickets Domain", () => {
           displayId: "57400",
           subject: "Dry run",
           status: "New Calls",
+          priority: "Low",
         },
       });
 
@@ -2505,7 +2506,7 @@ describe("Tickets Domain", () => {
           ticketNumber: "57400",
           contentVerified: true,
           action: "update",
-          target: { status: "Worked on" },
+          target: { status: "Awaiting Engineer" },
         },
       ],
     });
@@ -2515,8 +2516,26 @@ describe("Tickets Domain", () => {
       finalOutcome: "Updated",
       writeAttempted: false,
       writeMethod: "dryRun",
+      requestedState: {
+        ticketId: "ticket-57400",
+        status: "Awaiting Engineer",
+      },
+      attemptedState: null,
+      observedFinalState: {
+        status: "New Calls",
+        priority: "Low",
+      },
     });
     expect(mockClient.mutate).not.toHaveBeenCalled();
+
+    const stored = await getOperationStore().get(parsed.operation.operationId);
+    if (!stored) throw new Error("missing dry-run operation");
+    expect(stored).toMatchObject({
+      state: "Completed",
+      pendingItems: [],
+      continuationCount: 0,
+    });
+    expect(stored.terminalFailureReason).toBeUndefined();
   });
 
   it("dedupes approved triage notes and does not duplicate existing note", async () => {

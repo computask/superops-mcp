@@ -2998,6 +2998,7 @@ async function applyApprovedTriageAction(params: {
         result.failureReason = dryRunError;
         return result;
       }
+      result.requestedState = dryRunInput as Record<string, unknown>;
     }
     result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
     result.writeMethod = "dryRun";

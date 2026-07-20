@@ -981,6 +981,9 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
       next.state = hasFailureClassOutcome ? "CompletedWithFailures" : "Completed";
       delete next.nextEligibleTime;
       delete next.currentLease;
+      if (next.state === "Completed") {
+        delete next.terminalFailureReason;
+      }
     } else if (next.state === "Completed" || next.state === "CompletedWithFailures") {
       next.state = next.nextEligibleTime ? "Rescheduled" : "Running";
     }
