@@ -31,7 +31,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { runWithCredentials } from "./client.js";
 import {
-  chatGptDirectBlockedMutationToolNames,
+  blockedToolNamesByCategory,
   createMcpServer,
   resolveGatewayCredentials,
 } from "./mcp-server.js";
@@ -43,6 +43,7 @@ import {
   runWithAuditContext,
   runtimeFlagsFromEnv,
   toolAuditMetadata,
+  type ToolCategory,
 } from "./audit.js";
 import { finishExecution, runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
 import { runWithContinuationScheduler } from "./continuation-scheduler.js";
@@ -164,8 +165,11 @@ function withCors(res: Response): Response {
  * Run the MCP request through a fresh server + Web Standard transport.
  * Stateless: a new server/transport pair is created per request.
  */
-async function handleMcp(request: Request): Promise<Response> {
-  const server = createMcpServer();
+async function handleMcp(
+  request: Request,
+  blockedToolNames: ReadonlySet<string>
+): Promise<Response> {
+  const server = createMcpServer({ blockedToolNames });
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -216,6 +220,27 @@ async function workerOwnerHash(request: Request, env: Env): Promise<string | und
     subdomain: env.SUPEROPS_SUBDOMAIN,
     region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
   });
+}
+
+async function blockedToolNamesForWorkerEnv(
+  env: Env,
+  chatGptDirect: boolean
+): Promise<Set<string>> {
+  const categories = new Set<ToolCategory>();
+
+  if (env.ENABLE_WRITE_TOOLS !== "true") {
+    categories.add("write");
+  }
+  if (env.ENABLE_CUSTOM_MUTATION !== "true") {
+    categories.add("custom_mutation");
+  }
+  if (chatGptDirect && env.CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS !== "true") {
+    categories.add("write");
+    categories.add("custom_mutation");
+    categories.add("custom_query");
+  }
+
+  return blockedToolNamesByCategory(categories);
 }
 
 async function runWithWorkerAuditContext<T>(
@@ -287,9 +312,9 @@ function getRemoteJwks(jwksUrl: string): ReturnType<typeof createRemoteJWKSet> {
 
 async function rejectBlockedChatGptToolCall(
   request: Request,
-  env: Env
+  blockedToolNames: ReadonlySet<string>
 ): Promise<Response | undefined> {
-  if (env.CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS === "true") {
+  if (blockedToolNames.size === 0) {
     return undefined;
   }
 
@@ -321,14 +346,14 @@ async function rejectBlockedChatGptToolCall(
   const toolName = (params as { name?: unknown }).name;
   if (
     typeof toolName !== "string" ||
-    !(await chatGptDirectBlockedMutationToolNames()).has(toolName)
+    !blockedToolNames.has(toolName)
   ) {
     return undefined;
   }
 
   const toolArgs = ((params as { arguments?: unknown }).arguments ??
     {}) as Record<string, unknown>;
-  const message = `${toolName} is disabled on the ChatGPT direct route until write and broad-query tools are reviewed.`;
+  const message = `${toolName} is disabled by this MCP server configuration.`;
   auditToolCall({
     toolName,
     success: false,
@@ -596,7 +621,8 @@ async function handleBaseWorkerFetch(
   request: Request,
   env: Env,
   props?: unknown,
-  auditContextApplied = false
+  auditContextApplied = false,
+  blockedToolNames?: ReadonlySet<string>
 ): Promise<Response> {
   const url = new URL(request.url);
 
@@ -620,6 +646,8 @@ async function handleBaseWorkerFetch(
   }
 
   if (url.pathname === "/mcp") {
+    const mcpBlockedToolNames =
+      blockedToolNames ?? (await blockedToolNamesForWorkerEnv(env, false));
     const runMcpRequest = async (): Promise<Response> => {
     const isGatewayMode = (env.AUTH_MODE ?? "env") === "gateway";
 
@@ -651,9 +679,9 @@ async function handleBaseWorkerFetch(
     // Propagate credentials through AsyncLocalStorage so getCredentials()/
     // getClient() resolve them (process.env is unavailable on workerd).
     if (creds) {
-      return runWithCredentials(creds, () => handleMcp(request));
+      return runWithCredentials(creds, () => handleMcp(request, mcpBlockedToolNames));
     }
-    return handleMcp(request);
+    return handleMcp(request, mcpBlockedToolNames);
     };
 
     const runConfiguredMcpRequest = () =>
@@ -678,12 +706,13 @@ const chatGptMcpApiHandler = {
     ctx?: WorkerExecutionContext
   ): Promise<Response> {
     return runWithWorkerAuditContext(request, env, ctx?.props, async () => {
-      const blockedToolCall = await rejectBlockedChatGptToolCall(request, env);
+      const blockedToolNames = await blockedToolNamesForWorkerEnv(env, true);
+      const blockedToolCall = await rejectBlockedChatGptToolCall(request, blockedToolNames);
       if (blockedToolCall) {
         return blockedToolCall;
       }
 
-      return handleBaseWorkerFetch(request, env, ctx?.props, true);
+      return handleBaseWorkerFetch(request, env, ctx?.props, true, blockedToolNames);
     });
   },
 };

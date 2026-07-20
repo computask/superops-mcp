@@ -28,6 +28,7 @@ import {
   sanitizeToolResult,
   toolAuditMetadata,
   type ToolResult,
+  type ToolCategory,
   type AuditMetadata,
 } from "./audit.js";
 import {
@@ -142,29 +143,32 @@ async function getAllDomainTools(): Promise<ToolDefinition[]> {
   return tools;
 }
 
-/**
- * ChatGPT direct-route policy derives its synchronous-mutation and broad-query
- * blocklist from the same assembled registry returned by tools/list. The one
- * reviewed durable write workflow is intentionally exempt.
- */
-const CHATGPT_DIRECT_DURABLE_MUTATION_ALLOWLIST = new Set([
-  "superops_tickets_apply_triage_plan",
-]);
+export type McpServerOptions = {
+  blockedToolNames?: ReadonlySet<string>;
+};
 
-export async function chatGptDirectBlockedMutationToolNames(): Promise<Set<string>> {
+export async function blockedToolNamesByCategory(
+  categories: ReadonlySet<ToolCategory>
+): Promise<Set<string>> {
+  if (categories.size === 0) {
+    return new Set();
+  }
+
   const domainTools = await getAllDomainTools();
   return new Set(
     domainTools
-      .filter((tool) => {
-        const category = classifyTool(tool.name).category;
-        return (
-          (category === "write" ||
-            category === "custom_mutation" ||
-            category === "custom_query") &&
-          !CHATGPT_DIRECT_DURABLE_MUTATION_ALLOWLIST.has(tool.name)
-        );
-      })
+      .filter((tool) => categories.has(classifyTool(tool.name).category))
       .map((tool) => tool.name)
+  );
+}
+
+/**
+ * ChatGPT direct-route policy derives its synchronous-mutation and broad-query
+ * blocklist from the same assembled registry returned by tools/list.
+ */
+export async function chatGptDirectBlockedMutationToolNames(): Promise<Set<string>> {
+  return blockedToolNamesByCategory(
+    new Set<ToolCategory>(["write", "custom_mutation", "custom_query"])
   );
 }
 // Navigation / discovery tool - helps the LLM find the right tools
@@ -482,7 +486,8 @@ function enrichAuditMetadataFromResult(
  * Create and configure an MCP Server instance with all request handlers.
  * Called once for stdio, or per-request for HTTP / Workers transports.
  */
-export function createMcpServer(): Server {
+export function createMcpServer(options: McpServerOptions = {}): Server {
+  const blockedToolNames = options.blockedToolNames ?? new Set<string>();
   const server = new Server(
     {
       name: "superops-mcp",
@@ -496,11 +501,13 @@ export function createMcpServer(): Server {
   );
   setServerRef(server);
 
-  // List available tools - always returns ALL tools for MCP client compatibility
+  // List available tools - returns the assembled catalogue minus tools blocked
+  // by the current route/runtime policy.
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const domainTools = await getAllDomainTools();
+    const tools = [navigationTool, statusTool, testConnectionTool, ...operationTools, ...domainTools];
     return {
-      tools: [navigationTool, statusTool, testConnectionTool, ...operationTools, ...domainTools],
+      tools: tools.filter((tool) => !blockedToolNames.has(tool.name)),
     };
   });
 
@@ -514,7 +521,13 @@ export function createMcpServer(): Server {
       let metadata = toolAuditMetadata(name, args);
 
       try {
-        const result = boundedToolResult(sanitizeToolResult(await executeToolCall(name, args)));
+        const result = boundedToolResult(
+          sanitizeToolResult(
+            blockedToolNames.has(name)
+              ? errorResult(`${name} is disabled by this MCP server configuration.`)
+              : await executeToolCall(name, args)
+          )
+        );
         metadata = enrichAuditMetadataFromResult(name, result, metadata);
         const errorSummary = errorSummaryFromResult(result);
         finishExecution(result.isError ? "toolError" : "completed");

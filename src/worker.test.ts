@@ -303,7 +303,7 @@ async function getOAuthAccessToken(env: Env): Promise<string> {
 
 
 describe("ChatGPT direct mutation policy", () => {
-  it("derives synchronous mutation blocks from the registry while preserving the durable workflow and reads", async () => {
+  it("derives direct-route blocks from the registry while preserving reads", async () => {
     const blocked = await chatGptDirectBlockedMutationToolNames();
     expect([...blocked].sort()).toEqual([
       "superops_alerts_create",
@@ -311,12 +311,12 @@ describe("ChatGPT direct mutation policy", () => {
       "superops_custom_mutation",
       "superops_custom_query",
       "superops_tickets_add_note",
+      "superops_tickets_apply_triage_plan",
       "superops_tickets_create",
       "superops_tickets_log_time",
       "superops_tickets_resolve_full",
       "superops_tickets_update",
     ]);
-    expect(blocked.has("superops_tickets_apply_triage_plan")).toBe(false);
 
     expect(blocked.has("superops_operations_get")).toBe(false);
   });
@@ -397,13 +397,16 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(body.result?.serverInfo?.name).toBe("superops-mcp");
   });
 
-  it("lists all tools without credentials on the existing path", async () => {
-    const res = await mcp({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/list",
-      params: {},
-    });
+  it("lists all tools without credentials on the existing path when write flags are enabled", async () => {
+    const res = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {},
+      },
+      { ENABLE_WRITE_TOOLS: "true", ENABLE_CUSTOM_MUTATION: "true" }
+    );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       result?: { tools?: { name: string }[] };
@@ -685,6 +688,53 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(body.result?.content?.[0]?.text).toMatch(/credential/i);
   });
 
+  it("rejects hidden tools in the MCP call handler before domain execution", async () => {
+    const superOpsCalls: string[] = [];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (url.startsWith("https://api.superops.ai/")) {
+          superOpsCalls.push(url);
+          return new Response("unexpected SuperOps request", { status: 500 });
+        }
+        return originalFetch(input, init);
+      }
+    );
+
+    try {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 37,
+          method: "tools/call",
+          params: {
+            name: "superops_tickets_create",
+            arguments: { subject: "Test", clientId: "client-1" },
+          },
+        },
+        {
+          SUPEROPS_API_TOKEN: "test-token",
+          SUPEROPS_SUBDOMAIN: "computaskltd",
+          ENABLE_WRITE_TOOLS: "false",
+        }
+      );
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: { text?: string }[] };
+      };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toContain("disabled");
+      expect(superOpsCalls).toEqual([]);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
   it("emits a safe structured audit log for a successful tool call", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
@@ -780,7 +830,7 @@ describe("Cloudflare Worker entrypoint", () => {
         result?: { isError?: boolean; content?: { text?: string }[] };
       };
       expect(body.result?.isError).toBe(true);
-      expect(body.result?.content?.[0]?.text).toContain("Unreviewed synchronous write tools");
+      expect(body.result?.content?.[0]?.text).toContain("disabled");
 
       const records = auditRecords(logSpy);
       expect(records[0]).toMatchObject({
@@ -1273,8 +1323,12 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(res.status).toBe(403);
   });
 
-  it("completes the ChatGPT direct OAuth flow and lists tools", async () => {
-    const env = chatGptEnv();
+  it("filters write, custom mutation, and broad query tools from ChatGPT direct tools/list when disabled", async () => {
+    const env = chatGptEnv({
+      ENABLE_WRITE_TOOLS: "false",
+      ENABLE_CUSTOM_MUTATION: "false",
+      CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS: "false",
+    });
     const token = await getOAuthAccessToken(env);
 
     const res = await mcp(
@@ -1294,19 +1348,38 @@ describe("Cloudflare Worker entrypoint", () => {
       result?: { tools?: { name: string }[] };
     };
     const names = (body.result?.tools ?? []).map((t) => t.name);
-    expect(names).toContain("superops_navigate");
-    expect(names).toContain("superops_tickets_create");
+    for (const hidden of [
+      "superops_tickets_add_note",
+      "superops_tickets_update",
+      "superops_tickets_create",
+      "superops_tickets_log_time",
+      "superops_tickets_resolve_full",
+      "superops_tickets_apply_triage_plan",
+      "superops_custom_mutation",
+      "superops_custom_query",
+    ]) {
+      expect(names).not.toContain(hidden);
+    }
+    expect(names).toContain("superops_clients_list");
+    expect(names).toContain("superops_tickets_list");
+    expect(names).toContain("superops_operations_get");
+    expect(names).toContain("superops_operations_results");
   });
 
-  it("blocks write and broad-query tools on the ChatGPT direct route by default", async () => {
-    const env = chatGptEnv();
+  it("restores ChatGPT direct write and custom tools when the relevant flags are true", async () => {
+    const env = chatGptEnv({
+      ENABLE_WRITE_TOOLS: "true",
+      ENABLE_CUSTOM_MUTATION: "true",
+      CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS: "true",
+    });
     const token = await getOAuthAccessToken(env);
+
     const res = await mcp(
       {
         jsonrpc: "2.0",
-        id: 8,
-        method: "tools/call",
-        params: { name: "superops_custom_query", arguments: {} },
+        id: 71,
+        method: "tools/list",
+        params: {},
       },
       env,
       { Authorization: `Bearer ${token}` },
@@ -1315,10 +1388,42 @@ describe("Cloudflare Worker entrypoint", () => {
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
-      result?: { isError?: boolean; content?: { text?: string }[] };
+      result?: { tools?: { name: string }[] };
     };
-    expect(body.result?.isError).toBe(true);
-    expect(body.result?.content?.[0]?.text).toMatch(/disabled/i);
+    const names = (body.result?.tools ?? []).map((t) => t.name);
+    expect(names).toContain("superops_tickets_create");
+    expect(names).toContain("superops_tickets_apply_triage_plan");
+    expect(names).toContain("superops_custom_mutation");
+    expect(names).toContain("superops_custom_query");
+  });
+
+  it("blocks write and broad-query tools on the ChatGPT direct route by default", async () => {
+    const env = chatGptEnv();
+    const token = await getOAuthAccessToken(env);
+
+    for (const name of [
+      "superops_custom_query",
+      "superops_tickets_apply_triage_plan",
+    ]) {
+      const res = await mcp(
+        {
+          jsonrpc: "2.0",
+          id: 8,
+          method: "tools/call",
+          params: { name, arguments: {} },
+        },
+        env,
+        { Authorization: `Bearer ${token}` },
+        `${AUTH_SERVER}/mcp`
+      );
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        result?: { isError?: boolean; content?: { text?: string }[] };
+      };
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toMatch(/disabled/i);
+    }
   });
 
   it("does not execute blocked direct-route tools when credentials are present", async () => {

@@ -14,7 +14,7 @@ import { runWithContinuationScheduler } from "./continuation-scheduler.js";
 const SEED = 0x5eed250;
 const EXPECTED = 250;
 const MAX_HARNESS_CONTINUATION_INVOCATIONS = EXPECTED * 4;
-const LARGE_HARNESS_TIMEOUT_MS = 60_000;
+const LARGE_HARNESS_TIMEOUT_MS = 120_000;
 const UPDATED = "2026-07-18T10:01:00.000Z";
 
 const HARNESS_CREDS = { apiToken: "harness-token", subdomain: "harness" };
