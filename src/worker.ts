@@ -32,6 +32,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { runWithCredentials } from "./client.js";
 import {
   blockedToolNamesByCategory,
+  chatGptDirectBlockedToolNames,
   createMcpServer,
   resolveGatewayCredentials,
 } from "./mcp-server.js";
@@ -83,6 +84,7 @@ export interface Env {
   CHATGPT_AUTH_ACCESS_ISSUER?: string;
   CHATGPT_AUTH_ACCESS_AUD?: string;
   CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS?: string;
+  CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN?: string;
   SUPEROPS_EXECUTION_SUBREQUEST_BUDGET?: string;
   SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN?: string;
   SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH?: string;
@@ -222,22 +224,42 @@ async function workerOwnerHash(request: Request, env: Env): Promise<string | und
   });
 }
 
+function flagExactlyTrue(value: string | undefined): boolean {
+  return value === "true";
+}
+
+function chatGptDirectReviewedTriagePlanAllowed(env: Env): boolean {
+  return (
+    flagExactlyTrue(env.CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN) &&
+    flagExactlyTrue(env.SUPEROPS_CONTINUATION_ENABLED) &&
+    flagExactlyTrue(env.SUPEROPS_DURABLE_RETRY_ENABLED)
+  );
+}
+
 async function blockedToolNamesForWorkerEnv(
   env: Env,
   chatGptDirect: boolean
 ): Promise<Set<string>> {
+  if (chatGptDirect) {
+    const directMutatingToolsAllowed = flagExactlyTrue(
+      env.CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS
+    );
+    return chatGptDirectBlockedToolNames({
+      generalMutatingToolsAllowed:
+        directMutatingToolsAllowed && flagExactlyTrue(env.ENABLE_WRITE_TOOLS),
+      customMutationsAllowed:
+        directMutatingToolsAllowed && flagExactlyTrue(env.ENABLE_CUSTOM_MUTATION),
+      reviewedTriagePlanAllowed: chatGptDirectReviewedTriagePlanAllowed(env),
+    });
+  }
+
   const categories = new Set<ToolCategory>();
 
-  if (env.ENABLE_WRITE_TOOLS !== "true") {
+  if (!flagExactlyTrue(env.ENABLE_WRITE_TOOLS)) {
     categories.add("write");
   }
-  if (env.ENABLE_CUSTOM_MUTATION !== "true") {
+  if (!flagExactlyTrue(env.ENABLE_CUSTOM_MUTATION)) {
     categories.add("custom_mutation");
-  }
-  if (chatGptDirect && env.CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS !== "true") {
-    categories.add("write");
-    categories.add("custom_mutation");
-    categories.add("custom_query");
   }
 
   return blockedToolNamesByCategory(categories);

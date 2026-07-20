@@ -162,15 +162,40 @@ export async function blockedToolNamesByCategory(
   );
 }
 
+const CHATGPT_DIRECT_TRIAGE_PLAN_TOOL_NAME = "superops_tickets_apply_triage_plan";
+
+export type ChatGptDirectToolPolicy = {
+  generalMutatingToolsAllowed?: boolean;
+  customMutationsAllowed?: boolean;
+  reviewedTriagePlanAllowed?: boolean;
+};
+
 /**
  * ChatGPT direct-route policy derives its synchronous-mutation and broad-query
  * blocklist from the same assembled registry returned by tools/list.
  */
-export async function chatGptDirectBlockedMutationToolNames(): Promise<Set<string>> {
-  return blockedToolNamesByCategory(
-    new Set<ToolCategory>(["write", "custom_mutation", "custom_query"])
-  );
+export async function chatGptDirectBlockedToolNames(
+  policy: ChatGptDirectToolPolicy = {}
+): Promise<Set<string>> {
+  const categories = new Set<ToolCategory>(["custom_query"]);
+  if (policy.generalMutatingToolsAllowed !== true) {
+    categories.add("write");
+  }
+  if (policy.customMutationsAllowed !== true) {
+    categories.add("custom_mutation");
+  }
+
+  const blocked = await blockedToolNamesByCategory(categories);
+  if (policy.reviewedTriagePlanAllowed === true) {
+    blocked.delete(CHATGPT_DIRECT_TRIAGE_PLAN_TOOL_NAME);
+  } else {
+    blocked.add(CHATGPT_DIRECT_TRIAGE_PLAN_TOOL_NAME);
+  }
+  return blocked;
 }
+
+export const chatGptDirectBlockedMutationToolNames =
+  chatGptDirectBlockedToolNames;
 // Navigation / discovery tool - helps the LLM find the right tools
 const navigationTool: ToolDefinition = {
   name: "superops_navigate",
