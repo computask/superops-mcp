@@ -10,6 +10,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import worker, { gatewayOwnerHash, type Env } from "./worker.js";
 import { chatGptDirectBlockedToolNames } from "./mcp-server.js";
+import { MUTATING_TOOL_NAMES, READ_ONLY_TOOL_NAMES } from "./tool-catalogue.js";
 import { getOperationStore, runWithOperationStore, stableHash, type OperationLedgerRecord } from "./operation-store.js";
 
 const MCP_HEADERS = {
@@ -179,6 +180,56 @@ function auditRecords(spy: { mock: { calls: unknown[][] } }) {
       (record): record is Record<string, unknown> =>
         record?.event === "mcp.tool_call"
     );
+}
+
+
+type ToolSafetyAnnotations = {
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+};
+
+type PublishedTool = {
+  name: string;
+  description?: string;
+  annotations?: ToolSafetyAnnotations;
+};
+
+const EXPECTED_READ_ONLY_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true,
+};
+
+const EXPECTED_MUTATING_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+
+const READ_ONLY_DESCRIPTION_PREFIX = "Read-only. Does not modify SuperOps data.";
+
+function toolsByName(tools: PublishedTool[]): Map<string, PublishedTool> {
+  return new Map(tools.map((tool) => [tool.name, tool]));
+}
+
+async function listPublishedTools(
+  env: Env = {},
+  extraHeaders: Record<string, string> = {},
+  url = "http://worker.local/mcp"
+): Promise<PublishedTool[]> {
+  const res = await mcp(
+    { jsonrpc: "2.0", id: 900, method: "tools/list", params: {} },
+    env,
+    extraHeaders,
+    url
+  );
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { result?: { tools?: PublishedTool[] } };
+  return body.result?.tools ?? [];
 }
 
 async function cloudflareAccessJwt(email = ALLOWED_EMAIL): Promise<string> {
@@ -433,6 +484,51 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(names).toContain("superops_alerts_list");
     expect(names).toContain("superops_alerts_create");
     expect(names.length).toBeGreaterThan(10);
+  });
+
+
+  it("publishes explicit MCP safety annotations on the final tools/list response", async () => {
+    const tools = await listPublishedTools({
+      ENABLE_WRITE_TOOLS: "true",
+      ENABLE_CUSTOM_MUTATION: "true",
+    });
+    const byName = toolsByName(tools);
+
+    expect(byName.get("superops_tickets_triage_snapshot")?.annotations).toEqual(
+      EXPECTED_READ_ONLY_ANNOTATIONS
+    );
+    expect(byName.get("superops_tickets_get_safe_by_number")?.annotations).toEqual(
+      EXPECTED_READ_ONLY_ANNOTATIONS
+    );
+    expect(byName.get("superops_operations_get")?.annotations).toEqual(
+      EXPECTED_READ_ONLY_ANNOTATIONS
+    );
+    expect(byName.get("superops_tickets_apply_triage_plan")?.annotations).toEqual(
+      EXPECTED_MUTATING_ANNOTATIONS
+    );
+
+    for (const name of READ_ONLY_TOOL_NAMES) {
+      const tool = byName.get(name);
+      expect(tool, `${name} should be published in the full catalogue`).toBeDefined();
+      expect(tool?.annotations).toEqual(EXPECTED_READ_ONLY_ANNOTATIONS);
+      expect(tool?.description?.startsWith(READ_ONLY_DESCRIPTION_PREFIX)).toBe(true);
+    }
+
+    for (const name of MUTATING_TOOL_NAMES) {
+      const tool = byName.get(name);
+      expect(tool, `${name} should be published in the full catalogue`).toBeDefined();
+      expect(tool?.annotations?.readOnlyHint).toBe(false);
+      expect(tool?.annotations?.destructiveHint).toBe(true);
+    }
+
+    for (const tool of tools) {
+      if (MUTATING_TOOL_NAMES.has(tool.name)) {
+        expect(tool.annotations?.readOnlyHint).toBe(false);
+      } else {
+        expect(READ_ONLY_TOOL_NAMES.has(tool.name)).toBe(true);
+        expect(tool.annotations?.readOnlyHint).toBe(true);
+      }
+    }
   });
 
   it("fails closed for owner-scoped operation status without a trustworthy identity", async () => {
@@ -1352,10 +1448,14 @@ describe("Cloudflare Worker entrypoint", () => {
     );
     expect(list.status).toBe(200);
     const listBody = (await list.json()) as {
-      result?: { tools?: { name: string }[] };
+      result?: { tools?: PublishedTool[] };
     };
-    const names = (listBody.result?.tools ?? []).map((t) => t.name);
+    const tools = listBody.result?.tools ?? [];
+    const names = tools.map((t) => t.name);
     expect(names).not.toContain("superops_tickets_apply_triage_plan");
+    expect(toolsByName(tools).get("superops_tickets_triage_snapshot")?.annotations).toEqual(
+      EXPECTED_READ_ONLY_ANNOTATIONS
+    );
 
     const call = await mcp(
       {
@@ -1393,10 +1493,14 @@ describe("Cloudflare Worker entrypoint", () => {
     );
     expect(list.status).toBe(200);
     const listBody = (await list.json()) as {
-      result?: { tools?: { name: string }[] };
+      result?: { tools?: PublishedTool[] };
     };
-    const names = (listBody.result?.tools ?? []).map((t) => t.name);
+    const tools = listBody.result?.tools ?? [];
+    const names = tools.map((t) => t.name);
     expect(names).toContain("superops_tickets_apply_triage_plan");
+    expect(toolsByName(tools).get("superops_tickets_apply_triage_plan")?.annotations).toEqual(
+      EXPECTED_MUTATING_ANNOTATIONS
+    );
     for (const hidden of [
       "superops_tickets_add_note",
       "superops_tickets_update",
@@ -1628,10 +1732,14 @@ describe("Cloudflare Worker entrypoint", () => {
       `https://${INTERNAL_HOST}/mcp`
     );
     const listBody = (await list.json()) as {
-      result?: { tools?: { name: string }[] };
+      result?: { tools?: PublishedTool[] };
     };
-    const names = (listBody.result?.tools ?? []).map((t) => t.name);
+    const tools = listBody.result?.tools ?? [];
+    const names = tools.map((t) => t.name);
     expect(names).not.toContain("superops_tickets_apply_triage_plan");
+    expect(toolsByName(tools).get("superops_tickets_triage_snapshot")?.annotations).toEqual(
+      EXPECTED_READ_ONLY_ANNOTATIONS
+    );
     expect(names).toContain("superops_operations_get");
 
     const call = await mcp(

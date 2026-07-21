@@ -37,6 +37,7 @@ import {
   runWithExecutionContext,
 } from "./execution.js";
 import { boundedToolResult } from "./utils/tool-result.js";
+import { publishToolDefinition } from "./tool-catalogue.js";
 import {
   currentOwnerHash,
   getOperationStore,
@@ -532,7 +533,9 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
     const domainTools = await getAllDomainTools();
     const tools = [navigationTool, statusTool, testConnectionTool, ...operationTools, ...domainTools];
     return {
-      tools: tools.filter((tool) => !blockedToolNames.has(tool.name)),
+      tools: tools
+        .filter((tool) => !blockedToolNames.has(tool.name))
+        .map(publishToolDefinition),
     };
   });
 

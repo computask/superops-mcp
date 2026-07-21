@@ -4,6 +4,8 @@
  * Type definitions for the SuperOps.ai GraphQL API integration.
  */
 
+import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
+
 export interface SuperOpsCredentials {
   apiToken: string;
   subdomain: string;
@@ -303,6 +305,7 @@ export interface CustomField {
 export interface ToolDefinition {
   name: string;
   description: string;
+  annotations?: ToolAnnotations;
   inputSchema: {
     type: "object";
     properties: Record<string, unknown>;
