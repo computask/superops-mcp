@@ -294,6 +294,115 @@ describe("operation store", () => {
       });
     });
   });
+
+  it("clears or replaces provisional continuation reasons when durable operations complete", async () => {
+    const durable = ownerScopedDurableNamespace();
+    const ownerHash = stableHash("owner@example.com");
+    const staleReason = "Continuation required before all expected items were processed.";
+    const validationReason = "Expected status \"New Calls\", got \"Awaiting Engineer\".";
+
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+      const store = getOperationStore();
+      await store.put(record({
+        operationId: "op-durable-clean-complete",
+        state: "ContinuationRequired",
+        expectedItems: ["57400"],
+        completedItems: [],
+        failedItems: [],
+        skippedItems: [],
+        unattemptedItems: [],
+        pendingItems: ["57400"],
+        itemStates: { "57400": record().itemStates["57400"] },
+        compactResults: [{ ticketNumber: "57400", finalOutcome: "Updated" }],
+        terminalFailureReason: staleReason,
+      }));
+      const completed = await store.get("op-durable-clean-complete", ownerHash);
+      expect(completed).toMatchObject({ state: "Completed", pendingItems: [] });
+      expect(completed?.terminalFailureReason).toBeUndefined();
+
+      await store.put(record({
+        operationId: "op-durable-validation-failure",
+        state: "ContinuationRequired",
+        expectedItems: ["57401"],
+        completedItems: [],
+        failedItems: [],
+        skippedItems: [],
+        unattemptedItems: [],
+        pendingItems: ["57401"],
+        itemStates: {
+          "57401": {
+            ...record().itemStates["57401"],
+            stage: "FailedBeforeWrite",
+            outcome: "Blocked",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+            partialWrite: false,
+            verificationState: "NotRequired",
+            errorClass: "ValidationFailure",
+            failureReason: validationReason,
+          },
+        },
+        compactResults: [{
+          ticketNumber: "57401",
+          finalOutcome: "Blocked",
+          failureReason: validationReason,
+          writeAttempted: false,
+        }],
+        terminalFailureReason: staleReason,
+      }));
+      const failed = await store.get("op-durable-validation-failure", ownerHash);
+      expect(failed).toMatchObject({
+        state: "CompletedWithFailures",
+        terminalFailureReason: validationReason,
+        itemStates: {
+          "57401": {
+            stage: "FailedBeforeWrite",
+            writeAttempted: false,
+            failureReason: validationReason,
+          },
+        },
+      });
+      expect(failed?.itemStates["57401"].writeAttempted).toBe(false);
+      expect(operationResultView(failed!).items).toEqual([
+        expect.objectContaining({
+          itemId: "57401",
+          stage: "FailedBeforeWrite",
+          finalErrorClass: "ValidationFailure",
+          finalReason: validationReason,
+          writeAttempted: false,
+        }),
+      ]);
+
+      await store.put(record({
+        operationId: "op-durable-still-incomplete",
+        terminalFailureReason: staleReason,
+      }));
+      await expect(store.get("op-durable-still-incomplete", ownerHash)).resolves.toMatchObject({
+        state: "ContinuationRequired",
+        pendingItems: ["57401"],
+        terminalFailureReason: staleReason,
+      });
+
+      await store.put(record({ operationId: "op-durable-terminal-continuation" }));
+      await expect(store.terminalizeContinuationFailure({
+        operationId: "op-durable-terminal-continuation",
+        ownerHash,
+        errorClass: "ContinuationExecutionFailure",
+        outcome: "ContinuationDeliveryFailed",
+        reason: "Workflow continuation delivery retry limit exhausted.",
+      })).resolves.toMatchObject({
+        state: "CompletedWithFailures",
+        terminalFailureReason: "Workflow continuation delivery retry limit exhausted.",
+        itemStates: {
+          "57401": {
+            stage: "FailedBeforeWrite",
+            writeAttempted: false,
+            errorClass: "ContinuationExecutionFailure",
+          },
+        },
+      });
+    });
+  });
   it("derives operation status totals from reloaded durable item states", async () => {
     const durable = ownerScopedDurableNamespace();
     const ownerHash = stableHash("owner@example.com");

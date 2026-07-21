@@ -694,6 +694,13 @@ const RATE_LIMIT_STAGES = new Set<OperationItemStage>([
   "RateLimitExceeded",
 ]);
 
+const TERMINAL_CONTINUATION_ERROR_CLASSES = new Set<OperationErrorClass>([
+  "ContinuationFailure",
+  "ContinuationSchedulingFailure",
+  "ContinuationExecutionFailure",
+  "OperationStoreFailure",
+]);
+
 function isDurableObjectNamespace(value: unknown): value is DurableObjectNamespace {
   return typeof value === "object" &&
     value !== null &&
@@ -922,6 +929,72 @@ function itemResultKey(value: unknown): string | undefined {
     : undefined;
 }
 
+function stringField(record: Record<string, unknown> | undefined, field: string): string | undefined {
+  const value = record?.[field];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function compactResultForItem(
+  record: OperationLedgerRecord,
+  itemKey: string
+): Record<string, unknown> | undefined {
+  const result = record.compactResults.find((entry) => itemResultKey(entry) === itemKey);
+  return isRecordObject(result) ? result : undefined;
+}
+
+function itemTerminalFailureReason(
+  record: OperationLedgerRecord,
+  itemKey: string
+): string | undefined {
+  const item = record.itemStates[itemKey];
+  if (!item) return undefined;
+  const compactResult = compactResultForItem(record, itemKey);
+  return item.failureReason ??
+    stringField(compactResult, "failureReason") ??
+    stringField(compactResult, "finalReason") ??
+    item.outcome ??
+    stringField(compactResult, "finalOutcome") ??
+    item.errorClass ??
+    item.stage;
+}
+
+function hasTerminalContinuationFailure(record: OperationLedgerRecord): boolean {
+  return record.expectedItems.some((itemKey) => {
+    const item = record.itemStates[itemKey];
+    return Boolean(
+      item &&
+      TERMINAL_STAGES.has(item.stage) &&
+      item.errorClass &&
+      TERMINAL_CONTINUATION_ERROR_CLASSES.has(item.errorClass)
+    );
+  });
+}
+
+function deriveTerminalFailureReason(record: OperationLedgerRecord): string | undefined {
+  if (record.terminalFailureReason && hasTerminalContinuationFailure(record)) {
+    return record.terminalFailureReason;
+  }
+  for (const itemKey of record.expectedItems) {
+    const item = record.itemStates[itemKey];
+    if (item && FAILED_STAGES.has(item.stage)) {
+      return itemTerminalFailureReason(record, itemKey);
+    }
+  }
+  for (const itemKey of record.expectedItems) {
+    const item = record.itemStates[itemKey];
+    if (item && SKIPPED_STAGES.has(item.stage)) {
+      return itemTerminalFailureReason(record, itemKey);
+    }
+  }
+  for (const itemKey of record.expectedItems) {
+    const item = record.itemStates[itemKey];
+    if (item?.partialWrite || item?.ambiguousWrite) {
+      return itemTerminalFailureReason(record, itemKey);
+    }
+  }
+  return record.terminalFailureReason;
+}
+
 function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedgerRecord {
   const next = cloneRecord(record);
   const completed: string[] = [];
@@ -983,6 +1056,8 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
       delete next.currentLease;
       if (next.state === "Completed") {
         delete next.terminalFailureReason;
+      } else {
+        next.terminalFailureReason = deriveTerminalFailureReason(next);
       }
     } else if (next.state === "Completed" || next.state === "CompletedWithFailures") {
       next.state = next.nextEligibleTime ? "Rescheduled" : "Running";
