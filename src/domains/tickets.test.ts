@@ -3574,6 +3574,99 @@ describe("Tickets Domain", () => {
     });
   });
 
+  it("records verified single-ticket apply-plan update telemetry per item and operation", async () => {
+    await runWithOperationStore({}, async () => {
+      mockClient.query
+        .mockResolvedValueOnce({
+          getTicketList: {
+            tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        })
+        .mockResolvedValueOnce({
+          getTicket: {
+            ticketId: "ticket-57400",
+            displayId: "57400",
+            status: "New Calls",
+            updatedTime: "2026-07-18T10:00:00Z",
+          },
+        })
+        .mockResolvedValueOnce({
+          getTicket: {
+            ticketId: "ticket-57400",
+            displayId: "57400",
+            status: "Awaiting Engineer",
+            updatedTime: "2026-07-18T10:01:00Z",
+          },
+        });
+      mockClient.mutate.mockImplementationOnce(async () => {
+        const started = recordTypedSubrequestStart({
+          type: "write",
+          operationType: "mutation",
+          operationName: "UpdateTicket",
+        });
+        recordSubrequestFinish(started, 200, true);
+        return { updateTicket: { ticketId: "ticket-57400", status: "Awaiting Engineer" } };
+      });
+
+      const result = await runWithExecutionConfig({}, () =>
+        runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+            batchId: "verified-single-update-telemetry",
+            expectedCandidateTicketNumbers: ["57400"],
+            actions: [{
+              ticketNumber: "57400",
+              expectedStatus: "New Calls",
+              expectedUpdatedTime: "2026-07-18T10:00:00Z",
+              contentVerified: true,
+              action: "update",
+              target: { status: "Awaiting Engineer" },
+            }],
+          })
+        )
+      );
+      const parsed = JSON.parse(result.content[0].text);
+      const perItem = parsed.execution.items.perItem.find(
+        (item: { itemKey?: string }) => item.itemKey === "57400"
+      );
+      const stored = await getOperationStore().get("verified-single-update-telemetry");
+
+      expect(result.isError).not.toBe(true);
+      expect(parsed.execution.requestsByType).toMatchObject({ write: 1 });
+      expect(perItem).toMatchObject({ itemKey: "57400", writes: 1 });
+      expect(parsed.results[0]).toMatchObject({
+        ticketNumber: "57400",
+        finalOutcome: "Updated",
+        writeAttempted: true,
+        verified: true,
+        verifiedState: expect.objectContaining({ status: "Awaiting Engineer" }),
+        partialWrite: false,
+      });
+      expect(parsed.operation).toMatchObject({
+        state: "Completed",
+        verificationState: "Verified",
+        partialWrite: false,
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+      });
+      expect(stored).toMatchObject({
+        state: "Completed",
+        partialWriteCount: 0,
+        ambiguousWriteCount: 0,
+        itemStates: {
+          "57400": {
+            stage: "Completed",
+            outcome: "Updated",
+            writeAttempted: true,
+            writeMayHaveSucceeded: true,
+            partialWrite: false,
+            verificationState: "Verified",
+          },
+        },
+      });
+      expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    });
+  });
   it("persists conclusive rejection before retry scheduling", async () => {
     await runWithOperationStore({}, async () => {
       const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(

@@ -3103,6 +3103,56 @@ function buildApplyTriageLedgerRecord(params: {
     terminalFailureReason: terminalFailure,
   };
 }
+const APPLY_TRIAGE_TERMINAL_ITEM_STAGES = new Set<OperationItemState["stage"]>([
+  "Completed",
+  "CompletedAfterRetry",
+  "CompletedAfterAmbiguousWriteVerification",
+  "AmbiguousWriteUnresolved",
+  "Stale",
+  "Skipped",
+  "FailedBeforeWrite",
+  "FailedAfterPartialWrite",
+  "RateLimitExceeded",
+  "StaleAfterRateLimitWait",
+]);
+
+function applyTriageItemHasPossibleWrite(item: OperationItemState): boolean {
+  if (item.writeMayHaveSucceeded) return true;
+  if (item.observedMutationResult === "Accepted" || item.observedMutationResult === "VerifiedApplied") {
+    return true;
+  }
+  return item.writeAttempted &&
+    item.reliableResponseReceived !== true &&
+    item.observedMutationResult !== "Rejected";
+}
+
+function applyTriageOperationVerificationState(
+  items: OperationItemState[],
+  conservativeOutcome?: ContinuationItemOutcome
+): "Verified" | "Failed" | "Pending" | undefined {
+  if (conservativeOutcome?.verificationFailed === true) return "Failed";
+
+  const possibleWriteItems = items.filter(applyTriageItemHasPossibleWrite);
+  if (possibleWriteItems.some((item) => item.verificationState === "Failed")) {
+    return "Failed";
+  }
+  if (possibleWriteItems.length > 0) {
+    return possibleWriteItems.every((item) =>
+      APPLY_TRIAGE_TERMINAL_ITEM_STAGES.has(item.stage) &&
+      item.verificationState === "Verified" &&
+      item.partialWrite !== true &&
+      item.ambiguousWrite !== true
+    )
+      ? "Verified"
+      : "Pending";
+  }
+
+  if (conservativeOutcome?.verified === true) return "Verified";
+  if (conservativeOutcome?.writeMayHaveSucceeded === true || conservativeOutcome?.partialWrite === true) {
+    return "Pending";
+  }
+  return undefined;
+}
 function summarizeApplyResults(results: ApplyTriagePlanResult[]) {
   return {
     resolved: results.filter((result) => result.finalOutcome === "Resolved").length,
@@ -5394,11 +5444,10 @@ export function getTicketsTools(): DomainTools {
               conservativeOutcome?.writeMayHaveSucceeded === true || conservativeOutcome?.partialWrite === true;
             const conservativePartialWrite = durableItems.some((item) => item.partialWrite) ||
               conservativeOutcome?.partialWrite === true;
-            const conservativeVerificationState = conservativeOutcome?.verified === true
-              ? "Verified"
-              : conservativeOutcome?.verificationFailed === true
-                ? "Failed"
-                : conservativeWriteMayHaveSucceeded ? "Pending" : undefined;
+            const conservativeVerificationState = applyTriageOperationVerificationState(
+              durableItems,
+              conservativeOutcome
+            );
             const operationView = operationResultView(finalRecord);
             const durableFinalErrorClass = durableItems.find((item) => item.errorClass)?.errorClass ??
               conservativeOutcome?.errorClass;

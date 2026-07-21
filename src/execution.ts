@@ -433,9 +433,22 @@ export function withExecutionItem<T>(itemKey: string, fn: () => T): T {
     stale: false,
   };
   try {
-    return fn();
-  } finally {
+    const result = fn();
+    const maybePromise = result as unknown as { then?: unknown };
+    if (
+      typeof result === "object" &&
+      result !== null &&
+      typeof maybePromise.then === "function"
+    ) {
+      return Promise.resolve(result).finally(() => {
+        state.itemKey = previous;
+      }) as T;
+    }
     state.itemKey = previous;
+    return result;
+  } catch (error) {
+    state.itemKey = previous;
+    throw error;
   }
 }
 
