@@ -176,6 +176,69 @@ describe("Tickets Domain", () => {
     ]);
   });
 
+  it("publishes the complete approved triage action item schema", () => {
+    const domain = getTicketsTools();
+    const tool = domain.tools.find((candidate) => candidate.name === "superops_tickets_apply_triage_plan");
+    type TargetSchema = {
+      properties: Record<string, { enum?: string[] }>;
+      anyOf?: Array<{ required: string[] }>;
+      required?: string[];
+    };
+    type ActionSchemaVariant = {
+      properties: Record<string, unknown> & {
+        action: { const: string };
+        target: TargetSchema;
+      };
+      required?: string[];
+    };
+    const actions = tool?.inputSchema.properties.actions as {
+      type?: string;
+      items?: { oneOf?: ActionSchemaVariant[] };
+    };
+
+    expect(actions.type).toBe("array");
+    expect(actions.items).toBeDefined();
+    expect(actions.items).not.toEqual({});
+
+    const variants = actions.items?.oneOf ?? [];
+    expect(variants.map((variant) => variant.properties.action.const)).toEqual([
+      "update", "resolve", "addNote", "leave", "skip",
+    ]);
+
+    const update = variants.find((variant) => variant.properties.action.const === "update");
+    expect(update?.required).toEqual(
+      expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"])
+    );
+    expect(update?.properties.target.properties.status.enum).toContain("Awaiting Engineer");
+    expect(update?.properties.target.anyOf).toContainEqual({ required: ["status"] });
+    expect(update?.properties.target.properties).toEqual(
+      expect.objectContaining({
+        status: expect.any(Object),
+        priority: expect.any(Object),
+        impact: expect.any(Object),
+        urgency: expect.any(Object),
+        category: expect.any(Object),
+        subcategory: expect.any(Object),
+        cause: expect.any(Object),
+        resolutionCode: expect.any(Object),
+        techGroupName: expect.any(Object),
+        clientName: expect.any(Object),
+        clientId: expect.any(Object),
+        suppressCloseNotification: expect.any(Object),
+      })
+    );
+
+    const resolve = variants.find((variant) => variant.properties.action.const === "resolve");
+    expect(resolve?.properties.target.required).toEqual([
+      "category", "priority", "impact", "subcategory", "cause", "resolutionCode",
+    ]);
+
+    const addNote = variants.find((variant) => variant.properties.action.const === "addNote");
+    expect(addNote?.required).toEqual(
+      expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "note"])
+    );
+  });
+
   it("uses server-side status condition and returns New Calls tickets", async () => {
     mockClient.query.mockResolvedValue({
       getTicketList: {
@@ -2494,6 +2557,7 @@ describe("Tickets Domain", () => {
           subject: "Dry run",
           status: "New Calls",
           priority: "Low",
+          updatedTime: "2026-06-25T10:00:00",
         },
       });
 
@@ -2504,6 +2568,7 @@ describe("Tickets Domain", () => {
       actions: [
         {
           ticketNumber: "57400",
+          expectedUpdatedTime: "2026-06-25T10:00:00",
           contentVerified: true,
           action: "update",
           target: { status: "Awaiting Engineer" },
@@ -2517,7 +2582,6 @@ describe("Tickets Domain", () => {
       writeAttempted: false,
       writeMethod: "dryRun",
       requestedState: {
-        ticketId: "ticket-57400",
         status: "Awaiting Engineer",
       },
       attemptedState: null,
@@ -2536,6 +2600,49 @@ describe("Tickets Domain", () => {
       continuationCount: 0,
     });
     expect(stored.terminalFailureReason).toBeUndefined();
+  });
+
+  it("rejects an approved triage update with no recognised mutable target fields", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [
+        {
+          ticketNumber: "57400",
+          expectedUpdatedTime: "2026-06-25T10:00:00",
+          contentVerified: true,
+          action: "update",
+          target: {},
+        },
+      ],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("recognised mutable target field");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects unknown approved triage action fields instead of reporting an update no-op", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [
+        {
+          ticketNumber: "57400",
+          expectedUpdatedTime: "2026-06-25T10:00:00",
+          contentVerified: true,
+          action: "update",
+          requestedState: { status: "Awaiting Engineer" },
+        },
+      ],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("unsupported field(s): requestedState");
+    expect(result.content[0].text).not.toContain('"finalOutcome": "Updated"');
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
   it("dedupes approved triage notes and does not duplicate existing note", async () => {

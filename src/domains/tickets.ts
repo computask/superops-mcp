@@ -604,6 +604,201 @@ interface ApplyTriagePlanParams {
   allowWriteWithoutVerifiedContent?: boolean;
 }
 
+const TRIAGE_PLAN_ACTION_TYPES = ["resolve", "update", "addNote", "leave", "skip"] as const;
+const TRIAGE_PLAN_UPDATE_TARGET_FIELDS = [
+  "status",
+  "priority",
+  "impact",
+  "urgency",
+  "category",
+  "subcategory",
+  "cause",
+  "resolutionCode",
+  "techGroupName",
+  "clientName",
+  "clientId",
+  "suppressCloseNotification",
+] as const;
+
+const TRIAGE_PLAN_ACTION_FIELD_NAMES = [
+  "ticketNumber",
+  "expectedTicketId",
+  "expectedSubject",
+  "expectedSubjectHash",
+  "expectedClient",
+  "expectedClientHash",
+  "expectedStatus",
+  "expectedUpdatedTime",
+  "contentVerified",
+  "action",
+  "reason",
+  "note",
+  "noteFingerprint",
+  "isPublicNote",
+  "target",
+  "allowResolveFullFallbackToUpdate",
+  "allowWriteIfUpdatedTimeChanged",
+  "allowWriteWithoutVerifiedContent",
+] as const;
+const TRIAGE_PLAN_ACTION_FIELD_SET = new Set<string>(TRIAGE_PLAN_ACTION_FIELD_NAMES);
+const TRIAGE_PLAN_TARGET_FIELD_SET = new Set<string>(TRIAGE_PLAN_UPDATE_TARGET_FIELDS);
+
+const TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES = {
+  ticketNumber: {
+    type: "string",
+    description: "Ticket number/display ID from the approved snapshot.",
+  },
+  expectedTicketId: {
+    type: "string",
+    description: "Optional internal ticket ID expected from the approved snapshot.",
+  },
+  expectedSubject: {
+    type: "string",
+    description: "Optional exact subject expected from the approved snapshot.",
+  },
+  expectedSubjectHash: {
+    type: "string",
+    description: "Optional stable hash of the expected subject.",
+  },
+  expectedClient: {
+    type: "string",
+    description: "Optional exact client name expected from the approved snapshot.",
+  },
+  expectedClientHash: {
+    type: "string",
+    description: "Optional stable hash of the expected client name.",
+  },
+  expectedStatus: {
+    type: "string",
+    enum: [...VALID_TICKET_STATUSES],
+    description: "Optional current status expected before applying the action.",
+  },
+  expectedUpdatedTime: {
+    type: "string",
+    description: "Current updatedTime from the approved snapshot; used to block stale writes.",
+  },
+  contentVerified: {
+    type: "boolean",
+    description: "Required true for mutating actions unless an explicit override is supplied.",
+  },
+  allowWriteIfUpdatedTimeChanged: {
+    type: "boolean",
+    default: false,
+    description: "Per-action override allowing a write despite an updatedTime mismatch.",
+  },
+  allowWriteWithoutVerifiedContent: {
+    type: "boolean",
+    default: false,
+    description: "Per-action override allowing a mutating write without contentVerified=true.",
+  },
+} as const;
+
+const TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES = {
+  status: {
+    type: "string",
+    enum: [...VALID_TICKET_STATUSES],
+    description: "Target ticket status, e.g. Awaiting Engineer.",
+  },
+  priority: { type: "string", description: "Target priority display value from SuperOps field options." },
+  impact: { type: "string", description: "Target impact display value from SuperOps field options." },
+  urgency: { type: "string", description: "Target urgency display value from SuperOps field options." },
+  category: { type: "string", enum: [...VALID_TICKET_CATEGORIES], description: "Target ticket category." },
+  subcategory: { type: "string", description: "Target subcategory display value from SuperOps field options." },
+  cause: { type: "string", description: "Target cause display value from SuperOps field options." },
+  resolutionCode: { type: "string", description: "Target resolution code display value from SuperOps field options." },
+  techGroupName: { type: "string", description: "Target technician group name." },
+  clientName: { type: "string", description: "Target client/account name." },
+  clientId: { type: "string", description: "Target client/account ID." },
+  suppressCloseNotification: { type: "boolean", description: "Suppress SuperOps close notification where supported." },
+} as const;
+
+const TRIAGE_PLAN_UPDATE_TARGET_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES,
+  anyOf: TRIAGE_PLAN_UPDATE_TARGET_FIELDS.map((field) => ({ required: [field] })),
+} as const;
+
+const TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    ...TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES,
+    status: {
+      type: "string",
+      enum: [...VALID_TICKET_STATUSES],
+      default: DEFAULT_RESOLVE_TICKET_STATUS,
+      description: "Final resolve status. Defaults to Resolved.",
+    },
+  },
+  required: ["category", "priority", "impact", "subcategory", "cause", "resolutionCode"],
+} as const;
+
+const TRIAGE_PLAN_ACTION_SCHEMA = {
+  oneOf: [
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
+        action: { type: "string", const: "update" },
+        target: TRIAGE_PLAN_UPDATE_TARGET_SCHEMA,
+        note: { type: "string", description: "Optional private note to add after the update succeeds." },
+        isPublicNote: { type: "boolean", default: false, description: "Whether the optional note is client-visible." },
+      },
+      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"],
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
+        action: { type: "string", const: "resolve" },
+        target: TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA,
+        note: { type: "string", description: "Optional private note to add after the resolve succeeds." },
+        isPublicNote: { type: "boolean", default: false, description: "Whether the optional note is client-visible." },
+        allowResolveFullFallbackToUpdate: {
+          type: "boolean",
+          default: false,
+          description: "Allow controlled update fallback only after a SuperOps internal server error.",
+        },
+      },
+      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"],
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
+        action: { type: "string", const: "addNote" },
+        note: { type: "string", description: "Private note body to add." },
+        isPublicNote: { type: "boolean", default: false, description: "Whether the note is client-visible." },
+      },
+      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "note"],
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
+        action: { type: "string", const: "leave" },
+        reason: { type: "string", description: "Optional reason for leaving the ticket unchanged." },
+      },
+      required: ["ticketNumber", "action"],
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
+        action: { type: "string", const: "skip" },
+        reason: { type: "string", description: "Optional reason for skipping this approved candidate." },
+      },
+      required: ["ticketNumber", "action"],
+    },
+  ],
+} as const;
+
 interface ApplyTriagePlanResult {
   ticketNumber: string;
   ticketId?: string;
@@ -778,6 +973,73 @@ function jsonRecord(value: unknown): Record<string, unknown> | undefined {
     return undefined;
   }
   return value as Record<string, unknown>;
+}
+
+function validateTriagePlanActionShape(rawAction: unknown, index: number): string | undefined {
+  const action = jsonRecord(rawAction);
+  const label = `actions[${index}]`;
+  if (!action) {
+    return `${label} must be an object.`;
+  }
+
+  const unknownActionFields = Object.keys(action).filter(
+    (field) => !TRIAGE_PLAN_ACTION_FIELD_SET.has(field)
+  );
+  if (unknownActionFields.length > 0) {
+    return `${label} contains unsupported field(s): ${unknownActionFields.join(", ")}.`;
+  }
+
+  const ticketNumber = normaliseTicketNumber(action.ticketNumber);
+  if (!ticketNumber) {
+    return `${label}.ticketNumber is required.`;
+  }
+
+  if (
+    typeof action.action !== "string" ||
+    !(TRIAGE_PLAN_ACTION_TYPES as readonly string[]).includes(action.action)
+  ) {
+    return `${label}.action must be one of: ${TRIAGE_PLAN_ACTION_TYPES.join(", ")}.`;
+  }
+
+  const target = action.target === undefined ? undefined : jsonRecord(action.target);
+  if (action.target !== undefined && !target) {
+    return `${label}.target must be an object when supplied.`;
+  }
+
+  if (target) {
+    const unknownTargetFields = Object.keys(target).filter(
+      (field) => !TRIAGE_PLAN_TARGET_FIELD_SET.has(field)
+    );
+    if (unknownTargetFields.length > 0) {
+      return `${label}.target contains unsupported field(s): ${unknownTargetFields.join(", ")}.`;
+    }
+  }
+
+  if (action.action === "update") {
+    if (!target) {
+      return `${label} update action requires target with at least one mutable ticket field.`;
+    }
+    const hasRecognizedTarget = TRIAGE_PLAN_UPDATE_TARGET_FIELDS.some(
+      (field) => target[field] !== undefined
+    );
+    if (!hasRecognizedTarget) {
+      return `${label} update action requires at least one recognised mutable target field.`;
+    }
+  }
+
+  if (
+    action.action === "addNote" &&
+    (typeof action.note !== "string" || action.note.trim().length === 0)
+  ) {
+    return `${label} addNote action requires a non-empty note.`;
+  }
+}
+
+function validateTriagePlanActions(actions: unknown[]): string | undefined {
+  for (const [index, action] of actions.entries()) {
+    const validationError = validateTriagePlanActionShape(action, index);
+    if (validationError) return validationError;
+  }
 }
 
 function readableString(value: unknown, keys: string[]): string | undefined {
@@ -2998,7 +3260,6 @@ async function applyApprovedTriageAction(params: {
         result.failureReason = dryRunError;
         return result;
       }
-      result.requestedState = dryRunInput as Record<string, unknown>;
     }
     result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
     result.writeMethod = "dryRun";
@@ -4163,6 +4424,7 @@ export function getTicketsTools(): DomainTools {
             },
             actions: {
               type: "array",
+              items: TRIAGE_PLAN_ACTION_SCHEMA,
               description: "Approved per-ticket actions. Supported action values: resolve, update, addNote, leave, skip.",
             },
             dryRun: {
@@ -4955,6 +5217,11 @@ export function getTicketsTools(): DomainTools {
             }
 
             const actions = Array.isArray(params.actions) ? params.actions : [];
+            const actionValidationError = validateTriagePlanActions(actions);
+            if (actionValidationError) {
+              return errorResult(actionValidationError);
+            }
+
             const actionByTicket = new Map<string, TriagePlanAction>();
             for (const action of actions) {
               const ticketNumber = normaliseTicketNumber(action.ticketNumber);
