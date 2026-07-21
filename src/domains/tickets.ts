@@ -1746,12 +1746,13 @@ async function buildTriageSnapshotForCandidate(
     contentErrors.push(`Metadata could not be fetched safely: ${safeErrorMessage(error)}`);
   }
 
+  const contentTicketId = ticket.ticketId ?? candidate.ticketId;
   let conversations: TicketConversation[] = [];
   let notes: TicketNote[] = [];
 
   if (params.includeConversations) {
     try {
-      conversations = await getTicketConversations(client, candidate.ticketId);
+      conversations = await getTicketConversations(client, contentTicketId);
     } catch (error) {
       contentErrors.push(
         `Conversations could not be fetched safely: ${safeErrorMessage(error)}`
@@ -1761,7 +1762,7 @@ async function buildTriageSnapshotForCandidate(
 
   if (params.includeNotes) {
     try {
-      notes = await getTicketNotes(client, candidate.ticketId);
+      notes = await getTicketNotes(client, contentTicketId);
     } catch (error) {
       contentErrors.push(`Notes could not be fetched safely: ${safeErrorMessage(error)}`);
     }

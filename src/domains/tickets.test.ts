@@ -1409,6 +1409,242 @@ describe("Tickets Domain", () => {
     );
   });
 
+  it("keeps DESCRIPTION evidence in triage snapshots when canonical ticket content includes a newer acknowledgement", async () => {
+    const automatedAcknowledgement = {
+      conversationId: "conversation-ack",
+      type: "TECH_REPLY",
+      time: "2026-07-21T10:05:00Z",
+      user: { name: "Task Group" },
+      content: "Task Group automated acknowledgement: we have received your request.",
+    };
+    const customerDescription = {
+      conversationId: "description-request",
+      type: "DESCRIPTION",
+      time: "2026-07-21T10:00:00Z",
+      user: { name: "Catherine Cooper" },
+      content:
+        "Please could Catherine Cooper have access to the Twelve Trees SharePoint page as soon as possible.",
+    };
+
+    mockClient.query.mockImplementation(
+      async (query: string, variables?: { input?: { ticketId?: string } }) => {
+        if (query.includes("getTicketList")) {
+          return {
+            getTicketList: {
+              tickets: [
+                {
+                  ticketId: "candidate-58744",
+                  displayId: "58744",
+                  subject: "SharePoint access",
+                  status: "New Calls",
+                },
+              ],
+              listInfo: { page: 1, pageSize: 20, hasMore: false, totalCount: 1 },
+            },
+          };
+        }
+
+        if (query.includes("getTicket(input")) {
+          return {
+            getTicket: {
+              ticketId: "ticket-58744",
+              displayId: "58744",
+              subject: "SharePoint access",
+              status: "New Calls",
+              createdTime: "2026-07-21T10:00:00Z",
+              updatedTime: "2026-07-21T10:06:00Z",
+            },
+          };
+        }
+
+        if (query.includes("getTicketConversationList")) {
+          return {
+            getTicketConversationList:
+              variables?.input?.ticketId === "ticket-58744"
+                ? [automatedAcknowledgement, customerDescription]
+                : [automatedAcknowledgement],
+          };
+        }
+
+        if (query.includes("getTicketNoteList")) {
+          return { getTicketNoteList: [] };
+        }
+
+        throw new Error(`Unexpected query: ${query}`);
+      }
+    );
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      max: 20,
+      page: 1,
+      safeRead: true,
+      includeNotes: true,
+      includeConversations: true,
+      includeAttachments: "metadataOnly",
+      maxContentCharsPerTicket: 2500,
+      maxItemsPerTicket: 6,
+      latestFirst: true,
+      storeBatch: false,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    const contentReadCall = mockClient.query.mock.calls.find((call) =>
+      call[0].includes("getTicketConversationList")
+    );
+
+    expect(contentReadCall?.[1]).toEqual({ input: { ticketId: "ticket-58744" } });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+    expect(parsed.tickets[0].safeContentItems).toEqual([
+      expect.objectContaining({
+        type: "technician_reply",
+        plainText: expect.stringContaining("automated acknowledgement"),
+      }),
+      expect.objectContaining({
+        type: "description",
+        plainText: expect.stringContaining(
+          "Please could Catherine Cooper have access to the Twelve Trees SharePoint page"
+        ),
+      }),
+    ]);
+    expect(parsed.tickets[0].safeSummary).toContain("automated acknowledgement");
+    expect(parsed.tickets[0].safeSummary).toContain(
+      "Please could Catherine Cooper have access to the Twelve Trees SharePoint page"
+    );
+  });
+
+  it("applies triage snapshot item-count limits after ordering safe content", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [
+            {
+              ticketId: "ticket-limits",
+              displayId: "58745",
+              subject: "Limited evidence",
+              status: "New Calls",
+            },
+          ],
+          listInfo: { page: 1, pageSize: 20, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-limits",
+          displayId: "58745",
+          subject: "Limited evidence",
+          status: "New Calls",
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicketConversationList: [
+          {
+            conversationId: "conversation-newest",
+            type: "TECH_REPLY",
+            time: "2026-07-21T10:05:00Z",
+            content: "Newest acknowledgement retained by latest-first ordering.",
+          },
+          {
+            conversationId: "description-original",
+            type: "DESCRIPTION",
+            time: "2026-07-21T10:00:00Z",
+            content: "Original customer request that should be omitted only by item limit.",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ getTicketNoteList: [] });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      max: 20,
+      page: 1,
+      includeNotes: true,
+      includeConversations: true,
+      maxContentCharsPerTicket: 2500,
+      maxItemsPerTicket: 1,
+      latestFirst: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.tickets[0].safeContentItems).toEqual([
+      expect.objectContaining({
+        type: "technician_reply",
+        plainText: "Newest acknowledgement retained by latest-first ordering.",
+      }),
+    ]);
+    expect(JSON.stringify(parsed.tickets[0].safeContentItems)).not.toContain(
+      "Original customer request"
+    );
+  });
+
+  it("applies triage snapshot character limits to safe content", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [
+            {
+              ticketId: "ticket-char-limit",
+              displayId: "58746",
+              subject: "Character limited evidence",
+              status: "New Calls",
+            },
+          ],
+          listInfo: { page: 1, pageSize: 20, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-char-limit",
+          displayId: "58746",
+          subject: "Character limited evidence",
+          status: "New Calls",
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicketConversationList: [
+          {
+            conversationId: "conversation-short",
+            type: "TECH_REPLY",
+            time: "2026-07-21T10:05:00Z",
+            content: "Short acknowledgement.",
+          },
+          {
+            conversationId: "description-too-long",
+            type: "DESCRIPTION",
+            time: "2026-07-21T10:00:00Z",
+            content:
+              "Original customer request with more detail than this snapshot character budget can include.",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ getTicketNoteList: [] });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      max: 20,
+      page: 1,
+      includeNotes: true,
+      includeConversations: true,
+      maxContentCharsPerTicket: 35,
+      maxItemsPerTicket: 6,
+      latestFirst: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.tickets[0].safeContentItems).toEqual([
+      expect.objectContaining({
+        type: "technician_reply",
+        plainText: "Short acknowledgement.",
+      }),
+    ]);
+    expect(JSON.stringify(parsed.tickets[0].safeContentItems)).not.toContain(
+      "Original customer request"
+    );
+  });
   it("returns every triage snapshot candidate when safe content is unavailable", async () => {
     mockClient.query
       .mockResolvedValueOnce({
