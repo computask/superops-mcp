@@ -1124,6 +1124,55 @@ describe("operation store", () => {
     expect(durableObjectCalls).toBe(1);
   });
 
+  it.each([
+    {
+      name: "continuation flag disabled",
+      env: {},
+      reason: "Durable continuation Workflow disabled: SUPEROPS_CONTINUATION_ENABLED is not true.",
+    },
+    {
+      name: "durable retry flag disabled",
+      env: { SUPEROPS_CONTINUATION_ENABLED: "true", SUPEROPS_DURABLE_RETRY_ENABLED: "false" },
+      reason: "Durable continuation Workflow disabled: SUPEROPS_DURABLE_RETRY_ENABLED is not true.",
+    },
+    {
+      name: "Workflow binding missing",
+      env: { SUPEROPS_CONTINUATION_ENABLED: "true", SUPEROPS_DURABLE_RETRY_ENABLED: "true" },
+      reason: "Durable continuation Workflow unavailable: SUPEROPS_CONTINUATION_WORKFLOW binding is missing.",
+    },
+  ])("reports precise durable Workflow scheduling diagnostics for $name", async ({ env, reason }) => {
+    const values = new Map<string, unknown>();
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+      },
+    }, env);
+    const operationId = `op-workflow-diagnostic-${stableHash(reason)}`;
+    await durableObject.fetch(new Request(`https://operation.local/operations/${operationId}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record({ operationId })),
+    }));
+
+    const response = await durableObject.fetch(new Request(`https://operation.local/operations/${operationId}/schedule-continuation`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        operationId, ownerHash: stableHash("owner@example.com"),
+        reason: "RateLimitedRescheduled", nextEligibleTime: "2026-07-18T00:05:00.000Z",
+      }),
+    }));
+
+    await expect(response.json()).resolves.toMatchObject({
+      state: "CompletedWithFailures",
+      schedulingAttempted: true,
+      schedulingSucceeded: false,
+      schedulingError: reason,
+      terminalFailureReason: reason,
+    });
+  });
+
   it("counts Workflow createBatch scheduling calls in the central execution context", async () => {
     const values = new Map<string, unknown>();
     const batches: Array<Array<{ id: string; params: Record<string, unknown> }>> = [];

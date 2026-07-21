@@ -5546,11 +5546,17 @@ export function getTicketsTools(): DomainTools {
               } catch (error) {
                 continuationError ??= safeErrorMessage(error);
                 continuationScheduling = { attempted: true, scheduled: false,
-                  error: safeErrorMessage(error), mechanism: "serviceBinding" };
-                scheduled = { scheduled: false, reason: safeErrorMessage(error) };
+                  error: safeErrorMessage(error), mechanism: "serviceBinding",
+                  reasonCode: "exceptionDuringScheduling" };
+                scheduled = {
+                  scheduled: false,
+                  reason: safeErrorMessage(error),
+                  reasonCode: "exceptionDuringScheduling",
+                };
               }
               continuationScheduling ??= { attempted: true, scheduled: scheduled.scheduled,
                 status: scheduled.status, error: scheduled.scheduled ? undefined : scheduled.reason,
+                reasonCode: scheduled.reasonCode, diagnostics: scheduled.diagnostics,
                 mechanism: "serviceBinding" };
               if (scheduled.scheduled) {
                 try {
@@ -5566,7 +5572,7 @@ export function getTicketsTools(): DomainTools {
               } else if (!continuationScheduling.terminalized) {
                 const reason = scheduled.status
                   ? "Immediate continuation delivery failed with status " + scheduled.status + "."
-                  : "Immediate continuation delivery failed or is not configured.";
+                  : scheduled.reason ?? "Immediate continuation delivery failed or is not configured.";
                 let terminalizationError: unknown;
                 for (let attempt = 1; attempt <= 3; attempt += 1) {
                   try {

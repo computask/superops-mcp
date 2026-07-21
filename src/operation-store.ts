@@ -1865,10 +1865,17 @@ function operationRecentView(record: OperationLedgerRecord): Record<string, unkn
 export class SuperOpsOperationLedger {
   constructor(private readonly state: DurableObjectState, private readonly env: DurableContinuationEnv = {}) {}
 
-  private workflowEnabled(): boolean {
-    return this.env.SUPEROPS_CONTINUATION_ENABLED === "true" &&
-      this.env.SUPEROPS_DURABLE_RETRY_ENABLED === "true" &&
-      typeof this.env.SUPEROPS_CONTINUATION_WORKFLOW?.createBatch === "function";
+  private workflowUnavailableReason(): string | undefined {
+    if (this.env.SUPEROPS_CONTINUATION_ENABLED !== "true") {
+      return "Durable continuation Workflow disabled: SUPEROPS_CONTINUATION_ENABLED is not true.";
+    }
+    if (this.env.SUPEROPS_DURABLE_RETRY_ENABLED !== "true") {
+      return "Durable continuation Workflow disabled: SUPEROPS_DURABLE_RETRY_ENABLED is not true.";
+    }
+    if (typeof this.env.SUPEROPS_CONTINUATION_WORKFLOW?.createBatch !== "function") {
+      return "Durable continuation Workflow unavailable: SUPEROPS_CONTINUATION_WORKFLOW binding is missing.";
+    }
+    return undefined;
   }
 
   private maxSchedulingAttempts(): number {
@@ -1976,10 +1983,11 @@ export class SuperOpsOperationLedger {
     if (!Number.isFinite(wakeAt)) {
       return this.terminalizeSchedulingFailure(record, "Invalid durable continuation wake time.", now);
     }
-    if (!this.workflowEnabled()) {
+    const workflowUnavailableReason = this.workflowUnavailableReason();
+    if (workflowUnavailableReason) {
       return this.terminalizeSchedulingFailure(
         record,
-        "Durable continuation Workflow is disabled or unavailable.",
+        workflowUnavailableReason,
         now
       );
     }

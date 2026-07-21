@@ -60,6 +60,7 @@ async function deliverInternalContinuation(operationId: string, ownerHash: strin
     }),
     {
       SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
       SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "harness-internal-token",
       SUPEROPS_API_TOKEN: HARNESS_CREDS.apiToken,
       SUPEROPS_SUBDOMAIN: HARNESS_CREDS.subdomain,
@@ -73,6 +74,7 @@ async function deliverInternalContinuation(operationId: string, ownerHash: strin
 function withSuccessfulContinuationScheduling<T>(fn: () => T): T {
   return runWithContinuationScheduler({
     SUPEROPS_CONTINUATION_ENABLED: "true",
+    SUPEROPS_DURABLE_RETRY_ENABLED: "true",
     SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "harness-internal-token",
     SUPEROPS_CONTINUATION_SERVICE: {
       fetch: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
@@ -287,9 +289,17 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
           callsByInvocation.push({ calls: getExecutionState()?.subrequests ?? 0, effectiveBudget: 37, phase: "initial" });
         });
       });
-      const operationId = JSON.parse(initial.content[0].text).operation.operationId as string;
+      const initialParsed = JSON.parse(initial.content[0].text);
+      const operationId = initialParsed.operation.operationId as string;
+      expect(initialParsed.operation).toMatchObject({
+        complete: false,
+        continuationRequired: true,
+        continuationScheduling: { attempted: true, scheduled: true, mechanism: "serviceBinding" },
+      });
       const record = await store.get(operationId);
       if (!record) throw new Error("missing harness operation");
+      expect(record.schedulingSucceeded).toBe(true);
+      expect(record.pendingItems.length).toBeGreaterThan(0);
 
       const fetchCallsBeforeWrongOwner = fetchMock.mock.calls.length;
       await expect(runWithHarnessCredentials(() =>

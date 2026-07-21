@@ -48,6 +48,7 @@ import { runWithContinuationScheduler } from "../continuation-scheduler.js";
 function withSuccessfulContinuationScheduling<T>(fn: () => T): T {
   return runWithContinuationScheduler({
     SUPEROPS_CONTINUATION_ENABLED: "true",
+    SUPEROPS_DURABLE_RETRY_ENABLED: "true",
     SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "test-internal-token",
     SUPEROPS_CONTINUATION_SERVICE: {
       fetch: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
@@ -4384,6 +4385,7 @@ describe("Tickets Domain", () => {
         attempted: true,
         scheduled: false,
         terminalized: true,
+        reasonCode: "schedulerContextMissing",
       },
     });
     expect(stored).toMatchObject({
@@ -4396,10 +4398,65 @@ describe("Tickets Domain", () => {
           outcome: "ContinuationSchedulingFailed",
           errorClass: "ContinuationSchedulingFailure",
           writeAttempted: false,
+          failureReason: "Continuation scheduling unavailable: scheduler context was not installed.",
         },
       },
     });
     expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "disabled flag",
+      env: {
+        SUPEROPS_CONTINUATION_ENABLED: "false",
+        SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+        SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "test-internal-token",
+        SUPEROPS_CONTINUATION_SERVICE: {
+          fetch: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+        },
+      },
+      reasonCode: "continuationFeatureDisabled",
+      reason: "Continuation scheduling disabled: SUPEROPS_CONTINUATION_ENABLED is not true.",
+    },
+    {
+      name: "missing service binding",
+      env: {
+        SUPEROPS_CONTINUATION_ENABLED: "true",
+        SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+        SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "test-internal-token",
+      },
+      reasonCode: "serviceBindingMissing",
+      reason: "Continuation scheduling unavailable: SUPEROPS_CONTINUATION_SERVICE binding is missing.",
+    },
+  ])("reports precise immediate scheduling diagnostics for $name", async ({ env, reasonCode, reason }) => {
+    const result = await runWithContinuationScheduler(env, () => runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+        batchId: `precise-scheduling-${reasonCode}`,
+        expectedCandidateTicketNumbers: ["57400", "57401"],
+        actions: [],
+      })
+    ));
+    const parsed = JSON.parse(result.content[0].text);
+    const stored = await getOperationStore().get(`precise-scheduling-${reasonCode}`);
+
+    expect(parsed.operation.continuationScheduling).toMatchObject({
+      attempted: true,
+      scheduled: false,
+      terminalized: true,
+      reasonCode,
+      error: reason,
+      diagnostics: {
+        code: reasonCode,
+        internalTokenPresent: true,
+      },
+    });
+    expect(stored).toMatchObject({
+      state: "CompletedWithFailures",
+      terminalFailureReason: reason,
+      schedulingError: reason,
+    });
   });
 
   it("does not resume a pending triage write when updatedTime is stale", async () => {
@@ -4587,6 +4644,117 @@ describe("Tickets Domain", () => {
       verificationState: "Verified",
     });
     expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("verifies an ambiguous write before mutating later pending tickets", async () => {
+    const domain = getTicketsTools();
+    const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () =>
+        domain.handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "ambiguous-before-later-ticket",
+          expectedCandidateTicketNumbers: ["57400", "57401", "57402"],
+          actions: [
+            {
+              ticketNumber: "57401",
+              expectedUpdatedTime: "2026-07-18T10:00:00Z",
+              contentVerified: true,
+              action: "update",
+              target: { status: "Awaiting Engineer" },
+            },
+            {
+              ticketNumber: "57402",
+              expectedUpdatedTime: "2026-07-18T10:00:00Z",
+              contentVerified: true,
+              action: "update",
+              target: { status: "Awaiting Engineer" },
+            },
+          ],
+        })
+    ));
+    const operationId = JSON.parse(initial.content[0].text).operation.operationId;
+    const stored = await getOperationStore().get(operationId);
+    if (!stored) throw new Error("missing operation");
+    expect(stored.pendingItems).toEqual(["57401", "57402"]);
+    stored.itemStates["57401"] = {
+      ...stored.itemStates["57401"],
+      stage: "WriteStarted",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: true,
+      verificationState: "Pending",
+    };
+    await getOperationStore().put(stored);
+
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57401",
+          displayId: "57401",
+          status: "Awaiting Engineer",
+          updatedTime: "2026-07-18T10:01:00Z",
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57402", displayId: "57402" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57402",
+          displayId: "57402",
+          status: "New Calls",
+          updatedTime: "2026-07-18T10:00:00Z",
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57402",
+          displayId: "57402",
+          status: "Awaiting Engineer",
+          updatedTime: "2026-07-18T10:01:00Z",
+        },
+      });
+    mockClient.mutate.mockResolvedValueOnce({
+      updateTicket: { ticketId: "ticket-57402", status: "Awaiting Engineer" },
+    });
+
+    await runWithExecutionConfig({}, async () => {
+      await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
+        const resumed = await resumeApplyTriageOperation({
+          operationId,
+          ownerHash: stored.ownerHash,
+          leaseOwner: "test-ambiguous-before-later",
+        });
+        expect(resumed.state).toBe("Completed");
+      });
+    });
+
+    const finalRecord = await getOperationStore().get(operationId);
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "CompletedAfterAmbiguousWriteVerification",
+      outcome: "Updated",
+      writeAttempted: true,
+      verificationState: "Verified",
+    });
+    expect(finalRecord?.itemStates["57402"]).toMatchObject({
+      stage: "Completed",
+      outcome: "Updated",
+      writeAttempted: true,
+      verificationState: "Verified",
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(mockClient.query.mock.invocationCallOrder[1]).toBeLessThan(
+      mockClient.mutate.mock.invocationCallOrder[0]
+    );
   });
 
   it("does not repeat an ambiguous resolution when the requested target is already applied", async () => {

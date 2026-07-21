@@ -707,8 +707,10 @@ async function handleBaseWorkerFetch(
     };
 
     const runConfiguredMcpRequest = () =>
-      runWithOperationStore(env, () =>
-        runWithExecutionConfig(env, runMcpRequest)
+      runWithContinuationScheduler(env, () =>
+        runWithOperationStore(env, () =>
+          runWithExecutionConfig(env, runMcpRequest)
+        )
       );
 
     if (auditContextApplied) {

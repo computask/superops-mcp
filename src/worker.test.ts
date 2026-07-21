@@ -1540,6 +1540,120 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(callBody.result?.content?.[0]?.text).not.toMatch(/disabled/i);
   });
 
+  it("propagates continuation scheduler bindings through the ChatGPT direct MCP route", async () => {
+    const serviceRequests: Request[] = [];
+    const env = chatGptEnv({
+      SUPEROPS_API_TOKEN: "test-token",
+      SUPEROPS_SUBDOMAIN: "acme",
+      CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "direct-internal-token",
+      SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1",
+      SUPEROPS_CONTINUATION_SERVICE: {
+        fetch: async (request: Request) => {
+          serviceRequests.push(request);
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+      },
+    });
+    const token = await getOAuthAccessToken(env);
+
+    const call = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 721,
+        method: "tools/call",
+        params: {
+          name: "superops_tickets_apply_triage_plan",
+          arguments: {
+            batchId: "direct-route-continuation",
+            expectedCandidateTicketNumbers: ["57400", "57401"],
+            actions: [],
+          },
+        },
+      },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+
+    const callBody = (await call.json()) as {
+      result?: { content?: { text?: string }[]; isError?: boolean };
+    };
+    expect(callBody.result?.isError).not.toBe(true);
+    const parsed = JSON.parse(callBody.result?.content?.[0]?.text ?? "{}");
+    expect(parsed.operation).toMatchObject({
+      operationId: "direct-route-continuation",
+      complete: false,
+      continuationRequired: true,
+      continuationScheduling: {
+        attempted: true,
+        scheduled: true,
+        mechanism: "serviceBinding",
+      },
+    });
+    expect(serviceRequests).toHaveLength(1);
+    expect(serviceRequests[0].headers.get("X-SuperOps-Internal-Continuation")).toBe("direct-internal-token");
+    await expect(serviceRequests[0].json()).resolves.toMatchObject({
+      toolName: "superops_tickets_apply_triage_plan",
+      operationId: "direct-route-continuation",
+    });
+  });
+
+  it("does not schedule continuation for a completed single-ticket direct triage operation", async () => {
+    const serviceRequests: Request[] = [];
+    const env = chatGptEnv({
+      SUPEROPS_API_TOKEN: "test-token",
+      SUPEROPS_SUBDOMAIN: "acme",
+      CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "direct-internal-token",
+      SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "25",
+      SUPEROPS_CONTINUATION_SERVICE: {
+        fetch: async (request: Request) => {
+          serviceRequests.push(request);
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+      },
+    });
+    const token = await getOAuthAccessToken(env);
+
+    const call = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 722,
+        method: "tools/call",
+        params: {
+          name: "superops_tickets_apply_triage_plan",
+          arguments: {
+            batchId: "direct-route-single-ticket",
+            expectedCandidateTicketNumbers: ["57400"],
+            actions: [],
+          },
+        },
+      },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+
+    const callBody = (await call.json()) as {
+      result?: { content?: { text?: string }[]; isError?: boolean };
+    };
+    expect(callBody.result?.isError).not.toBe(true);
+    const parsed = JSON.parse(callBody.result?.content?.[0]?.text ?? "{}");
+    expect(parsed.operation).toMatchObject({
+      operationId: "direct-route-single-ticket",
+      complete: true,
+      continuationRequired: false,
+      state: "Completed",
+    });
+    expect(parsed.operation.continuationScheduling).toBeUndefined();
+    expect(serviceRequests).toHaveLength(0);
+  });
+
   it("keeps all other direct mutation and custom tools blocked when triage is allowed", async () => {
     const env = chatGptEnv({
       SUPEROPS_API_TOKEN: "test-token",
