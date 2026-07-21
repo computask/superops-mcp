@@ -1323,11 +1323,22 @@ function truncateSafeText(value: string, maxChars: number): {
   text: string;
   truncated: boolean;
 } {
+  if (maxChars <= 0) {
+    return { text: "", truncated: value.length > 0 };
+  }
+
   if (value.length <= maxChars) {
     return { text: value, truncated: false };
   }
 
   const marker = "\n\n[... content truncated by safe retrieval ...]\n\n";
+  if (maxChars <= marker.length) {
+    if (maxChars <= 3) {
+      return { text: value.slice(0, maxChars), truncated: true };
+    }
+    return { text: `${value.slice(0, maxChars - 3)}...`, truncated: true };
+  }
+
   const available = Math.max(0, maxChars - marker.length);
   const firstLength = Math.floor(available * 0.75);
   const lastLength = available - firstLength;
@@ -1582,11 +1593,31 @@ function buildSafeTicketResult(params: {
       sanitization.itemsOmittedByLimit += 1;
       continue;
     }
-    if (usedChars + item.plainText.length > safeParams.maxTotalChars) {
+    const remainingChars = safeParams.maxTotalChars - usedChars;
+    if (remainingChars <= 0) {
       sanitization.itemsOmittedByLimit += 1;
       sanitization.truncated = true;
       continue;
     }
+
+    if (item.plainText.length > remainingChars) {
+      const truncated = truncateSafeText(item.plainText, remainingChars);
+      if (truncated.text.length === 0) {
+        sanitization.itemsOmittedByLimit += 1;
+        sanitization.truncated = true;
+        continue;
+      }
+      const limitedItem = {
+        ...item,
+        plainText: truncated.text,
+        truncated: true,
+      };
+      usedChars += limitedItem.plainText.length;
+      limitedItems.push(limitedItem);
+      sanitization.truncated = true;
+      continue;
+    }
+
     usedChars += item.plainText.length;
     limitedItems.push(item);
   }

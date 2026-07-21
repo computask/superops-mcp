@@ -1635,71 +1635,88 @@ describe("Tickets Domain", () => {
     );
   });
 
-  it("applies triage snapshot character limits to safe content", async () => {
-    mockClient.query
-      .mockResolvedValueOnce({
-        getTicketList: {
-          tickets: [
+  it.each([2500, 10000])(
+    "applies triage snapshot character limit %i to safe content",
+    async (maxContentCharsPerTicket) => {
+      mockClient.query
+        .mockResolvedValueOnce({
+          getTicketList: {
+            tickets: [
+              {
+                ticketId: "ticket-58744-char-limit",
+                displayId: "58744",
+                subject: "SharePoint access",
+                status: "New Calls",
+              },
+            ],
+            listInfo: { page: 1, pageSize: 20, hasMore: false, totalCount: 1 },
+          },
+        })
+        .mockResolvedValueOnce({
+          getTicket: {
+            ticketId: "ticket-58744-char-limit",
+            displayId: "58744",
+            subject: "SharePoint access",
+            status: "New Calls",
+          },
+        })
+        .mockResolvedValueOnce({
+          getTicketConversationList: [
             {
-              ticketId: "ticket-char-limit",
-              displayId: "58746",
-              subject: "Character limited evidence",
-              status: "New Calls",
+              conversationId: "conversation-short",
+              type: "TECH_REPLY",
+              time: "2026-07-21T10:05:00Z",
+              content: "Task Group automated acknowledgement: we have received your request.",
+            },
+            {
+              conversationId: "description-too-long",
+              type: "DESCRIPTION",
+              time: "2026-07-21T10:00:00Z",
+              content:
+                "Please could Catherine Cooper have access to the Twelve Trees SharePoint page " +
+                Array(2000).fill("details").join(" "),
             },
           ],
-          listInfo: { page: 1, pageSize: 20, hasMore: false, totalCount: 1 },
-        },
-      })
-      .mockResolvedValueOnce({
-        getTicket: {
-          ticketId: "ticket-char-limit",
-          displayId: "58746",
-          subject: "Character limited evidence",
-          status: "New Calls",
-        },
-      })
-      .mockResolvedValueOnce({
-        getTicketConversationList: [
-          {
-            conversationId: "conversation-short",
-            type: "TECH_REPLY",
-            time: "2026-07-21T10:05:00Z",
-            content: "Short acknowledgement.",
-          },
-          {
-            conversationId: "description-too-long",
-            type: "DESCRIPTION",
-            time: "2026-07-21T10:00:00Z",
-            content:
-              "Original customer request with more detail than this snapshot character budget can include.",
-          },
-        ],
-      })
-      .mockResolvedValueOnce({ getTicketNoteList: [] });
+        })
+        .mockResolvedValueOnce({ getTicketNoteList: [] });
 
-    const domain = getTicketsTools();
-    const result = await domain.handleCall("superops_tickets_triage_snapshot", {
-      status: ["New Calls"],
-      max: 20,
-      page: 1,
-      includeNotes: true,
-      includeConversations: true,
-      maxContentCharsPerTicket: 35,
-      maxItemsPerTicket: 6,
-      latestFirst: true,
-    });
-    const parsed = JSON.parse(result.content[0].text);
+      const domain = getTicketsTools();
+      const result = await domain.handleCall("superops_tickets_triage_snapshot", {
+        status: ["New Calls"],
+        max: 20,
+        page: 1,
+        includeNotes: true,
+        includeConversations: true,
+        maxContentCharsPerTicket,
+        maxItemsPerTicket: 6,
+        latestFirst: true,
+      });
+      const parsed = JSON.parse(result.content[0].text);
 
-    expect(parsed.tickets[0].safeContentItems).toEqual([
-      expect.objectContaining({
-        type: "technician_reply",
-        plainText: "Short acknowledgement.",
-      }),
-    ]);
-    expect(JSON.stringify(parsed.tickets[0].safeContentItems)).not.toContain(
-      "Original customer request"
-    );
-  });
+      expect(parsed.tickets[0].safeContentItems).toEqual([
+        expect.objectContaining({
+          id: "conversation-short",
+          type: "technician_reply",
+          plainText: "Task Group automated acknowledgement: we have received your request.",
+          truncated: false,
+        }),
+        expect.objectContaining({
+          id: "description-too-long",
+          type: "description",
+          plainText: expect.stringContaining(
+            "Please could Catherine Cooper have access to the Twelve Trees SharePoint page"
+          ),
+          truncated: true,
+        }),
+      ]);
+      expect(
+        parsed.tickets[0].safeContentItems.reduce(
+          (total: number, item: { plainText: string }) => total + item.plainText.length,
+          0
+        )
+      ).toBeLessThanOrEqual(maxContentCharsPerTicket);
+    }
+  );
   it("returns every triage snapshot candidate when safe content is unavailable", async () => {
     mockClient.query
       .mockResolvedValueOnce({
