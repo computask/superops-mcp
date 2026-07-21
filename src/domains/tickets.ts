@@ -1464,6 +1464,38 @@ function safeErrorMessage(error: unknown): string {
   ).slice(0, 500);
 }
 
+function uniqueTicketIds(ticketIds: (string | undefined)[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const ticketId of ticketIds) {
+    const normalized = typeof ticketId === "string" ? ticketId.trim() : "";
+    if (normalized.length === 0 || seen.has(normalized)) continue;
+    seen.add(normalized);
+    unique.push(normalized);
+  }
+  return unique;
+}
+
+function addUniqueConversation(
+  conversations: TicketConversation[],
+  seenConversationIds: Set<string>,
+  conversation: TicketConversation
+): void {
+  if (seenConversationIds.has(conversation.conversationId)) return;
+  seenConversationIds.add(conversation.conversationId);
+  conversations.push(conversation);
+}
+
+function addUniqueNote(
+  notes: TicketNote[],
+  seenNoteIds: Set<string>,
+  note: TicketNote
+): void {
+  if (seenNoteIds.has(note.noteId)) return;
+  seenNoteIds.add(note.noteId);
+  notes.push(note);
+}
+
 function buildSafeTicketResult(params: {
   ticket: Ticket;
   safeParams: Required<SafeTicketParams>;
@@ -1627,6 +1659,101 @@ function buildSafeTicketResult(params: {
   };
 }
 
+async function collectSafeTicketContent(params: {
+  client: SuperOpsClientInstance;
+  ticket: Ticket;
+  safeParams: Required<SafeTicketParams>;
+  initialContentTicketIds?: string[];
+  displayId?: string;
+  displayIdMatches?: Ticket[];
+}): Promise<{
+  safeResult: ReturnType<typeof buildSafeTicketResult>;
+  contentErrors: string[];
+}> {
+  const { client, ticket, safeParams, displayId, displayIdMatches } = params;
+  const contentErrors: string[] = [];
+  const conversations: TicketConversation[] = [];
+  const notes: TicketNote[] = [];
+  const seenConversationIds = new Set<string>();
+  const seenNoteIds = new Set<string>();
+  const readTicketIds = new Set<string>();
+  let conversationReadSucceeded = false;
+
+  async function readContentFromTicketIds(ticketIds: string[]): Promise<void> {
+    for (const ticketId of uniqueTicketIds(ticketIds)) {
+      if (readTicketIds.has(ticketId)) continue;
+      readTicketIds.add(ticketId);
+
+      if (safeParams.includeConversations) {
+        try {
+          const ticketConversations = await getTicketConversations(client, ticketId);
+          conversationReadSucceeded = true;
+          for (const conversation of ticketConversations) {
+            addUniqueConversation(conversations, seenConversationIds, conversation);
+          }
+        } catch (error) {
+          contentErrors.push(
+            `Conversations could not be fetched safely: ${safeErrorMessage(error)}`
+          );
+        }
+      }
+
+      if (safeParams.includeNotes) {
+        try {
+          const ticketNotes = await getTicketNotes(client, ticketId);
+          for (const note of ticketNotes) {
+            addUniqueNote(notes, seenNoteIds, note);
+          }
+        } catch (error) {
+          contentErrors.push(`Notes could not be fetched safely: ${safeErrorMessage(error)}`);
+        }
+      }
+    }
+  }
+
+  await readContentFromTicketIds([
+    ...(params.initialContentTicketIds ?? []),
+    ticket.ticketId,
+  ]);
+
+  const hasDescription = conversations.some(
+    (conversation) => conversation.type?.toUpperCase() === "DESCRIPTION"
+  );
+
+  if (safeParams.includeConversations && conversationReadSucceeded && !hasDescription) {
+    const normalizedDisplayId = normaliseTicketNumber(displayId ?? ticket.displayId);
+    let matches = displayIdMatches;
+
+    if (!matches && normalizedDisplayId) {
+      try {
+        matches = await resolveTicketIdByDisplayId(client, normalizedDisplayId);
+      } catch (error) {
+        contentErrors.push(
+          `Display-number content lookup could not be fetched safely: ${safeErrorMessage(error)}`
+        );
+      }
+    }
+
+    if (matches?.length === 1) {
+      await readContentFromTicketIds([matches[0].ticketId]);
+    } else if (matches && matches.length > 1) {
+      contentErrors.push(
+        `Display-number content lookup was not unique for ticket ${normalizedDisplayId}.`
+      );
+    }
+  }
+
+  return {
+    safeResult: buildSafeTicketResult({
+      ticket,
+      safeParams,
+      conversations,
+      notes,
+      contentErrors: contentErrors.length > 0 ? contentErrors : undefined,
+    }),
+    contentErrors,
+  };
+}
 
 function triageItemType(item: SafeContentItem): string {
   if (item.type === "description") return "description";
@@ -1660,6 +1787,7 @@ function buildTriageSnapshotTicket(params: {
 }) {
   const { candidate, ticket, safeResult, contentErrors, metadataAvailable } = params;
   const safeContentItems = safeResult.safeContent.items.map((item) => ({
+    id: item.id,
     type: triageItemType(item),
     time: item.createdTime,
     author: item.author,
@@ -1746,40 +1874,19 @@ async function buildTriageSnapshotForCandidate(
     contentErrors.push(`Metadata could not be fetched safely: ${safeErrorMessage(error)}`);
   }
 
-  const contentTicketId = ticket.ticketId ?? candidate.ticketId;
-  let conversations: TicketConversation[] = [];
-  let notes: TicketNote[] = [];
-
-  if (params.includeConversations) {
-    try {
-      conversations = await getTicketConversations(client, contentTicketId);
-    } catch (error) {
-      contentErrors.push(
-        `Conversations could not be fetched safely: ${safeErrorMessage(error)}`
-      );
-    }
-  }
-
-  if (params.includeNotes) {
-    try {
-      notes = await getTicketNotes(client, contentTicketId);
-    } catch (error) {
-      contentErrors.push(`Notes could not be fetched safely: ${safeErrorMessage(error)}`);
-    }
-  }
-
-  const safeResult = buildSafeTicketResult({
+  const collection = await collectSafeTicketContent({
+    client,
     ticket,
     safeParams: safeParamsForTriageSnapshot(params),
-    conversations,
-    notes,
-    contentErrors: undefined,
+    initialContentTicketIds: [candidate.ticketId],
+    displayId: ticket.displayId ?? candidate.displayId,
   });
 
+  contentErrors.push(...collection.contentErrors);
   return buildTriageSnapshotTicket({
     candidate,
     ticket,
-    safeResult,
+    safeResult: collection.safeResult,
     contentErrors,
     metadataAvailable,
   });
@@ -5147,38 +5254,15 @@ export function getTicketsTools(): DomainTools {
             const ticketId = matches[0].ticketId;
             const ticket = await getTicketByInternalId(client, ticketId);
 
-            const contentErrors: string[] = [];
-            let conversations: TicketConversation[] = [];
-            let notes: TicketNote[] = [];
-
-            if (safeParams.includeConversations) {
-              try {
-                conversations = await getTicketConversations(client, ticket.ticketId);
-              } catch (error) {
-                contentErrors.push(
-                  `Conversations could not be fetched safely: ${safeErrorMessage(error)}`
-                );
-              }
-            }
-
-            if (safeParams.includeNotes) {
-              try {
-                notes = await getTicketNotes(client, ticket.ticketId);
-              } catch (error) {
-                contentErrors.push(
-                  `Notes could not be fetched safely: ${safeErrorMessage(error)}`
-                );
-              }
-            }
-
-            const result = buildSafeTicketResult({
+            const collection = await collectSafeTicketContent({
+              client,
               ticket,
               safeParams,
-              conversations,
-              notes,
-              contentErrors: contentErrors.length > 0 ? contentErrors : undefined,
+              initialContentTicketIds: [ticketId],
+              displayId,
+              displayIdMatches: matches,
             });
-
+            const result = collection.safeResult;
             return {
               content: [
                 {

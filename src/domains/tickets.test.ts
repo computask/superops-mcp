@@ -1314,7 +1314,20 @@ describe("Tickets Domain", () => {
         },
       })
       .mockResolvedValueOnce({ getTicketConversationList: [] })
-      .mockResolvedValueOnce({ getTicketNoteList: [] });
+      .mockResolvedValueOnce({ getTicketNoteList: [] })
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [
+            {
+              ticketId: "ticket-57401",
+              displayId: "57401",
+              subject: "No content",
+              status: "New Calls",
+            },
+          ],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      });
 
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_triage_snapshot", {
@@ -1409,35 +1422,53 @@ describe("Tickets Domain", () => {
     );
   });
 
-  it("keeps DESCRIPTION evidence in triage snapshots when canonical ticket content includes a newer acknowledgement", async () => {
+  it("returns the same canonical DESCRIPTION evidence from safe-by-number and triage snapshot", async () => {
     const automatedAcknowledgement = {
-      conversationId: "conversation-ack",
+      conversationId: "5059118458555555840",
       type: "TECH_REPLY",
-      time: "2026-07-21T10:05:00Z",
+      time: "2026-07-21T15:30:06.942",
       user: { name: "Task Group" },
       content: "Task Group automated acknowledgement: we have received your request.",
     };
     const customerDescription = {
-      conversationId: "description-request",
+      conversationId: "5383986353711595520",
       type: "DESCRIPTION",
-      time: "2026-07-21T10:00:00Z",
+      time: "2026-07-21T15:30:05.642",
       user: { name: "Catherine Cooper" },
       content:
         "Please could Catherine Cooper have access to the Twelve Trees SharePoint page as soon as possible.",
     };
 
+    type TicketQueryVariables = {
+      input?: {
+        ticketId?: string;
+        condition?: { attribute?: string; value?: unknown };
+      };
+    };
+
     mockClient.query.mockImplementation(
-      async (query: string, variables?: { input?: { ticketId?: string } }) => {
+      async (query: string, variables?: TicketQueryVariables) => {
+        const input = variables?.input;
+        const ticketId = input?.ticketId;
+
         if (query.includes("getTicketList")) {
+          const isDisplayLookup = input?.condition?.attribute === "displayId";
           return {
             getTicketList: {
               tickets: [
-                {
-                  ticketId: "candidate-58744",
-                  displayId: "58744",
-                  subject: "SharePoint access",
-                  status: "New Calls",
-                },
+                isDisplayLookup
+                  ? {
+                      ticketId: "canonical-58744",
+                      displayId: "58744",
+                      subject: "SharePoint access",
+                      status: "New Calls",
+                    }
+                  : {
+                      ticketId: "list-candidate-58744",
+                      displayId: "58744",
+                      subject: "SharePoint access",
+                      status: "New Calls",
+                    },
               ],
               listInfo: { page: 1, pageSize: 20, hasMore: false, totalCount: 1 },
             },
@@ -1447,12 +1478,12 @@ describe("Tickets Domain", () => {
         if (query.includes("getTicket(input")) {
           return {
             getTicket: {
-              ticketId: "ticket-58744",
+              ticketId: ticketId ?? "list-candidate-58744",
               displayId: "58744",
               subject: "SharePoint access",
               status: "New Calls",
-              createdTime: "2026-07-21T10:00:00Z",
-              updatedTime: "2026-07-21T10:06:00Z",
+              createdTime: "2026-07-21T15:30:05.000",
+              updatedTime: "2026-07-21T15:30:07.000",
             },
           };
         }
@@ -1460,7 +1491,7 @@ describe("Tickets Domain", () => {
         if (query.includes("getTicketConversationList")) {
           return {
             getTicketConversationList:
-              variables?.input?.ticketId === "ticket-58744"
+              ticketId === "canonical-58744"
                 ? [automatedAcknowledgement, customerDescription]
                 : [automatedAcknowledgement],
           };
@@ -1475,7 +1506,16 @@ describe("Tickets Domain", () => {
     );
 
     const domain = getTicketsTools();
-    const result = await domain.handleCall("superops_tickets_triage_snapshot", {
+    const safeByNumberResult = await domain.handleCall("superops_tickets_get_safe_by_number", {
+      ticketNumber: "58744",
+      includeNotes: true,
+      includeConversations: true,
+      attachments: "metadataOnly",
+      maxTotalChars: 2500,
+      maxItems: 6,
+      latestFirst: true,
+    });
+    const triageResult = await domain.handleCall("superops_tickets_triage_snapshot", {
       status: ["New Calls"],
       max: 20,
       page: 1,
@@ -1489,30 +1529,45 @@ describe("Tickets Domain", () => {
       storeBatch: false,
     });
 
-    expect(result.isError).toBeUndefined();
-    const parsed = JSON.parse(result.content[0].text);
-    const contentReadCall = mockClient.query.mock.calls.find((call) =>
-      call[0].includes("getTicketConversationList")
+    expect(safeByNumberResult.isError).toBeUndefined();
+    expect(triageResult.isError).toBeUndefined();
+    const safeByNumber = JSON.parse(safeByNumberResult.content[0].text);
+    const triageSnapshot = JSON.parse(triageResult.content[0].text);
+    const snapshotTicket = triageSnapshot.tickets[0];
+
+    const safeItems = safeByNumber.safeContent.items.map(
+      (item: { id: string; plainText: string }) => ({
+        id: item.id,
+        plainText: item.plainText,
+      })
+    );
+    const snapshotItems = snapshotTicket.safeContentItems.map(
+      (item: { id: string; plainText: string }) => ({
+        id: item.id,
+        plainText: item.plainText,
+      })
     );
 
-    expect(contentReadCall?.[1]).toEqual({ input: { ticketId: "ticket-58744" } });
-    expect(mockClient.mutate).not.toHaveBeenCalled();
-    expect(parsed.tickets[0].safeContentItems).toEqual([
-      expect.objectContaining({
-        type: "technician_reply",
+    expect(safeItems).toEqual([
+      {
+        id: "5059118458555555840",
         plainText: expect.stringContaining("automated acknowledgement"),
-      }),
-      expect.objectContaining({
-        type: "description",
+      },
+      {
+        id: "5383986353711595520",
         plainText: expect.stringContaining(
           "Please could Catherine Cooper have access to the Twelve Trees SharePoint page"
         ),
-      }),
+      },
     ]);
-    expect(parsed.tickets[0].safeSummary).toContain("automated acknowledgement");
-    expect(parsed.tickets[0].safeSummary).toContain(
+    expect(snapshotItems).toEqual(safeItems);
+    expect(snapshotTicket.safeSummary).toContain("automated acknowledgement");
+    expect(snapshotTicket.safeSummary).toContain(
       "Please could Catherine Cooper have access to the Twelve Trees SharePoint page"
     );
+    expect(new Set(snapshotTicket.safeContentItems.map((item: { id: string }) => item.id)).size)
+      .toBe(snapshotTicket.safeContentItems.length);
+    expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
   it("applies triage snapshot item-count limits after ordering safe content", async () => {
