@@ -1984,6 +1984,18 @@ function formatValidOptionValues(values: string[]): string {
   return `${visible.join(", ")}${suffix}`;
 }
 
+function uniqueTrimmedValues(values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    unique.push(trimmed);
+  }
+  return unique;
+}
+
 function structuredValidationResult(
   failure: StructuredValidationFailure,
   writeContract: Record<string, unknown> = {}
@@ -2051,7 +2063,8 @@ function mandatoryValidationRuntimeMessage(
 function resolveOptionValue(
   fieldName: ValidatedTicketOptionField,
   field: SuperOpsField,
-  rawValue: unknown
+  rawValue: unknown,
+  params?: TicketClassificationParams
 ):
   | { value: string; option: NonNullable<SuperOpsField["options"]>[number] }
   | { error: string } {
@@ -2072,15 +2085,57 @@ function resolveOptionValue(
   }
 
   const requested = rawValue.trim();
-  const exact = options.find((option) => option.value?.trim() === requested);
-  if (exact?.value) {
-    return { value: exact.value.trim(), option: exact };
-  }
-
   const lowered = requested.toLowerCase();
-  const matches = options.filter(
+  const exactMatches = options.filter((option) => option.value?.trim() === requested);
+  const matches = exactMatches.length > 0 ? exactMatches : options.filter(
     (option) => option.value?.trim().toLowerCase() === lowered
   );
+
+  if (matches.length === 0) {
+    return {
+      error: `Invalid ${label}: "${requested}". Valid values: ${formatValidOptionValues(values)}`,
+    };
+  }
+
+  const parentFieldName =
+    field.parentField?.columnName ?? FALLBACK_PARENT_FIELDS[fieldName];
+  const parentValues = uniqueTrimmedValues(
+    matches.map((option) => option.parentOption?.value)
+  );
+  const rawParent = parentFieldName && params
+    ? (params as unknown as Record<string, unknown>)[parentFieldName]
+    : undefined;
+  const requestedParent = typeof rawParent === "string" && rawParent.trim().length > 0
+    ? rawParent.trim()
+    : undefined;
+
+  if (parentFieldName && parentValues.length > 0) {
+    if (requestedParent) {
+      const parentMatches = matches.filter(
+        (option) => option.parentOption?.value?.trim() === requestedParent
+      );
+
+      if (parentMatches.length === 1 && parentMatches[0].value) {
+        return { value: parentMatches[0].value.trim(), option: parentMatches[0] };
+      }
+
+      if (parentMatches.length === 0) {
+        return {
+          error: `${label} "${requested}" belongs under ${parentFieldName} ${formatValidOptionValues(parentValues)}, not "${requestedParent}".`,
+        };
+      }
+
+      return {
+        error: `The ${label} value "${requested}" is ambiguous under ${parentFieldName} "${requestedParent}". Valid ${parentFieldName} values: ${formatValidOptionValues(parentValues)}`,
+      };
+    }
+
+    if (matches.length > 1) {
+      return {
+        error: `The ${label} value "${requested}" is ambiguous. Include ${parentFieldName} in the same update. Valid ${parentFieldName} values: ${formatValidOptionValues(parentValues)}`,
+      };
+    }
+  }
 
   if (matches.length === 1 && matches[0].value) {
     return { value: matches[0].value.trim(), option: matches[0] };
@@ -2174,7 +2229,7 @@ async function addValidatedTicketOptionUpdates(
       return `SuperOps did not return field metadata for ${TICKET_OPTION_FIELD_LABELS[fieldName]} via getFields; cannot safely update ${fieldName}.`;
     }
 
-    const resolved = resolveOptionValue(fieldName, field, params[fieldName]);
+    const resolved = resolveOptionValue(fieldName, field, params[fieldName], params);
     if ("error" in resolved) {
       return resolved.error;
     }
@@ -2207,7 +2262,7 @@ function addValidatedTicketOptionUpdatesFromFields(
       return `SuperOps did not return field metadata for ${TICKET_OPTION_FIELD_LABELS[fieldName]} via getFields; cannot safely update ${fieldName}.`;
     }
 
-    const resolved = resolveOptionValue(fieldName, field, params[fieldName]);
+    const resolved = resolveOptionValue(fieldName, field, params[fieldName], params);
     if ("error" in resolved) {
       return resolved.error;
     }
@@ -2287,7 +2342,7 @@ function validateResolvedTicketFields(params: {
       continue;
     }
 
-    const resolved = resolveOptionValue(fieldName, field, value);
+    const resolved = resolveOptionValue(fieldName, field, value, params.optionParams);
     if ("error" in resolved) {
       invalidFields[fieldName] = resolved.error;
       continue;

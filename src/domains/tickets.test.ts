@@ -136,6 +136,45 @@ function ticketField(
   };
 }
 
+const SECURITY_ACCESS_SUBCATEGORY_ID = "2568302641668456449";
+const CHANGE_ACCESS_SUBCATEGORY_ID = "8051631619094929408";
+
+function subcategoryFieldWithParents(
+  options: Array<{ id: string; value: string; parentCategory: string }>
+) {
+  return {
+    id: "subcategory-field",
+    module: "TICKET",
+    columnName: "subcategory",
+    label: "subcategory",
+    options: options.map((option) => ({
+      id: option.id,
+      value: option.value,
+      parentOption: {
+        id: `category-${option.parentCategory}`,
+        value: option.parentCategory,
+      },
+    })),
+    parentField: { id: "category-field", columnName: "category" },
+  };
+}
+
+function duplicateAccessSubcategoryField(reverse = false) {
+  const options = [
+    {
+      id: SECURITY_ACCESS_SUBCATEGORY_ID,
+      value: "Access",
+      parentCategory: "3. Security Incident",
+    },
+    {
+      id: CHANGE_ACCESS_SUBCATEGORY_ID,
+      value: "Access",
+      parentCategory: "2. Change request",
+    },
+  ];
+  return subcategoryFieldWithParents(reverse ? [...options].reverse() : options);
+}
+
 describe("Tickets Domain", () => {
   let mockClient: { query: ReturnType<typeof vi.fn>; mutate: ReturnType<typeof vi.fn> };
 
@@ -2759,6 +2798,141 @@ describe("Tickets Domain", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("Include category");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+
+  async function runTriageSubcategoryDryRun(
+    field: ReturnType<typeof subcategoryFieldWithParents>,
+    target: { category?: string; subcategory: string }
+  ) {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          subject: "Dry run subcategory",
+          status: "New Calls",
+          updatedTime: "2026-06-25T10:00:00",
+        },
+      })
+      .mockResolvedValueOnce({ getFields: [field] });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [
+        {
+          ticketNumber: "57400",
+          expectedUpdatedTime: "2026-06-25T10:00:00",
+          contentVerified: true,
+          action: "update",
+          target,
+        },
+      ],
+    });
+
+    return JSON.parse(result.content[0].text);
+  }
+
+  it.each([
+    ["normal order", "2. Change request", CHANGE_ACCESS_SUBCATEGORY_ID, false],
+    ["normal order", "3. Security Incident", SECURITY_ACCESS_SUBCATEGORY_ID, false],
+    ["reversed order", "2. Change request", CHANGE_ACCESS_SUBCATEGORY_ID, true],
+    ["reversed order", "3. Security Incident", SECURITY_ACCESS_SUBCATEGORY_ID, true],
+  ] as const)(
+    "selects duplicate Access subcategory option %s for %s using option ID %s",
+    async (_order, category, expectedOptionId, reverse) => {
+      const field = duplicateAccessSubcategoryField(reverse);
+      const expectedOption = field.options.find((option) => option.id === expectedOptionId);
+      expect(expectedOption).toMatchObject({
+        value: "Access",
+        parentOption: { value: category },
+      });
+
+      const parsed = await runTriageSubcategoryDryRun(field, {
+        category,
+        subcategory: "Access",
+      });
+
+      expect(parsed.results[0]).toMatchObject({
+        finalOutcome: "Updated",
+        writeAttempted: false,
+        writeMethod: "dryRun",
+        requestedState: {
+          category,
+          subcategory: "Access",
+        },
+        attemptedState: null,
+      });
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+    }
+  );
+
+  it("blocks duplicate Access subcategory without category as ambiguous before write", async () => {
+    const parsed = await runTriageSubcategoryDryRun(duplicateAccessSubcategoryField(), {
+      subcategory: "Access",
+    });
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Blocked",
+      failureStage: "validation",
+      writeAttempted: false,
+    });
+    expect(parsed.results[0].failureReason).toContain("ambiguous");
+    expect(parsed.results[0].failureReason).toContain("Include category");
+    expect(parsed.results[0].failureReason).toContain("2. Change request");
+    expect(parsed.results[0].failureReason).toContain("3. Security Incident");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("blocks duplicate Access subcategory with an invalid parent category before write", async () => {
+    const parsed = await runTriageSubcategoryDryRun(duplicateAccessSubcategoryField(), {
+      category: "1. Support request",
+      subcategory: "Access",
+    });
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Blocked",
+      failureStage: "validation",
+      writeAttempted: false,
+    });
+    expect(parsed.results[0].failureReason).toContain('not "1. Support request"');
+    expect(parsed.results[0].failureReason).toContain("2. Change request");
+    expect(parsed.results[0].failureReason).toContain("3. Security Incident");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("validates a unique dependent subcategory normally in triage dry-run", async () => {
+    const parsed = await runTriageSubcategoryDryRun(
+      subcategoryFieldWithParents([
+        {
+          id: "unique-wireless-subcategory",
+          value: "Wireless",
+          parentCategory: "1. Support request",
+        },
+      ]),
+      {
+        category: "1. Support request",
+        subcategory: "Wireless",
+      }
+    );
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Updated",
+      writeAttempted: false,
+      writeMethod: "dryRun",
+      requestedState: {
+        category: "1. Support request",
+        subcategory: "Wireless",
+      },
+    });
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
