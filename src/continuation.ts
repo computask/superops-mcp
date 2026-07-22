@@ -31,6 +31,7 @@ export interface ContinuationItemOutcome {
   partialWrite: boolean;
   verified?: boolean;
   verificationFailed?: boolean;
+  verificationNotRequired?: boolean;
   stale?: boolean;
   failureReason?: string;
   retryCount?: number;
@@ -303,7 +304,15 @@ export async function runOperationContinuation(
               ? "Verified"
               : effectiveOutcome.verificationFailed
                 ? "Failed"
-                : undefined,
+                : effectiveOutcome.verificationNotRequired ||
+                    (
+                      effectiveOutcome.stage === "Completed" &&
+                      !effectiveOutcome.writeAttempted &&
+                      !effectiveOutcome.writeMayHaveSucceeded &&
+                      !effectiveOutcome.partialWrite
+                    )
+                  ? "NotRequired"
+                  : undefined,
             retryCount: effectiveOutcome.retryCount,
             nextEligibleTime: effectiveOutcome.nextEligibleTime,
             failureReason: effectiveOutcome.failureReason,

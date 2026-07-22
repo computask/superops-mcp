@@ -171,8 +171,9 @@ export class SuperOpsClient {
 
       throw new SuperOpsError(
         message,
-        error.extensions?.code,
-        error.extensions?.retryAfter
+        typeof error.extensions?.code === "string" ? error.extensions.code : undefined,
+        retryAfterFromGraphQLError(error),
+        error.extensions
       );
     }
 
@@ -194,12 +195,19 @@ export class SuperOpsClient {
 export class SuperOpsError extends Error {
   readonly code?: string;
   readonly retryAfter?: number;
+  readonly extensions?: Record<string, unknown>;
 
-  constructor(message: string, code?: string, retryAfter?: number) {
+  constructor(
+    message: string,
+    code?: string,
+    retryAfter?: number,
+    extensions?: Record<string, unknown>
+  ) {
     super(message);
     this.name = "SuperOpsError";
     this.code = code;
     this.retryAfter = retryAfter;
+    this.extensions = extensions;
   }
 }
 
@@ -267,6 +275,34 @@ function parseRateLimitReset(value: string | null): number | undefined {
   return parsed;
 }
 
+function retryAfterFromGraphQLError(error: {
+  extensions?: Record<string, unknown>;
+}): number | undefined {
+  const extensions = error.extensions;
+  if (!extensions) return undefined;
+  return (
+    parseRetryAfterValue(extensions.retryAfter) ??
+    parseRetryAfterValue(extensions.retry_after) ??
+    parseRetryAfterValue(extensions.retryAfterSeconds) ??
+    parseRateLimitResetValue(extensions.rateLimitReset) ??
+    parseRateLimitResetValue(extensions.rate_limit_reset) ??
+    parseRateLimitResetValue(extensions.resetAt)
+  );
+}
+
+function parseRetryAfterValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === "string") return parseRetryAfter(value);
+  return undefined;
+}
+
+function parseRateLimitResetValue(value: unknown): number | undefined {
+  if (typeof value === "number") return parseRateLimitReset(String(value));
+  if (typeof value === "string") return parseRateLimitReset(value);
+  return undefined;
+}
 function shouldRetrySuperOpsRequest(error: unknown, isWrite: boolean): boolean {
   if (isWrite) return false;
   if (error instanceof SuperOpsHttpError) {
@@ -281,6 +317,9 @@ function shouldRetrySuperOpsRequest(error: unknown, isWrite: boolean): boolean {
 function isGraphQLRateLimit(error: SuperOpsError): boolean {
   const code = (error.code ?? "").toLowerCase();
   const message = error.message.toLowerCase();
+  const extensions = error.extensions
+    ? JSON.stringify(error.extensions).toLowerCase()
+    : "";
   if (/\bnot\s+(a\s+)?rate[-\s]?limit(?:ed|ing)?\b/.test(message)) {
     return false;
   }
@@ -288,6 +327,10 @@ function isGraphQLRateLimit(error: SuperOpsError): boolean {
     code.includes("rate") ||
     code.includes("thrott") ||
     code === "too_many_requests" ||
+    code === "rate_limit_exceeded" ||
+    extensions.includes("rate_limit_exceeded") ||
+    extensions.includes("too_many_requests") ||
+    extensions.includes("throttl") ||
     /\b(rate[-\s]?limit(?:ed|ing)?|too many requests|throttl(?:e|ed|ing))\b/i.test(
       error.message
     )

@@ -4,7 +4,7 @@
  * Tools for managing service tickets in SuperOps.ai PSA.
  */
 
-import { getClient, SuperOpsError, SuperOpsHttpError } from "../client.js";
+import { getClient, getCredentials, SuperOpsError, SuperOpsHttpError } from "../client.js";
 import type {
   DomainTools,
   Client,
@@ -32,6 +32,8 @@ import {
   ExecutionCpuBudgetExceededError,
   ExecutionTimeoutBudgetExceededError,
   getExecutionConfig,
+  hasExecutionBudgetFor,
+  recordRetryDelay,
 } from "../execution.js";
 import {
   runOperationContinuation,
@@ -99,6 +101,10 @@ const STATUS_EQUALS_OPERATOR = "is";
 const STATUS_IN_OPERATOR = "in";
 const TICKET_FIELD_MODULE = "TICKET";
 const CLIENT_LOOKUP_PAGE_SIZE = 200;
+const FIELD_OPTIONS_MAX_INTERNAL_ATTEMPTS = 2;
+/** Short Cloudflare Cache API TTL for tenant field metadata; SuperOps option sets change rarely. */
+const FIELD_OPTIONS_CACHE_TTL_MS = 5 * 60 * 1000;
+const FIELD_OPTIONS_RETRY_ENDPOINT = "SuperOps GraphQL /msp getFields";
 
 const CLIENT_NAME_ALIASES: Record<string, string> = {
   "task group": "TaskGroup",
@@ -117,6 +123,64 @@ const VALIDATED_TICKET_OPTION_FIELDS = [
 
 type ValidatedTicketOptionField =
   (typeof VALIDATED_TICKET_OPTION_FIELDS)[number];
+
+interface TicketOptionFieldsRetrieval {
+  fields: Map<ValidatedTicketOptionField, SuperOpsField>;
+  metadata: {
+    source: "fresh" | "cache";
+    cacheStatus: "miss" | "fallback" | "unavailable";
+    cacheTtlSeconds: number;
+    cachedAt?: string;
+    expiresAt?: string;
+    attempts: number;
+    retried: boolean;
+    rateLimited: boolean;
+    retryAfterPresent: boolean;
+  };
+}
+
+interface TicketOptionFieldsCacheEntry {
+  fields: Map<ValidatedTicketOptionField, SuperOpsField>;
+  cachedAtMs: number;
+  expiresAtMs: number;
+}
+
+interface TicketOptionFieldsCachePayload {
+  version: 1;
+  tenant: string;
+  region: "us" | "eu";
+  fields: ValidatedTicketOptionField[];
+  cachedAtMs: number;
+  expiresAtMs: number;
+  entries: Array<[ValidatedTicketOptionField, SuperOpsField]>;
+}
+
+interface TicketOptionFieldsCacheIdentity {
+  tenant: string;
+  region: "us" | "eu";
+  fields: ValidatedTicketOptionField[];
+  request: Request;
+  memoryKey: string;
+}
+
+interface TicketOptionFieldsCacheLookup {
+  entry?: TicketOptionFieldsCacheEntry;
+  available: boolean;
+  valid: boolean;
+  readFailed: boolean;
+  nativeAvailable: boolean;
+}
+
+interface CloudflareNativeCache {
+  match(request: Request): Promise<Response | undefined>;
+  put(request: Request, response: Response): Promise<void>;
+}
+
+interface CloudflareNativeCacheStorage {
+  default?: CloudflareNativeCache;
+}
+
+const ticketFieldOptionsCache = new Map<string, TicketOptionFieldsCacheEntry>();
 
 const RESOLVED_REQUIRED_OPTION_FIELDS = [
   "priority",
@@ -2210,6 +2274,334 @@ async function getTicketOptionFields(
   return byName;
 }
 
+function cloneTicketOptionFields(
+  fields: Map<ValidatedTicketOptionField, SuperOpsField>
+): Map<ValidatedTicketOptionField, SuperOpsField> {
+  return new Map(
+    [...fields.entries()].map(([fieldName, field]) => [
+      fieldName,
+      JSON.parse(JSON.stringify(field)) as SuperOpsField,
+    ])
+  );
+}
+
+function fieldOptionsCacheIdentity(
+  fieldNames: readonly ValidatedTicketOptionField[]
+): TicketOptionFieldsCacheIdentity | undefined {
+  const credentials = getCredentials();
+  if (!credentials?.subdomain) return undefined;
+  const tenant = credentials.subdomain.trim().toLowerCase();
+  if (!tenant) return undefined;
+  const region = credentials.region ?? "us";
+  const fields = [...fieldNames].sort() as ValidatedTicketOptionField[];
+  const params = new URLSearchParams({
+    v: "1",
+    tenant,
+    region,
+    fields: fields.join(","),
+  });
+  const request = new Request(
+    `https://superops-mcp.internal/cache/ticket-field-options?${params.toString()}`
+  );
+  return {
+    tenant,
+    region,
+    fields,
+    request,
+    memoryKey: JSON.stringify({ version: 1, tenant, region, fields }),
+  };
+}
+
+function defaultFieldOptionsNativeCache(): CloudflareNativeCache | undefined {
+  return (globalThis as { caches?: CloudflareNativeCacheStorage }).caches?.default;
+}
+
+function sameFieldSet(
+  left: readonly ValidatedTicketOptionField[],
+  right: readonly ValidatedTicketOptionField[]
+): boolean {
+  return left.length === right.length && left.every((field, index) => field === right[index]);
+}
+
+function cacheEntryMetadata(entry: TicketOptionFieldsCacheEntry | undefined) {
+  return entry
+    ? {
+        cachedAt: new Date(entry.cachedAtMs).toISOString(),
+        expiresAt: new Date(entry.expiresAtMs).toISOString(),
+      }
+    : {};
+}
+
+function cacheableTicketOptionFields(
+  fields: Map<ValidatedTicketOptionField, SuperOpsField>,
+  fieldNames: readonly ValidatedTicketOptionField[]
+): boolean {
+  return fieldNames.every((fieldName) => {
+    const field = fields.get(fieldName);
+    return Boolean(
+      field &&
+      field.columnName === fieldName &&
+      field.module === TICKET_FIELD_MODULE &&
+      Array.isArray(field.options)
+    );
+  });
+}
+
+function payloadToTicketOptionCacheEntry(
+  payload: unknown,
+  identity: TicketOptionFieldsCacheIdentity,
+  nowMs: number
+): TicketOptionFieldsCacheEntry | undefined {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return undefined;
+  const candidate = payload as Partial<TicketOptionFieldsCachePayload>;
+  if (
+    candidate.version !== 1 ||
+    candidate.tenant !== identity.tenant ||
+    candidate.region !== identity.region ||
+    !Array.isArray(candidate.fields) ||
+    !sameFieldSet(candidate.fields, identity.fields) ||
+    typeof candidate.cachedAtMs !== "number" ||
+    typeof candidate.expiresAtMs !== "number" ||
+    candidate.expiresAtMs <= nowMs ||
+    !Array.isArray(candidate.entries)
+  ) {
+    return undefined;
+  }
+  const fields = new Map<ValidatedTicketOptionField, SuperOpsField>();
+  for (const entry of candidate.entries) {
+    if (!Array.isArray(entry) || entry.length !== 2) return undefined;
+    const [fieldName, field] = entry;
+    if (!identity.fields.includes(fieldName)) return undefined;
+    fields.set(fieldName, field);
+  }
+  if (!cacheableTicketOptionFields(fields, identity.fields)) return undefined;
+  return {
+    fields,
+    cachedAtMs: candidate.cachedAtMs,
+    expiresAtMs: candidate.expiresAtMs,
+  };
+}
+
+async function readTicketOptionFieldsCache(
+  identity: TicketOptionFieldsCacheIdentity | undefined
+): Promise<TicketOptionFieldsCacheLookup> {
+  const nativeCache = defaultFieldOptionsNativeCache();
+  if (!identity) {
+    return { available: false, valid: false, readFailed: false, nativeAvailable: Boolean(nativeCache) };
+  }
+  const nowMs = Date.now();
+  if (nativeCache) {
+    try {
+      const response = await nativeCache.match(identity.request);
+      if (!response) {
+        return { available: false, valid: false, readFailed: false, nativeAvailable: true };
+      }
+      const payload = await response.json();
+      const entry = payloadToTicketOptionCacheEntry(payload, identity, nowMs);
+      return {
+        entry,
+        available: true,
+        valid: Boolean(entry),
+        readFailed: false,
+        nativeAvailable: true,
+      };
+    } catch {
+      return { available: false, valid: false, readFailed: true, nativeAvailable: true };
+    }
+  }
+
+  const entry = ticketFieldOptionsCache.get(identity.memoryKey);
+  const valid = Boolean(entry && entry.expiresAtMs > nowMs);
+  return {
+    entry: valid ? entry : undefined,
+    available: Boolean(entry),
+    valid,
+    readFailed: false,
+    nativeAvailable: false,
+  };
+}
+
+async function writeTicketOptionFieldsCache(
+  identity: TicketOptionFieldsCacheIdentity | undefined,
+  fields: Map<ValidatedTicketOptionField, SuperOpsField>
+): Promise<void> {
+  if (!identity || !cacheableTicketOptionFields(fields, identity.fields)) return;
+  const cachedAtMs = Date.now();
+  const expiresAtMs = cachedAtMs + FIELD_OPTIONS_CACHE_TTL_MS;
+  const entry: TicketOptionFieldsCacheEntry = {
+    fields: cloneTicketOptionFields(fields),
+    cachedAtMs,
+    expiresAtMs,
+  };
+  const nativeCache = defaultFieldOptionsNativeCache();
+  if (nativeCache) {
+    try {
+      const payload: TicketOptionFieldsCachePayload = {
+        version: 1,
+        tenant: identity.tenant,
+        region: identity.region,
+        fields: identity.fields,
+        cachedAtMs,
+        expiresAtMs,
+        entries: [...entry.fields.entries()],
+      };
+      await nativeCache.put(
+        identity.request,
+        new Response(JSON.stringify(payload), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": `max-age=${FIELD_OPTIONS_CACHE_TTL_MS / 1000}`,
+          },
+        })
+      );
+    } catch {
+      // Cache writes are an optimisation and must not fail a successful fresh lookup.
+    }
+    return;
+  }
+
+  ticketFieldOptionsCache.set(identity.memoryKey, entry);
+}
+function fieldOptionsRetryDelay(error: unknown, attempt: number): {
+  delayMs: number;
+  retryAfterPresent: boolean;
+  suppliedDelayMs?: number;
+  source: "retry-after" | "backoff";
+} {
+  const config = getExecutionConfig();
+  const retryAfterSeconds =
+    error instanceof SuperOpsHttpError || error instanceof SuperOpsError
+      ? error.retryAfter
+      : undefined;
+  if (typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds)) {
+    const suppliedDelayMs = Math.max(0, Math.ceil(retryAfterSeconds * 1000));
+    return {
+      delayMs: Math.min(config.maxSingleDelayMs, suppliedDelayMs),
+      retryAfterPresent: true,
+      suppliedDelayMs,
+      source: "retry-after",
+    };
+  }
+
+  const base = config.backoffBaseDelayMs * 2 ** Math.max(0, attempt - 1);
+  const jitter = config.backoffJitterRatio <= 0
+    ? 0
+    : base * config.backoffJitterRatio * Math.random();
+  return {
+    delayMs: Math.min(config.maxSingleDelayMs, Math.ceil(base + jitter)),
+    retryAfterPresent: false,
+    source: "backoff",
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function getTicketOptionFieldsForTool(
+  client: SuperOpsClientInstance,
+  fieldNames: ValidatedTicketOptionField[]
+): Promise<TicketOptionFieldsRetrieval> {
+  const cacheIdentity = fieldOptionsCacheIdentity(fieldNames);
+  const config = getExecutionConfig();
+  const maxAttempts = Math.max(
+    1,
+    Math.min(FIELD_OPTIONS_MAX_INTERNAL_ATTEMPTS, config.maxReadRetryAttempts)
+  );
+  const startedMs = Date.now();
+  let attempts = 0;
+  let retryAfterPresent = false;
+  let lastError: unknown;
+
+  while (attempts < maxAttempts) {
+    attempts += 1;
+    try {
+      const fields = await getTicketOptionFields(client, fieldNames);
+      await writeTicketOptionFieldsCache(cacheIdentity, fields);
+      return {
+        fields,
+        metadata: {
+          source: "fresh",
+          cacheStatus: cacheIdentity ? "miss" : "unavailable",
+          cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
+          attempts,
+          retried: attempts > 1,
+          rateLimited: false,
+          retryAfterPresent,
+        },
+      };
+    } catch (error) {
+      lastError = error;
+      if (!isRateLimitError(error) || attempts >= maxAttempts) break;
+      const retry = fieldOptionsRetryDelay(error, attempts);
+      retryAfterPresent ||= retry.retryAfterPresent;
+      const elapsedAfterDelay = Date.now() - startedMs + retry.delayMs;
+      if (
+        elapsedAfterDelay > config.maxRetryDurationMs ||
+        !hasExecutionBudgetFor(1) ||
+        elapsedAfterDelay + config.safeRemainingTimeMs >= config.maxDurationMs
+      ) {
+        break;
+      }
+      recordRetryDelay({
+        attempt: attempts,
+        source: retry.source,
+        retryAfterSupplied: retry.retryAfterPresent,
+        suppliedDelayMs: retry.suppliedDelayMs,
+        parsedDelayMs: retry.suppliedDelayMs ?? retry.delayMs,
+        cappedDelayMs: retry.delayMs,
+        actualDelayMs: retry.delayMs,
+        endpoint: FIELD_OPTIONS_RETRY_ENDPOINT,
+        operationType: "query",
+        operationName: "getFields",
+      });
+      await sleep(retry.delayMs);
+    }
+  }
+
+  const cacheLookup = isRateLimitError(lastError)
+    ? await readTicketOptionFieldsCache(cacheIdentity)
+    : { available: false, valid: false, readFailed: false, nativeAvailable: Boolean(defaultFieldOptionsNativeCache()) };
+  if (isRateLimitError(lastError) && cacheLookup.entry) {
+    return {
+      fields: cloneTicketOptionFields(cacheLookup.entry.fields),
+      metadata: {
+        source: "cache",
+        cacheStatus: "fallback",
+        cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
+        ...cacheEntryMetadata(cacheLookup.entry),
+        attempts,
+        retried: attempts > 1,
+        rateLimited: true,
+        retryAfterPresent,
+      },
+    };
+  }
+
+  throw {
+    fieldOptionsError: true,
+    errorClass: isRateLimitError(lastError)
+      ? "SuperOpsRateLimit"
+      : lastError instanceof SuperOpsHttpError
+        ? "SuperOpsHttpError"
+        : lastError instanceof SuperOpsError
+          ? "SuperOpsGraphQLError"
+          : "SuperOpsMetadataError",
+    rateLimited: isRateLimitError(lastError),
+    attempts,
+    retryAfterPresent,
+    cacheEntryAvailable: cacheLookup.available,
+    cacheEntryValid: cacheLookup.valid,
+    cacheReadFailed: cacheLookup.readFailed,
+    nativeCacheAvailable: cacheLookup.nativeAvailable,
+    finalReason: safeErrorMessage(lastError),
+  };
+}
+
+export function resetTicketFieldOptionsCacheForTests(): void {
+  ticketFieldOptionsCache.clear();
+}
 async function addValidatedTicketOptionUpdates(
   client: SuperOpsClientInstance,
   params: TicketClassificationParams,
@@ -2500,11 +2892,13 @@ async function createTicketNote(
 function isRateLimitError(error: unknown): boolean {
   if (error instanceof SuperOpsHttpError) return error.status === 429;
   if (error instanceof SuperOpsError) {
+    const extensions = JSON.stringify(error.extensions ?? {});
     return /rate|thrott|too_many_requests/i.test(error.code ?? "") ||
-      /rate limit|too many requests|throttl/i.test(error.message);
+      /rate[-_\s]?limit|too many requests|throttl/i.test(error.message) ||
+      /rate_limit_exceeded|too_many_requests|throttl/i.test(extensions);
   }
   const message = error instanceof Error ? error.message : String(error);
-  return /rate limit|too many requests|status\s*429/i.test(message);
+  return /rate[-_\s]?limit|too many requests|status\s*429/i.test(message);
 }
 
 function rateLimitRetryMetadata(error: unknown): {
@@ -3781,6 +4175,9 @@ function applyResultToContinuationOutcome(
         : ambiguousMutation ? "Ambiguous" : undefined,
     partialWrite: result.partialWrite,
     verified: result.verified,
+    verificationNotRequired: !result.writeAttempted &&
+      !result.partialWrite &&
+      ["Resolved", "Updated", "Left", "NoApprovedAction"].includes(result.finalOutcome),
     rateLimited: rateLimitReschedule,
     nextEligibleTime: rateLimitReschedule
       ? new Date(Date.now() + (result.rateLimitRetryAfterMs ?? 0)).toISOString()
@@ -5243,8 +5640,27 @@ export function getTicketsTools(): DomainTools {
               );
             }
 
-            const fields = await getTicketOptionFields(client, requestedFields);
-            const result = Object.fromEntries(
+            let retrieval: TicketOptionFieldsRetrieval;
+            try {
+              retrieval = await getTicketOptionFieldsForTool(client, requestedFields);
+            } catch (error) {
+              if (typeof error === "object" && error !== null && "fieldOptionsError" in error) {
+                const structured = { ...(error as Record<string, unknown>) };
+                delete structured.fieldOptionsError;
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify(structured, null, 2),
+                    },
+                  ],
+                  isError: true,
+                };
+              }
+              throw error;
+            }
+            const fields = retrieval.fields;
+            const result: Record<string, unknown> = Object.fromEntries(
               requestedFields.map((fieldName) => {
                 const field = fields.get(fieldName);
                 return [
@@ -5258,7 +5674,7 @@ export function getTicketsTools(): DomainTools {
                 ];
               })
             );
-
+            result._metadata = { retrieval: retrieval.metadata };
             return {
               content: [
                 {

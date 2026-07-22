@@ -237,6 +237,41 @@ describe("SuperOpsClient rate-limit handling", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("retries DataFetchingException GraphQL wrappers that contain rate_limit_exceeded", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            errors: [
+              {
+                message: "Exception while fetching data for getFields",
+                extensions: {
+                  code: "DataFetchingException",
+                  classification: "DataFetchingException",
+                  errorType: "rate_limit_exceeded",
+                  retryAfter: "1",
+                },
+              },
+            ],
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ data: { ok: true } }), { status: 200 })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new SuperOpsClient({ apiToken: "secret-token", subdomain: "example" });
+
+    const result = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0", SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0" },
+      () => runWithExecutionContext("superops_tickets_field_options", () => client.query("query getFields { ok }"))
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
   it("does not classify unrelated GraphQL validation errors as throttling", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

@@ -11,13 +11,16 @@ vi.mock("../client.js", () => ({
     query: vi.fn(),
     mutate: vi.fn(),
   })),
+  getCredentials: vi.fn(() => ({ apiToken: "secret-token", subdomain: "example", region: "us" })),
   SuperOpsError: class SuperOpsError extends Error {
     code?: string;
     retryAfter?: number;
-    constructor(message: string, code?: string, retryAfter?: number) {
+    extensions?: Record<string, unknown>;
+    constructor(message: string, code?: string, retryAfter?: number, extensions?: Record<string, unknown>) {
       super(message);
       this.code = code;
       this.retryAfter = retryAfter;
+      this.extensions = extensions;
     }
   },
   SuperOpsHttpError: class SuperOpsHttpError extends Error {
@@ -33,8 +36,8 @@ vi.mock("../client.js", () => ({
   },
 }));
 
-import { getClient, SuperOpsError, SuperOpsHttpError } from "../client.js";
-import { getTicketsTools, resumeApplyTriageOperation } from "./tickets.js";
+import { getClient, getCredentials, SuperOpsError, SuperOpsHttpError } from "../client.js";
+import { getTicketsTools, resetTicketFieldOptionsCacheForTests, resumeApplyTriageOperation } from "./tickets.js";
 import {
   getExecutionState,
   recordSubrequestFinish,
@@ -44,6 +47,7 @@ import {
 } from "../execution.js";
 import { getOperationStore, operationResultView, runWithOperationStore, stableHash } from "../operation-store.js";
 import { runWithContinuationScheduler } from "../continuation-scheduler.js";
+import { publishToolDefinition, READ_ONLY_TOOL_NAMES } from "../tool-catalogue.js";
 
 function withSuccessfulContinuationScheduling<T>(fn: () => T): T {
   return runWithContinuationScheduler({
@@ -160,6 +164,19 @@ function subcategoryFieldWithParents(
   };
 }
 
+function installFieldOptionsNativeCache(options: { matchFails?: boolean; putFails?: boolean } = {}) {
+  const store = new Map<string, Response>();
+  const match = vi.fn(async (request: Request) => {
+    if (options.matchFails) throw new Error("cache read failed");
+    return store.get(request.url)?.clone();
+  });
+  const put = vi.fn(async (request: Request, response: Response) => {
+    if (options.putFails) throw new Error("cache write failed");
+    store.set(request.url, response.clone());
+  });
+  vi.stubGlobal("caches", { default: { match, put } });
+  return { store, match, put };
+}
 function duplicateAccessSubcategoryField(reverse = false) {
   const options = [
     {
@@ -185,9 +202,13 @@ describe("Tickets Domain", () => {
       mutate: vi.fn(),
     };
     vi.mocked(getClient).mockReturnValue(mockClient as unknown as ReturnType<typeof getClient>);
+    vi.mocked(getCredentials).mockReturnValue({ apiToken: "secret-token", subdomain: "example", region: "us" });
   });
 
   afterEach(() => {
+    resetTicketFieldOptionsCacheForTests();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -783,6 +804,262 @@ describe("Tickets Domain", () => {
       ],
     });
     expect(parsed.urgency.options[0].value).toBe("Low");
+    expect(parsed._metadata.retrieval).toMatchObject({ source: "fresh", attempts: 1, retried: false, rateLimited: false });
+  });
+
+  it("retries one GraphQL rate_limit_exceeded field-options response internally and then succeeds", async () => {
+    mockClient.query
+      .mockRejectedValueOnce(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"))
+      .mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
+
+    const domain = getTicketsTools();
+    const result = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0", SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0" },
+      () => domain.handleCall("superops_tickets_field_options", { fields: ["priority"] })
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).not.toBe(true);
+    expect(mockClient.query).toHaveBeenCalledTimes(2);
+    expect(parsed.priority.options[0].value).toBe("Very Low");
+    expect(parsed._metadata.retrieval).toMatchObject({ source: "fresh", attempts: 2, retried: true });
+  });
+
+  it("retries HTTP 429 field-options responses with Retry-After metadata", async () => {
+    mockClient.query
+      .mockRejectedValueOnce(new SuperOpsHttpError("HTTP error: 429 Too Many Requests", 429, "Too Many Requests", 1))
+      .mockResolvedValueOnce({ getFields: [ticketField("impact", ["Low"])] });
+
+    const domain = getTicketsTools();
+    const result = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0", SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0" },
+      () => domain.handleCall("superops_tickets_field_options", { fields: ["impact"] })
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.query).toHaveBeenCalledTimes(2);
+    expect(parsed.impact.options[0].value).toBe("Low");
+    expect(parsed._metadata.retrieval).toMatchObject({ attempts: 2, retried: true, retryAfterPresent: true });
+  });
+
+  it("recognises DataFetchingException field-options wrappers containing rate_limit_exceeded", async () => {
+    mockClient.query
+      .mockRejectedValueOnce(new SuperOpsError(
+        "Exception while fetching data for getFields",
+        "DataFetchingException",
+        undefined,
+        { classification: "DataFetchingException", errorType: "rate_limit_exceeded" }
+      ))
+      .mockResolvedValueOnce({ getFields: [ticketField("urgency", ["Low"])] });
+
+    const domain = getTicketsTools();
+    const result = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0", SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0" },
+      () => domain.handleCall("superops_tickets_field_options", { fields: ["urgency"] })
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.query).toHaveBeenCalledTimes(2);
+    expect(parsed.urgency.options[0].value).toBe("Low");
+    expect(parsed._metadata.retrieval.retried).toBe(true);
+  });
+
+  it("bounds field-options retry attempts and returns structured rate-limit errors", async () => {
+    mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
+
+    const domain = getTicketsTools();
+    const result = await runWithExecutionConfig(
+      {
+        SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "5",
+        SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0",
+        SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0",
+      },
+      () => domain.handleCall("superops_tickets_field_options", { fields: ["priority"] })
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(mockClient.query).toHaveBeenCalledTimes(2);
+    expect(parsed).toMatchObject({ errorClass: "SuperOpsRateLimit", rateLimited: true, attempts: 2, cacheEntryAvailable: false });
+  });
+
+  it("writes successful field-options lookups to caches.default", async () => {
+    const nativeCache = installFieldOptionsNativeCache();
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+    const parsed = JSON.parse(result.content[0].text);
+    const cacheUrl = [...nativeCache.store.keys()][0];
+    const cachedPayload = await [...nativeCache.store.values()][0].clone().json() as Record<string, unknown>;
+
+    expect(result.isError).not.toBe(true);
+    expect(parsed.priority.options[0].value).toBe("Very Low");
+    expect(nativeCache.put).toHaveBeenCalledTimes(1);
+    expect(cacheUrl).toContain("tenant=example");
+    expect(cacheUrl).toContain("region=us");
+    expect(cacheUrl).toContain("fields=priority");
+    expect(cacheUrl).not.toContain("secret-token");
+    expect(JSON.stringify(cachedPayload)).not.toContain("secret-token");
+    expect(cachedPayload).toMatchObject({ tenant: "example", region: "us", fields: ["priority"] });
+  });
+
+  it("retrieves caches.default field-options entries across invocations after transient rate-limit retries fail", async () => {
+    const nativeCache = installFieldOptionsNativeCache();
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
+    const domain = getTicketsTools();
+    const first = await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+    expect(JSON.parse(first.content[0].text).priority.options[0].value).toBe("Very Low");
+    expect(nativeCache.put).toHaveBeenCalledTimes(1);
+
+    resetTicketFieldOptionsCacheForTests();
+    mockClient.query.mockReset();
+    mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
+    const fallback = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0", SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0" },
+      () => domain.handleCall("superops_tickets_field_options", { fields: ["priority"] })
+    );
+    const parsed = JSON.parse(fallback.content[0].text);
+
+    expect(fallback.isError).not.toBe(true);
+    expect(mockClient.query).toHaveBeenCalledTimes(2);
+    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(parsed.priority.options[0].value).toBe("Very Low");
+    expect(parsed._metadata.retrieval).toMatchObject({ source: "cache", cacheStatus: "fallback", rateLimited: true });
+  });
+
+  it("keeps caches.default field-options entries isolated by tenant", async () => {
+    const nativeCache = installFieldOptionsNativeCache();
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Tenant A"])] });
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+
+    resetTicketFieldOptionsCacheForTests();
+    mockClient.query.mockReset();
+    mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
+    vi.mocked(getCredentials).mockReturnValue({ apiToken: "secret-token", subdomain: "other", region: "us" });
+    const result = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0", SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0" },
+      () => domain.handleCall("superops_tickets_field_options", { fields: ["priority"] })
+    );
+
+    expect(result.isError).toBe(true);
+    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ cacheEntryAvailable: false, cacheEntryValid: false });
+  });
+
+  it("keeps caches.default field-options entries isolated by region", async () => {
+    const nativeCache = installFieldOptionsNativeCache();
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["US Priority"])] });
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+
+    resetTicketFieldOptionsCacheForTests();
+    mockClient.query.mockReset();
+    mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
+    vi.mocked(getCredentials).mockReturnValue({ apiToken: "secret-token", subdomain: "example", region: "eu" });
+    const result = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0", SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0" },
+      () => domain.handleCall("superops_tickets_field_options", { fields: ["priority"] })
+    );
+
+    expect(result.isError).toBe(true);
+    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ cacheEntryAvailable: false, cacheEntryValid: false });
+  });
+
+  it("keeps caches.default field-options entries isolated by requested field set", async () => {
+    const nativeCache = installFieldOptionsNativeCache();
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+
+    resetTicketFieldOptionsCacheForTests();
+    mockClient.query.mockReset();
+    mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
+    const result = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0", SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0" },
+      () => domain.handleCall("superops_tickets_field_options", { fields: ["impact"] })
+    );
+
+    expect(result.isError).toBe(true);
+    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.content[0].text)).toMatchObject({ cacheEntryAvailable: false, cacheEntryValid: false });
+  });
+
+  it("rejects expired caches.default field-options entries", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-22T00:00:00.000Z"));
+    const nativeCache = installFieldOptionsNativeCache();
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+
+    resetTicketFieldOptionsCacheForTests();
+    vi.setSystemTime(new Date("2026-07-22T00:05:01.000Z"));
+    mockClient.query.mockReset();
+    mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
+    const result = await runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_SINGLE_DELAY_MS: "0", SUPEROPS_EXECUTION_BACKOFF_JITTER_RATIO: "0" },
+      () => domain.handleCall("superops_tickets_field_options", { fields: ["priority"] })
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(parsed).toMatchObject({ cacheEntryAvailable: true, cacheEntryValid: false, rateLimited: true, nativeCacheAvailable: true });
+  });
+
+  it("does not let cache read failure break successful fresh field-options lookup", async () => {
+    const nativeCache = installFieldOptionsNativeCache({ matchFails: true });
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).not.toBe(true);
+    expect(parsed.priority.options[0].value).toBe("Very Low");
+    expect(nativeCache.match).not.toHaveBeenCalled();
+  });
+
+  it("does not let cache write failure break successful fresh field-options lookup", async () => {
+    const nativeCache = installFieldOptionsNativeCache({ putFails: true });
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).not.toBe(true);
+    expect(parsed.priority.options[0].value).toBe("Very Low");
+    expect(nativeCache.put).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not use cached options to conceal permanent field-options failures", async () => {
+    const nativeCache = installFieldOptionsNativeCache();
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
+    const domain = getTicketsTools();
+    await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+
+    resetTicketFieldOptionsCacheForTests();
+    mockClient.query.mockReset();
+    mockClient.query.mockRejectedValue(new SuperOpsError("Invalid metadata request", "BAD_USER_INPUT"));
+    const result = await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(nativeCache.match).not.toHaveBeenCalled();
+    expect(mockClient.query).toHaveBeenCalledTimes(1);
+    expect(parsed).toMatchObject({ errorClass: "SuperOpsGraphQLError", rateLimited: false, attempts: 1, cacheEntryAvailable: false });
+  });
+  it("keeps the field-options MCP tool classified as read-only", () => {
+    const domain = getTicketsTools();
+    const fieldOptionsTool = domain.tools.find((tool) => tool.name === "superops_tickets_field_options");
+    if (!fieldOptionsTool) throw new Error("field-options tool missing");
+
+    expect(READ_ONLY_TOOL_NAMES.has("superops_tickets_field_options")).toBe(true);
+    expect(publishToolDefinition(fieldOptionsTool).annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
   });
 
   it("uses documented ticket fields in list and get queries", async () => {
@@ -4993,6 +5270,66 @@ describe("Tickets Domain", () => {
     )).toBe(true);
   });
 
+  it("marks completed dry-run update continuation items as verification not required", async () => {
+    const domain = getTicketsTools();
+    await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () => domain.handleCall("superops_tickets_apply_triage_plan", {
+        batchId: "dry-run-update-verification-state",
+        expectedCandidateTicketNumbers: ["57400", "58776"],
+        dryRun: true,
+        actions: [{
+          ticketNumber: "58776",
+          expectedUpdatedTime: "2026-07-18T10:00:00Z",
+          contentVerified: true,
+          action: "update",
+          target: { status: "Awaiting Engineer" },
+        }],
+      })
+    ));
+    const stored = await getOperationStore().get("dry-run-update-verification-state");
+    if (!stored) throw new Error("missing dry-run operation");
+    expect(stored.pendingItems).toEqual(["58776"]);
+
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-58776", displayId: "58776" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-58776",
+          displayId: "58776",
+          status: "New Calls",
+          updatedTime: "2026-07-18T10:00:00Z",
+        },
+      });
+
+    await runWithExecutionConfig({}, () =>
+      runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        resumeApplyTriageOperation({
+          operationId: "dry-run-update-verification-state",
+          ownerHash: stored.ownerHash,
+          leaseOwner: "dry-run-worker",
+        })
+      )
+    );
+
+    const finalRecord = await getOperationStore().get("dry-run-update-verification-state");
+    expect(finalRecord?.state).toBe("Completed");
+    expect(finalRecord?.pendingItems).toEqual([]);
+    expect(finalRecord?.itemStates["58776"]).toMatchObject({
+      stage: "Completed",
+      outcome: "Updated",
+      writeAttempted: false,
+      writeMayHaveSucceeded: false,
+      partialWrite: false,
+      verificationState: "NotRequired",
+    });
+  });
+
   it("does not reschedule or replay an ambiguous private-note failure", async () => {
     const domain = getTicketsTools();
     await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
@@ -5031,6 +5368,7 @@ describe("Tickets Domain", () => {
       writeAttempted: true,
       writeMayHaveSucceeded: true,
       partialWrite: true,
+      verificationState: "Pending",
       errorClass: "AmbiguousWrite",
     });
     expect(finalRecord.itemStates["57401"].nextEligibleTime).toBeUndefined();
@@ -5158,9 +5496,13 @@ describe("Tickets triage execution budget", () => {
       mutate: vi.fn(),
     };
     vi.mocked(getClient).mockReturnValue(mockClient as unknown as ReturnType<typeof getClient>);
+    vi.mocked(getCredentials).mockReturnValue({ apiToken: "secret-token", subdomain: "example", region: "us" });
   });
 
   afterEach(() => {
+    resetTicketFieldOptionsCacheForTests();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 

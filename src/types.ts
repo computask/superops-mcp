@@ -23,8 +23,9 @@ export interface GraphQLError {
   path?: string[];
   extensions?: {
     code?: string;
-    retryAfter?: number;
+    retryAfter?: number | string;
     field?: string;
+    [key: string]: unknown;
   };
 }
 
