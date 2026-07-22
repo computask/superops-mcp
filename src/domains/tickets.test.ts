@@ -118,6 +118,22 @@ const RESOLVED_CLASSIFICATION = {
   resolutionCode: "Permanent Fix",
 };
 
+const LIVE_RESOLVE_PLUS_NOTE_REGRESSION = {
+  operationId: "fbe86605-626c-4d21-8d30-9291a531ec85",
+  ticketNumber: "58831",
+  ticketId: "6641868342796124160",
+  clientName: "TaskGroup",
+  clientId: "2993553194649526272",
+  note: "JUNK",
+  target: {
+    status: "Resolved",
+    clientName: "TaskGroup",
+    clientId: "2993553194649526272",
+    suppressCloseNotification: true,
+    ...RESOLVED_CLASSIFICATION,
+  },
+};
+
 function ticketField(
   columnName: string,
   values: string[],
@@ -3879,14 +3895,14 @@ describe("Tickets Domain", () => {
           status: "New Calls",
         },
       })
+      .mockResolvedValueOnce({ getTicketNoteList: [] })
       .mockResolvedValueOnce({
         getTicket: {
           ticketId: "ticket-57400",
           displayId: "57400",
           status: "Worked on",
         },
-      })
-      .mockResolvedValueOnce({ getTicketNoteList: [] });
+      });
     mockClient.mutate
       .mockResolvedValueOnce({
         updateTicket: { ticketId: "ticket-57400", displayId: "57400" },
@@ -3929,6 +3945,425 @@ describe("Tickets Domain", () => {
       finalOutcome: "Updated",
       noteAdded: true,
       verified: true,
+    });
+  });
+
+  it.each([
+    {
+      name: "final state exposes only the client name",
+      caseId: "name-only",
+      finalClient: { name: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.clientName },
+      expected: { finalOutcome: "Resolved", verified: true },
+    },
+    {
+      name: "final state exposes only the account ID",
+      caseId: "id-only",
+      finalClient: { accountId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.clientId },
+      expected: { finalOutcome: "Resolved", verified: true },
+    },
+    {
+      name: "final state exposes null-to-TaskGroup reassignment",
+      caseId: "null-reassign",
+      initialClient: null,
+      finalClient: {
+        accountId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.clientId,
+        name: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.clientName,
+      },
+      expected: { finalOutcome: "Resolved", verified: true },
+    },
+  ])("verifies clientName plus clientId when $name", async ({ caseId, initialClient, finalClient, expected }) => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{
+            ticketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId,
+            displayId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketNumber,
+          }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId,
+          displayId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketNumber,
+          status: "New Calls",
+          client: initialClient === undefined ? { name: "Old Client" } : initialClient,
+          updatedTime: "2026-07-22T09:00:00Z",
+        },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId,
+          displayId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketNumber,
+          status: "Resolved",
+          client: finalClient,
+          ...RESOLVED_CLASSIFICATION,
+        },
+      });
+    mockClient.mutate.mockResolvedValueOnce({
+      updateTicket: { ticketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId },
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      batchId: `${LIVE_RESOLVE_PLUS_NOTE_REGRESSION.operationId}-${caseId}`,
+      expectedCandidateTicketNumbers: [LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketNumber],
+      actions: [{
+        ticketNumber: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketNumber,
+        expectedTicketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId,
+        expectedUpdatedTime: "2026-07-22T09:00:00Z",
+        contentVerified: true,
+        action: "resolve",
+        target: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target,
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject(expected);
+    expect(parsed.results[0].failureReason).toBeNull();
+    expect(mockClient.mutate).toHaveBeenCalledWith(expect.stringContaining("updateTicket"), {
+      input: expect.objectContaining({
+        ticketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId,
+        client: { accountId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.clientId },
+      }),
+    });
+  });
+
+  it("fails client-name verification when the final read exposes the wrong name", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls",
+          updatedTime: "2026-07-22T09:00:00Z" },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "Resolved",
+          client: { name: "Other Client" }, ...RESOLVED_CLASSIFICATION },
+      });
+    mockClient.mutate.mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-57400" } });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400", expectedUpdatedTime: "2026-07-22T09:00:00Z",
+        contentVerified: true, action: "resolve",
+        target: { ...LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target },
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Failed",
+      failureStage: "verifyFinalState",
+      partialWrite: true,
+      verified: false,
+    });
+    expect(parsed.results[0].failureReason).toContain('"field":"clientName"');
+    expect(parsed.results[0].failureReason).toContain('"actual":"Other Client"');
+  });
+
+  it("fails client-ID verification when the final read exposes the wrong account ID", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls",
+          updatedTime: "2026-07-22T09:00:00Z" },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "Resolved",
+          client: { accountId: "wrong-client-id", name: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.clientName },
+          ...RESOLVED_CLASSIFICATION },
+      });
+    mockClient.mutate.mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-57400" } });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400", expectedUpdatedTime: "2026-07-22T09:00:00Z",
+        contentVerified: true, action: "resolve",
+        target: { ...LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target },
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Failed",
+      failureStage: "verifyFinalState",
+      partialWrite: true,
+      verified: false,
+    });
+    expect(parsed.results[0].failureReason).toContain('"field":"clientId"');
+    expect(parsed.results[0].failureReason).toContain('"actual":"wrong-client-id"');
+  });
+
+  it("resolves and adds the approved private note after a duplicate-note check", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId,
+          displayId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketNumber }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId,
+          displayId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketNumber,
+          status: "New Calls", updatedTime: "2026-07-22T09:00:00Z" },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({ getTicketNoteList: [] })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId,
+          displayId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketNumber,
+          status: "Resolved", client: { name: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.clientName },
+          ...RESOLVED_CLASSIFICATION },
+      });
+    mockClient.mutate
+      .mockResolvedValueOnce({ updateTicket: { ticketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId } })
+      .mockResolvedValueOnce({ createTicketNote: { noteId: "note-live-regression", privacyType: "PRIVATE" } });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      batchId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.operationId,
+      expectedCandidateTicketNumbers: [LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketNumber],
+      actions: [{
+        ticketNumber: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketNumber,
+        expectedTicketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId,
+        expectedUpdatedTime: "2026-07-22T09:00:00Z",
+        contentVerified: true,
+        action: "resolve",
+        note: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.note,
+        isPublicNote: false,
+        target: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target,
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.query.mock.calls[3][0]).toContain("getTicketNoteList");
+    expect(mockClient.query.mock.invocationCallOrder[3]).toBeLessThan(
+      mockClient.mutate.mock.invocationCallOrder[0]
+    );
+    expect(mockClient.mutate).toHaveBeenNthCalledWith(2, expect.stringContaining("createTicketNote"), {
+      input: {
+        ticket: { ticketId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.ticketId },
+        content: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.note,
+        privacyType: "PRIVATE",
+      },
+    });
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved",
+      noteAdded: true,
+      noteDeduped: false,
+      noteDedupeChecked: true,
+      verified: true,
+    });
+  });
+
+  it("dedupes an existing approved private note while still resolving the ticket", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls",
+          updatedTime: "2026-07-22T09:00:00Z" },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({ getTicketNoteList: [{ noteId: "note-existing", content: "JUNK", privacyType: "PRIVATE" }] })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "Resolved",
+          client: { accountId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.clientId }, ...RESOLVED_CLASSIFICATION },
+      });
+    mockClient.mutate.mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-57400" } });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400", expectedUpdatedTime: "2026-07-22T09:00:00Z",
+        contentVerified: true, action: "resolve", note: "JUNK",
+        target: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target,
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved",
+      noteAdded: false,
+      noteDeduped: true,
+      noteDedupeChecked: true,
+      verified: true,
+    });
+  });
+
+  it("blocks public note creation before any resolve write", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls",
+          updatedTime: "2026-07-22T09:00:00Z" },
+      });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400", expectedUpdatedTime: "2026-07-22T09:00:00Z",
+        contentVerified: true, action: "resolve", note: "JUNK", isPublicNote: true,
+        target: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target,
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Blocked",
+      failureStage: "notePrivacy",
+      notePlanned: true,
+      writeAttempted: false,
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("dry-runs the complete resolve-plus-private-note plan with zero writes", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls",
+          updatedTime: "2026-07-22T09:00:00Z" },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      dryRun: true,
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400", expectedUpdatedTime: "2026-07-22T09:00:00Z",
+        contentVerified: true, action: "resolve", note: "JUNK",
+        target: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target,
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved",
+      writeAttempted: false,
+      writeMethod: "dryRun",
+      notePlanned: true,
+      noteDedupeChecked: true,
+      plannedMutations: ["resolve_full", "createTicketNote"],
+    });
+  });
+
+  it("reports a partial outcome when resolution succeeds but private note creation fails", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls",
+          updatedTime: "2026-07-22T09:00:00Z" },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({ getTicketNoteList: [] })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "Resolved",
+          client: { accountId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.clientId }, ...RESOLVED_CLASSIFICATION },
+      });
+    mockClient.mutate
+      .mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-57400" } })
+      .mockRejectedValueOnce(new Error("note write failed"));
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400", expectedUpdatedTime: "2026-07-22T09:00:00Z",
+        contentVerified: true, action: "resolve", note: "JUNK",
+        target: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target,
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Failed",
+      failureStage: "createTicketNote",
+      failureReason: "note write failed",
+      partialWrite: true,
+      noteAdded: false,
+      noteDeduped: false,
+      verified: true,
+    });
+  });
+
+  it("continues remaining note work after resolution verification without resolving again", async () => {
+    const domain = getTicketsTools();
+    await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () => domain.handleCall("superops_tickets_apply_triage_plan", {
+        batchId: "resolve-note-continuation-regression",
+        expectedCandidateTicketNumbers: ["57400", "57401"],
+        actions: [{
+          ticketNumber: "57401", expectedUpdatedTime: "2026-07-22T09:00:00Z",
+          contentVerified: true, action: "resolve", note: "JUNK",
+          target: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target,
+        }],
+      })
+    ));
+    const stored = await getOperationStore().get("resolve-note-continuation-regression");
+    if (!stored) throw new Error("missing resolve-note continuation operation");
+    stored.itemStates["57401"] = {
+      ...stored.itemStates["57401"],
+      stage: "ResolutionVerified",
+      mutationType: "resolution",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: false,
+      verificationState: "Verified",
+      observedMutationResult: "VerifiedApplied",
+    };
+    await getOperationStore().put(stored);
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "Resolved",
+          updatedTime: "2026-07-22T09:01:00Z", client: { accountId: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.clientId },
+          ...RESOLVED_CLASSIFICATION },
+      })
+      .mockResolvedValueOnce({ getTicketNoteList: [] });
+    mockClient.mutate.mockResolvedValueOnce({ createTicketNote: { noteId: "note-resumed", privacyType: "PRIVATE" } });
+
+    await runWithExecutionConfig({}, () => runWithExecutionContext(
+      "superops_tickets_apply_triage_plan",
+      () => resumeApplyTriageOperation({
+        operationId: "resolve-note-continuation-regression",
+        ownerHash: stored.ownerHash,
+        leaseOwner: "resolve-note-worker",
+      })
+    ));
+
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(mockClient.mutate.mock.calls[0][0]).toContain("createTicketNote");
+    const finalRecord = await getOperationStore().get("resolve-note-continuation-regression");
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "CompletedAfterAmbiguousWriteVerification",
+      outcome: "Resolved",
+      verificationState: "Verified",
     });
   });
 

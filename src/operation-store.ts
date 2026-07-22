@@ -873,7 +873,7 @@ const EXPLICIT_STAGE_TRANSITIONS: Partial<Record<OperationItemStage, ReadonlySet
   ResolutionWriteAmbiguous: new Set(["ResolutionVerified", "Verifying"]),
   ResolutionVerified: new Set(["NoteChecked", "NoteWriteStarted", "Verifying"]),
   StatusUpdated: new Set(["NoteChecked", "Verifying"]),
-  NoteChecked: new Set(["NoteWriteStarted", "NoteAdded", "Verifying"]),
+  NoteChecked: new Set(["Validated", "WriteNotStarted", "WriteStarted", "ResolutionValidated", "ResolutionWriteStarted", "NoteWriteStarted", "NoteAdded", "Verifying"]),
   NoteWriteStarted: new Set(["NoteAdded", "NoteWriteAmbiguous", "Verifying", "RateLimitedRescheduled"]),
   NoteWriteAmbiguous: new Set(["Verifying"]),
   NoteAdded: new Set(["Verifying"]),

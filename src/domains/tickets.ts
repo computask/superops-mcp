@@ -874,6 +874,9 @@ interface ApplyTriagePlanResult {
   writeMethod?: string | null;
   noteAdded: boolean;
   noteDeduped: boolean;
+  notePlanned?: boolean;
+  noteDedupeChecked?: boolean;
+  plannedMutations?: string[];
   verified: boolean;
   finalState?: Record<string, unknown> | null;
   failureStage?: string | null;
@@ -2935,6 +2938,14 @@ function ticketClientName(ticket: Ticket): string | undefined {
   return readableString(ticket.client, ["name", "accountName"]);
 }
 
+function ticketClientAccountId(ticket: Ticket): string | undefined {
+  const client = jsonRecord(ticket.client);
+  const accountId = client?.accountId ?? client?.clientId ?? client?.id;
+  return typeof accountId === "string" && accountId.trim().length > 0
+    ? accountId.trim()
+    : undefined;
+}
+
 function ticketTechGroupName(ticket: Ticket): string | undefined {
   return readableString(ticket.techGroup, ["name", "groupName"]);
 }
@@ -2998,6 +3009,8 @@ function synchronousVerificationFailureReason(verification: Record<string, unkno
   return "Verification did not establish the requested final state.";
 }
 function ticketFinalState(ticket: Ticket): Record<string, unknown> {
+  const clientName = ticketClientName(ticket);
+  const clientId = ticketClientAccountId(ticket);
   return {
     status: ticket.status,
     priority: ticket.priority,
@@ -3008,25 +3021,22 @@ function ticketFinalState(ticket: Ticket): Record<string, unknown> {
     cause: ticket.cause,
     resolutionCode: ticket.resolutionCode,
     techGroup: ticketTechGroupName(ticket) ?? ticket.techGroup,
-    client: ticketClientName(ticket) ?? ticket.client,
+    client: clientName ?? ticket.client,
+    clientName,
+    clientId,
   };
 }
 
-function ticketVerificationValue(
-  ticket: Ticket,
-  field: string,
-  action: TriagePlanAction
-): unknown {
+function ticketVerificationValue(ticket: Ticket, field: string): unknown {
   if (field === "techGroup") {
     return ticketTechGroupName(ticket);
   }
-  if (field === "client") {
-    const client = jsonRecord(ticket.client);
-    if (action.target?.clientId) {
-      return typeof client?.accountId === "string" ? client.accountId : undefined;
-    }
+  if (field === "clientName") {
     const clientName = ticketClientName(ticket);
     return clientName ? canonicalClientName(clientName) : undefined;
+  }
+  if (field === "clientId") {
+    return ticketClientAccountId(ticket);
   }
   return (ticket as unknown as Record<string, unknown>)[field];
 }
@@ -3056,14 +3066,31 @@ function verifyFinalTargetState(
   if (target.techGroupName !== undefined) {
     requested.push({ field: "techGroup", expected: target.techGroupName });
   }
-  if (target.clientName !== undefined) {
-    requested.push({ field: "client", expected: canonicalClientName(target.clientName) });
-  } else if (target.clientId !== undefined) {
-    requested.push({ field: "client", expected: target.clientId });
+  if (target.clientId !== undefined || target.clientName !== undefined) {
+    const actualClientId = ticketClientAccountId(ticket);
+    const actualClientName = ticketClientName(ticket);
+    if (target.clientId !== undefined && actualClientId !== undefined) {
+      requested.push({ field: "clientId", expected: target.clientId });
+    }
+    if (target.clientName !== undefined && actualClientName !== undefined) {
+      requested.push({ field: "clientName", expected: canonicalClientName(target.clientName) });
+    }
+    if (actualClientId === undefined && actualClientName === undefined) {
+      if (target.clientId !== undefined) {
+        requested.push({ field: "clientId", expected: target.clientId });
+      }
+      if (target.clientName !== undefined) {
+        requested.push({ field: "clientName", expected: canonicalClientName(target.clientName) });
+      }
+    } else if (target.clientId !== undefined && target.clientName === undefined && actualClientId === undefined) {
+      requested.push({ field: "clientId", expected: target.clientId });
+    } else if (target.clientName !== undefined && target.clientId === undefined && actualClientName === undefined) {
+      requested.push({ field: "clientName", expected: canonicalClientName(target.clientName) });
+    }
   }
 
   const mismatches = requested.flatMap(({ field, expected }) => {
-    const actual = ticketVerificationValue(ticket, field, action);
+    const actual = ticketVerificationValue(ticket, field);
     return compareTicketValue(expected, actual) ? [] : [{ field, expected, actual }];
   });
 
@@ -3179,6 +3206,61 @@ async function existingNoteMatches(
   return existingNoteMatchesFingerprint(client, ticketId, normalizedNoteFingerprint(note));
 }
 
+function noteBodyForPlan(note: string | undefined): string | undefined {
+  return typeof note === "string" && note.trim().length > 0 ? note : undefined;
+}
+
+function markNotePlanned(result: ApplyTriagePlanResult, note: string | undefined): boolean {
+  const planned = noteBodyForPlan(note) !== undefined;
+  if (planned) {
+    result.notePlanned = true;
+  }
+  return planned;
+}
+
+async function checkNoteForPlan(params: {
+  client: SuperOpsClientInstance;
+  ticketId: string;
+  note?: string;
+  dedupe: boolean;
+  result: ApplyTriagePlanResult;
+  beforeCheck?: () => Promise<void>;
+}): Promise<"none" | "deduped" | "pending"> {
+  const note = noteBodyForPlan(params.note);
+  if (!note) return "none";
+  markNotePlanned(params.result, note);
+  if (!params.dedupe) return "pending";
+  await params.beforeCheck?.();
+  params.result.noteDedupeChecked = true;
+  if (await existingNoteMatches(params.client, params.ticketId, note)) {
+    params.result.noteDeduped = true;
+    return "deduped";
+  }
+  return "pending";
+}
+
+async function createNoteForPlan(params: {
+  client: SuperOpsClientInstance;
+  ticketId: string;
+  note?: string;
+  isPublic?: boolean;
+  result: ApplyTriagePlanResult;
+  beforeCreate?: () => Promise<void>;
+  afterCreate?: (note: TicketNote) => Promise<void>;
+}): Promise<void> {
+  const note = noteBodyForPlan(params.note);
+  if (!note) return;
+  await params.beforeCreate?.();
+  const created = await createTicketNote(
+    params.client,
+    params.ticketId,
+    note,
+    params.isPublic ?? false
+  );
+  await params.afterCreate?.(created);
+  params.result.noteAdded = true;
+}
+
 async function addNoteForPlan(params: {
   client: SuperOpsClientInstance;
   ticketId: string;
@@ -3190,23 +3272,9 @@ async function addNoteForPlan(params: {
   beforeCreate?: () => Promise<void>;
   afterCreate?: (note: TicketNote) => Promise<void>;
 }): Promise<void> {
-  if (typeof params.note !== "string" || params.note.trim().length === 0) {
-    return;
-  }
-  await params.beforeCheck?.();
-  if (params.dedupe && await existingNoteMatches(params.client, params.ticketId, params.note)) {
-    params.result.noteDeduped = true;
-    return;
-  }
-  await params.beforeCreate?.();
-  const created = await createTicketNote(
-    params.client,
-    params.ticketId,
-    params.note,
-    params.isPublic ?? false
-  );
-  await params.afterCreate?.(created);
-  params.result.noteAdded = true;
+  const notePlan = await checkNoteForPlan(params);
+  if (notePlan !== "pending") return;
+  await createNoteForPlan(params);
 }
 
 async function buildApprovedUpdateInput(
@@ -3465,6 +3533,9 @@ function compactApplyResult(result: ApplyTriagePlanResult): Record<string, unkno
     writeMethod: result.writeMethod,
     noteAdded: result.noteAdded,
     noteDeduped: result.noteDeduped,
+    notePlanned: result.notePlanned,
+    noteDedupeChecked: result.noteDedupeChecked,
+    plannedMutations: result.plannedMutations,
     verified: result.verified,
     failureStage: result.failureStage,
     failureReason: result.failureReason,
@@ -3886,6 +3957,14 @@ async function applyApprovedTriageAction(params: {
     return result;
   }
 
+  if (noteBodyForPlan(action.note) && action.isPublicNote === true) {
+    result.finalOutcome = "Blocked";
+    result.failureStage = "notePrivacy";
+    result.failureReason = "Approved triage notes must be private; public note creation is not allowed.";
+    markNotePlanned(result, action.note);
+    return result;
+  }
+
   if (params.dryRun) {
     if (action.action === "resolve" || action.action === "update") {
       const dryRunInput = action.action === "resolve"
@@ -3898,6 +3977,13 @@ async function applyApprovedTriageAction(params: {
         result.failureReason = dryRunError;
         return result;
       }
+      result.plannedMutations = [action.action === "resolve" ? "resolve_full" : "update"];
+    } else if (action.action === "addNote") {
+      result.plannedMutations = [];
+    }
+    if (markNotePlanned(result, action.note)) {
+      result.noteDedupeChecked = params.dedupeNotes;
+      result.plannedMutations = [...(result.plannedMutations ?? []), "createTicketNote"];
     }
     result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
     result.writeMethod = "dryRun";
@@ -3911,7 +3997,7 @@ async function applyApprovedTriageAction(params: {
         client,
         ticketId: ticket.ticketId,
         note: action.note,
-        isPublic: action.isPublicNote,
+        isPublic: false,
         dedupe: params.dedupeNotes,
         result,
         beforeCheck: params.beforeNoteCheck,
@@ -3950,6 +4036,25 @@ async function applyApprovedTriageAction(params: {
         result.finalOutcome = "Blocked";
         result.failureStage = "validation";
         result.failureReason = updateError;
+        return result;
+      }
+
+      let notePlan: "none" | "deduped" | "pending" = "none";
+      try {
+        notePlan = await checkNoteForPlan({
+          client,
+          ticketId: ticket.ticketId,
+          note: action.note,
+          dedupe: params.dedupeNotes,
+          result,
+          beforeCheck: params.beforeNoteCheck,
+        });
+      } catch (error) {
+        if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
+        result.finalOutcome = "Failed";
+        result.failureStage = "duplicateNoteCheck";
+        result.failureReason = safeErrorMessage(error);
+        result.partialWrite = false;
         return result;
       }
 
@@ -4014,6 +4119,32 @@ async function applyApprovedTriageAction(params: {
             result.verified = true;
             result.fallbackResult = "Not required; intended resolution is already visible.";
             await params.afterVerification?.("resolution");
+            try {
+              if (notePlan === "pending") {
+                await createNoteForPlan({
+                  client,
+                  ticketId: ticket.ticketId,
+                  note: action.note,
+                  isPublic: false,
+                  result,
+                  beforeCreate: async () => {
+                    await (params.beforeMutation?.("note") ?? Promise.resolve());
+                    result.writeAttempted = true;
+                  },
+                  afterCreate: (note) => params.afterMutation?.("note", {
+                    ticketId: ticket.ticketId,
+                    noteId: note.noteId,
+                  }) ?? Promise.resolve(),
+                });
+              }
+            } catch (noteError) {
+              if (noteError instanceof DurableCheckpointError || isExecutionStopError(noteError)) throw noteError;
+              result.finalOutcome = "Failed";
+              result.failureStage = "createTicketNote";
+              result.failureReason = safeErrorMessage(noteError);
+              result.partialWrite = true;
+              return result;
+            }
             return result;
           } else if (reread.updatedTime !== ticket.updatedTime) {
             result.finalOutcome = "SkippedChangedSinceSnapshot";
@@ -4067,23 +4198,23 @@ async function applyApprovedTriageAction(params: {
       await params.afterVerification?.(action.action === "resolve" ? "resolution" : "update");
 
       try {
-        await addNoteForPlan({
-          client,
-          ticketId: ticket.ticketId,
-          note: action.note,
-          isPublic: action.isPublicNote,
-          dedupe: params.dedupeNotes,
-          result,
-          beforeCheck: params.beforeNoteCheck,
-          beforeCreate: async () => {
-            await (params.beforeMutation?.("note") ?? Promise.resolve());
-            result.writeAttempted = true;
-          },
-          afterCreate: (note) => params.afterMutation?.("note", {
+        if (notePlan === "pending") {
+          await createNoteForPlan({
+            client,
             ticketId: ticket.ticketId,
-            noteId: note.noteId,
-          }) ?? Promise.resolve(),
-        });
+            note: action.note,
+            isPublic: false,
+            result,
+            beforeCreate: async () => {
+              await (params.beforeMutation?.("note") ?? Promise.resolve());
+              result.writeAttempted = true;
+            },
+            afterCreate: (note) => params.afterMutation?.("note", {
+              ticketId: ticket.ticketId,
+              noteId: note.noteId,
+            }) ?? Promise.resolve(),
+          });
+        }
       } catch (error) {
         if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
         result.finalOutcome = "Failed";
@@ -4164,7 +4295,9 @@ function applyResultToContinuationOutcome(
     retryDelaySource: result.rateLimitDelaySource,
     retryAfterSupplied: result.rateLimitRetryAfterSupplied,
     suppliedDelayMs: result.rateLimitRetryAfterSupplied ? result.rateLimitRequestedDelayMs : undefined,
-    retryOperationName: result.writeMethod === "createTicketNote" ? "CreateTicketNote" : "UpdateTicket",
+    retryOperationName: result.failureStage === "createTicketNote" || result.writeMethod === "createTicketNote"
+      ? "CreateTicketNote"
+      : "UpdateTicket",
     retryEndpoint: "SuperOps GraphQL /msp",
     observedMutationResult: rateLimitReschedule
       ? "Rejected"
@@ -4217,6 +4350,7 @@ function publicNoteBlockedResult(ticketNumber: string, action: TriagePlanAction)
   result.finalOutcome = "Blocked";
   result.failureStage = "notePrivacy";
   result.failureReason = "Continuation will not create public notes; approved triage notes must be private.";
+  markNotePlanned(result, action.note);
   return result;
 }
 
