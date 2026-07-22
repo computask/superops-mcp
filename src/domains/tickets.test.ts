@@ -45,7 +45,7 @@ import {
   runWithExecutionConfig,
   runWithExecutionContext,
 } from "../execution.js";
-import { getOperationStore, operationResultView, runWithOperationStore, stableHash } from "../operation-store.js";
+import { currentOwnerHash, getOperationStore, operationResultView, runWithOperationStore, stableHash, SuperOpsOperationLedger } from "../operation-store.js";
 import { runWithContinuationScheduler } from "../continuation-scheduler.js";
 import { publishToolDefinition, READ_ONLY_TOOL_NAMES } from "../tool-catalogue.js";
 
@@ -60,6 +60,61 @@ function withSuccessfulContinuationScheduling<T>(fn: () => T): T {
   }, fn);
 }
 
+function ownerScopedDurableNamespaceForTickets() {
+  const valuesByName = new Map<string, Map<string, unknown>>();
+  const ledgers = new Map<string, SuperOpsOperationLedger>();
+  const valuesFor = (name: string) => {
+    let values = valuesByName.get(name);
+    if (!values) {
+      values = new Map<string, unknown>();
+      valuesByName.set(name, values);
+    }
+    return values;
+  };
+  const namespace = {
+    idFromName: (name: string) => name,
+    get: (id: unknown) => {
+      const name = String(id);
+      let ledger = ledgers.get(name);
+      if (!ledger) {
+        const values = valuesFor(name);
+        ledger = new SuperOpsOperationLedger({
+          storage: {
+            get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+            put: async (key: string | Record<string, unknown>, value?: unknown) => {
+              if (typeof key === "string") values.set(key, value);
+              else for (const [entryKey, entryValue] of Object.entries(key)) values.set(entryKey, entryValue);
+            },
+            delete: async (key: string) => values.delete(key),
+            list: async <T = unknown>(options?: { prefix?: string }) => new Map(
+              [...values.entries()].filter(([key]) => !options?.prefix || key.startsWith(options.prefix))
+            ) as Map<string, T>,
+          },
+        });
+        ledgers.set(name, ledger);
+      }
+      return { fetch: (request: Request) => ledger!.fetch(request) };
+    },
+  };
+  return { namespace };
+}
+
+function installFakeExecutionClock(startIso = "2026-07-22T09:00:00.000Z") {
+  vi.useFakeTimers();
+  const startMs = Date.parse(startIso);
+  let monotonicMs = 0;
+  vi.setSystemTime(new Date(startMs));
+  vi.stubGlobal("performance", { now: () => monotonicMs });
+  return {
+    advanceTo(elapsedMs: number) {
+      monotonicMs = elapsedMs;
+      vi.setSystemTime(new Date(startMs + elapsedMs));
+    },
+    resetMonotonic() {
+      monotonicMs = 0;
+    },
+  };
+}
 const VALID_TICKET_STATUSES = [
   "Worked on",
   "Awaiting Customer Reply",
@@ -6062,6 +6117,324 @@ describe("Tickets triage execution budget", () => {
     });
     expect(mockClient.query).not.toHaveBeenCalled();
     expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+  it("schedules and resumes a dry-run when the cooperative guard fires before the first item", async () => {
+    const durable = ownerScopedDurableNamespaceForTickets();
+    const clock = installFakeExecutionClock();
+    const scheduledContinuations: unknown[] = [];
+    const schedulerEnv = {
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "test-internal-token",
+      SUPEROPS_CONTINUATION_SERVICE: {
+        fetch: async (request: Request) => {
+          scheduledContinuations.push(await request.json());
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+      },
+    };
+
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+      const store = getOperationStore();
+      const put = store.put.bind(store);
+      const claimNextItem = store.claimNextItem.bind(store);
+      store.put = vi.fn(async (...args: Parameters<typeof store.put>) => {
+        await put(...args);
+        clock.advanceTo(21_702);
+      });
+      store.claimNextItem = vi.fn(claimNextItem);
+
+      const initial = await runWithContinuationScheduler(schedulerEnv, () => runWithExecutionConfig(
+        {
+          SUPEROPS_EXECUTION_CPU_GUARD_MS: "20000",
+          SUPEROPS_EXECUTION_MAX_DURATION_MS: "25000",
+          SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+        },
+        () => runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+            batchId: "3bb55703-59c9-43a6-8455-50ca68a44ad0",
+            expectedCandidateTicketNumbers: ["58824"],
+            dryRun: true,
+            actions: [{
+              ticketNumber: "58824",
+              expectedStatus: "New Calls",
+              expectedUpdatedTime: "2026-07-22T08:30:00.000Z",
+              contentVerified: true,
+              action: "update",
+              target: { status: "Awaiting Engineer" },
+            }],
+          })
+        )
+      ));
+      const parsedInitial = JSON.parse(initial.content[0].text);
+      const ownerHash = currentOwnerHash();
+      const yielded = await store.get("3bb55703-59c9-43a6-8455-50ca68a44ad0", ownerHash);
+
+      expect(initial.isError).not.toBe(true);
+      expect(parsedInitial.operation).toMatchObject({
+        complete: false,
+        continuationRequired: true,
+        persisted: true,
+        state: "ContinuationRequired",
+        continuationScheduling: {
+          attempted: true,
+          scheduled: true,
+        },
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+      });
+      expect(parsedInitial.operation.errorClass).toBeUndefined();
+      expect(parsedInitial.operation.finalReason).toBeUndefined();
+      expect(store.claimNextItem).not.toHaveBeenCalled();
+      expect(mockClient.query).not.toHaveBeenCalled();
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+      expect(scheduledContinuations).toHaveLength(1);
+      expect(yielded).toMatchObject({
+        state: "ContinuationRequired",
+        pendingItems: ["58824"],
+        unattemptedItems: ["58824"],
+        continuationCount: 1,
+        schedulingAttempted: true,
+        schedulingSucceeded: true,
+        itemStates: {
+          "58824": {
+            stage: "Unattempted",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+            partialWrite: false,
+          },
+        },
+      });
+      expect(yielded?.itemStates["58824"]).not.toHaveProperty("attemptCount");
+      expect(yielded?.compactResults).toEqual([]);
+
+      clock.resetMonotonic();
+      mockClient.query
+        .mockResolvedValueOnce({
+          getTicketList: {
+            tickets: [{ ticketId: "ticket-58824", displayId: "58824" }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        })
+        .mockResolvedValueOnce({
+          getTicket: {
+            ticketId: "ticket-58824",
+            displayId: "58824",
+            subject: "Dry-run resume",
+            status: "New Calls",
+            updatedTime: "2026-07-22T08:30:00.000Z",
+          },
+        });
+
+      const resumed = await runWithExecutionConfig(
+        {
+          SUPEROPS_EXECUTION_CPU_GUARD_MS: "20000",
+          SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+        },
+        () => runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          resumeApplyTriageOperation({
+            operationId: "3bb55703-59c9-43a6-8455-50ca68a44ad0",
+            ownerHash,
+            leaseOwner: "resume-after-cooperative-yield",
+          })
+        )
+      );
+      const finalRecord = await store.get("3bb55703-59c9-43a6-8455-50ca68a44ad0", ownerHash);
+
+      expect(resumed).toMatchObject({
+        state: "Completed",
+        continuationRequired: false,
+        completedItems: 1,
+        pendingItems: 0,
+        unattemptedItems: 0,
+      });
+      expect(finalRecord).toMatchObject({
+        state: "Completed",
+        pendingItems: [],
+        unattemptedItems: [],
+        continuationCount: 1,
+        itemStates: {
+          "58824": {
+            stage: "Completed",
+            outcome: "Updated",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+            partialWrite: false,
+            verificationState: "NotRequired",
+          },
+        },
+      });
+      expect(finalRecord?.compactResults).toContainEqual(expect.objectContaining({
+        ticketNumber: "58824",
+        finalOutcome: "Updated",
+        writeAttempted: false,
+        writeMethod: "dryRun",
+      }));
+      expect(mockClient.query).toHaveBeenCalledTimes(2);
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+    });
+  });
+
+  it("persists completion after a slow field-option read exhausts the cooperative guard", async () => {
+    const durable = ownerScopedDurableNamespaceForTickets();
+    const clock = installFakeExecutionClock();
+
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+      mockClient.query.mockImplementation(async (query: string) => {
+        if (query.includes("getTicketList")) {
+          return {
+            getTicketList: {
+              tickets: [{ ticketId: "ticket-58824", displayId: "58824" }],
+              listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+            },
+          };
+        }
+        if (query.includes("getTicket(")) {
+          return {
+            getTicket: {
+              ticketId: "ticket-58824",
+              displayId: "58824",
+              subject: "Slow metadata dry run",
+              status: "New Calls",
+              updatedTime: "2026-07-22T08:30:00.000Z",
+            },
+          };
+        }
+        if (query.includes("getFields")) {
+          clock.advanceTo(21_702);
+          return { getFields: [ticketField("priority", ["High"])] };
+        }
+        throw new Error("unexpected query");
+      });
+
+      const result = await runWithExecutionConfig(
+        {
+          SUPEROPS_EXECUTION_CPU_GUARD_MS: "20000",
+          SUPEROPS_EXECUTION_MAX_DURATION_MS: "25000",
+          SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+        },
+        () => runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+            batchId: "slow-field-options-before-final-persist",
+            expectedCandidateTicketNumbers: ["58824"],
+            dryRun: true,
+            actions: [{
+              ticketNumber: "58824",
+              expectedStatus: "New Calls",
+              expectedUpdatedTime: "2026-07-22T08:30:00.000Z",
+              contentVerified: true,
+              action: "update",
+              target: { priority: "High" },
+            }],
+          })
+        )
+      );
+      const parsed = JSON.parse(result.content[0].text);
+      const stored = await getOperationStore().get("slow-field-options-before-final-persist", currentOwnerHash());
+
+      expect(result.isError).not.toBe(true);
+      expect(parsed.operation).toMatchObject({
+        complete: true,
+        continuationRequired: false,
+        state: "Completed",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+      });
+      expect(stored).toMatchObject({
+        state: "Completed",
+        pendingItems: [],
+        unattemptedItems: [],
+        continuationCount: 0,
+        itemStates: {
+          "58824": {
+            stage: "Completed",
+            outcome: "Updated",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+            verificationState: "NotRequired",
+          },
+        },
+      });
+      expect(mockClient.query).toHaveBeenCalledTimes(3);
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+    });
+  });
+  it("terminalizes a pre-item cooperative yield when immediate scheduling genuinely fails", async () => {
+    const durable = ownerScopedDurableNamespaceForTickets();
+    const clock = installFakeExecutionClock();
+
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+      const store = getOperationStore();
+      const put = store.put.bind(store);
+      store.put = vi.fn(async (...args: Parameters<typeof store.put>) => {
+        await put(...args);
+        clock.advanceTo(21_702);
+      });
+
+      const result = await runWithContinuationScheduler({
+        SUPEROPS_CONTINUATION_ENABLED: "true",
+        SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+        SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "test-internal-token",
+        SUPEROPS_CONTINUATION_SERVICE: {
+          fetch: async () => new Response("delivery unavailable", { status: 503 }),
+        },
+      }, () => runWithExecutionConfig(
+        {
+          SUPEROPS_EXECUTION_CPU_GUARD_MS: "20000",
+          SUPEROPS_EXECUTION_MAX_DURATION_MS: "25000",
+          SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+        },
+        () => runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+            batchId: "cooperative-yield-scheduler-failure",
+            expectedCandidateTicketNumbers: ["58824"],
+            dryRun: true,
+            actions: [{
+              ticketNumber: "58824",
+              contentVerified: true,
+              action: "update",
+              target: { status: "Awaiting Engineer" },
+            }],
+          })
+        )
+      ));
+      const parsed = JSON.parse(result.content[0].text);
+      const stored = await store.get("cooperative-yield-scheduler-failure", currentOwnerHash());
+
+      expect(parsed.operation).toMatchObject({
+        complete: true,
+        continuationRequired: false,
+        state: "CompletedWithFailures",
+        continuationScheduling: {
+          attempted: true,
+          scheduled: false,
+          terminalized: true,
+          status: 503,
+          reasonCode: "non2xxContinuationResponse",
+        },
+        errorClass: "ContinuationSchedulingFailure",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+      });
+      expect(parsed.operation.continuationScheduling.error).toContain("Continuation service returned non-2xx status 503");
+      expect(stored).toMatchObject({
+        state: "CompletedWithFailures",
+        continuationCount: 1,
+        schedulingAttempted: true,
+        schedulingSucceeded: false,
+        itemStates: {
+          "58824": {
+            stage: "FailedBeforeWrite",
+            outcome: "ContinuationSchedulingFailed",
+            errorClass: "ContinuationSchedulingFailure",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+          },
+        },
+      });
+      expect(mockClient.query).not.toHaveBeenCalled();
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+    });
   });
   it("runs the real triage adapter across a 250-item mocked continuation harness", async () => {
     const domain = getTicketsTools();

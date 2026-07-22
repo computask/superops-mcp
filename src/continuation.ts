@@ -130,6 +130,9 @@ export async function runOperationContinuation(
 
   let processedThisInvocation = 0;
   for (;;) {
+    if (record.pendingItems.length === 0) {
+      return continuationResult(record, false);
+    }
     if (processedThisInvocation >= getExecutionConfig().maxItemsPerBatch) {
       record = await store.scheduleContinuation({
         operationId: params.operationId,

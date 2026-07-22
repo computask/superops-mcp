@@ -6204,8 +6204,12 @@ export function getTicketsTools(): DomainTools {
             const operationView = operationResultView(finalRecord);
             const durableFinalErrorClass = durableItems.find((item) => item.errorClass)?.errorClass ??
               conservativeOutcome?.errorClass;
+            const possibleSuperOpsWriteBeforeStoreFailure = conservativeWriteAttempted ||
+              conservativeWriteMayHaveSucceeded || conservativePartialWrite;
             const conservativeFinalReason = continuationError && !durableFinalErrorClass
-              ? "OperationStorePostWriteFailure"
+              ? possibleSuperOpsWriteBeforeStoreFailure
+                ? "OperationStorePostWriteFailure"
+                : "OperationStoreFailure"
               : conservativeOutcome?.outcome ?? durableItems.find((item) => item.failureReason)?.failureReason;
 
             return {

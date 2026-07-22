@@ -535,20 +535,21 @@ export function recordTypedSubrequestStart(params: {
 }): { index: number; startedMs: number; record?: SubrequestRecord } {
   const state = getExecutionState();
   if (!state) return { index: 0, startedMs: Date.now() };
+  const usesReservedBudget = params.allowSafetyMargin === true;
   const effectiveLimit =
     state.config.subrequestBudget -
-    (params.allowSafetyMargin ? 0 : state.config.subrequestSafetyMargin);
+    (usesReservedBudget ? 0 : state.config.subrequestSafetyMargin);
   if (state.subrequests + 1 > effectiveLimit) {
     state.terminationReason = "subrequestBudget";
     throw new ExecutionBudgetExceededError(state, 1);
   }
   const monotonicElapsed = (globalThis.performance?.now?.() ?? Date.now()) - state.startedHighResolutionMs;
-  if (monotonicElapsed >= state.config.cpuGuardMs) {
+  if (!usesReservedBudget && monotonicElapsed >= state.config.cpuGuardMs) {
     state.terminationReason = "cooperativeCpuGuard";
     throw new ExecutionCpuBudgetExceededError(state);
   }
   const elapsed = Date.now() - state.startedMs;
-  if (elapsed + state.config.safeRemainingTimeMs >= state.config.maxDurationMs) {
+  if (!usesReservedBudget && elapsed + state.config.safeRemainingTimeMs >= state.config.maxDurationMs) {
     state.terminationReason = "executionTimeBudget";
     throw new ExecutionTimeoutBudgetExceededError(state);
   }
