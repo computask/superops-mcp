@@ -875,6 +875,7 @@ interface ApplyTriagePlanResult {
   noteAdded: boolean;
   noteDeduped: boolean;
   notePlanned?: boolean;
+  noteDedupePlanned?: boolean;
   noteDedupeChecked?: boolean;
   plannedMutations?: string[];
   verified: boolean;
@@ -3218,6 +3219,19 @@ function markNotePlanned(result: ApplyTriagePlanResult, note: string | undefined
   return planned;
 }
 
+function markNoteDedupePlanned(
+  result: ApplyTriagePlanResult,
+  note: string | undefined,
+  dedupe: boolean
+): boolean {
+  const planned = markNotePlanned(result, note);
+  if (planned && dedupe) {
+    result.noteDedupePlanned = true;
+    result.noteDedupeChecked = false;
+  }
+  return planned && dedupe;
+}
+
 async function checkNoteForPlan(params: {
   client: SuperOpsClientInstance;
   ticketId: string;
@@ -3230,9 +3244,11 @@ async function checkNoteForPlan(params: {
   if (!note) return "none";
   markNotePlanned(params.result, note);
   if (!params.dedupe) return "pending";
+  markNoteDedupePlanned(params.result, note, true);
   await params.beforeCheck?.();
+  const noteDeduped = await existingNoteMatches(params.client, params.ticketId, note);
   params.result.noteDedupeChecked = true;
-  if (await existingNoteMatches(params.client, params.ticketId, note)) {
+  if (noteDeduped) {
     params.result.noteDeduped = true;
     return "deduped";
   }
@@ -3534,6 +3550,7 @@ function compactApplyResult(result: ApplyTriagePlanResult): Record<string, unkno
     noteAdded: result.noteAdded,
     noteDeduped: result.noteDeduped,
     notePlanned: result.notePlanned,
+    noteDedupePlanned: result.noteDedupePlanned,
     noteDedupeChecked: result.noteDedupeChecked,
     plannedMutations: result.plannedMutations,
     verified: result.verified,
@@ -3982,7 +3999,7 @@ async function applyApprovedTriageAction(params: {
       result.plannedMutations = [];
     }
     if (markNotePlanned(result, action.note)) {
-      result.noteDedupeChecked = params.dedupeNotes;
+      markNoteDedupePlanned(result, action.note, params.dedupeNotes);
       result.plannedMutations = [...(result.plannedMutations ?? []), "createTicketNote"];
     }
     result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
@@ -4403,7 +4420,16 @@ async function ambiguityCheckedTriageResult(params: {
     result.writeAttempted = true;
     result.writeMethod = "createTicketNote";
     const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
-    if (await existingNoteMatchesFingerprint(client, ticket.ticketId, fingerprint)) {
+    if (fingerprint) {
+      result.notePlanned = true;
+      result.noteDedupePlanned = true;
+      result.noteDedupeChecked = false;
+    }
+    const noteDeduped = await existingNoteMatchesFingerprint(client, ticket.ticketId, fingerprint);
+    if (fingerprint) {
+      result.noteDedupeChecked = true;
+    }
+    if (noteDeduped) {
       result.noteDeduped = true;
       result.finalOutcome = "Updated";
       result.verified = true;

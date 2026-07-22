@@ -134,6 +134,13 @@ const LIVE_RESOLVE_PLUS_NOTE_REGRESSION = {
   },
 };
 
+const DRY_RUN_NOTE_DEDUPE_REGRESSION = {
+  operationId: "a9574d2c-11cc-4c1e-b8e9-6ccd3a923c94",
+  ticketNumber: "58824",
+  ticketId: "ticket-58824",
+  note: "JUNK",
+};
+
 function ticketField(
   columnName: string,
   values: string[],
@@ -3473,6 +3480,8 @@ describe("Tickets Domain", () => {
       finalOutcome: "Updated",
       noteAdded: false,
       noteDeduped: true,
+      noteDedupePlanned: true,
+      noteDedupeChecked: true,
       verified: true,
     });
     expect(mockClient.mutate).not.toHaveBeenCalled();
@@ -4159,6 +4168,7 @@ describe("Tickets Domain", () => {
       finalOutcome: "Resolved",
       noteAdded: true,
       noteDeduped: false,
+      noteDedupePlanned: true,
       noteDedupeChecked: true,
       verified: true,
     });
@@ -4197,6 +4207,7 @@ describe("Tickets Domain", () => {
       finalOutcome: "Resolved",
       noteAdded: false,
       noteDeduped: true,
+      noteDedupePlanned: true,
       noteDedupeChecked: true,
       verified: true,
     });
@@ -4232,7 +4243,66 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
-  it("dry-runs the complete resolve-plus-private-note plan with zero writes", async () => {
+  it("dry-runs the complete resolve-plus-private-note plan with planned but unchecked note dedupe", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: DRY_RUN_NOTE_DEDUPE_REGRESSION.ticketId,
+          displayId: DRY_RUN_NOTE_DEDUPE_REGRESSION.ticketNumber }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: DRY_RUN_NOTE_DEDUPE_REGRESSION.ticketId,
+          displayId: DRY_RUN_NOTE_DEDUPE_REGRESSION.ticketNumber, status: "New Calls",
+          updatedTime: "2026-07-22T09:00:00Z" },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      batchId: DRY_RUN_NOTE_DEDUPE_REGRESSION.operationId,
+      dryRun: true,
+      expectedCandidateTicketNumbers: [DRY_RUN_NOTE_DEDUPE_REGRESSION.ticketNumber],
+      actions: [{
+        ticketNumber: DRY_RUN_NOTE_DEDUPE_REGRESSION.ticketNumber,
+        expectedTicketId: DRY_RUN_NOTE_DEDUPE_REGRESSION.ticketId,
+        expectedUpdatedTime: "2026-07-22T09:00:00Z",
+        contentVerified: true,
+        action: "resolve",
+        note: DRY_RUN_NOTE_DEDUPE_REGRESSION.note,
+        target: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target,
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    const noteReadCalls = mockClient.query.mock.calls.filter(([query]) =>
+      String(query).includes("getTicketNoteList")
+    );
+    const stored = await getOperationStore().get(DRY_RUN_NOTE_DEDUPE_REGRESSION.operationId);
+    if (!stored) throw new Error("missing dry-run note-dedupe operation");
+    const operationView = operationResultView(stored);
+
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+    expect(noteReadCalls).toHaveLength(0);
+    expect(parsed.execution?.requestsByType?.duplicateNoteCheck).toBeUndefined();
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved",
+      writeAttempted: false,
+      writeMethod: "dryRun",
+      notePlanned: true,
+      noteDedupePlanned: true,
+      noteDedupeChecked: false,
+      noteAdded: false,
+      noteDeduped: false,
+      plannedMutations: ["resolve_full", "createTicketNote"],
+    });
+    expect(operationView.results).toEqual(parsed.results);
+    expect(stored.compactResults[0]).toMatchObject({
+      noteDedupePlanned: true,
+      noteDedupeChecked: false,
+      noteAdded: false,
+      noteDeduped: false,
+    });
+  });
+
+  it("dry-runs resolve without note without note planning or note mutation intent", async () => {
     mockClient.query
       .mockResolvedValueOnce({
         getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
@@ -4249,21 +4319,22 @@ describe("Tickets Domain", () => {
       expectedCandidateTicketNumbers: ["57400"],
       actions: [{
         ticketNumber: "57400", expectedUpdatedTime: "2026-07-22T09:00:00Z",
-        contentVerified: true, action: "resolve", note: "JUNK",
+        contentVerified: true, action: "resolve",
         target: LIVE_RESOLVE_PLUS_NOTE_REGRESSION.target,
       }],
     });
     const parsed = JSON.parse(result.content[0].text);
 
-    expect(mockClient.mutate).not.toHaveBeenCalled();
     expect(parsed.results[0]).toMatchObject({
       finalOutcome: "Resolved",
       writeAttempted: false,
-      writeMethod: "dryRun",
-      notePlanned: true,
-      noteDedupeChecked: true,
-      plannedMutations: ["resolve_full", "createTicketNote"],
+      plannedMutations: ["resolve_full"],
     });
+    expect(parsed.results[0].notePlanned).toBeUndefined();
+    expect(parsed.results[0].noteDedupePlanned).toBeUndefined();
+    expect(parsed.results[0].noteDedupeChecked).toBeUndefined();
+    expect(parsed.results[0].plannedMutations).not.toContain("createTicketNote");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
   it("reports a partial outcome when resolution succeeds but private note creation fails", async () => {
@@ -4365,6 +4436,14 @@ describe("Tickets Domain", () => {
       outcome: "Resolved",
       verificationState: "Verified",
     });
+    expect(finalRecord?.compactResults).toContainEqual(expect.objectContaining({
+      ticketNumber: "57401",
+      finalOutcome: "Resolved",
+      noteDedupePlanned: true,
+      noteDedupeChecked: true,
+      noteAdded: true,
+      noteDeduped: false,
+    }));
   });
 
   it("does not attempt resolve fallback on mandatory validation errors", async () => {
