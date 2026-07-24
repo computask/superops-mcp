@@ -371,7 +371,6 @@ describe("Tickets Domain", () => {
     expect(update?.properties.target.properties).toEqual(
       expect.objectContaining({
         status: expect.any(Object),
-        priority: expect.any(Object),
         impact: expect.any(Object),
         urgency: expect.any(Object),
         category: expect.any(Object),
@@ -387,9 +386,8 @@ describe("Tickets Domain", () => {
 
     const resolve = variants.find((variant) => variant.properties.action.const === "resolve");
     expect(resolve?.properties.target.required).toEqual([
-      "category", "priority", "impact", "subcategory", "cause", "resolutionCode",
+      "category", "impact", "subcategory", "cause", "resolutionCode",
     ]);
-
     const addNote = variants.find((variant) => variant.properties.action.const === "addNote");
     expect(addNote?.required).toEqual(
       expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "note"])
@@ -3862,13 +3860,13 @@ describe("Tickets Domain", () => {
           status: "New Calls",
         },
       })
-      .mockResolvedValueOnce({ getFields: [ticketField("priority", ["High"])] })
+      .mockResolvedValueOnce({ getFields: [ticketField("impact", ["High"])] })
       .mockResolvedValueOnce({
         getTicket: {
           ticketId: "ticket-57400",
           displayId: "57400",
           status: "Worked on",
-          priority: "High",
+          impact: "High",
         },
       });
     mockClient.mutate.mockResolvedValueOnce({
@@ -3883,7 +3881,7 @@ describe("Tickets Domain", () => {
           ticketNumber: "57400",
           contentVerified: true,
           action: "update",
-          target: { status: "Worked on", priority: "High" },
+          target: { status: "Worked on", impact: "High" },
         },
       ],
     });
@@ -3891,7 +3889,7 @@ describe("Tickets Domain", () => {
 
     expect(mockClient.mutate).toHaveBeenCalledWith(
       expect.stringContaining("updateTicket"),
-      { input: { ticketId: "ticket-57400", status: "Worked on", priority: "High" } }
+      { input: { ticketId: "ticket-57400", status: "Worked on", impact: "High" } }
     );
     expect(parsed.results[0]).toMatchObject({
       finalOutcome: "Updated",
@@ -3900,6 +3898,272 @@ describe("Tickets Domain", () => {
     });
   });
 
+
+  it("treats legacy triage update priority as derived and still adds the private note after writable fields verify", async () => {
+    await runWithOperationStore({}, async () => {
+      mockClient.query
+        .mockResolvedValueOnce({
+          getTicketList: {
+            tickets: [{ ticketId: "ticket-59004", displayId: "59004" }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        })
+        .mockResolvedValueOnce({
+          getTicket: {
+            ticketId: "ticket-59004",
+            displayId: "59004",
+            status: "New Calls",
+            impact: "Medium",
+            urgency: "Low",
+            priority: "Medium",
+            updatedTime: "2026-07-24T08:00:00Z",
+          },
+        })
+        .mockResolvedValueOnce({ getFields: [ticketField("impact", ["Low"]), ticketField("urgency", ["Medium"])] })
+        .mockResolvedValueOnce({ getTicketNoteList: [] })
+        .mockResolvedValueOnce({
+          getTicket: {
+            ticketId: "ticket-59004",
+            displayId: "59004",
+            status: "New Calls",
+            impact: "Low",
+            urgency: "Medium",
+            priority: "Low",
+            updatedTime: "2026-07-24T08:01:00Z",
+          },
+        });
+      mockClient.mutate
+        .mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-59004", displayId: "59004" } })
+        .mockResolvedValueOnce({
+          createTicketNote: {
+            noteId: "note-derived-priority",
+            content: "Writable fields verified",
+            privacyType: "PRIVATE",
+          },
+        });
+
+      const result = await runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "derived-priority-update-59004",
+          expectedCandidateTicketNumbers: ["59004"],
+          actions: [{
+            ticketNumber: "59004",
+            expectedStatus: "New Calls",
+            expectedUpdatedTime: "2026-07-24T08:00:00Z",
+            contentVerified: true,
+            action: "update",
+            target: { impact: "Low", urgency: "Medium", priority: "Medium" },
+            note: "Writable fields verified",
+          }],
+        })
+      );
+      const parsed = JSON.parse(result.content[0].text);
+      const stored = await getOperationStore().get("derived-priority-update-59004");
+      const storedResult = stored?.compactResults[0] as Record<string, unknown> | undefined;
+
+      expect(result.isError).not.toBe(true);
+      expect(mockClient.mutate).toHaveBeenNthCalledWith(
+        1,
+        expect.stringContaining("updateTicket"),
+        { input: { ticketId: "ticket-59004", impact: "Low", urgency: "Medium" } }
+      );
+      expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
+      expect(mockClient.mutate).toHaveBeenNthCalledWith(
+        2,
+        expect.stringContaining("createTicketNote"),
+        expect.objectContaining({ input: expect.objectContaining({ privacyType: "PRIVATE" }) })
+      );
+      expect(parsed.results[0]).toMatchObject({
+        finalOutcome: "Updated",
+        verified: true,
+        noteAdded: true,
+        requestedState: { impact: "Low", urgency: "Medium" },
+        writableTargetState: { impact: "Low", urgency: "Medium" },
+        derivedReadOnlyState: { priority: "Medium" },
+        ignoredTargetFields: [{ field: "priority", value: "Medium", reason: expect.stringContaining("derived") }],
+        attemptedState: { ticketId: "ticket-59004", impact: "Low", urgency: "Medium" },
+        observedFinalState: expect.objectContaining({ impact: "Low", urgency: "Medium", priority: "Low" }),
+      });
+      expect(parsed.results[0].requestedState).not.toHaveProperty("priority");
+      expect(parsed.results[0].attemptedState).not.toHaveProperty("priority");
+      expect(storedResult).toMatchObject({
+        requestedState: parsed.results[0].requestedState,
+        writableTargetState: parsed.results[0].writableTargetState,
+        derivedReadOnlyState: parsed.results[0].derivedReadOnlyState,
+        ignoredTargetFields: parsed.results[0].ignoredTargetFields,
+        observedFinalState: expect.objectContaining({ priority: "Low" }),
+      });
+
+      const mutateCallsBeforeResume = mockClient.mutate.mock.calls.length;
+      await resumeApplyTriageOperation({
+        operationId: "derived-priority-update-59004",
+        ownerHash: stored?.ownerHash ?? currentOwnerHash(),
+        leaseOwner: "derived-priority-completed-resume",
+      });
+      expect(mockClient.mutate).toHaveBeenCalledTimes(mutateCallsBeforeResume);
+    });
+  });
+
+  it("does not send priority for triage resolve actions with impact and urgency", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-59005", displayId: "59005" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-59005",
+          displayId: "59005",
+          status: "New Calls",
+          updatedTime: "2026-07-24T08:00:00Z",
+        },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-59005",
+          displayId: "59005",
+          status: "Resolved",
+          ...RESOLVED_CLASSIFICATION,
+          priority: "Low",
+          urgency: "Medium",
+        },
+      });
+    mockClient.mutate.mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-59005", displayId: "59005" } });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["59005"],
+      actions: [{
+        ticketNumber: "59005",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-24T08:00:00Z",
+        contentVerified: true,
+        action: "resolve",
+        target: { ...RESOLVED_CLASSIFICATION, priority: "Medium", urgency: "Medium", status: "Resolved" },
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).not.toBe(true);
+    expect(mockClient.mutate.mock.calls[0][1].input).toMatchObject({
+      ticketId: "ticket-59005",
+      status: "Resolved",
+      suppressCloseNotification: true,
+      impact: "Low",
+      urgency: "Medium",
+    });
+    expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved",
+      verified: true,
+      derivedReadOnlyState: { priority: "Medium" },
+      observedFinalState: expect.objectContaining({ priority: "Low" }),
+    });
+  });
+
+  it.each([
+    ["impact", { impact: "High", urgency: "Medium", priority: "Low" }, '"field":"impact"'],
+    ["urgency", { impact: "Low", urgency: "High", priority: "Low" }, '"field":"urgency"'],
+  ] as const)("still fails triage update verification when %s mismatches", async (_fieldName, finalFields, expectedMismatch) => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-59006", displayId: "59006" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-59006",
+          displayId: "59006",
+          status: "New Calls",
+          updatedTime: "2026-07-24T08:00:00Z",
+        },
+      })
+      .mockResolvedValueOnce({ getFields: [ticketField("impact", ["Low"]), ticketField("urgency", ["Medium"])] })
+      .mockResolvedValueOnce({ getTicketNoteList: [] })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-59006",
+          displayId: "59006",
+          status: "New Calls",
+          ...finalFields,
+        },
+      });
+    mockClient.mutate.mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-59006", displayId: "59006" } });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["59006"],
+      actions: [{
+        ticketNumber: "59006",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-24T08:00:00Z",
+        contentVerified: true,
+        action: "update",
+        target: { impact: "Low", urgency: "Medium", priority: "Medium" },
+        note: "Should wait for verified writable fields",
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Failed",
+      verified: false,
+      failureStage: "verifyFinalState",
+      noteAdded: false,
+    });
+    expect(parsed.results[0].failureReason).toContain(expectedMismatch);
+    expect(parsed.results[0].failureReason).not.toContain('"field":"priority"');
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report legacy priority as a planned dry-run mutation", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-59007", displayId: "59007" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-59007",
+          displayId: "59007",
+          status: "New Calls",
+          priority: "Low",
+          updatedTime: "2026-07-24T08:00:00Z",
+        },
+      })
+      .mockResolvedValueOnce({ getFields: [ticketField("impact", ["Low"]), ticketField("urgency", ["Medium"])] });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["59007"],
+      dryRun: true,
+      actions: [{
+        ticketNumber: "59007",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-24T08:00:00Z",
+        contentVerified: true,
+        action: "update",
+        target: { impact: "Low", urgency: "Medium", priority: "Medium" },
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Updated",
+      writeAttempted: false,
+      writeMethod: "dryRun",
+      plannedMutations: ["update"],
+      requestedState: { impact: "Low", urgency: "Medium" },
+      derivedReadOnlyState: { priority: "Medium" },
+    });
+    expect(parsed.results[0].requestedState).not.toHaveProperty("priority");
+    expect(parsed.results[0].attemptedState).toBeNull();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
   it("maps approved resolve mandatory fields from action.target and validates them", async () => {
     mockClient.query
       .mockResolvedValueOnce({
@@ -3950,7 +4214,12 @@ describe("Tickets Domain", () => {
           ticketId: "ticket-57400",
           status: "Resolved",
           suppressCloseNotification: true,
-          ...RESOLVED_CLASSIFICATION,
+          impact: RESOLVED_CLASSIFICATION.impact,
+          urgency: RESOLVED_CLASSIFICATION.urgency,
+          category: RESOLVED_CLASSIFICATION.category,
+          subcategory: RESOLVED_CLASSIFICATION.subcategory,
+          cause: RESOLVED_CLASSIFICATION.cause,
+          resolutionCode: RESOLVED_CLASSIFICATION.resolutionCode,
         },
       }
     );
@@ -4341,8 +4610,14 @@ describe("Tickets Domain", () => {
         ticketId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketId,
         status: "Resolved",
         client: { accountId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientId },
-        ...RESOLVED_CLASSIFICATION,
+        impact: RESOLVED_CLASSIFICATION.impact,
+        urgency: RESOLVED_CLASSIFICATION.urgency,
+        category: RESOLVED_CLASSIFICATION.category,
+        subcategory: RESOLVED_CLASSIFICATION.subcategory,
+        cause: RESOLVED_CLASSIFICATION.cause,
+        resolutionCode: RESOLVED_CLASSIFICATION.resolutionCode,
       });
+      expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
       expect(parsed.results[0]).toMatchObject({
         finalOutcome: "PartialResolveStatusMissing",
         writeMethod: "resolve_full",
@@ -6639,7 +6914,7 @@ describe("Tickets triage execution budget", () => {
         }
         if (query.includes("getFields")) {
           clock.advanceTo(21_702);
-          return { getFields: [ticketField("priority", ["High"])] };
+          return { getFields: [ticketField("impact", ["High"])] };
         }
         throw new Error("unexpected query");
       });
@@ -6661,7 +6936,7 @@ describe("Tickets triage execution budget", () => {
               expectedUpdatedTime: "2026-07-22T08:30:00.000Z",
               contentVerified: true,
               action: "update",
-              target: { priority: "High" },
+              target: { impact: "High" },
             }],
           })
         )

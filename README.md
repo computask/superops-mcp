@@ -417,7 +417,7 @@ the tool re-reads metadata. It attempts one update fallback only when the intend
 resolution is absent and `updatedTime` is unchanged. A visible resolution, changed
 `updatedTime`, ambiguous read, or validation failure blocks fallback.
 
-Update and resolve actions are always re-read before success is reported. Every requested target field must match the final state; otherwise the outcome is `Failed` with `failureStage: "verifyFinalState"` and `partialWrite: true`. Private notes are added only after that verification succeeds. Note dedupe trims text, collapses whitespace, and compares case-insensitively.
+Update and resolve actions are always re-read before success is reported. Every writable requested target field must match the final state; otherwise the outcome is `Failed` with `failureStage: "verifyFinalState"` and `partialWrite: true`. Priority is derived from impact and urgency, so `superops_tickets_apply_triage_plan` does not publish priority as a writable target, does not send it in `UpdateTicketInput`, and ignores legacy `target.priority` for writes and independent verification while reporting it as a derived/read-only field. Private notes are added only after writable-field verification succeeds. Note dedupe trims text, collapses whitespace, and compares case-insensitively.
 
 For direct human-client tickets that remain in New Calls, use an operational note: classify it, state that it remains for manual engineer reply, and direct the engineer to review the original request, confirm it, and reply before progressing. Rate limits are reported with `failureStage: "rateLimit"`;
 the tool does not perform ad hoc repeated retries.

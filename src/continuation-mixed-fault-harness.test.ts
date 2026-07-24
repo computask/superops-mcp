@@ -156,7 +156,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       } else if (index === 37) {
         actions.push({ ...common, action: "skip" });
       } else if (index % 29 === 0) {
-        actions.push({ ...common, action: "update", target: { priority: "not-a-live-option" } });
+        actions.push({ ...common, action: "update", target: { impact: "not-a-live-option" } });
       } else if (index % 31 === 0) {
         tickets.get(ticketNumber)!.updatedTime = "2026-07-18T10:00:01.000Z";
         actions.push({ ...common, action: "update", target: { status: "Awaiting Engineer" } });
@@ -170,7 +170,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
     }
     // Deterministic representative injected transport faults, selected after
     // action construction so each maps to an actual mutation-capable item.
-    const mutationCandidates = actions.filter((action) => action.action !== "update" || (action.target as { priority?: string }).priority !== "not-a-live-option")
+    const mutationCandidates = actions.filter((action) => action.action !== "update" || (action.target as { impact?: string }).impact !== "not-a-live-option")
       .filter((action) => tickets.get(String(action.ticketNumber))!.updatedTime.endsWith("00.000Z"));
     const updateCandidate = mutationCandidates.find((action) => action.action === "update")!;
     const resolveCandidate = mutationCandidates.find((action) => action.action === "resolve")!;

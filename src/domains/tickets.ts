@@ -194,6 +194,18 @@ const RESOLVED_REQUIRED_FIELDS = [
   ...RESOLVED_REQUIRED_OPTION_FIELDS,
   "category",
 ] as const;
+const TRIAGE_RESOLVED_REQUIRED_OPTION_FIELDS = [
+  "impact",
+  "subcategory",
+  "cause",
+  "resolutionCode",
+] as const satisfies readonly ValidatedTicketOptionField[];
+const TRIAGE_RESOLVED_REQUIRED_FIELDS = [
+  ...TRIAGE_RESOLVED_REQUIRED_OPTION_FIELDS,
+  "category",
+] as const;
+const TRIAGE_DERIVED_PRIORITY_IGNORE_REASON =
+  "Priority is derived from impact and urgency; target.priority is ignored for triage writes and verification.";
 
 const TICKET_OPTION_FIELD_LABELS: Record<ValidatedTicketOptionField, string> = {
   priority: "priority",
@@ -670,9 +682,8 @@ interface ApplyTriagePlanParams {
 }
 
 const TRIAGE_PLAN_ACTION_TYPES = ["resolve", "update", "addNote", "leave", "skip"] as const;
-const TRIAGE_PLAN_UPDATE_TARGET_FIELDS = [
+const TRIAGE_PLAN_WRITABLE_TARGET_FIELDS = [
   "status",
-  "priority",
   "impact",
   "urgency",
   "category",
@@ -683,6 +694,11 @@ const TRIAGE_PLAN_UPDATE_TARGET_FIELDS = [
   "clientName",
   "clientId",
   "suppressCloseNotification",
+] as const;
+const TRIAGE_PLAN_DERIVED_READONLY_TARGET_FIELDS = ["priority"] as const;
+const TRIAGE_PLAN_ACCEPTED_TARGET_FIELDS = [
+  ...TRIAGE_PLAN_WRITABLE_TARGET_FIELDS,
+  ...TRIAGE_PLAN_DERIVED_READONLY_TARGET_FIELDS,
 ] as const;
 
 const TRIAGE_PLAN_ACTION_FIELD_NAMES = [
@@ -706,7 +722,7 @@ const TRIAGE_PLAN_ACTION_FIELD_NAMES = [
   "allowWriteWithoutVerifiedContent",
 ] as const;
 const TRIAGE_PLAN_ACTION_FIELD_SET = new Set<string>(TRIAGE_PLAN_ACTION_FIELD_NAMES);
-const TRIAGE_PLAN_TARGET_FIELD_SET = new Set<string>(TRIAGE_PLAN_UPDATE_TARGET_FIELDS);
+const TRIAGE_PLAN_TARGET_FIELD_SET = new Set<string>(TRIAGE_PLAN_ACCEPTED_TARGET_FIELDS);
 
 const TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES = {
   ticketNumber: {
@@ -764,7 +780,6 @@ const TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES = {
     enum: [...VALID_TICKET_STATUSES],
     description: "Target ticket status, e.g. Awaiting Engineer.",
   },
-  priority: { type: "string", description: "Target priority display value from SuperOps field options." },
   impact: { type: "string", description: "Target impact display value from SuperOps field options." },
   urgency: { type: "string", description: "Target urgency display value from SuperOps field options." },
   category: { type: "string", enum: [...VALID_TICKET_CATEGORIES], description: "Target ticket category." },
@@ -781,7 +796,7 @@ const TRIAGE_PLAN_UPDATE_TARGET_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES,
-  anyOf: TRIAGE_PLAN_UPDATE_TARGET_FIELDS.map((field) => ({ required: [field] })),
+  anyOf: TRIAGE_PLAN_WRITABLE_TARGET_FIELDS.map((field) => ({ required: [field] })),
 } as const;
 
 const TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA = {
@@ -796,7 +811,7 @@ const TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA = {
       description: "Final resolve status. Defaults to Resolved.",
     },
   },
-  required: ["category", "priority", "impact", "subcategory", "cause", "resolutionCode"],
+  required: ["category", "impact", "subcategory", "cause", "resolutionCode"],
 } as const;
 
 const TRIAGE_PLAN_ACTION_SCHEMA = {
@@ -899,6 +914,9 @@ interface ApplyTriagePlanResult {
   partialWrite: boolean;
   requestedState?: Record<string, unknown> | null;
   attemptedState?: Record<string, unknown> | null;
+  writableTargetState?: Record<string, unknown> | null;
+  derivedReadOnlyState?: Record<string, unknown> | null;
+  ignoredTargetFields?: Array<{ field: string; value: unknown; reason: string }>;
   observedFinalState?: Record<string, unknown> | null;
   verifiedState?: Record<string, unknown> | null;
   /** Compact retry metadata only; never include an upstream response body. */
@@ -1099,7 +1117,7 @@ function validateTriagePlanActionShape(rawAction: unknown, index: number): strin
     if (!target) {
       return `${label} update action requires target with at least one mutable ticket field.`;
     }
-    const hasRecognizedTarget = TRIAGE_PLAN_UPDATE_TARGET_FIELDS.some(
+    const hasRecognizedTarget = TRIAGE_PLAN_WRITABLE_TARGET_FIELDS.some(
       (field) => target[field] !== undefined
     );
     if (!hasRecognizedTarget) {
@@ -2697,7 +2715,7 @@ function stringValue(value: unknown): string | undefined {
 
 function ticketClassificationValue(
   ticket: Ticket,
-  fieldName: (typeof RESOLVED_REQUIRED_FIELDS)[number]
+  fieldName: (typeof RESOLVED_REQUIRED_FIELDS)[number] | (typeof TRIAGE_RESOLVED_REQUIRED_FIELDS)[number]
 ): string | undefined {
   return stringValue((ticket as unknown as Record<string, unknown>)[fieldName]);
 }
@@ -2718,12 +2736,14 @@ function validateResolvedTicketFields(params: {
   optionParams: TicketClassificationParams;
   optionFields: Map<ValidatedTicketOptionField, SuperOpsField>;
   input: Record<string, unknown>;
+  requiredOptionFields?: readonly ValidatedTicketOptionField[];
 }): StructuredValidationFailure | undefined {
   const missingFields: string[] = [];
   const invalidFields: Record<string, string> = {};
+  const requiredOptionFields = params.requiredOptionFields ?? RESOLVED_REQUIRED_OPTION_FIELDS;
   const validOptions = validOptionsForFields(
     params.optionFields,
-    RESOLVED_REQUIRED_OPTION_FIELDS
+    requiredOptionFields
   );
   validOptions.category = [...VALID_TICKET_CATEGORIES];
 
@@ -2736,7 +2756,7 @@ function validateResolvedTicketFields(params: {
     params.input.category = category;
   }
 
-  for (const fieldName of RESOLVED_REQUIRED_OPTION_FIELDS) {
+  for (const fieldName of requiredOptionFields) {
     const value = stringValue(params.optionParams[fieldName]);
     if (!value) {
       missingFields.push(fieldName);
@@ -3054,6 +3074,34 @@ function ticketVerificationValue(ticket: Ticket, field: string): unknown {
   return (ticket as unknown as Record<string, unknown>)[field];
 }
 
+function triageWritableTargetState(action?: TriagePlanAction): Record<string, unknown> | null {
+  const target = action?.target;
+  if (!target) return null;
+  const writable = Object.fromEntries(
+    TRIAGE_PLAN_WRITABLE_TARGET_FIELDS.flatMap((field) =>
+      target[field] !== undefined ? [[field, target[field]] as const] : []
+    )
+  );
+  return Object.keys(writable).length > 0 ? writable : null;
+}
+
+function triageDerivedReadOnlyState(action?: TriagePlanAction): Record<string, unknown> | null {
+  const target = action?.target;
+  if (!target) return null;
+  const derived = Object.fromEntries(
+    TRIAGE_PLAN_DERIVED_READONLY_TARGET_FIELDS.flatMap((field) =>
+      target[field] !== undefined ? [[field, target[field]] as const] : []
+    )
+  );
+  return Object.keys(derived).length > 0 ? derived : null;
+}
+
+function ignoredTriageTargetFields(action?: TriagePlanAction): Array<{ field: string; value: unknown; reason: string }> | undefined {
+  const target = action?.target;
+  if (!target || target.priority === undefined) return undefined;
+  return [{ field: "priority", value: target.priority, reason: TRIAGE_DERIVED_PRIORITY_IGNORE_REASON }];
+}
+
 function compareTicketValue(expected: unknown, actual: unknown): boolean {
   if (typeof expected === "string" && typeof actual === "string") {
     return expected.trim() === actual.trim();
@@ -3069,7 +3117,7 @@ function verifyFinalTargetState(
   const requested: { field: string; expected: unknown }[] = [];
 
   for (const field of [
-    "status", "priority", "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
+    "status", "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
   ] as const) {
     if (target[field] !== undefined) {
       requested.push({ field, expected: target[field] });
@@ -3115,6 +3163,8 @@ function baseApplyResult(
   action?: TriagePlanAction,
   ticket?: Ticket
 ): ApplyTriagePlanResult {
+  const writableTargetState = triageWritableTargetState(action);
+  const derivedReadOnlyState = triageDerivedReadOnlyState(action);
   return {
     ticketNumber,
     ticketId: ticket?.ticketId,
@@ -3144,8 +3194,11 @@ function baseApplyResult(
     finalVerificationState: "NotRequired",
     terminalReason: null,
     partialWrite: false,
-    requestedState: action?.target ? { ...action.target } : null,
+    requestedState: writableTargetState,
     attemptedState: null,
+    writableTargetState,
+    derivedReadOnlyState,
+    ignoredTargetFields: ignoredTriageTargetFields(action),
     observedFinalState: ticket ? ticketFinalState(ticket) : null,
     verifiedState: null,
   };
@@ -3345,7 +3398,7 @@ async function buildApprovedUpdateInput(
     client,
     target,
     input,
-    ["priority", "impact", "urgency", "resolutionCode", "cause", "subcategory"]
+    ["impact", "urgency", "resolutionCode", "cause", "subcategory"]
   );
   if (optionValidationError) {
     return { error: optionValidationError };
@@ -3405,7 +3458,6 @@ async function buildApprovedResolveInput(
   }
 
   const optionParams: TicketClassificationParams = {
-    priority: target.priority,
     impact: target.impact,
     urgency: target.urgency,
     category: target.category,
@@ -3419,17 +3471,17 @@ async function buildApprovedResolveInput(
     requestedValidatedOptionFields(optionParams)
   );
   if (requiresResolvedPreflight) {
-    for (const fieldName of RESOLVED_REQUIRED_OPTION_FIELDS) {
+    for (const fieldName of TRIAGE_RESOLVED_REQUIRED_OPTION_FIELDS) {
       optionFieldsToFetch.add(fieldName);
     }
   }
 
   if (
     requiresResolvedPreflight &&
-    RESOLVED_REQUIRED_FIELDS.some((fieldName) => !optionParams[fieldName])
+    TRIAGE_RESOLVED_REQUIRED_FIELDS.some((fieldName) => !optionParams[fieldName])
   ) {
     const sourceTicket = currentTicket ?? await getTicketByInternalId(client, ticketId);
-    for (const fieldName of RESOLVED_REQUIRED_FIELDS) {
+    for (const fieldName of TRIAGE_RESOLVED_REQUIRED_FIELDS) {
       if (!optionParams[fieldName]) {
         optionParams[fieldName] = ticketClassificationValue(sourceTicket, fieldName);
       }
@@ -3445,6 +3497,7 @@ async function buildApprovedResolveInput(
       optionParams,
       optionFields,
       input,
+      requiredOptionFields: TRIAGE_RESOLVED_REQUIRED_OPTION_FIELDS,
     });
     if (validationError) {
       return { error: JSON.stringify(validationError) };
@@ -3452,8 +3505,8 @@ async function buildApprovedResolveInput(
 
     const optionalOptionFields = requestedValidatedOptionFields(optionParams).filter(
       (fieldName) =>
-        !RESOLVED_REQUIRED_OPTION_FIELDS.includes(
-          fieldName as (typeof RESOLVED_REQUIRED_OPTION_FIELDS)[number]
+        !TRIAGE_RESOLVED_REQUIRED_OPTION_FIELDS.includes(
+          fieldName as (typeof TRIAGE_RESOLVED_REQUIRED_OPTION_FIELDS)[number]
         )
     );
     const optionalValidationError = addValidatedTicketOptionUpdatesFromFields(
@@ -3980,6 +4033,9 @@ function compactApplyResult(result: ApplyTriagePlanResult): Record<string, unkno
     partialWrite: result.partialWrite,
     requestedState: result.requestedState,
     attemptedState: result.attemptedState,
+    writableTargetState: result.writableTargetState,
+    derivedReadOnlyState: result.derivedReadOnlyState,
+    ignoredTargetFields: result.ignoredTargetFields,
     observedFinalState: result.observedFinalState,
     verifiedState: result.verifiedState,
     finalState: result.finalState,
@@ -4967,7 +5023,7 @@ function createApplyTriageContinuationAdapter(
       }
       const target = action.target ?? {};
       const optionLookup = action.action === "resolve" ||
-        [target.priority, target.impact, target.urgency, target.resolutionCode,
+        [target.impact, target.urgency, target.resolutionCode,
           target.cause, target.subcategory].some(Boolean) ? 1 : 0;
       const clientLookup = target.clientName && !target.clientId ? 1 : 0;
       const techGroupLookup = target.techGroupName ? 1 : 0;
