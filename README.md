@@ -82,7 +82,7 @@ mechanism rather than committing it to this file.
 - MCP endpoint: `https://<your-mcp-host>/mcp`
 - Health endpoint: `https://<your-mcp-host>/health`
 - Required non-secret vars: `AUTH_MODE=env`, `SUPEROPS_SUBDOMAIN=computaskltd`, `SUPEROPS_REGION=us`, `LOG_LEVEL=warn`
-- Non-secret safety defaults: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=false`, `ENABLE_CUSTOM_MUTATION=false`, `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=false`
+- Non-secret safety defaults: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=false`, `ENABLE_CUSTOM_MUTATION=false`, `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=false`, `CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION=false`
 - Execution controls additionally include per-request timeout, CPU guard, continuation/retry/delay/scheduling ceilings, retention, and maximum operation lifetime. The exact committed values are in `wrangler.json` and are described in the continuation runbook.
 - Required secrets: the SuperOps API token Worker secret, plus any OAuth/session secrets required by the deployed auth provider. SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY is also required when durable approved private-note recovery is enabled; store it as a Cloudflare secret and keep it distinct from SUPEROPS_INTERNAL_CONTINUATION_TOKEN.
 - Never commit: API token values, OAuth access/refresh tokens, bearer tokens, Cloudflare service token values, client secrets, private keys, or full request headers
@@ -103,9 +103,10 @@ Safe deployed smoke tools:
 - `superops_tickets_list`
 - `superops_alerts_list`
 - `superops_assets_list`
+- `superops_scripts_list`
 - `superops_technicians_list`
 
-Unreviewed synchronous write tools and custom mutation are blocked by default. The reviewed durable `superops_tickets_apply_triage_plan` remains available, as do read and operation-status tools. Direct ticket writes, alert writes, and `superops_custom_mutation` require an explicit reviewed override and retain only their conservative synchronous ambiguity contract.
+Unreviewed synchronous write tools and custom mutation are blocked by default. The reviewed durable `superops_tickets_apply_triage_plan` remains available, as do read and operation-status tools. Direct ticket writes, alert writes, and `superops_custom_mutation` require an explicit reviewed override and retain only their conservative synchronous ambiguity contract. Saved script execution is separate and remains hidden/blocked unless `CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION=true`.
 
 `superops_custom_mutation` is the highest-risk tool because it accepts custom
 GraphQL mutation text. Audit logs record only safe metadata for custom GraphQL:
@@ -126,6 +127,7 @@ Emergency disable process:
 - Set `MCP_ENABLED=false` to stop MCP tool execution.
 - `ENABLE_WRITE_TOOLS=false` blocks unreviewed synchronous ticket and alert writes; the reviewed durable apply-triage path remains available. Use `MCP_ENABLED=false` for an all-tool emergency stop.
 - Set `ENABLE_CUSTOM_MUTATION=false` to block custom GraphQL mutations.
+- Keep `CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION=false` unless single-asset saved-script execution has been explicitly reviewed for exposure.
 - Re-run the deployment pipeline after changing Worker vars, then verify `/health` and `superops_status`.
 
 Token rotation plan:

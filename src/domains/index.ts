@@ -7,5 +7,6 @@
 export { getClientsTools } from "./clients.js";
 export { getTicketsTools } from "./tickets.js";
 export { getAssetsTools } from "./assets.js";
+export { getScriptsTools } from "./scripts.js";
 export { getTechniciansTools } from "./technicians.js";
 export { getCustomTools } from "./custom.js";

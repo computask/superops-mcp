@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
-export type ToolCategory = "read" | "write" | "custom_query" | "custom_mutation";
+export type ToolCategory = "read" | "write" | "script_execution" | "custom_query" | "custom_mutation";
 
 export interface AuditContext {
   requestId: string;
@@ -12,6 +12,7 @@ export interface AuditContext {
   mcpEnabled: boolean;
   writeToolsEnabled: boolean;
   customMutationEnabled: boolean;
+  scriptExecutionEnabled: boolean;
 }
 
 export interface ToolResult {
@@ -65,6 +66,7 @@ const HIGH_RISK_WRITE_TOOLS = new Set([
   "superops_tickets_log_time",
   "superops_alerts_create",
   "superops_alerts_resolve",
+  "superops_scripts_execute_on_asset",
   "superops_custom_mutation",
 ]);
 
@@ -102,14 +104,16 @@ export function runtimeFlagsFromEnv(env: {
   MCP_ENABLED?: string;
   ENABLE_WRITE_TOOLS?: string;
   ENABLE_CUSTOM_MUTATION?: string;
+  CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION?: string;
 }): Pick<
   AuditContext,
-  "mcpEnabled" | "writeToolsEnabled" | "customMutationEnabled"
+  "mcpEnabled" | "writeToolsEnabled" | "customMutationEnabled" | "scriptExecutionEnabled"
 > {
   return {
     mcpEnabled: enabledFlag(env.MCP_ENABLED, true),
     writeToolsEnabled: enabledFlag(env.ENABLE_WRITE_TOOLS, false),
     customMutationEnabled: enabledFlag(env.ENABLE_CUSTOM_MUTATION, false),
+    scriptExecutionEnabled: env.CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION?.trim().toLowerCase() === "true",
   };
 }
 
@@ -131,6 +135,7 @@ export function runWithAuditContext<T>(
     MCP_ENABLED: readProcessEnv("MCP_ENABLED"),
     ENABLE_WRITE_TOOLS: readProcessEnv("ENABLE_WRITE_TOOLS"),
     ENABLE_CUSTOM_MUTATION: readProcessEnv("ENABLE_CUSTOM_MUTATION"),
+    CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION: readProcessEnv("CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION"),
   });
 
   return RUNTIME_CONTEXT.run(
@@ -143,6 +148,8 @@ export function runWithAuditContext<T>(
       writeToolsEnabled: context.writeToolsEnabled ?? flags.writeToolsEnabled,
       customMutationEnabled:
         context.customMutationEnabled ?? flags.customMutationEnabled,
+      scriptExecutionEnabled:
+        context.scriptExecutionEnabled ?? flags.scriptExecutionEnabled,
     },
     fn
   );
@@ -160,6 +167,7 @@ export function getAuditContext(): AuditContext {
       MCP_ENABLED: readProcessEnv("MCP_ENABLED"),
       ENABLE_WRITE_TOOLS: readProcessEnv("ENABLE_WRITE_TOOLS"),
       ENABLE_CUSTOM_MUTATION: readProcessEnv("ENABLE_CUSTOM_MUTATION"),
+    CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION: readProcessEnv("CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION"),
     }),
   };
 }
@@ -174,6 +182,10 @@ export function classifyTool(name: string): {
 
   if (name === "superops_custom_mutation") {
     return { category: "custom_mutation", highRisk: true };
+  }
+
+  if (name === "superops_scripts_execute_on_asset") {
+    return { category: "script_execution", highRisk: true };
   }
 
   if (HIGH_RISK_WRITE_TOOLS.has(name)) {
@@ -201,6 +213,10 @@ export function blockedToolReason(name: string): string | undefined {
 
   if (!context.customMutationEnabled && name === "superops_custom_mutation") {
     return "Custom GraphQL mutations are disabled by ENABLE_CUSTOM_MUTATION=false.";
+  }
+
+  if (!context.scriptExecutionEnabled && name === "superops_scripts_execute_on_asset") {
+    return "Script execution is disabled by CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION=false.";
   }
 }
 
@@ -289,6 +305,14 @@ const WRITE_FIELD_KEYS: Partial<Record<string, string[]>> = {
     "alertIds",
     "verify",
     "dryRun",
+  ],
+  superops_scripts_execute_on_asset: [
+    "scriptId",
+    "expectedScriptName",
+    "assetId",
+    "expectedAssetNameOrHostname",
+    "expectedClientAccountId",
+    "reviewed",
   ],
 };
 

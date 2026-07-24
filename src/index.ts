@@ -33,6 +33,7 @@
  * - MCP_ENABLED: Set false to disable MCP tool execution
  * - ENABLE_WRITE_TOOLS: Set false to block write-capable ticket tools
  * - ENABLE_CUSTOM_MUTATION: Set false to block custom GraphQL mutations
+ * - CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION: Set true to expose/run saved script execution
  */
 
 import {
@@ -45,10 +46,18 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 import { getCredentials, runWithCredentials } from "./client.js";
-import { createMcpServer } from "./mcp-server.js";
-import { runWithAuditContext, runtimeFlagsFromEnv } from "./audit.js";
+import { blockedToolNamesByCategory, createMcpServer } from "./mcp-server.js";
+import { runWithAuditContext, runtimeFlagsFromEnv, type ToolCategory } from "./audit.js";
 import { envTenantOwnerHash, gatewayOwnerHash } from "./operation-store.js";
 
+
+async function processBlockedToolNames(): Promise<Set<string>> {
+  const categories = new Set<ToolCategory>();
+  if (process.env.CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION !== "true") {
+    categories.add("script_execution");
+  }
+  return blockedToolNamesByCategory(categories);
+}
 /**
  * Start the server with stdio transport (default).
  */
@@ -56,7 +65,7 @@ async function startStdioTransport(): Promise<void> {
   const creds = getCredentials();
   const ownerHash = creds ? await envTenantOwnerHash(creds) : undefined;
   await runWithAuditContext({ ownerHash, ownerIdentityRequired: true }, async () => {
-    const server = createMcpServer();
+    const server = createMcpServer({ blockedToolNames: await processBlockedToolNames() });
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("SuperOps.ai MCP server running on stdio (all tools available)");
@@ -137,6 +146,7 @@ async function startHttpTransport(): Promise<void> {
               MCP_ENABLED: process.env.MCP_ENABLED,
               ENABLE_WRITE_TOOLS: process.env.ENABLE_WRITE_TOOLS,
               ENABLE_CUSTOM_MUTATION: process.env.ENABLE_CUSTOM_MUTATION,
+              CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION: process.env.CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION,
             }),
           },
           async () => {
@@ -160,7 +170,7 @@ async function startHttpTransport(): Promise<void> {
               // Run the entire MCP request inside AsyncLocalStorage context
               // so getCredentials()/getClient() pick up per-request creds
               await runWithCredentials(creds, async () => {
-                const perRequestServer = createMcpServer();
+                const perRequestServer = createMcpServer({ blockedToolNames: await processBlockedToolNames() });
                 const transport = new StreamableHTTPServerTransport({
                   sessionIdGenerator: () => randomUUID(),
                   enableJsonResponse: true,
@@ -173,7 +183,7 @@ async function startHttpTransport(): Promise<void> {
             }
 
             // Non-gateway mode: single server, env-var credentials
-            const perRequestServer = createMcpServer();
+            const perRequestServer = createMcpServer({ blockedToolNames: await processBlockedToolNames() });
             const transport = new StreamableHTTPServerTransport({
               sessionIdGenerator: () => randomUUID(),
               enableJsonResponse: true,

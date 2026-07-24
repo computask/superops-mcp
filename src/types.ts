@@ -318,6 +318,7 @@ export type Domain =
   | "clients"
   | "tickets"
   | "assets"
+  | "scripts"
   | "alerts"
   | "technicians"
   | "custom";

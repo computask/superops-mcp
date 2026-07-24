@@ -143,6 +143,7 @@ function chatGptEnv(overrides: Partial<Env> = {}): Env {
     CHATGPT_AUTH_ACCESS_AUD: ACCESS_AUD,
     CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS: "false",
     CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "false",
+    CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION: "false",
     OAUTH_KV: createMemoryKv(),
     ...overrides,
   };
@@ -362,6 +363,7 @@ describe("ChatGPT direct mutation policy", () => {
       "superops_alerts_resolve",
       "superops_custom_mutation",
       "superops_custom_query",
+      "superops_scripts_execute_on_asset",
       "superops_tickets_add_note",
       "superops_tickets_apply_triage_plan",
       "superops_tickets_create",
@@ -373,6 +375,18 @@ describe("ChatGPT direct mutation policy", () => {
     expect(blocked.has("superops_operations_get")).toBe(false);
   });
 
+
+  it("only exempts script execution when the dedicated script flag is allowed", async () => {
+    const blocked = await chatGptDirectBlockedToolNames({
+      reviewedTriagePlanAllowed: true,
+      scriptExecutionAllowed: true,
+    });
+
+    expect(blocked.has("superops_scripts_execute_on_asset")).toBe(false);
+    expect(blocked.has("superops_tickets_apply_triage_plan")).toBe(false);
+    expect(blocked.has("superops_custom_mutation")).toBe(true);
+    expect(blocked.has("superops_custom_query")).toBe(true);
+  });
   it("only exempts the reviewed durable triage plan when explicitly allowed", async () => {
     const blocked = await chatGptDirectBlockedToolNames({
       reviewedTriagePlanAllowed: true,
@@ -382,6 +396,7 @@ describe("ChatGPT direct mutation policy", () => {
     expect(blocked.has("superops_tickets_add_note")).toBe(true);
     expect(blocked.has("superops_custom_mutation")).toBe(true);
     expect(blocked.has("superops_custom_query")).toBe(true);
+    expect(blocked.has("superops_scripts_execute_on_asset")).toBe(true);
     expect(blocked.has("superops_operations_results")).toBe(false);
   });
 });
@@ -483,6 +498,8 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(names).toContain("superops_tickets_list");
     expect(names).toContain("superops_alerts_list");
     expect(names).toContain("superops_alerts_create");
+    expect(names).toContain("superops_scripts_list");
+    expect(names).not.toContain("superops_scripts_execute_on_asset");
     expect(names.length).toBeGreaterThan(10);
   });
 
@@ -491,6 +508,7 @@ describe("Cloudflare Worker entrypoint", () => {
     const tools = await listPublishedTools({
       ENABLE_WRITE_TOOLS: "true",
       ENABLE_CUSTOM_MUTATION: "true",
+      CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION: "true",
     });
     const byName = toolsByName(tools);
 
@@ -504,6 +522,9 @@ describe("Cloudflare Worker entrypoint", () => {
       EXPECTED_READ_ONLY_ANNOTATIONS
     );
     expect(byName.get("superops_tickets_apply_triage_plan")?.annotations).toEqual(
+      EXPECTED_MUTATING_ANNOTATIONS
+    );
+    expect(byName.get("superops_scripts_execute_on_asset")?.annotations).toEqual(
       EXPECTED_MUTATING_ANNOTATIONS
     );
 
@@ -1511,6 +1532,7 @@ describe("Cloudflare Worker entrypoint", () => {
       "superops_alerts_resolve",
       "superops_custom_mutation",
       "superops_custom_query",
+      "superops_scripts_execute_on_asset",
     ]) {
       expect(names).not.toContain(hidden);
     }
@@ -1669,6 +1691,7 @@ describe("Cloudflare Worker entrypoint", () => {
       "superops_alerts_create",
       "superops_custom_mutation",
       "superops_custom_query",
+      "superops_scripts_execute_on_asset",
     ]) {
       const res = await mcp(
         {
@@ -1753,8 +1776,90 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(names).toContain("superops_custom_mutation");
     expect(names).not.toContain("superops_tickets_apply_triage_plan");
     expect(names).not.toContain("superops_custom_query");
+    expect(names).not.toContain("superops_scripts_execute_on_asset");
   });
 
+
+  it("hides script execution by default while publishing read-only script tools on ChatGPT direct", async () => {
+    const env = chatGptEnv({
+      SUPEROPS_API_TOKEN: "test-token",
+      SUPEROPS_SUBDOMAIN: "acme",
+    });
+    const token = await getOAuthAccessToken(env);
+
+    const list = await mcp(
+      { jsonrpc: "2.0", id: 761, method: "tools/list", params: {} },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+    const listBody = (await list.json()) as { result?: { tools?: PublishedTool[] } };
+    const tools = listBody.result?.tools ?? [];
+    const names = tools.map((tool) => tool.name);
+    expect(names).toContain("superops_scripts_list");
+    expect(names).toContain("superops_scripts_execution_get");
+    expect(names).not.toContain("superops_scripts_execute_on_asset");
+    expect(toolsByName(tools).get("superops_scripts_list")?.annotations).toEqual(
+      EXPECTED_READ_ONLY_ANNOTATIONS
+    );
+
+    const call = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 762,
+        method: "tools/call",
+        params: { name: "superops_scripts_execute_on_asset", arguments: {} },
+      },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+    const callBody = (await call.json()) as { result?: { isError?: boolean; content?: { text?: string }[] } };
+    expect(callBody.result?.isError).toBe(true);
+    expect(callBody.result?.content?.[0]?.text).toMatch(/disabled/i);
+  });
+
+  it("exposes script execution only with the dedicated script flag", async () => {
+    const env = chatGptEnv({
+      SUPEROPS_API_TOKEN: "test-token",
+      SUPEROPS_SUBDOMAIN: "acme",
+      CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION: "true",
+    });
+    const token = await getOAuthAccessToken(env);
+
+    const list = await mcp(
+      { jsonrpc: "2.0", id: 763, method: "tools/list", params: {} },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+    const listBody = (await list.json()) as { result?: { tools?: PublishedTool[] } };
+    const tools = listBody.result?.tools ?? [];
+    const names = tools.map((tool) => tool.name);
+    expect(names).toContain("superops_scripts_execute_on_asset");
+    expect(toolsByName(tools).get("superops_scripts_execute_on_asset")?.annotations).toEqual(
+      EXPECTED_MUTATING_ANNOTATIONS
+    );
+    expect(names).not.toContain("superops_tickets_apply_triage_plan");
+    expect(names).not.toContain("superops_custom_mutation");
+    expect(names).not.toContain("superops_custom_query");
+
+    const call = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 764,
+        method: "tools/call",
+        params: { name: "superops_scripts_execute_on_asset", arguments: {} },
+      },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+    const callBody = (await call.json()) as { result?: { isError?: boolean; content?: { text?: string }[] } };
+    expect(callBody.result?.isError).toBe(true);
+    expect(callBody.result?.content?.[0]?.text).toContain("scriptId is required");
+    expect(callBody.result?.content?.[0]?.text).not.toMatch(/disabled/i);
+  });
   it("does not execute blocked direct-route tools when credentials are present", async () => {
     const env = chatGptEnv({
       SUPEROPS_API_TOKEN: "test-token",
@@ -1785,6 +1890,7 @@ describe("Cloudflare Worker entrypoint", () => {
       for (const name of [
         "superops_custom_query",
         "superops_tickets_apply_triage_plan",
+        "superops_scripts_execute_on_asset",
       ]) {
         const res = await mcp(
           {

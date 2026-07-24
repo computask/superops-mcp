@@ -41,6 +41,11 @@ export const READ_ONLY_TOOL_NAMES = new Set<string>([
   "superops_assets_get",
   "superops_assets_software",
   "superops_assets_patches",
+  "superops_scripts_list",
+  "superops_scripts_get",
+  "superops_scripts_supported_targets",
+  "superops_scripts_executions_list",
+  "superops_scripts_execution_get",
   "superops_alerts_list",
   "superops_alerts_get",
   "superops_alerts_for_asset",
@@ -60,6 +65,7 @@ export const MUTATING_TOOL_NAMES = new Set<string>([
   "superops_tickets_log_time",
   "superops_alerts_resolve",
   "superops_alerts_create",
+  "superops_scripts_execute_on_asset",
   "superops_custom_mutation",
 ]);
 

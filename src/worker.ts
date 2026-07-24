@@ -85,6 +85,7 @@ export interface Env {
   CHATGPT_AUTH_ACCESS_AUD?: string;
   CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS?: string;
   CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN?: string;
+  CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION?: string;
   SUPEROPS_EXECUTION_SUBREQUEST_BUDGET?: string;
   SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN?: string;
   SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH?: string;
@@ -228,6 +229,10 @@ function flagExactlyTrue(value: string | undefined): boolean {
   return value === "true";
 }
 
+function scriptExecutionAllowed(env: Env): boolean {
+  return flagExactlyTrue(env.CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION);
+}
+
 function chatGptDirectReviewedTriagePlanAllowed(env: Env): boolean {
   return (
     flagExactlyTrue(env.CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN) &&
@@ -250,6 +255,7 @@ async function blockedToolNamesForWorkerEnv(
       customMutationsAllowed:
         directMutatingToolsAllowed && flagExactlyTrue(env.ENABLE_CUSTOM_MUTATION),
       reviewedTriagePlanAllowed: chatGptDirectReviewedTriagePlanAllowed(env),
+      scriptExecutionAllowed: scriptExecutionAllowed(env),
     });
   }
 
@@ -260,6 +266,9 @@ async function blockedToolNamesForWorkerEnv(
   }
   if (!flagExactlyTrue(env.ENABLE_CUSTOM_MUTATION)) {
     categories.add("custom_mutation");
+  }
+  if (!scriptExecutionAllowed(env)) {
+    categories.add("script_execution");
   }
 
   return blockedToolNamesByCategory(categories);
