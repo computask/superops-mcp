@@ -195,7 +195,25 @@ const DRY_RUN_NOTE_DEDUPE_REGRESSION = {
   ticketId: "ticket-58824",
   note: "JUNK",
 };
-
+const LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION = {
+  operationIds: [
+    "8d7b83fb-e890-4685-bb9c-79815a85dc1a",
+    "0c61fa84-8f90-478c-8cec-ea6f5283c8d6",
+    "79af4663-9b1d-4a8c-9c56-2d9377c22bd0",
+  ],
+  ticketNumber: "58824",
+  ticketId: "4191204259748139008",
+  clientName: "TaskGroup",
+  clientId: "2993553194649526272",
+  note: "JUNK",
+  target: {
+    status: "Resolved",
+    clientName: "TaskGroup",
+    clientId: "2993553194649526272",
+    suppressCloseNotification: true,
+    ...RESOLVED_CLASSIFICATION,
+  },
+};
 function ticketField(
   columnName: string,
   values: string[],
@@ -3639,7 +3657,7 @@ describe("Tickets Domain", () => {
       writeAttempted: true,
       writeMethod: "resolve_full",
       fallbackAttempted: false,
-      fallbackResult: "Ambiguous resolution response remains unresolved; fallback was not attempted.",
+      fallbackResult: "Fallback was not attempted: Latest verification did not show only a missing resolve status.",
       failureStage: "ambiguousWrite",
       partialWrite: true,
       verified: false,
@@ -4268,6 +4286,262 @@ describe("Tickets Domain", () => {
     });
   });
 
+  it.each(LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.operationIds)(
+    "classifies live partial resolve status-missing operation %s without fallback when the flag is false",
+    async (operationId) => {
+      const currentTicket = {
+        ticketId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketId,
+        displayId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketNumber,
+        subject: "Sales call",
+        status: "New Calls",
+        client: {
+          accountId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientId,
+          name: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientName,
+        },
+        updatedTime: "2026-07-24T09:00:00Z",
+        ...RESOLVED_CLASSIFICATION,
+      };
+      mockClient.query
+        .mockResolvedValueOnce({
+          getTicketList: { tickets: [{ ticketId: currentTicket.ticketId, displayId: currentTicket.displayId }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+        })
+        .mockResolvedValueOnce({ getTicket: currentTicket })
+        .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+        .mockResolvedValueOnce({ getTicketNoteList: [{ noteId: "note-existing-junk", content: "JUNK", privacyType: "PRIVATE" }] })
+        .mockResolvedValueOnce({ getTicket: currentTicket });
+      mockClient.mutate.mockRejectedValueOnce(
+        new SuperOpsError("SuperOps internal server error", "INTERNAL_SERVER_ERROR", undefined, {
+          code: "INTERNAL_SERVER_ERROR",
+          classification: "DataFetchingException",
+          exception: { stacktrace: ["redacted by diagnostics"] },
+        })
+      );
+
+      const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+        batchId: operationId,
+        expectedCandidateTicketNumbers: [LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketNumber],
+        actions: [{
+          ticketNumber: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketNumber,
+          expectedTicketId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketId,
+          expectedStatus: "New Calls",
+          expectedUpdatedTime: "2026-07-24T09:00:00Z",
+          contentVerified: true,
+          action: "resolve",
+          note: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.note,
+          target: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.target,
+        }],
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      const stored = await getOperationStore().get(operationId);
+      if (!stored) throw new Error("missing live partial regression operation");
+
+      expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+      expect(mockClient.mutate.mock.calls[0][1].input).toMatchObject({
+        ticketId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketId,
+        status: "Resolved",
+        client: { accountId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientId },
+        ...RESOLVED_CLASSIFICATION,
+      });
+      expect(parsed.results[0]).toMatchObject({
+        finalOutcome: "PartialResolveStatusMissing",
+        writeMethod: "resolve_full",
+        primaryWriteMethod: "updateTicket.resolve_full",
+        primaryWriteOutcome: "Ambiguous",
+        statusObserved: "New Calls",
+        fallbackEligible: false,
+        fallbackAttempted: false,
+        fallbackWriteMethod: null,
+        terminalReason: "PartialResolveStatusMissing",
+        noteAdded: false,
+        noteDeduped: true,
+        partialWrite: true,
+        verified: false,
+      });
+      expect(parsed.results[0].partialFieldsObserved).toMatchObject({
+        clientName: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientName,
+        clientId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientId,
+        ...RESOLVED_CLASSIFICATION,
+      });
+      expect(parsed.results[0].primaryFailureDiagnostics).toMatchObject({
+        classification: "GraphQLError",
+        graphQLErrorCode: "INTERNAL_SERVER_ERROR",
+        httpStatus: null,
+        graphQLDataPresent: "unknown",
+        partialMutationDataReturned: "unknown",
+      });
+      expect(JSON.stringify(parsed.results[0].primaryFailureDiagnostics)).not.toContain("stacktrace");
+      expect(operationResultView(stored).results).toEqual(parsed.results);
+    }
+  );
+
+  it("uses one status-only fallback when enabled and requested fields already match", async () => {
+    const partialTicket = {
+      ticketId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketId,
+      displayId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketNumber,
+      status: "New Calls",
+      updatedTime: "2026-07-24T09:01:00Z",
+      client: { accountId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientId,
+        name: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientName },
+      ...RESOLVED_CLASSIFICATION,
+    };
+    mockClient.query
+      .mockResolvedValueOnce({ getTicketList: { tickets: [{ ticketId: partialTicket.ticketId, displayId: partialTicket.displayId }],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } })
+      .mockResolvedValueOnce({ getTicket: { ...partialTicket, updatedTime: "2026-07-24T09:00:00Z" } })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({ getTicket: partialTicket })
+      .mockResolvedValueOnce({ getTicket: { ...partialTicket, status: "Resolved", updatedTime: "2026-07-24T09:02:00Z" } });
+    mockClient.mutate
+      .mockRejectedValueOnce(new Error("network response lost after resolve_full"))
+      .mockResolvedValueOnce({ updateTicket: { ticketId: partialTicket.ticketId, status: "Resolved" } });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      batchId: "status-only-fallback-completes",
+      allowResolveFullFallbackToUpdate: true,
+      expectedCandidateTicketNumbers: [LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketNumber],
+      actions: [{
+        ticketNumber: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketNumber,
+        expectedTicketId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketId,
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-24T09:00:00Z",
+        contentVerified: true,
+        action: "resolve",
+        target: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.target,
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(mockClient.mutate.mock.calls[1][1]).toEqual({
+      input: { ticketId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.ticketId, status: "Resolved" },
+    });
+    expect(mockClient.mutate.mock.calls[1][1].input).not.toHaveProperty("client");
+    expect(mockClient.mutate.mock.calls[1][1].input).not.toHaveProperty("priority");
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved",
+      primaryWriteMethod: "updateTicket.resolve_full",
+      primaryWriteOutcome: "Ambiguous",
+      fallbackEligible: true,
+      fallbackAttempted: true,
+      fallbackWriteMethod: "updateTicket.statusOnly",
+      fallbackOutcome: "VerifiedApplied",
+      fallbackResult: "Updated",
+      statusObserved: "Resolved",
+      verified: true,
+      partialWrite: false,
+    });
+    expect(parsed.results[0].physicalWrites).toEqual([
+      { method: "updateTicket.resolve_full", outcome: "Ambiguous" },
+      { method: "updateTicket.statusOnly", outcome: "Accepted" },
+    ]);
+  });
+
+  it("fails closed when status-only fallback verification mismatches", async () => {
+    const partialTicket = {
+      ticketId: "ticket-57400", displayId: "57400", status: "New Calls",
+      updatedTime: "2026-07-24T09:01:00Z",
+      client: { accountId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientId },
+      ...RESOLVED_CLASSIFICATION,
+    };
+    mockClient.query
+      .mockResolvedValueOnce({ getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } })
+      .mockResolvedValueOnce({ getTicket: { ...partialTicket, updatedTime: "2026-07-24T09:00:00Z" } })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({ getTicket: partialTicket })
+      .mockResolvedValueOnce({ getTicket: partialTicket });
+    mockClient.mutate
+      .mockRejectedValueOnce(new Error("lost resolve response"))
+      .mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-57400", status: "Resolved" } });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      allowResolveFullFallbackToUpdate: true,
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{ ticketNumber: "57400", expectedStatus: "New Calls", expectedUpdatedTime: "2026-07-24T09:00:00Z",
+        contentVerified: true, action: "resolve", target: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.target }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Failed",
+      failureStage: "statusOnlyFallbackVerify",
+      fallbackAttempted: true,
+      fallbackOutcome: "Accepted",
+      terminalReason: "StatusOnlyFallbackVerificationMismatch",
+      partialWrite: true,
+      verified: false,
+    });
+  });
+
+  it("verifies an ambiguous status-only fallback write without retrying it", async () => {
+    const partialTicket = {
+      ticketId: "ticket-57400", displayId: "57400", status: "New Calls",
+      updatedTime: "2026-07-24T09:01:00Z",
+      client: { accountId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientId },
+      ...RESOLVED_CLASSIFICATION,
+    };
+    mockClient.query
+      .mockResolvedValueOnce({ getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } })
+      .mockResolvedValueOnce({ getTicket: { ...partialTicket, updatedTime: "2026-07-24T09:00:00Z" } })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({ getTicket: partialTicket })
+      .mockResolvedValueOnce({ getTicket: { ...partialTicket, status: "Resolved", updatedTime: "2026-07-24T09:02:00Z" } });
+    mockClient.mutate
+      .mockRejectedValueOnce(new Error("lost resolve response"))
+      .mockRejectedValueOnce(new Error("lost status-only response"));
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      allowResolveFullFallbackToUpdate: true,
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{ ticketNumber: "57400", expectedStatus: "New Calls", expectedUpdatedTime: "2026-07-24T09:00:00Z",
+        contentVerified: true, action: "resolve", target: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.target }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved",
+      fallbackAttempted: true,
+      fallbackOutcome: "VerifiedAppliedAfterAmbiguous",
+      verified: true,
+      partialWrite: false,
+    });
+  });
+
+  it("blocks status-only fallback when latest updatedTime is unavailable or fields diverge", async () => {
+    const partialTicket = {
+      ticketId: "ticket-57400", displayId: "57400", status: "New Calls",
+      client: { accountId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientId },
+      ...RESOLVED_CLASSIFICATION,
+    };
+    mockClient.query
+      .mockResolvedValueOnce({ getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } })
+      .mockResolvedValueOnce({ getTicket: { ...partialTicket, updatedTime: "2026-07-24T09:00:00Z" } })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({ getTicket: partialTicket });
+    mockClient.mutate.mockRejectedValueOnce(new Error("lost resolve response"));
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      allowResolveFullFallbackToUpdate: true,
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{ ticketNumber: "57400", expectedStatus: "New Calls", expectedUpdatedTime: "2026-07-24T09:00:00Z",
+        contentVerified: true, action: "resolve", target: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.target }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "PartialResolveStatusMissing",
+      fallbackEligible: false,
+      fallbackAttempted: false,
+      terminalReason: "PartialResolveStatusMissing",
+    });
+    expect(parsed.results[0].fallbackResult).toContain("updatedTime");
+  });
   it("blocks public note creation before any resolve write", async () => {
     mockClient.query
       .mockResolvedValueOnce({
@@ -5645,6 +5919,69 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it("does not replay resolve_full or status-only fallback after a fallback-start checkpoint", async () => {
+    const domain = getTicketsTools();
+    await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+      () => domain.handleCall("superops_tickets_apply_triage_plan", {
+        batchId: "status-only-fallback-no-replay",
+        allowResolveFullFallbackToUpdate: true,
+        expectedCandidateTicketNumbers: ["57400", "57401"],
+        actions: [{
+          ticketNumber: "57401", expectedStatus: "New Calls", expectedUpdatedTime: "2026-07-24T09:00:00Z",
+          contentVerified: true, action: "resolve", target: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.target,
+        }],
+      })
+    ));
+    const stored = await getOperationStore().get("status-only-fallback-no-replay");
+    if (!stored) throw new Error("missing fallback no-replay operation");
+    stored.itemStates["57401"] = {
+      ...stored.itemStates["57401"],
+      stage: "ResolutionWriteStarted",
+      mutationType: "resolveFallback",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: true,
+      fallbackAllowed: true,
+      fallbackAttempted: true,
+      attemptCount: 2,
+      verificationState: "Pending",
+      observedMutationResult: "Ambiguous",
+    };
+    await getOperationStore().put(stored);
+    mockClient.query
+      .mockResolvedValueOnce({ getTicketList: { tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } })
+      .mockResolvedValueOnce({ getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls",
+        updatedTime: "2026-07-24T09:01:00Z",
+        client: { accountId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientId },
+        ...RESOLVED_CLASSIFICATION } });
+
+    await runWithExecutionConfig({}, () => runWithExecutionContext(
+      "superops_tickets_apply_triage_plan",
+      () => resumeApplyTriageOperation({
+        operationId: "status-only-fallback-no-replay",
+        ownerHash: stored.ownerHash,
+        leaseOwner: "status-only-no-replay-worker",
+      })
+    ));
+
+    const finalRecord = await getOperationStore().get("status-only-fallback-no-replay");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "FailedAfterPartialWrite",
+      outcome: "PartialResolveStatusMissing",
+      fallbackAttempted: true,
+      attemptCount: 2,
+      partialWrite: true,
+    });
+    expect(operationResultView(finalRecord!).results).toContainEqual(expect.objectContaining({
+      ticketNumber: "57401",
+      finalOutcome: "PartialResolveStatusMissing",
+      fallbackAttempted: true,
+      terminalReason: "PartialResolveStatusMissing",
+    }));
+  });
   it("does not repeat an ambiguous private note when its canonical content is observed", async () => {
     const domain = getTicketsTools();
     const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
