@@ -3622,6 +3622,72 @@ describe("Tickets Domain", () => {
       input: { ticket: { ticketId: "ticket-57400" }, content: "Approved private note", privacyType: "PRIVATE" },
     });
   });
+  it("finds a matching private note across canonical note pages and does not create a duplicate", async () => {
+    const events: string[] = [];
+    mockClient.query.mockImplementation(async (query: string, variables?: { input?: Record<string, unknown> }) => {
+      if (query.includes("getTicketList")) {
+        events.push("ticket-list");
+        return { getTicketList: { tickets: [{ ticketId: "ticket-57402", displayId: "57402" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } };
+      }
+      if (query.includes("getTicketNoteList")) {
+        events.push(`notes-page-${variables?.input?.page ?? 1}`);
+        return variables?.input?.page === 2
+          ? { getTicketNoteList: { notes: [{ noteId: "private-junk", content: "JUNK", privacyType: "PRIVATE" }], listInfo: { hasMore: false } } }
+          : { getTicketNoteList: { notes: [{ noteId: "public-junk", content: "JUNK", privacyType: "PUBLIC" }], listInfo: { hasMore: true } } };
+      }
+      events.push("ticket");
+      return { getTicket: { ticketId: "ticket-57402", displayId: "57402", status: "New Calls" } };
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57402"],
+      actions: [{ ticketNumber: "57402", contentVerified: true, action: "addNote", note: " junk " }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Updated",
+      noteAdded: false,
+      noteDeduped: true,
+      noteDedupeChecked: true,
+      verified: true,
+    });
+    expect(events).toEqual(["ticket-list", "ticket", "notes-page-1", "notes-page-2", "ticket"]);
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("blocks note creation when canonical note retrieval fails before an update", async () => {
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) return { getTicketList: {
+        tickets: [{ ticketId: "ticket-57403", displayId: "57403" }],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+      } };
+      if (query.includes("getTicketNoteList")) throw new Error("note read unavailable");
+      return { getTicket: { ticketId: "ticket-57403", displayId: "57403", status: "New Calls" } };
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57403"],
+      actions: [{
+        ticketNumber: "57403",
+        contentVerified: true,
+        action: "update",
+        note: "JUNK",
+        target: { status: "Awaiting Engineer" },
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Failed",
+      failureStage: "duplicateNoteCheck",
+      writeAttempted: false,
+      partialWrite: false,
+    });
+    expect(parsed.results[0].failureReason).toContain("note read unavailable");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
   function stagedResolveAction(overrides: Partial<Record<string, unknown>> = {}) {
     return {
       ticketNumber: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketNumber,
@@ -3699,6 +3765,102 @@ describe("Tickets Domain", () => {
     return { original, classified, final };
   }
 
+  it("dedupes ticket 59005 private JUNK via the canonical note collector before status-only close", async () => {
+    const events: string[] = [];
+    const internalTicketId = LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketId;
+    const displayTicketId = LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketNumber;
+    let statusResolved = false;
+    mockClient.query.mockImplementation(async (query: string, variables?: { input?: Record<string, unknown> }) => {
+      if (query.includes("getTicketList")) {
+        events.push("ticket-list");
+        return { getTicketList: { tickets: [{ ticketId: internalTicketId, displayId: displayTicketId }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } };
+      }
+      if (query.includes("getFields")) {
+        events.push("fields");
+        return { getFields: RESOLVED_OPTION_FIELDS };
+      }
+      if (query.includes("getTicketNoteList")) {
+        events.push(`notes:${variables?.input?.ticketId}`);
+        return { getTicketNoteList: [
+          {
+            noteId: "8656361040688640000",
+            addedOn: "2026-07-25T16:18:03.579",
+            content: "JUNK",
+            privacyType: "PRIVATE",
+          },
+          {
+            noteId: "6987000510001594368",
+            addedOn: "2026-07-25T17:46:38.333",
+            content: "JUNK",
+            privacyType: "PRIVATE",
+          },
+        ] };
+      }
+      events.push(`ticket:${variables?.input?.ticketId}`);
+      return { getTicket: {
+        ticketId: displayTicketId,
+        displayId: displayTicketId,
+        status: statusResolved ? "Resolved" : "New Calls",
+        updatedTime: statusResolved
+          ? "2026-07-25T17:46:38.390"
+          : LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.originalUpdatedTime,
+        client: {
+          accountId: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.clientId,
+          name: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.clientName,
+        },
+        impact: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.target.impact,
+        urgency: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.target.urgency,
+        category: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.target.category,
+        subcategory: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.target.subcategory,
+        cause: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.target.cause,
+        resolutionCode: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.target.resolutionCode,
+      } };
+    });
+    mockClient.mutate.mockImplementation(async (mutation: string, variables: { input: Record<string, unknown> }) => {
+      expect(mutation).not.toContain("createTicketNote");
+      expect(variables.input).toMatchObject({
+        ticketId: internalTicketId,
+        status: "Resolved",
+        suppressCloseNotification: true,
+      });
+      statusResolved = true;
+      events.push("status-write");
+      return { updateTicket: { ticketId: internalTicketId, status: "Resolved" } };
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: [displayTicketId],
+      actions: [{
+        ticketNumber: displayTicketId,
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.originalUpdatedTime,
+        contentVerified: true,
+        action: "resolve",
+        note: "JUNK",
+        target: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.target,
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved",
+      workflowMode: "staged",
+      classificationWriteOutcome: "NotRequired",
+      noteAdded: false,
+      noteDeduped: true,
+      noteDedupeChecked: true,
+      statusWriteOutcome: "Accepted",
+      suppressCloseNotificationIncluded: true,
+      verified: true,
+    });
+    expect(parsed.results[0].physicalWrites).toEqual([
+      { method: "updateTicket.statusOnly", outcome: "Accepted" },
+    ]);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(events).toContain(`notes:${internalTicketId}`);
+    expect(events).not.toContain(`notes:${displayTicketId}`);
+  });
   it("staged junk resolve dry-run reports planned stages and zero writes", async () => {
     installStagedResolveMocks({ note: "missing" });
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
@@ -5643,7 +5805,11 @@ describe("Tickets Domain", () => {
       writeMayHaveSucceeded: true,
       partialWrite: false,
     });
-    expect(finalRecord?.compactResults).toContainEqual(expect.objectContaining({
+    const compact = finalRecord?.compactResults.find((entry) =>
+      typeof entry === "object" && entry !== null &&
+      (entry as { ticketNumber?: string }).ticketNumber === "57401"
+    ) as Record<string, unknown> | undefined;
+    expect(compact).toMatchObject({
       ticketNumber: "57401",
       finalOutcome: "Resolved",
       noteWriteOutcome: "NoteVerifiedAfterDelay",
@@ -5652,7 +5818,18 @@ describe("Tickets Domain", () => {
       noteVerifiedAfterDelay: true,
       statusWriteOutcome: "Accepted",
       suppressCloseNotificationIncluded: true,
-    }));
+    });
+    expect(compact?.physicalWrites).toEqual([
+      { method: "updateTicket.classification", outcome: "Accepted" },
+      { method: "createTicketNote", outcome: "Accepted" },
+      { method: "updateTicket.statusOnly", outcome: "Accepted" },
+    ]);
+    expect(compact?.completedStages).toEqual(expect.arrayContaining([
+      "PreflightValidated",
+      "ClassificationVerified",
+      "NoteAdded",
+      "NoteVerified",
+    ]));
     expect(mockClient.mutate.mock.calls.filter(([mutation]) => String(mutation).includes("createTicketNote"))).toHaveLength(1);
     expect(mockClient.mutate.mock.calls).toContainEqual([
       expect.stringContaining("updateTicket"),

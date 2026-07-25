@@ -956,6 +956,52 @@ function itemResultKey(value: unknown): string | undefined {
     : undefined;
 }
 
+function mergeArrayHistory(previous: unknown, next: unknown): unknown[] | undefined {
+  const values = [
+    ...(Array.isArray(previous) ? previous : []),
+    ...(Array.isArray(next) ? next : []),
+  ];
+  if (values.length === 0) return undefined;
+  const seen = new Set<string>();
+  const merged: unknown[] = [];
+  for (const value of values) {
+    const key = typeof value === "object" && value !== null
+      ? JSON.stringify(value)
+      : String(value);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(value);
+  }
+  return merged;
+}
+
+function mergeCompactResultHistory(previous: unknown, next: unknown): unknown {
+  if (!isRecordObject(previous) || !isRecordObject(next)) return next;
+  const shouldMergeStagedHistory = previous.workflowMode === "staged" ||
+    next.workflowMode === "staged" ||
+    Array.isArray(previous.completedStages) ||
+    Array.isArray(next.completedStages);
+  if (!shouldMergeStagedHistory) return next;
+  const merged: Record<string, unknown> = { ...previous, ...next };
+  for (const field of ["physicalWrites", "completedStages"] as const) {
+    const history = mergeArrayHistory(previous[field], next[field]);
+    if (history) merged[field] = history;
+  }
+  for (const field of [
+    "classificationWriteMethod",
+    "classificationWriteOutcome",
+    "noteWriteOutcome",
+    "statusWriteMethod",
+    "statusWriteOutcome",
+    "suppressCloseNotificationRequested",
+    "suppressCloseNotificationIncluded",
+  ] as const) {
+    if ((merged[field] === undefined || merged[field] === null) && previous[field] !== undefined) {
+      merged[field] = previous[field];
+    }
+  }
+  return merged;
+}
 function stringField(record: Record<string, unknown> | undefined, field: string): string | undefined {
   const value = record?.[field];
   return typeof value === "string" && value.trim() ? value : undefined;
@@ -1185,10 +1231,13 @@ function applyItemPatch(
 
   if (params.result !== undefined) {
     const compactKey = itemResultKey(params.result) ?? params.itemKey;
+    const previousResult = record.compactResults.find(
+      (result) => (itemResultKey(result) ?? "") === compactKey
+    );
     record.compactResults = record.compactResults.filter(
       (result) => (itemResultKey(result) ?? "") !== compactKey
     );
-    record.compactResults.push(params.result);
+    record.compactResults.push(mergeCompactResultHistory(previousResult, params.result));
   }
 
   record.currentItem = params.itemKey;

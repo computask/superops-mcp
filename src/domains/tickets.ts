@@ -477,7 +477,14 @@ interface GetTicketConversationListResponse {
 }
 
 interface GetTicketNoteListResponse {
-  getTicketNoteList: TicketNote[];
+  getTicketNoteList: TicketNote[] | {
+    notes?: TicketNote[];
+    ticketNotes?: TicketNote[];
+    items?: TicketNote[];
+    data?: TicketNote[];
+    list?: TicketNote[];
+    listInfo?: ListInfo;
+  };
 }
 
 interface GetTicketFieldsResponse {
@@ -512,6 +519,9 @@ interface AddTimeEntryResponse {
 }
 
 type SuperOpsClientInstance = ReturnType<typeof getClient>;
+
+const CANONICAL_NOTE_PAGE_SIZE = 50;
+const CANONICAL_NOTE_MAX_PAGES = 5;
 
 interface SafeTicketParams {
   ticketNumber?: string | number;
@@ -1058,16 +1068,142 @@ async function getTicketConversations(
   return response.getTicketConversationList;
 }
 
+function ticketNoteArray(value: unknown): TicketNote[] | undefined {
+  return Array.isArray(value) ? value as TicketNote[] : undefined;
+}
+
+function parseTicketNotePage(value: GetTicketNoteListResponse["getTicketNoteList"]): {
+  notes: TicketNote[];
+  hasMore: boolean;
+} {
+  if (Array.isArray(value)) {
+    return { notes: value, hasMore: false };
+  }
+  const page = value as Record<string, unknown>;
+  const notes = ticketNoteArray(page.notes) ??
+    ticketNoteArray(page.ticketNotes) ??
+    ticketNoteArray(page.items) ??
+    ticketNoteArray(page.data) ??
+    ticketNoteArray(page.list) ??
+    [];
+  const listInfo = jsonRecord(page.listInfo);
+  return {
+    notes,
+    hasMore: listInfo?.hasMore === true,
+  };
+}
+
+async function getTicketNotesPage(
+  client: SuperOpsClientInstance,
+  ticketId: string,
+  page: number
+): Promise<{ notes: TicketNote[]; hasMore: boolean }> {
+  const input: Record<string, unknown> = { ticketId };
+  if (page > 1) {
+    input.page = page;
+    input.pageSize = CANONICAL_NOTE_PAGE_SIZE;
+  }
+  const response = await client.query<GetTicketNoteListResponse>(
+    GET_TICKET_NOTE_LIST_QUERY,
+    { input }
+  );
+
+  return parseTicketNotePage(response.getTicketNoteList);
+}
+
 async function getTicketNotes(
   client: SuperOpsClientInstance,
   ticketId: string
 ): Promise<TicketNote[]> {
-  const response = await client.query<GetTicketNoteListResponse>(
-    GET_TICKET_NOTE_LIST_QUERY,
-    { input: { ticketId } }
-  );
+  return (await getTicketNotesPage(client, ticketId, 1)).notes;
+}
 
-  return response.getTicketNoteList;
+function collectionHasPrivateFingerprint(
+  notes: TicketNote[],
+  fingerprint: string | undefined
+): boolean {
+  return Boolean(fingerprint) && notes.some(
+    (note) => note.privacyType === "PRIVATE" &&
+      normalizedNoteFingerprint(note.content) === fingerprint
+  );
+}
+async function collectCanonicalTicketNotes(params: {
+  client: SuperOpsClientInstance;
+  ticketId: string;
+  ticketNumber?: string;
+  additionalTicketIds?: string[];
+  stopAfterPrivateFingerprint?: string;
+}): Promise<{
+  available: boolean;
+  notes: TicketNote[];
+  ticketIdsRead: string[];
+  errors: string[];
+}> {
+  const notes: TicketNote[] = [];
+  const seenNoteIds = new Set<string>();
+  const ticketIdsRead: string[] = [];
+  const errors: string[] = [];
+  let matchedRequestedPrivateFingerprint = false;
+
+  function hasRequestedPrivateFingerprint(): boolean {
+    return Boolean(params.stopAfterPrivateFingerprint) && collectionHasPrivateFingerprint(notes, params.stopAfterPrivateFingerprint);
+  }
+
+  async function readTicketId(ticketId: string): Promise<boolean> {
+    const normalized = ticketId.trim();
+    if (!normalized || ticketIdsRead.includes(normalized)) return true;
+    ticketIdsRead.push(normalized);
+    try {
+      for (let page = 1; page <= CANONICAL_NOTE_MAX_PAGES; page += 1) {
+        const result = await getTicketNotesPage(params.client, normalized, page);
+        for (const note of result.notes) {
+          addUniqueNote(notes, seenNoteIds, note);
+        }
+        if (hasRequestedPrivateFingerprint()) {
+          matchedRequestedPrivateFingerprint = true;
+          break;
+        }
+        if (!result.hasMore) break;
+      }
+      return true;
+    } catch (error) {
+      errors.push(`Notes could not be fetched for ticketId ${normalized}: ${safeErrorMessage(error)}`);
+      return false;
+    }
+  }
+
+  const initialTicketIds = uniqueTicketIds([
+    ...(params.additionalTicketIds ?? []),
+    params.ticketId,
+  ]).slice(0, 3);
+  for (const ticketId of initialTicketIds) {
+    if (!await readTicketId(ticketId)) {
+      return { available: false, notes, ticketIdsRead, errors };
+    }
+    if (matchedRequestedPrivateFingerprint) break;
+  }
+
+  const displayId = normaliseTicketNumber(params.ticketNumber);
+  const probablyDisplayId = displayId && initialTicketIds.some((ticketId) => ticketId === displayId);
+  if (notes.length === 0 && displayId && probablyDisplayId) {
+    try {
+      const matches = await resolveTicketIdByDisplayId(params.client, displayId);
+      if (matches.length !== 1) {
+        errors.push(matches.length === 0
+          ? `No ticket was found for display number ${displayId} while collecting notes.`
+          : `Display number ${displayId} was not unique while collecting notes.`);
+        return { available: false, notes, ticketIdsRead, errors };
+      }
+      if (!await readTicketId(matches[0].ticketId)) {
+        return { available: false, notes, ticketIdsRead, errors };
+      }
+    } catch (error) {
+      errors.push(`Display-number note lookup could not be fetched safely: ${safeErrorMessage(error)}`);
+      return { available: false, notes, ticketIdsRead, errors };
+    }
+  }
+
+  return { available: true, notes, ticketIdsRead, errors };
 }
 
 async function resolveTicketIdByDisplayId(
@@ -1856,8 +1992,11 @@ async function collectSafeTicketContent(params: {
 
       if (safeParams.includeNotes) {
         try {
-          const ticketNotes = await getTicketNotes(client, ticketId);
-          for (const note of ticketNotes) {
+          const ticketNotes = await collectCanonicalTicketNotes({ client, ticketId });
+          if (!ticketNotes.available) {
+            throw new Error(ticketNotes.errors.join("; ") || "Ticket notes were unavailable.");
+          }
+          for (const note of ticketNotes.notes) {
             addUniqueNote(notes, seenNoteIds, note);
           }
         } catch (error) {
@@ -3299,14 +3438,24 @@ function validateExpectedTicket(
 async function existingNoteMatchesFingerprint(
   client: SuperOpsClientInstance,
   ticketId: string,
-  fingerprint: string | undefined
+  fingerprint: string | undefined,
+  options: { ticketNumber?: string; additionalTicketIds?: string[] } = {}
 ): Promise<boolean> {
   if (!fingerprint) return false;
-  const notes = await getTicketNotes(client, ticketId);
+  const collection = await collectCanonicalTicketNotes({
+    client,
+    ticketId,
+    ticketNumber: options.ticketNumber,
+    additionalTicketIds: options.additionalTicketIds,
+    stopAfterPrivateFingerprint: fingerprint,
+  });
+  if (!collection.available) {
+    throw new Error(collection.errors.join("; ") || "Ticket notes were unavailable.");
+  }
   // Continuation recovery is deliberately private-note only. A public note with
   // identical text is neither evidence that the approved private note was
   // written nor a reason to skip its private write.
-  return notes.some(
+  return collection.notes.some(
     (existing) => existing.privacyType === "PRIVATE" &&
       normalizedNoteFingerprint(existing.content) === fingerprint
   );
@@ -3315,9 +3464,10 @@ async function existingNoteMatchesFingerprint(
 async function existingNoteMatches(
   client: SuperOpsClientInstance,
   ticketId: string,
-  note: string
+  note: string,
+  options: { ticketNumber?: string; additionalTicketIds?: string[] } = {}
 ): Promise<boolean> {
-  return existingNoteMatchesFingerprint(client, ticketId, normalizedNoteFingerprint(note));
+  return existingNoteMatchesFingerprint(client, ticketId, normalizedNoteFingerprint(note), options);
 }
 
 function noteBodyForPlan(note: string | undefined): string | undefined {
@@ -3348,6 +3498,8 @@ function markNoteDedupePlanned(
 async function checkNoteForPlan(params: {
   client: SuperOpsClientInstance;
   ticketId: string;
+  ticketNumber?: string;
+  additionalTicketIds?: string[];
   note?: string;
   dedupe: boolean;
   result: ApplyTriagePlanResult;
@@ -3359,7 +3511,10 @@ async function checkNoteForPlan(params: {
   if (!params.dedupe) return "pending";
   markNoteDedupePlanned(params.result, note, true);
   await params.beforeCheck?.();
-  const noteDeduped = await existingNoteMatches(params.client, params.ticketId, note);
+  const noteDeduped = await existingNoteMatches(params.client, params.ticketId, note, {
+    ticketNumber: params.ticketNumber,
+    additionalTicketIds: params.additionalTicketIds,
+  });
   params.result.noteDedupeChecked = true;
   if (noteDeduped) {
     params.result.noteDeduped = true;
@@ -3394,6 +3549,8 @@ async function createNoteForPlan(params: {
 async function addNoteForPlan(params: {
   client: SuperOpsClientInstance;
   ticketId: string;
+  ticketNumber?: string;
+  additionalTicketIds?: string[];
   note?: string;
   isPublic?: boolean;
   dedupe: boolean;
@@ -3749,6 +3906,7 @@ async function applyStagedResolveAction(params: {
   ticketNumber: string;
   action: TriagePlanAction;
   ticket: Ticket;
+  resolvedTicketId: string;
   result: ApplyTriagePlanResult;
   verify: boolean;
   dedupeNotes: boolean;
@@ -3779,7 +3937,7 @@ async function applyStagedResolveAction(params: {
 
   const classificationAction = stagedResolveClassificationAction(action);
   const finalAction = stagedResolveFinalAction(action);
-  const classificationInput = await buildStagedResolveClassificationInput(client, params.ticket.ticketId, action);
+  const classificationInput = await buildStagedResolveClassificationInput(client, params.resolvedTicketId, action);
   const classificationInputError = (classificationInput as { error?: unknown }).error;
   if (typeof classificationInputError === "string") {
     return markStagedFailure({
@@ -3794,6 +3952,7 @@ async function applyStagedResolveAction(params: {
 
   const classificationMismatches = verifyFinalTargetState(classificationAction, params.ticket).mismatches;
   let trustedTicket = params.ticket;
+  const stagedNoteTicketIds = () => [params.resolvedTicketId, params.ticket.ticketId, trustedTicket.ticketId];
   const classificationWriteRequired = classificationInputHasWritableFields(classificationInput as Record<string, unknown>) &&
     classificationMismatches.length > 0 &&
     !stagedResolveResumeHasVerifiedClassification(params.resumeStage);
@@ -3846,7 +4005,7 @@ async function applyStagedResolveAction(params: {
       recordPhysicalWrite(result, "updateTicket.classification", result.primaryWriteOutcome);
       let reread: Ticket;
       try {
-        reread = await getTicketByInternalId(client, params.ticket.ticketId);
+        reread = await getTicketByInternalId(client, params.resolvedTicketId);
       } catch (verifyError) {
         return markStagedFailure({
           result,
@@ -3912,7 +4071,7 @@ async function applyStagedResolveAction(params: {
       params.resumeStage === "ClassificationVerified" || !classificationWriteRequired) {
     const verifiedClassification = !classificationWriteRequired && !params.resumeStage
       ? params.ticket
-      : await getTicketByInternalId(client, params.ticket.ticketId);
+      : await getTicketByInternalId(client, params.resolvedTicketId);
     const verification = verifyFinalTargetState(classificationAction, verifiedClassification);
     result.finalState = ticketFinalState(verifiedClassification);
     result.observedFinalState = result.finalState;
@@ -3928,7 +4087,7 @@ async function applyStagedResolveAction(params: {
     }
     trustedTicket = verifiedClassification;
   } else {
-    const verifiedClassification = await getTicketByInternalId(client, params.ticket.ticketId);
+    const verifiedClassification = await getTicketByInternalId(client, params.resolvedTicketId);
     const verification = verifyFinalTargetState(classificationAction, verifiedClassification);
     result.finalState = ticketFinalState(verifiedClassification);
     result.observedFinalState = result.finalState;
@@ -3959,6 +4118,8 @@ async function applyStagedResolveAction(params: {
       notePlan = await checkNoteForPlan({
         client,
         ticketId: trustedTicket.ticketId,
+        ticketNumber: params.ticketNumber,
+        additionalTicketIds: stagedNoteTicketIds(),
         note: action.note,
         dedupe: params.dedupeNotes,
         result,
@@ -3998,12 +4159,12 @@ async function applyStagedResolveAction(params: {
       try {
         await params.beforeMutation?.("note");
         result.writeAttempted = true;
-        const created = await createTicketNote(client, trustedTicket.ticketId, noteBodyForPlan(action.note) as string, false);
+        const created = await createTicketNote(client, params.resolvedTicketId, noteBodyForPlan(action.note) as string, false);
         result.noteAdded = true;
         result.writeMayHaveSucceeded = true;
         result.noteWriteOutcome = "Accepted";
         recordPhysicalWrite(result, "createTicketNote", "Accepted");
-        await params.afterMutation?.("note", { ticketId: trustedTicket.ticketId, noteId: created.noteId });
+        await params.afterMutation?.("note", { ticketId: params.resolvedTicketId, noteId: created.noteId });
       } catch (error) {
         if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
         const rejected = isReliableSynchronousMutationRejection(error);
@@ -4012,7 +4173,10 @@ async function applyStagedResolveAction(params: {
         const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
         let observed = false;
         try {
-          observed = await existingNoteMatchesFingerprint(client, trustedTicket.ticketId, fingerprint);
+          observed = await existingNoteMatchesFingerprint(client, trustedTicket.ticketId, fingerprint, {
+            ticketNumber: params.ticketNumber,
+            additionalTicketIds: stagedNoteTicketIds(),
+          });
           result.noteDedupeChecked = true;
         } catch {
           observed = false;
@@ -4034,7 +4198,10 @@ async function applyStagedResolveAction(params: {
       }
     }
     const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
-    const noteVerified = await existingNoteMatchesFingerprint(client, trustedTicket.ticketId, fingerprint);
+    const noteVerified = await existingNoteMatchesFingerprint(client, trustedTicket.ticketId, fingerprint, {
+      ticketNumber: params.ticketNumber,
+      additionalTicketIds: stagedNoteTicketIds(),
+    });
     result.noteDedupeChecked = true;
     result.initialNoteVerificationObserved ??= noteVerified;
     result.noteVerificationAttempts = (params.noteVisibilityPriorAttempts ?? 0) + 1;
@@ -4068,7 +4235,7 @@ async function applyStagedResolveAction(params: {
     preStatusTicket = trustedTicket;
   } else {
     try {
-      preStatusTicket = await getTicketByInternalId(client, trustedTicket.ticketId);
+      preStatusTicket = await getTicketByInternalId(client, params.resolvedTicketId);
     } catch (error) {
       if (isExecutionStopError(error)) throw error;
       return markStagedFailure({
@@ -4120,7 +4287,7 @@ async function applyStagedResolveAction(params: {
   }
   trustedTicket = preStatusTicket;
 
-  const statusInput = buildStagedResolveStatusInput(trustedTicket.ticketId, action.target?.status);
+  const statusInput = buildStagedResolveStatusInput(params.resolvedTicketId, action.target?.status);
   const statusInputError = (statusInput as { error?: unknown }).error;
   if (typeof statusInputError === "string") {
     return markStagedFailure({
@@ -4170,7 +4337,7 @@ async function applyStagedResolveAction(params: {
       result.writeMayHaveSucceeded = !rejected;
       let statusReread: Ticket;
       try {
-        statusReread = await getTicketByInternalId(client, trustedTicket.ticketId);
+        statusReread = await getTicketByInternalId(client, params.resolvedTicketId);
       } catch (verifyError) {
         return markStagedFailure({
           result,
@@ -4203,7 +4370,7 @@ async function applyStagedResolveAction(params: {
 
   const finalTicket = statusAlreadyResolved
     ? trustedTicket
-    : await getTicketByInternalId(client, trustedTicket.ticketId);
+    : await getTicketByInternalId(client, params.resolvedTicketId);
   const finalVerification = verifyFinalTargetState(finalAction, finalTicket);
   result.finalState = ticketFinalState(finalTicket);
   result.observedFinalState = result.finalState;
@@ -4222,7 +4389,11 @@ async function applyStagedResolveAction(params: {
     const noteVerified = await existingNoteMatchesFingerprint(
       client,
       finalTicket.ticketId,
-      action.noteFingerprint ?? normalizedNoteFingerprint(action.note)
+      action.noteFingerprint ?? normalizedNoteFingerprint(action.note),
+      {
+        ticketNumber: params.ticketNumber,
+        additionalTicketIds: [params.resolvedTicketId, params.ticket.ticketId, finalTicket.ticketId],
+      }
     );
     result.noteDedupeChecked = true;
     if (!noteVerified) {
@@ -5453,6 +5624,8 @@ async function applyApprovedTriageAction(params: {
       await addNoteForPlan({
         client,
         ticketId: ticket.ticketId,
+        ticketNumber,
+        additionalTicketIds: [resolved.ticketId, ticket.ticketId],
         note: action.note,
         isPublic: false,
         dedupe: params.dedupeNotes,
@@ -5493,6 +5666,7 @@ async function applyApprovedTriageAction(params: {
           ticketNumber,
           action,
           ticket,
+          resolvedTicketId: resolved.ticketId,
           result,
           verify: params.verify,
           dedupeNotes: params.dedupeNotes,
@@ -5520,6 +5694,8 @@ async function applyApprovedTriageAction(params: {
         notePlan = await checkNoteForPlan({
           client,
           ticketId: ticket.ticketId,
+          ticketNumber,
+          additionalTicketIds: [resolved.ticketId, ticket.ticketId],
           note: action.note,
           dedupe: params.dedupeNotes,
           result,
@@ -5845,7 +6021,10 @@ async function ambiguityCheckedTriageResult(params: {
       result.noteDedupePlanned = true;
       result.noteDedupeChecked = false;
     }
-    const noteDeduped = await existingNoteMatchesFingerprint(client, ticket.ticketId, fingerprint);
+    const noteDeduped = await existingNoteMatchesFingerprint(client, ticket.ticketId, fingerprint, {
+      ticketNumber,
+      additionalTicketIds: [resolved.ticketId, ticket.ticketId],
+    });
     if (fingerprint) {
       result.noteDedupeChecked = true;
     }
@@ -5901,6 +6080,8 @@ async function ambiguityCheckedTriageResult(params: {
       await addNoteForPlan({
         client,
         ticketId: ticket.ticketId,
+        ticketNumber,
+        additionalTicketIds: [resolved.ticketId, ticket.ticketId],
         note: action.note,
         isPublic: false,
         dedupe: applyParams.dedupeNotes ?? true,
@@ -6398,7 +6579,10 @@ for (const stage of remainingStages) {
           );
         }
 
-        const noteObserved = await existingNoteMatchesFingerprint(client, resolvedForNotes.ticketId, fingerprint);
+        const noteObserved = await existingNoteMatchesFingerprint(client, resolvedForNotes.ticketId, fingerprint, {
+          ticketNumber: claim.itemKey,
+          additionalTicketIds: [resolvedForNotes.ticketId],
+        });
         visibilityResult.noteDedupeChecked = true;
         visibilityResult.initialNoteVerificationObserved = false;
         const attempts = (claim.item.retryCount ?? 0) + 1;
