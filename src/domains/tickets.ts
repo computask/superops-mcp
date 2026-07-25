@@ -973,6 +973,7 @@ interface ApplyTriagePlanResult {
   rateLimitRequestedDelayMs?: number;
   rateLimitDelaySource?: "retry-after" | "backoff";
   rateLimitConclusiveRejection?: boolean;
+  rateLimitOperationName?: string;
 }
 interface StructuredValidationFailure {
   ok: false;
@@ -3216,6 +3217,34 @@ function rateLimitRetryMetadata(error: unknown): {
       ? error.status === 429
       : error instanceof SuperOpsError && isRateLimitError(error),
   };
+}
+
+function preWriteReadFailureResult(params: {
+  ticketNumber: string;
+  action: TriagePlanAction;
+  error: unknown;
+  operationName: string;
+}): ApplyTriagePlanResult {
+  const result = baseApplyResult(params.ticketNumber, params.action);
+  result.finalOutcome = "Failed";
+  result.failureStage = "readMetadata";
+  result.failureReason = safeErrorMessage(params.error);
+  if (!isRateLimitError(params.error)) {
+    return result;
+  }
+
+  const rateLimit = rateLimitRetryMetadata(params.error);
+  result.failureStage = "rateLimit";
+  result.retrySafe = true;
+  result.rateLimitRetryAfterMs = rateLimit.delayMs;
+  result.rateLimitRequestedDelayMs = rateLimit.requestedDelayMs;
+  result.rateLimitRetryAfterSupplied = rateLimit.retryAfterSupplied;
+  result.rateLimitDelaySource = rateLimit.delaySource;
+  // A throttled read cannot have changed SuperOps state. This flag feeds the
+  // existing durable rate-limit continuation path without implying a write.
+  result.rateLimitConclusiveRejection = true;
+  result.rateLimitOperationName = params.operationName;
+  return result;
 }
 
 function ticketClientName(ticket: Ticket): string | undefined {
@@ -5616,7 +5645,18 @@ async function applyApprovedTriageAction(params: {
     return result;
   }
 
-  const resolved = await resolveTicketId(client, { ticketNumber });
+  let resolved: Awaited<ReturnType<typeof resolveTicketId>>;
+  try {
+    resolved = await resolveTicketId(client, { ticketNumber });
+  } catch (error) {
+    if (isExecutionStopError(error)) throw error;
+    return preWriteReadFailureResult({
+      ticketNumber,
+      action,
+      error,
+      operationName: "getTicketList",
+    });
+  }
   if (resolved.error || !resolved.ticketId) {
     const result = baseApplyResult(ticketNumber, action);
     result.finalOutcome = "NotFound";
@@ -5630,11 +5670,12 @@ async function applyApprovedTriageAction(params: {
     ticket = await getTicketByInternalId(client, resolved.ticketId);
   } catch (error) {
     if (isExecutionStopError(error)) throw error;
-    const result = baseApplyResult(ticketNumber, action);
-    result.finalOutcome = "NotFound";
-    result.failureStage = "readMetadata";
-    result.failureReason = safeErrorMessage(error);
-    return result;
+    return preWriteReadFailureResult({
+      ticketNumber,
+      action,
+      error,
+      operationName: "getTicket",
+    });
   }
 
   const result = baseApplyResult(ticketNumber, action, ticket);
@@ -5997,9 +6038,10 @@ function applyResultToContinuationOutcome(
     retryDelaySource: result.rateLimitDelaySource,
     retryAfterSupplied: result.rateLimitRetryAfterSupplied,
     suppliedDelayMs: result.rateLimitRetryAfterSupplied ? result.rateLimitRequestedDelayMs : undefined,
-    retryOperationName: result.failureStage === "createTicketNote" || result.writeMethod === "createTicketNote"
-      ? "CreateTicketNote"
-      : "UpdateTicket",
+    retryOperationName: result.rateLimitOperationName ??
+      (result.failureStage === "createTicketNote" || result.writeMethod === "createTicketNote"
+        ? "CreateTicketNote"
+        : "UpdateTicket"),
     retryEndpoint: "SuperOps GraphQL /msp",
     retryCount: noteVisibilityPending || noteVisibilityUnresolved ? result.noteVerificationAttempts : undefined,
     observedMutationResult: rateLimitReschedule

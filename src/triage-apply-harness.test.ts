@@ -81,6 +81,7 @@ const BASE_EXECUTION_CONFIG: ExecutionConfigInput = {
   SUPEROPS_EXECUTION_MAX_DURATION_MS: "300000",
   SUPEROPS_EXECUTION_REQUEST_TIMEOUT_MS: "120000",
   SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT: "100",
+  SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_ATTEMPTS: "3",
 };
 
 type HistoryEvent = { sequence: number; kind: string; details?: Record<string, unknown> };
@@ -242,6 +243,7 @@ type FakeSuperOpsOptions = {
   classified?: boolean;
   resolved?: boolean;
   initialNotes?: unknown[];
+  canonicalTicketReadRateLimits?: number;
   noteReadUnavailable?: boolean;
   unsupportedNoteEnvelope?: boolean;
   noteVisibilityMisses?: number;
@@ -279,6 +281,19 @@ function graphQlError(operation: string, code = "VALIDATION_ERROR"): Response {
   }), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
+function graphQlReadRateLimit(operation: string): Response {
+  return new Response(JSON.stringify({
+    data: { [operation]: null },
+    errors: [{
+      message: null,
+      extensions: {
+        clientError: [{ code: "rate_limit_exceeded", param: null }],
+        classification: "DataFetchingException",
+      },
+    }],
+  }), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
 function ticketFields() {
   const field = (columnName: string, values: string[], parent?: { columnName: string; value: string }) => ({
     id: `${columnName}-field`,
@@ -306,6 +321,7 @@ class FakeSuperOps {
   readonly visibleNotes: unknown[];
   private pendingNote: typeof RAW_GRAPHQL_PRIVATE_JUNK | undefined;
   private remainingVisibilityMisses: number;
+  private remainingCanonicalTicketReadRateLimits: number;
   private updatedSequence = 0;
   private ticketReadCount = 0;
 
@@ -320,6 +336,7 @@ class FakeSuperOps {
     };
     this.visibleNotes = [...(options.initialNotes ?? [])];
     this.remainingVisibilityMisses = options.noteVisibilityMisses ?? 0;
+    this.remainingCanonicalTicketReadRateLimits = options.canonicalTicketReadRateLimits ?? 0;
     if (options.classified) this.setClassified();
   }
 
@@ -454,6 +471,15 @@ class FakeSuperOps {
     }
     if (query.includes("getTicket")) {
       this.ticketReadCount += 1;
+      if (this.remainingCanonicalTicketReadRateLimits > 0) {
+        this.remainingCanonicalTicketReadRateLimits -= 1;
+        this.history.add("superops.read.ticket", {
+          ticketId: input.ticketId,
+          read: this.ticketReadCount,
+          rateLimited: true,
+        });
+        return graphQlReadRateLimit("getTicket");
+      }
       if (this.options.unrelatedChangeOnTicketRead === this.ticketReadCount) {
         this.ticket.cause = "User Request";
         this.ticket.updatedTime = this.nextUpdatedTime();
@@ -561,14 +587,15 @@ class TriageHarness {
   }
 
   async resume(now?: string): Promise<void> {
+    const resumeNumber = this.history.count("continuation.resume") + 1;
+    this.history.add("continuation.resume", { now, resumeNumber });
     await this.runContext(() => resumeApplyTriageOperation({
       operationId: this.operationId,
       ownerHash: currentOwnerHash(),
-      leaseOwner: `harness-resume-${this.history.count("continuation.resume") + 1}`,
+      leaseOwner: `harness-resume-${resumeNumber}`,
       leaseMs: 1000,
       now,
     }));
-    this.history.add("continuation.resume", { now });
   }
 
   async resumeUntilTerminal(maxContinuations = 6): Promise<OperationLedgerRecord> {
@@ -961,6 +988,87 @@ describe("deterministic end-to-end apply-triage harness", () => {
       event.kind === "ledger.checkpoint" && event.details?.stage === "PreflightValidated"
     );
     expect(durablePreflight?.sequence).toBeLessThan(harness.history.first("superops.write.classification"));
+    harness.assertGlobalInvariants(record);
+  });
+
+  it("reschedules the exact pre-write getTicket DataFetchingException and completes 59005 in a fresh continuation", async () => {
+    const harness = new TriageHarness("preflight-ticket-rate-limit", {
+      classified: true,
+      initialNotes: [{ ...CANONICAL_PRIVATE_JUNK }],
+      canonicalTicketReadRateLimits: 3,
+    });
+    const { parsed } = await harness.invoke({}, {
+      SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "3",
+    });
+    const rescheduled = await harness.record();
+
+    expect(parsed.operation).toMatchObject({
+      complete: false,
+      continuationRequired: true,
+      state: "Rescheduled",
+      writeAttempted: false,
+      writeMayHaveSucceeded: false,
+    });
+    expect(rescheduled.itemStates[TICKET_NUMBER]).toMatchObject({
+      stage: "RateLimitedRescheduled",
+      writeAttempted: false,
+      writeMayHaveSucceeded: false,
+      errorClass: "SuperOpsRateLimit",
+      rateLimit: {
+        operationName: "getTicket",
+        writeAttempted: false,
+      },
+    });
+    expect(rescheduled.itemStates[TICKET_NUMBER]?.attemptCount ?? 0).toBe(0);
+    expect(harness.history.count("superops.read.ticket")).toBe(3);
+    expect(harness.history.events.filter((event) => event.kind.startsWith("superops.write."))).toHaveLength(0);
+
+    const record = await harness.resumeUntilTerminal();
+    const result = itemResult(record);
+    expect(result).toMatchObject({
+      ticketNumber: TICKET_NUMBER,
+      classificationWriteOutcome: "NotRequired",
+      noteDedupeChecked: true,
+      noteDeduped: true,
+      noteAdded: false,
+      statusWriteMethod: "updateTicket.statusOnly",
+      suppressCloseNotificationIncluded: true,
+      finalOutcome: "Resolved",
+      finalVerificationState: "Verified",
+      verified: true,
+    });
+    expect(harness.history.first("continuation.resume")).toBeLessThan(harness.history.first("superops.write.status"));
+    expect(harness.history.count("superops.write.classification")).toBe(0);
+    expect(harness.history.count("superops.write.note")).toBe(0);
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(record);
+  });
+
+  it("terminalizes persistent pre-write getTicket throttling at the durable ceiling without any write", async () => {
+    const harness = new TriageHarness("persistent-preflight-ticket-rate-limit", {
+      classified: true,
+      initialNotes: [{ ...CANONICAL_PRIVATE_JUNK }],
+      canonicalTicketReadRateLimits: Number.POSITIVE_INFINITY,
+    });
+    await harness.invoke();
+    const record = await harness.resumeUntilTerminal();
+
+    expect(record.state).toBe("CompletedWithFailures");
+    expect(record.itemStates[TICKET_NUMBER]).toMatchObject({
+      stage: "RateLimitExceeded",
+      writeAttempted: false,
+      writeMayHaveSucceeded: false,
+      partialWrite: false,
+      errorClass: "RateLimitExceeded",
+      rateLimit: {
+        operationName: "getTicket",
+        attempts: 4,
+        writeAttempted: false,
+        finalResult: "RateLimitExceeded",
+      },
+    });
+    expect(harness.history.count("continuation.resume")).toBe(3);
+    expect(harness.history.events.filter((event) => event.kind.startsWith("superops.write."))).toHaveLength(0);
     harness.assertGlobalInvariants(record);
   });
 
