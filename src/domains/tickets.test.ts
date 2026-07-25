@@ -3640,6 +3640,7 @@ describe("Tickets Domain", () => {
     note?: "missing" | "deduped" | "none" | "fail";
     classificationReject?: unknown;
     statusReject?: unknown;
+    original?: Record<string, unknown>;
     classificationAfter?: Record<string, unknown>;
     preStatus?: Record<string, unknown>;
     final?: Record<string, unknown>;
@@ -3650,6 +3651,7 @@ describe("Tickets Domain", () => {
       status: "New Calls",
       client: null,
       updatedTime: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.originalUpdatedTime,
+      ...(options.original ?? {}),
     };
     const classified = {
       ...original,
@@ -3721,6 +3723,166 @@ describe("Tickets Domain", () => {
     });
   });
 
+  it("staged resolve persists preflight before already-correct classification and only closes status", async () => {
+    const checkpointStages: string[] = [];
+
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const checkpointItem = store.checkpointItem.bind(store);
+      store.checkpointItem = vi.fn(async (params) => {
+        if (params.itemKey === LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketNumber) {
+          checkpointStages.push(String(params.patch.stage));
+        }
+        return checkpointItem(params);
+      });
+      installStagedResolveMocks({
+        note: "deduped",
+        original: {
+          client: {
+            accountId: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.clientId,
+            name: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.clientName,
+          },
+          impact: "Low",
+          urgency: "Low",
+          category: "7. Sales call",
+          subcategory: "No Action Needed",
+          cause: "Unknown",
+          resolutionCode: "Permanent Fix",
+        },
+      });
+
+      const result = await withSuccessfulContinuationScheduling(() => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "staged-noop-classification-59005",
+          expectedCandidateTicketNumbers: [LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketNumber],
+          actions: [stagedResolveAction()],
+        })
+      ));
+      const parsed = JSON.parse(result.content[0].text);
+      const stored = await store.get("staged-noop-classification-59005", currentOwnerHash());
+
+      expect(result.isError).not.toBe(true);
+      expect(checkpointStages).toEqual([
+        "PreflightValidated",
+        "ClassificationVerified",
+        "NoteDedupeChecked",
+        "NoteVerified",
+        "StatusWriteStarted",
+        "StatusWriteSucceeded",
+        "StatusVerified",
+      ]);
+      expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+      expect(mockClient.mutate.mock.calls[0][1].input).toEqual({
+        ticketId: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketId,
+        status: "Resolved",
+        suppressCloseNotification: true,
+      });
+      expect(parsed.results[0]).toMatchObject({
+        finalOutcome: "Resolved",
+        workflowMode: "staged",
+        classificationWriteMethod: "updateTicket.classification",
+        classificationWriteOutcome: "NotRequired",
+        noteDeduped: true,
+        noteAdded: false,
+        noteWriteOutcome: "VerifiedExistingPrivateNote",
+        statusWriteOutcome: "Accepted",
+        suppressCloseNotificationIncluded: true,
+        writeAttempted: true,
+        verified: true,
+      });
+      expect(parsed.results[0].physicalWrites).toEqual([
+        { method: "updateTicket.statusOnly", outcome: "Accepted" },
+      ]);
+      expect(stored?.itemStates[LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketNumber]).toMatchObject({
+        stage: "Completed",
+        outcome: "Resolved",
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+        partialWrite: false,
+        verificationState: "Verified",
+      });
+      expect(operationResultView(stored!).results).toEqual(parsed.results);
+
+      vi.clearAllMocks();
+      await runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        resumeApplyTriageOperation({
+          operationId: "staged-noop-classification-59005",
+          ownerHash: stored!.ownerHash,
+          leaseOwner: "noop-classification-replay-check",
+        })
+      );
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+    });
+  });
+  it("terminalizes a no-write staged classification checkpoint failure before any write", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const checkpointItem = store.checkpointItem.bind(store);
+      store.checkpointItem = vi.fn(async (params) => {
+        if (params.patch.stage === "PreflightValidated") {
+          throw new Error("PreflightValidated persistence failed");
+        }
+        return checkpointItem(params);
+      });
+      installStagedResolveMocks({
+        note: "deduped",
+        original: {
+          client: {
+            accountId: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.clientId,
+            name: LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.clientName,
+          },
+          impact: "Low",
+          urgency: "Low",
+          category: "7. Sales call",
+          subcategory: "No Action Needed",
+          cause: "Unknown",
+          resolutionCode: "Permanent Fix",
+        },
+      });
+
+      const result = await withSuccessfulContinuationScheduling(() => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "staged-noop-classification-preflight-store-failure",
+          expectedCandidateTicketNumbers: [LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketNumber],
+          actions: [stagedResolveAction()],
+        })
+      ));
+      const parsed = JSON.parse(result.content[0].text);
+      const stored = await store.get("staged-noop-classification-preflight-store-failure", currentOwnerHash());
+
+      expect(result.isError).toBe(true);
+      expect(parsed.operation).toMatchObject({
+        complete: true,
+        continuationRequired: false,
+        persisted: true,
+        state: "CompletedWithFailures",
+        errorClass: "OperationStoreFailure",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+        partialWrite: false,
+      });
+      expect(parsed.operation.finalReason).toContain("fresh operation");
+      expect(stored).toMatchObject({
+        state: "CompletedWithFailures",
+        pendingItems: [],
+        unattemptedItems: [],
+        itemStates: {
+          [LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketNumber]: {
+            stage: "FailedBeforeWrite",
+            outcome: "OperationStoreFailed",
+            errorClass: "OperationStoreFailure",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+            partialWrite: false,
+          },
+        },
+      });
+      expect(stored?.terminalFailureReason).toContain("fresh operation");
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+    });
+  });
   it("staged resolve sends classification/client without status, priority or suppression, then status-only suppressed close", async () => {
     installStagedResolveMocks({ note: "none" });
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
@@ -4262,9 +4424,27 @@ describe("Tickets Domain", () => {
       const parsed = JSON.parse(result.content[0].text);
       const stored = await store.get("checkpoint-failure-before-first-write");
       expect(result.isError).toBe(true);
-      expect(parsed.operation).toMatchObject({ writeAttempted: false, writeMayHaveSucceeded: false });
+      expect(parsed.operation).toMatchObject({
+        complete: true,
+        continuationRequired: false,
+        state: "CompletedWithFailures",
+        errorClass: "OperationStoreFailure",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+      });
+      expect(parsed.operation.finalReason).toContain("fresh operation");
+      expect(stored).toMatchObject({
+        state: "CompletedWithFailures",
+        pendingItems: [],
+        unattemptedItems: [],
+      });
       expect(stored?.itemStates["57400"]).toMatchObject({
-        stage: "WriteNotStarted", writeAttempted: false, writeMayHaveSucceeded: false,
+        stage: "FailedBeforeWrite",
+        outcome: "OperationStoreFailed",
+        errorClass: "OperationStoreFailure",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+        partialWrite: false,
       });
       expect(mockClient.mutate).not.toHaveBeenCalled();
     });

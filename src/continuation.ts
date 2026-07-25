@@ -467,6 +467,53 @@ export async function runOperationContinuation(
         });
         return continuationResult(record, true, caughtError.name);
       }
+      if (caughtError.name === "DurableCheckpointError" || caughtError.message.startsWith("Durable checkpoint failed")) {
+        let currentItem = claim.item;
+        try {
+          currentItem = (await store.get(params.operationId, params.ownerHash))?.itemStates[claim.itemKey] ?? claim.item;
+        } catch {
+          currentItem = claim.item;
+        }
+        const checkpointProgressPersisted = currentItem.stage !== claim.item.stage ||
+          currentItem.writeAttempted !== claim.item.writeAttempted ||
+          currentItem.writeMayHaveSucceeded !== claim.item.writeMayHaveSucceeded ||
+          currentItem.partialWrite !== claim.item.partialWrite ||
+          currentItem.observedMutationResult !== claim.item.observedMutationResult ||
+          currentItem.retryCount !== claim.item.retryCount;
+        if (checkpointProgressPersisted) {
+          throw error;
+        }
+        const possibleWrite = currentItem.writeMayHaveSucceeded === true &&
+          currentItem.observedMutationResult !== "Rejected";
+        const failureReason = caughtError.message +
+          " This operation was terminalized because a required durable checkpoint could not be persisted; submit a fresh operation after the code defect or durable-store failure is corrected.";
+        const conservativeOutcome: ContinuationItemOutcome = {
+          stage: possibleWrite ? "AmbiguousWriteUnresolved" : "FailedBeforeWrite",
+          outcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : "OperationStoreFailure",
+          writeAttempted: currentItem.writeAttempted === true,
+          writeMayHaveSucceeded: currentItem.writeMayHaveSucceeded === true,
+          partialWrite: possibleWrite || currentItem.partialWrite === true,
+          failureReason,
+          errorClass: "OperationStoreFailure",
+          result: {
+            itemKey: claim.itemKey,
+            finalOutcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : "OperationStoreFailure",
+            writeAttempted: currentItem.writeAttempted === true,
+            writeMayHaveSucceeded: currentItem.writeMayHaveSucceeded === true,
+            partialWrite: possibleWrite || currentItem.partialWrite === true,
+            failureReason,
+          },
+        };
+        (caughtError as { conservativeOutcome?: ContinuationItemOutcome }).conservativeOutcome = conservativeOutcome;
+        record = await store.terminalizeContinuationFailure({
+          operationId: params.operationId,
+          ownerHash: params.ownerHash,
+          errorClass: "OperationStoreFailure",
+          outcome: "OperationStoreFailed",
+          reason: failureReason,
+        });
+        return continuationResult(record, false, "OperationStoreFailure");
+      }
       throw error;
     }
   }

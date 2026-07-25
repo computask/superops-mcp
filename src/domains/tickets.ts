@@ -3543,6 +3543,13 @@ function stagedResolveResumeHasVerifiedClassification(stage: OperationItemState[
     stage === "StatusVerified";
 }
 
+function stagedResolveResumeHasPreflightValidation(stage: OperationItemState["stage"] | undefined): boolean {
+  return stage === "PreflightValidated" ||
+    stage === "ClassificationWriteStarted" ||
+    stage === "ClassificationWriteSucceeded" ||
+    stagedResolveResumeHasVerifiedClassification(stage);
+}
+
 function stagedResolveResumeHasCheckedNote(stage: OperationItemState["stage"] | undefined): boolean {
   return stage === "NoteDedupeChecked" ||
     stage === "NoteWriteStarted" ||
@@ -3748,6 +3755,7 @@ async function applyStagedResolveAction(params: {
   resumeStage?: OperationItemState["stage"];
   noteVisibilityPriorAttempts?: number;
   beforeNoteCheck?: () => Promise<void>;
+  afterPreflightValidation?: () => Promise<void>;
   beforeMutation?: (mutationType: DurableMutationType) => Promise<void>;
   afterMutation?: (
     mutationType: DurableMutationType,
@@ -3791,6 +3799,10 @@ async function applyStagedResolveAction(params: {
     !stagedResolveResumeHasVerifiedClassification(params.resumeStage);
   result.classificationWriteMethod = "updateTicket.classification";
   result.classificationWriteOutcome = classificationWriteRequired ? "Pending" : "NotRequired";
+
+  if (!classificationWriteRequired && !stagedResolveResumeHasPreflightValidation(params.resumeStage)) {
+    await params.afterPreflightValidation?.();
+  }
 
   if (classificationWriteRequired) {
     result.attemptedState = classificationInput as Record<string, unknown>;
@@ -5309,6 +5321,7 @@ async function applyApprovedTriageAction(params: {
   resumeStage?: OperationItemState["stage"];
   noteVisibilityPriorAttempts?: number;
   beforeNoteCheck?: () => Promise<void>;
+  afterPreflightValidation?: () => Promise<void>;
   beforeMutation?: (mutationType: DurableMutationType) => Promise<void>;
   afterMutation?: (
     mutationType: DurableMutationType,
@@ -5486,6 +5499,7 @@ async function applyApprovedTriageAction(params: {
           resumeStage: params.resumeStage,
           noteVisibilityPriorAttempts: params.noteVisibilityPriorAttempts,
           beforeNoteCheck: params.beforeNoteCheck,
+          afterPreflightValidation: params.afterPreflightValidation,
           beforeMutation: params.beforeMutation,
           afterMutation: params.afterMutation,
           afterConclusiveRejection: params.afterConclusiveRejection,
@@ -5789,6 +5803,7 @@ async function ambiguityCheckedTriageResult(params: {
   ambiguityStage: OperationItemState["stage"];
   fallbackAlreadyAttempted?: boolean;
   beforeNoteCheck?: () => Promise<void>;
+  afterPreflightValidation?: () => Promise<void>;
   beforeMutation?: (mutationType: DurableMutationType) => Promise<void>;
   afterMutation?: (
     mutationType: DurableMutationType,
@@ -6116,6 +6131,30 @@ function createApplyTriageContinuationAdapter(
           throw new DurableCheckpointError(error);
         }
       };
+      const afterPreflightValidation = async () => {
+        if (stagedResolveResumeHasPreflightValidation(checkpointStage)) return;
+        try {
+          await checkpoint({
+            stage: "PreflightValidated",
+            mutationType: "classification",
+            writeAttempted: durableWriteAttempted,
+            writeMayHaveSucceeded: durableWriteMayHaveSucceeded,
+            reliableResponseReceived,
+            observedMutationResult,
+            canonicalTargetHash,
+            noteFingerprint: action?.noteFingerprint ?? normalizedNoteFingerprint(action?.note),
+            fallbackAllowed: action?.allowResolveFullFallbackToUpdate ??
+              storedParams.allowResolveFullFallbackToUpdate ?? false,
+            fallbackAttempted,
+            fallbackApplied,
+            partialWrite: claim.item.partialWrite,
+            verificationState: "Pending",
+          });
+          checkpointStage = "PreflightValidated";
+        } catch (error) {
+          throw new DurableCheckpointError(error);
+        }
+      };
       const beforeMutation = async (
         mutationType: DurableMutationType
       ) => {
@@ -6409,6 +6448,7 @@ for (const stage of remainingStages) {
             ambiguityStage: claim.item.stage,
             fallbackAlreadyAttempted: claim.item.fallbackAttempted === true,
             beforeNoteCheck,
+            afterPreflightValidation,
             beforeMutation,
             afterMutation,
             afterConclusiveRejection,
@@ -6431,6 +6471,7 @@ for (const stage of remainingStages) {
               resumeStage: resumeStageOverride,
               noteVisibilityPriorAttempts: claim.item.retryCount,
               beforeNoteCheck,
+              afterPreflightValidation,
               beforeMutation,
               afterMutation,
               afterConclusiveRejection,
@@ -7677,6 +7718,45 @@ export function getTicketsTools(): DomainTools {
               continuationError ??= safeErrorMessage(error);
             }
             let continuationScheduling: Record<string, unknown> | undefined;
+            const checkpointFailureRequiresFreshOperation = continuationError !== undefined &&
+              !continuationError.includes("crash-boundary after") &&
+              (
+                conservativeOutcome?.errorClass === "OperationStoreFailure" ||
+                /Durable checkpoint failed|Invalid operation item transition|persistence failed|crash-boundary before/.test(continuationError)
+              );
+            if (checkpointFailureRequiresFreshOperation && !finalRecordReadFailed &&
+                !["Completed", "CompletedWithFailures", "Failed", "Cancelled"].includes(finalRecord.state)) {
+              const durableItemsBeforeTerminalize = Object.values(finalRecord.itemStates);
+              const possibleWriteBeforeCheckpointFailure = durableItemsBeforeTerminalize.some((item) =>
+                item.writeMayHaveSucceeded === true && item.observedMutationResult !== "Rejected"
+              );
+              const checkpointFailureMessage = continuationError ?? "";
+              const checkpointFailureReason = checkpointFailureMessage.includes("fresh operation")
+                ? checkpointFailureMessage
+                : checkpointFailureMessage +
+                  " This operation was terminalized because a required durable checkpoint could not be persisted; submit a fresh operation after the code defect or durable-store failure is corrected.";
+              conservativeOutcome = {
+                stage: possibleWriteBeforeCheckpointFailure ? "AmbiguousWriteUnresolved" : "FailedBeforeWrite",
+                outcome: possibleWriteBeforeCheckpointFailure ? "AmbiguousWriteRequiresReconciliation" : "OperationStoreFailure",
+                writeAttempted: durableItemsBeforeTerminalize.some((item) => item.writeAttempted),
+                writeMayHaveSucceeded: durableItemsBeforeTerminalize.some((item) => item.writeMayHaveSucceeded),
+                partialWrite: possibleWriteBeforeCheckpointFailure || durableItemsBeforeTerminalize.some((item) => item.partialWrite),
+                failureReason: checkpointFailureReason,
+                errorClass: "OperationStoreFailure",
+              };
+              try {
+                finalRecord = await store.terminalizeContinuationFailure({
+                  operationId,
+                  ownerHash,
+                  errorClass: "OperationStoreFailure",
+                  outcome: "OperationStoreFailed",
+                  reason: checkpointFailureReason,
+                });
+                conservativeOutcome = undefined;
+              } catch (error) {
+                continuationError = checkpointFailureReason + " Terminal failure persistence also failed: " + safeErrorMessage(error);
+              }
+            }
             const continuationRequired = (continuation?.continuationRequired ??
               finalRecord.pendingItems.length > 0) || finalRecordReadFailed || Boolean(conservativeOutcome);
             if (continuationRequired && !finalRecord.nextEligibleTime && !finalRecordReadFailed && !conservativeOutcome) {
@@ -7793,7 +7873,7 @@ export function getTicketsTools(): DomainTools {
                 expectedCandidateTicketNumbers: expected,
                 results, summary, execution: executionDiagnostics(),
               }, null, 2) }],
-              isError: Boolean(continuationError),
+              isError: Boolean(continuationError || durableFinalErrorClass === "OperationStoreFailure"),
             };
           }
           case "superops_tickets_conversation_list": {

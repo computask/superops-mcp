@@ -831,6 +831,68 @@ describe("operation store", () => {
     });
   });
 
+  it("requires preflight before no-write staged classification verification", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const ownerHash = stableHash("owner@example.com");
+      await store.put(record({ operationId: "op-staged-noop-classification" }));
+      const claim = await store.claimNextItem({
+        operationId: "op-staged-noop-classification",
+        ownerHash,
+        leaseOwner: "noop-classification",
+        leaseMs: 60_000,
+      });
+      if (!claim) throw new Error("expected noop-classification claim");
+
+      await expect(store.checkpointItem({
+        operationId: "op-staged-noop-classification",
+        ownerHash,
+        itemKey: "57401",
+        leaseId: claim.lease.leaseId,
+        patch: {
+          stage: "ClassificationVerified",
+          mutationType: "classification",
+          writeAttempted: false,
+          writeMayHaveSucceeded: false,
+          partialWrite: false,
+          verificationState: "Verified",
+        },
+      })).rejects.toThrow(/Invalid operation item transition from Unattempted to ClassificationVerified/);
+
+      await expect(store.checkpointItem({
+        operationId: "op-staged-noop-classification",
+        ownerHash,
+        itemKey: "57401",
+        leaseId: claim.lease.leaseId,
+        patch: {
+          stage: "PreflightValidated",
+          mutationType: "classification",
+          writeAttempted: false,
+          writeMayHaveSucceeded: false,
+          partialWrite: false,
+          verificationState: "Pending",
+        },
+      })).resolves.toMatchObject({
+        itemStates: { "57401": { stage: "PreflightValidated" } },
+      });
+      await expect(store.checkpointItem({
+        operationId: "op-staged-noop-classification",
+        ownerHash,
+        itemKey: "57401",
+        leaseId: claim.lease.leaseId,
+        patch: {
+          stage: "ClassificationVerified",
+          mutationType: "classification",
+          writeAttempted: false,
+          writeMayHaveSucceeded: false,
+          partialWrite: false,
+          verificationState: "Verified",
+        },
+      })).resolves.toMatchObject({
+        itemStates: { "57401": { stage: "ClassificationVerified" } },
+      });
+    });
+  });
   it("allows a verified resolution readback from the ambiguous resolution stage without opening backward transitions", async () => {
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();
