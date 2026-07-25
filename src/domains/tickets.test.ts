@@ -5321,6 +5321,310 @@ describe("Tickets Domain", () => {
     )).toBe(true);
   });
 
+  function stagedVisibilityAction(note = "JUNK") {
+    return {
+      ticketNumber: "57401",
+      contentVerified: true,
+      action: "resolve" as const,
+      note,
+      target: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.target,
+    };
+  }
+
+  function installStagedVisibilityMocks(options: { publicOnly?: boolean } = {}) {
+    const events: string[] = [];
+    let classificationApplied = false;
+    let statusResolved = false;
+    let privateNoteVisible = false;
+    const noteBody = "JUNK";
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        events.push("ticket-list");
+        return { getTicketList: { tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } };
+      }
+      if (query.includes("getFields")) {
+        events.push("fields");
+        return { getFields: RESOLVED_OPTION_FIELDS };
+      }
+      if (query.includes("getTicketNoteList")) {
+        events.push("notes");
+        return { getTicketNoteList: privateNoteVisible
+          ? [{ noteId: "private-note", content: noteBody, privacyType: options.publicOnly ? "PUBLIC" : "PRIVATE" }]
+          : [] };
+      }
+      events.push("ticket");
+      return { getTicket: {
+        ticketId: "ticket-57401",
+        displayId: "57401",
+        status: statusResolved ? "Resolved" : "New Calls",
+        updatedTime: statusResolved ? "2026-07-25T16:20:00.000Z" : "2026-07-25T16:18:03.608Z",
+        ...(classificationApplied ? {
+          client: { accountId: LIVE_PARTIAL_RESOLVE_STATUS_MISSING_REGRESSION.clientId },
+          ...RESOLVED_CLASSIFICATION,
+        } : {}),
+      } };
+    });
+    mockClient.mutate.mockImplementation(async (mutation: string, variables: { input: Record<string, unknown> }) => {
+      if (mutation.includes("createTicketNote")) {
+        events.push("note-write");
+        expect(variables.input.privacyType).toBe("PRIVATE");
+        return { createTicketNote: { noteId: "created-note", privacyType: "PRIVATE" } };
+      }
+      if (variables.input.status === "Resolved") {
+        events.push("status-write");
+        expect(variables.input.suppressCloseNotification).toBe(true);
+        statusResolved = true;
+      } else {
+        events.push("classification-write");
+        classificationApplied = true;
+      }
+      return { updateTicket: { ticketId: "ticket-57401", status: variables.input.status } };
+    });
+    return {
+      events,
+      showPrivateNote() { privateNoteVisible = true; },
+      markClassificationApplied() { classificationApplied = true; },
+    };
+  }
+
+  it("defers accepted staged private-note verification when the first read misses", async () => {
+    const mocks = installStagedVisibilityMocks();
+    const result = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+      runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "staged-note-visibility-pending",
+          expectedCandidateTicketNumbers: ["57401"],
+          actions: [stagedVisibilityAction()],
+        })
+      )
+    ));
+    const parsed = JSON.parse(result.content[0].text);
+    const stored = await getOperationStore().get("staged-note-visibility-pending");
+
+    expect(result.isError).not.toBe(true);
+    expect(parsed.operation).toMatchObject({ complete: false, continuationRequired: true });
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "NoteVisibilityPending",
+      noteWriteOutcome: "NoteVisibilityPending",
+      initialNoteVerificationObserved: false,
+      noteVerificationAttempts: 1,
+      noteVerifiedAfterDelay: false,
+      continuationRequired: true,
+      currentStage: "NoteAdded",
+      terminalReason: "NoteVisibilityPending",
+    });
+    expect(stored?.itemStates["57401"]).toMatchObject({
+      stage: "NoteAdded",
+      outcome: "NoteVisibilityPending",
+      retryCount: 1,
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      observedMutationResult: "Accepted",
+    });
+    expect(stored?.pendingItems).toEqual(["57401"]);
+    expect(mocks.events).toContain("note-write");
+    expect(mocks.events).not.toContain("status-write");
+    expect(mockClient.mutate.mock.calls.filter(([mutation]) => String(mutation).includes("createTicketNote"))).toHaveLength(1);
+  });
+
+  it("verifies a delayed staged private note without duplicating it, then closes status with notification suppression", async () => {
+    const mocks = installStagedVisibilityMocks();
+    await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+      runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "staged-note-visibility-delayed-success",
+          expectedCandidateTicketNumbers: ["57401"],
+          actions: [stagedVisibilityAction()],
+        })
+      )
+    ));
+    const stored = await getOperationStore().get("staged-note-visibility-delayed-success");
+    if (!stored) throw new Error("missing delayed success operation");
+    mocks.showPrivateNote();
+
+    await runWithExecutionConfig({}, () => runWithExecutionContext(
+      "superops_tickets_apply_triage_plan",
+      () => resumeApplyTriageOperation({
+        operationId: "staged-note-visibility-delayed-success",
+        ownerHash: stored.ownerHash,
+        leaseOwner: "delayed-note-success",
+        now: stored.nextEligibleTime ?? new Date().toISOString(),
+      })
+    ));
+
+    const finalRecord = await getOperationStore().get("staged-note-visibility-delayed-success");
+    expect(finalRecord?.state).toBe("Completed");
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "Completed",
+      outcome: "Resolved",
+      verificationState: "Verified",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: false,
+    });
+    expect(finalRecord?.compactResults).toContainEqual(expect.objectContaining({
+      ticketNumber: "57401",
+      finalOutcome: "Resolved",
+      noteWriteOutcome: "NoteVerifiedAfterDelay",
+      initialNoteVerificationObserved: false,
+      noteVerificationAttempts: 2,
+      noteVerifiedAfterDelay: true,
+      statusWriteOutcome: "Accepted",
+      suppressCloseNotificationIncluded: true,
+    }));
+    expect(mockClient.mutate.mock.calls.filter(([mutation]) => String(mutation).includes("createTicketNote"))).toHaveLength(1);
+    expect(mockClient.mutate.mock.calls).toContainEqual([
+      expect.stringContaining("updateTicket"),
+      expect.objectContaining({ input: expect.objectContaining({ status: "Resolved", suppressCloseNotification: true }) }),
+    ]);
+  });
+
+  it("starts a NoteWriteStarted continuation with note reconciliation and does not replay classification or note writes", async () => {
+    const mocks = installStagedVisibilityMocks();
+    await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+      runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "staged-note-write-started-reconcile-first",
+          expectedCandidateTicketNumbers: ["57401"],
+          actions: [stagedVisibilityAction()],
+        })
+      )
+    ));
+    const stored = await getOperationStore().get("staged-note-write-started-reconcile-first");
+    if (!stored) throw new Error("missing NoteWriteStarted operation");
+    stored.itemStates["57401"] = {
+      ...stored.itemStates["57401"],
+      stage: "NoteWriteStarted",
+      retryCount: 1,
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: true,
+      observedMutationResult: "Accepted",
+      verificationState: "Pending",
+    };
+    await getOperationStore().put(stored);
+    mocks.showPrivateNote();
+    mocks.markClassificationApplied();
+    mocks.events.length = 0;
+    mockClient.mutate.mockClear();
+
+    await runWithExecutionConfig({}, () => runWithExecutionContext(
+      "superops_tickets_apply_triage_plan",
+      () => resumeApplyTriageOperation({
+        operationId: "staged-note-write-started-reconcile-first",
+        ownerHash: stored.ownerHash,
+        leaseOwner: "note-write-started-worker",
+        now: stored.nextEligibleTime ?? new Date().toISOString(),
+      })
+    ));
+
+    expect(mocks.events.slice(0, 2)).toEqual(["ticket-list", "notes"]);
+    expect(mocks.events).not.toContain("classification-write");
+    expect(mocks.events).not.toContain("note-write");
+    expect(mocks.events).toContain("status-write");
+    expect(mockClient.mutate.mock.calls).toHaveLength(1);
+    expect(mockClient.mutate.mock.calls[0][1].input).toMatchObject({
+      status: "Resolved",
+      suppressCloseNotification: true,
+    });
+  });
+
+  it.each([
+    ["absent", false],
+    ["public", true],
+  ] as const)("ends unresolved and does not close when the private note remains %s", async (_case, publicOnly) => {
+    const mocks = installStagedVisibilityMocks({ publicOnly });
+    await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+      runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: `staged-note-visibility-unresolved-${_case}`,
+          expectedCandidateTicketNumbers: ["57401"],
+          actions: [stagedVisibilityAction()],
+        })
+      )
+    ));
+    const stored = await getOperationStore().get(`staged-note-visibility-unresolved-${_case}`);
+    if (!stored) throw new Error("missing unresolved operation");
+    stored.itemStates["57401"] = {
+      ...stored.itemStates["57401"],
+      stage: "NoteAdded",
+      retryCount: 3,
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: true,
+      observedMutationResult: "Accepted",
+      verificationState: "Pending",
+    };
+    await getOperationStore().put(stored);
+    if (publicOnly) mocks.showPrivateNote();
+    mocks.events.length = 0;
+    mockClient.mutate.mockClear();
+
+    await runWithExecutionConfig({}, () => runWithExecutionContext(
+      "superops_tickets_apply_triage_plan",
+      () => resumeApplyTriageOperation({
+        operationId: `staged-note-visibility-unresolved-${_case}`,
+        ownerHash: stored.ownerHash,
+        leaseOwner: `unresolved-${_case}`,
+        now: stored.nextEligibleTime ?? new Date().toISOString(),
+      })
+    ));
+
+    const finalRecord = await getOperationStore().get(`staged-note-visibility-unresolved-${_case}`);
+    expect(finalRecord?.itemStates["57401"]).toMatchObject({
+      stage: "AmbiguousWriteUnresolved",
+      outcome: "NoteVisibilityUnresolved",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: true,
+      verificationState: "Pending",
+      errorClass: "AmbiguousWrite",
+    });
+    expect(finalRecord?.compactResults).toContainEqual(expect.objectContaining({
+      ticketNumber: "57401",
+      finalOutcome: "Failed",
+      noteWriteOutcome: "NoteVisibilityUnresolved",
+      noteVerificationAttempts: 4,
+      terminalReason: "NoteVisibilityUnresolved",
+    }));
+    expect(mocks.events).toEqual(["ticket-list", "notes"]);
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("leaves staged resolve dry-run note behaviour unchanged", async () => {
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) return { getTicketList: {
+        tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
+        listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+      } };
+      if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
+      return { getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" } };
+    });
+
+    const result = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+      runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+        getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "staged-note-visibility-dry-run",
+          dryRun: true,
+          expectedCandidateTicketNumbers: ["57401"],
+          actions: [stagedVisibilityAction()],
+        })
+      )
+    ));
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Resolved",
+      writeMethod: "dryRun",
+      notePlanned: true,
+      noteDedupePlanned: true,
+      noteDedupeChecked: false,
+    });
+    expect(parsed.results[0].noteWriteOutcome).toBeUndefined();
+    expect(mockClient.query.mock.calls.some(([query]) => String(query).includes("getTicketNoteList"))).toBe(false);
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
   it("marks completed dry-run update continuation items as verification not required", async () => {
     const domain = getTicketsTools();
     await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(

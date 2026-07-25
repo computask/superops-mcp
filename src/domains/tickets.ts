@@ -635,6 +635,7 @@ type TriageFinalOutcome =
   | "Skipped"
   | "Blocked"
   | "Failed"
+  | "NoteVisibilityPending"
   | "RejectedOrNoChange"
   | "AmbiguousNoChangeObserved"
   | "PartialResolveStatusMissing"
@@ -896,6 +897,11 @@ interface ApplyTriagePlanResult {
   notePlanned?: boolean;
   noteDedupePlanned?: boolean;
   noteDedupeChecked?: boolean;
+  noteWriteOutcome?: string | null;
+  initialNoteVerificationObserved?: boolean;
+  noteVerificationAttempts?: number;
+  noteVerifiedAfterDelay?: boolean;
+  continuationRequired?: boolean;
   plannedMutations?: string[];
   workflowMode?: "staged" | "combined";
   completedStages?: string[];
@@ -3458,6 +3464,9 @@ async function buildApprovedUpdateInput(
   return input;
 }
 
+const STAGED_NOTE_VISIBILITY_RECONCILIATION_DELAY_MS = 15_000;
+const STAGED_NOTE_VISIBILITY_MAX_ATTEMPTS = 4;
+
 const STAGED_RESOLVE_CLASSIFICATION_FIELDS = [
   "impact",
   "urgency",
@@ -3650,6 +3659,62 @@ function updateStagedNoChangeFailureStage(result: ApplyTriagePlanResult, stage: 
   result.terminalReason = result.finalOutcome;
 }
 
+function stagedNoteVisibilityNextEligibleTime(): string {
+  return new Date(Date.now() + STAGED_NOTE_VISIBILITY_RECONCILIATION_DELAY_MS).toISOString();
+}
+
+function markStagedNoteVisibilityPending(params: {
+  result: ApplyTriagePlanResult;
+  stage?: string;
+  attempts: number;
+  initialObserved?: boolean;
+}): ApplyTriagePlanResult {
+  params.result.finalOutcome = "NoteVisibilityPending";
+  params.result.failureStage = "noteVisibility";
+  params.result.failureReason = "Accepted private-note write is not visible yet; status resolution is deferred to read-only reconciliation.";
+  params.result.terminalReason = "NoteVisibilityPending";
+  params.result.partialWrite = true;
+  params.result.writeMayHaveSucceeded = true;
+  params.result.verified = false;
+  params.result.finalVerificationState = "Pending";
+  params.result.noteWriteOutcome = "NoteVisibilityPending";
+  params.result.initialNoteVerificationObserved = params.initialObserved ?? false;
+  params.result.noteVerificationAttempts = params.attempts;
+  params.result.noteVerifiedAfterDelay = false;
+  params.result.continuationRequired = true;
+  markWorkflowStage(params.result, params.stage ?? "NoteVisibilityPending");
+  return params.result;
+}
+
+function markStagedNoteVisibilityUnresolved(params: {
+  result: ApplyTriagePlanResult;
+  attempts: number;
+}): ApplyTriagePlanResult {
+  const result = markStagedFailure({
+    result: params.result,
+    stage: "noteVisibility",
+    reason: "Accepted private-note write remained invisible after " + params.attempts + " read-only verification attempts; status resolution was not attempted.",
+    terminalReason: "NoteVisibilityUnresolved",
+    partialWrite: true,
+    writeMayHaveSucceeded: true,
+    verificationState: "Pending",
+  });
+  result.noteWriteOutcome = "NoteVisibilityUnresolved";
+  result.initialNoteVerificationObserved = false;
+  result.noteVerificationAttempts = params.attempts;
+  result.noteVerifiedAfterDelay = false;
+  result.continuationRequired = false;
+  return result;
+}
+
+function markStagedNoteVerifiedAfterDelay(result: ApplyTriagePlanResult, attempts: number): void {
+  result.noteWriteOutcome = "NoteVerifiedAfterDelay";
+  result.initialNoteVerificationObserved = false;
+  result.noteVerificationAttempts = attempts;
+  result.noteVerifiedAfterDelay = true;
+  result.continuationRequired = false;
+}
+
 function markStagedFailure(params: {
   result: ApplyTriagePlanResult;
   stage: string;
@@ -3681,6 +3746,7 @@ async function applyStagedResolveAction(params: {
   verify: boolean;
   dedupeNotes: boolean;
   resumeStage?: OperationItemState["stage"];
+  noteVisibilityPriorAttempts?: number;
   beforeNoteCheck?: () => Promise<void>;
   beforeMutation?: (mutationType: DurableMutationType) => Promise<void>;
   afterMutation?: (
@@ -3722,7 +3788,7 @@ async function applyStagedResolveAction(params: {
   let trustedTicket = params.ticket;
   const classificationWriteRequired = classificationInputHasWritableFields(classificationInput as Record<string, unknown>) &&
     classificationMismatches.length > 0 &&
-    !(params.resumeStage === "ClassificationWriteStarted" || params.resumeStage === "ClassificationWriteSucceeded" || params.resumeStage === "ClassificationVerified");
+    !stagedResolveResumeHasVerifiedClassification(params.resumeStage);
   result.classificationWriteMethod = "updateTicket.classification";
   result.classificationWriteOutcome = classificationWriteRequired ? "Pending" : "NotRequired";
 
@@ -3898,15 +3964,21 @@ async function applyStagedResolveAction(params: {
         writeMayHaveSucceeded: result.writeMayHaveSucceeded,
       });
     }
+    if (notePlan === "deduped" && (params.noteVisibilityPriorAttempts ?? 0) > 0) {
+      markStagedNoteVerifiedAfterDelay(result, (params.noteVisibilityPriorAttempts ?? 0) + 1);
+    }
     if (notePlan === "pending" && stagedResolveResumeAtOrPastNoteWrite(params.resumeStage)) {
-      return markStagedFailure({
+      const attempts = (params.noteVisibilityPriorAttempts ?? 0) + 1;
+      result.writeAttempted = true;
+      result.writeMayHaveSucceeded = true;
+      result.partialWrite = true;
+      if (attempts >= STAGED_NOTE_VISIBILITY_MAX_ATTEMPTS) {
+        return markStagedNoteVisibilityUnresolved({ result, attempts });
+      }
+      return markStagedNoteVisibilityPending({
         result,
-        stage: "noteVerification",
-        reason: "Previously started private-note stage was not observed; staged writes were not replayed.",
-        terminalReason: "AmbiguousNoteCreationUnresolved",
-        partialWrite: result.writeAttempted || stagedResolveResumeAtOrPastNoteWrite(params.resumeStage),
-        writeMayHaveSucceeded: result.writeMayHaveSucceeded ?? stagedResolveResumeAtOrPastNoteWrite(params.resumeStage),
-        verificationState: "Pending",
+        stage: params.resumeStage === "NoteWriteStarted" ? "NoteWriteStarted" : "NoteAdded",
+        attempts,
       });
     }
     if (notePlan === "pending") {
@@ -3917,6 +3989,7 @@ async function applyStagedResolveAction(params: {
         const created = await createTicketNote(client, trustedTicket.ticketId, noteBodyForPlan(action.note) as string, false);
         result.noteAdded = true;
         result.writeMayHaveSucceeded = true;
+        result.noteWriteOutcome = "Accepted";
         recordPhysicalWrite(result, "createTicketNote", "Accepted");
         await params.afterMutation?.("note", { ticketId: trustedTicket.ticketId, noteId: created.noteId });
       } catch (error) {
@@ -3951,15 +4024,26 @@ async function applyStagedResolveAction(params: {
     const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
     const noteVerified = await existingNoteMatchesFingerprint(client, trustedTicket.ticketId, fingerprint);
     result.noteDedupeChecked = true;
+    result.initialNoteVerificationObserved ??= noteVerified;
+    result.noteVerificationAttempts = (params.noteVisibilityPriorAttempts ?? 0) + 1;
     if (!noteVerified) {
-      return markStagedFailure({
+      const attempts = result.noteVerificationAttempts;
+      if (attempts >= STAGED_NOTE_VISIBILITY_MAX_ATTEMPTS) {
+        return markStagedNoteVisibilityUnresolved({ result, attempts });
+      }
+      return markStagedNoteVisibilityPending({
         result,
-        stage: "noteVerification",
-        reason: "Approved private note was not observed after note stage.",
-        terminalReason: "NoteVerificationFailed",
-        partialWrite: result.writeAttempted,
-        writeMayHaveSucceeded: result.writeMayHaveSucceeded,
+        stage: "NoteAdded",
+        attempts,
+        initialObserved: false,
       });
+    }
+    if ((params.noteVisibilityPriorAttempts ?? 0) > 0 || result.initialNoteVerificationObserved === false) {
+      markStagedNoteVerifiedAfterDelay(result, result.noteVerificationAttempts ?? 1);
+    } else {
+      result.noteWriteOutcome ??= result.noteAdded ? "AcceptedAndVerified" : "VerifiedExistingPrivateNote";
+      result.noteVerifiedAfterDelay = false;
+      result.continuationRequired = false;
     }
     markWorkflowStage(result, "NoteVerified");
     if (!stagedResolveResumeHasVerifiedNote(params.resumeStage)) {
@@ -4833,6 +4917,11 @@ function compactApplyResult(
     notePlanned: result.notePlanned,
     noteDedupePlanned: result.noteDedupePlanned,
     noteDedupeChecked: result.noteDedupeChecked,
+    noteWriteOutcome: result.noteWriteOutcome,
+    initialNoteVerificationObserved: result.initialNoteVerificationObserved,
+    noteVerificationAttempts: result.noteVerificationAttempts,
+    noteVerifiedAfterDelay: result.noteVerifiedAfterDelay,
+    continuationRequired: result.continuationRequired,
     plannedMutations: stagedVerifiedSuccess ? undefined : result.plannedMutations,
     workflowMode: result.workflowMode,
     completedStages: stagedVerifiedSuccess ? undefined : result.completedStages,
@@ -5218,6 +5307,7 @@ async function applyApprovedTriageAction(params: {
   allowWriteIfUpdatedTimeChanged: boolean;
   allowWriteWithoutVerifiedContent: boolean;
   resumeStage?: OperationItemState["stage"];
+  noteVisibilityPriorAttempts?: number;
   beforeNoteCheck?: () => Promise<void>;
   beforeMutation?: (mutationType: DurableMutationType) => Promise<void>;
   afterMutation?: (
@@ -5394,6 +5484,7 @@ async function applyApprovedTriageAction(params: {
           verify: params.verify,
           dedupeNotes: params.dedupeNotes,
           resumeStage: params.resumeStage,
+          noteVisibilityPriorAttempts: params.noteVisibilityPriorAttempts,
           beforeNoteCheck: params.beforeNoteCheck,
           beforeMutation: params.beforeMutation,
           afterMutation: params.afterMutation,
@@ -5579,12 +5670,18 @@ function applyResultToContinuationOutcome(
 ): ContinuationItemOutcome {
   const rateLimitReschedule = result.failureStage === "rateLimit" &&
     result.rateLimitConclusiveRejection === true;
+  const noteVisibilityPending = result.terminalReason === "NoteVisibilityPending";
+  const noteVisibilityUnresolved = result.terminalReason === "NoteVisibilityUnresolved";
   const ambiguousMutation = result.writeAttempted && result.partialWrite && (
     result.failureStage === "update" || result.failureStage === "resolve_full" ||
     result.failureStage === "createTicketNote" || result.failureStage === "write" ||
     result.failureStage === "ambiguousWrite"
   );
-  const persistedStage = result.failureStage === "ambiguousWrite"
+  const persistedStage = noteVisibilityPending
+    ? stage === "NoteWriteStarted" ? "NoteWriteStarted" : "NoteAdded"
+    : noteVisibilityUnresolved
+      ? "AmbiguousWriteUnresolved"
+      : result.failureStage === "ambiguousWrite"
     ? "AmbiguousWriteUnresolved"
     : ambiguousMutation
       ? result.failureStage === "createTicketNote"
@@ -5596,13 +5693,15 @@ function applyResultToContinuationOutcome(
   return {
     stage: rateLimitReschedule ? "RateLimitedRescheduled" : persistedStage,
     outcome: rateLimitReschedule ? "SuperOpsRateLimitRescheduled" :
+      noteVisibilityPending ? "NoteVisibilityPending" :
+      noteVisibilityUnresolved ? "NoteVisibilityUnresolved" :
       result.failureStage === "ambiguousWrite" ? "AmbiguousWriteUnresolved" : result.finalOutcome,
     writeAttempted: result.writeAttempted,
     // A conclusive throttle proves this mutation was not accepted. Ambiguous
     // transports remain conservative; only a reliable rejection can clear
     // possible-write state and authorise a checked retry.
     writeMayHaveSucceeded: rateLimitReschedule ? false : result.writeMayHaveSucceeded === true,
-    reliableResponseReceived: rateLimitReschedule ? true : result.writeAttempted && result.writeMayHaveSucceeded === false ? true : undefined,
+    reliableResponseReceived: rateLimitReschedule || noteVisibilityPending || noteVisibilityUnresolved ? true : result.writeAttempted && result.writeMayHaveSucceeded === false ? true : undefined,
     retryDelaySource: result.rateLimitDelaySource,
     retryAfterSupplied: result.rateLimitRetryAfterSupplied,
     suppliedDelayMs: result.rateLimitRetryAfterSupplied ? result.rateLimitRequestedDelayMs : undefined,
@@ -5610,8 +5709,11 @@ function applyResultToContinuationOutcome(
       ? "CreateTicketNote"
       : "UpdateTicket",
     retryEndpoint: "SuperOps GraphQL /msp",
+    retryCount: noteVisibilityPending || noteVisibilityUnresolved ? result.noteVerificationAttempts : undefined,
     observedMutationResult: rateLimitReschedule
       ? "Rejected"
+      : noteVisibilityPending || noteVisibilityUnresolved
+        ? "Accepted"
       : result.verified
         ? priorObservedMutationResult === "Rejected" && !result.writeAttempted
           ? "Rejected"
@@ -5627,13 +5729,19 @@ function applyResultToContinuationOutcome(
     rateLimited: rateLimitReschedule,
     nextEligibleTime: rateLimitReschedule
       ? new Date(Date.now() + (result.rateLimitRetryAfterMs ?? 0)).toISOString()
-      : undefined,
+      : noteVisibilityPending
+        ? stagedNoteVisibilityNextEligibleTime()
+        : undefined,
     verificationFailed: result.failureStage === "verify" || result.failureStage === "verifyFinalState",
     stale: result.finalOutcome === "SkippedChangedSinceSnapshot",
     failureReason: result.failureReason ?? undefined,
     result: compactApplyResult(result, compactOptions),
     errorClass: rateLimitReschedule
       ? "SuperOpsRateLimit"
+      : noteVisibilityPending
+        ? undefined
+      : noteVisibilityUnresolved
+        ? "AmbiguousWrite"
       : result.finalOutcome === "SkippedChangedSinceSnapshot"
         ? "StaleData"
       : result.failureStage === "ambiguousWrite" || ambiguousMutation
@@ -6217,8 +6325,71 @@ for (const stage of remainingStages) {
           throw new DurableCheckpointError(error);
         }
       };
+      let resumeStageOverride: OperationItemState["stage"] | undefined = claim.item.stage;
+      let noteVerifiedAfterDelayAttempts: number | undefined;
+      if (action?.action === "resolve" &&
+          (claim.item.stage === "NoteWriteStarted" || claim.item.stage === "NoteAdded")) {
+        const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
+        const visibilityResult = baseApplyResult(claim.itemKey, action);
+        visibilityResult.workflowMode = "staged";
+        visibilityResult.writeMethod = "staged";
+        visibilityResult.writeAttempted = true;
+        visibilityResult.writeMayHaveSucceeded = true;
+        visibilityResult.partialWrite = true;
+        visibilityResult.noteAdded = claim.item.stage === "NoteAdded" || Boolean(claim.item.createdNoteId);
+        visibilityResult.notePlanned = Boolean(fingerprint);
+        visibilityResult.noteDedupePlanned = Boolean(fingerprint);
+        visibilityResult.physicalWrites = [];
+        markWorkflowStage(visibilityResult, claim.item.stage);
+
+        const resolvedForNotes = await resolveTicketId(client, { ticketNumber: claim.itemKey });
+        if (resolvedForNotes.error || !resolvedForNotes.ticketId) {
+          visibilityResult.finalOutcome = "Failed";
+          visibilityResult.failureStage = "noteVisibilityRead";
+          visibilityResult.failureReason = resolvedForNotes.error ?? "Ticket was not found while reconciling private-note visibility.";
+          visibilityResult.terminalReason = "NoteVisibilityUnresolved";
+          visibilityResult.finalVerificationState = "Pending";
+          return applyResultToContinuationOutcome(
+            markStagedNoteVisibilityUnresolved({
+              result: visibilityResult,
+              attempts: (claim.item.retryCount ?? 0) + 1,
+            }),
+            claim.item.stage,
+            observedMutationResult
+          );
+        }
+
+        const noteObserved = await existingNoteMatchesFingerprint(client, resolvedForNotes.ticketId, fingerprint);
+        visibilityResult.noteDedupeChecked = true;
+        visibilityResult.initialNoteVerificationObserved = false;
+        const attempts = (claim.item.retryCount ?? 0) + 1;
+        visibilityResult.noteVerificationAttempts = attempts;
+        if (!noteObserved) {
+          if (attempts >= STAGED_NOTE_VISIBILITY_MAX_ATTEMPTS) {
+            return applyResultToContinuationOutcome(
+              markStagedNoteVisibilityUnresolved({ result: visibilityResult, attempts }),
+              claim.item.stage,
+              observedMutationResult
+            );
+          }
+          return applyResultToContinuationOutcome(
+            markStagedNoteVisibilityPending({
+              result: visibilityResult,
+              stage: claim.item.stage,
+              attempts,
+            }),
+            claim.item.stage,
+            observedMutationResult
+          );
+        }
+
+        await afterVerification("note");
+        noteVerifiedAfterDelayAttempts = attempts;
+        resumeStageOverride = "NoteVerified";
+      }
+
       const stagedResolveResume = action?.action === "resolve" &&
-        stagedResolveResumeSkipsSnapshotExpectations(claim.item.stage);
+        stagedResolveResumeSkipsSnapshotExpectations(resumeStageOverride);
       const shouldResolveAmbiguity = !stagedResolveResume && (
         claim.item.stage === "WriteStarted" ||
         claim.item.stage === "WriteAmbiguous" ||
@@ -6257,7 +6428,8 @@ for (const stage of remainingStages) {
                 storedParams.allowWriteIfUpdatedTimeChanged ?? false,
               allowWriteWithoutVerifiedContent:
                 storedParams.allowWriteWithoutVerifiedContent ?? false,
-              resumeStage: claim.item.stage,
+              resumeStage: resumeStageOverride,
+              noteVisibilityPriorAttempts: claim.item.retryCount,
               beforeNoteCheck,
               beforeMutation,
               afterMutation,
@@ -6265,6 +6437,10 @@ for (const stage of remainingStages) {
               afterVerification,
             }),
           };
+
+      if (noteVerifiedAfterDelayAttempts !== undefined) {
+        markStagedNoteVerifiedAfterDelay(applied.result, noteVerifiedAfterDelayAttempts);
+      }
 
       const trimStagedSuccessDetails = Array.isArray(storedParams.expectedCandidateTicketNumbers) &&
         storedParams.expectedCandidateTicketNumbers.length > 50;
@@ -6276,8 +6452,10 @@ for (const stage of remainingStages) {
       );
       outcome.retryCount = typeof applied.retryCount === "number"
         ? applied.retryCount
-        : (claim.item.retryCount ?? 0) +
-          (claim.item.observedMutationResult === "Rejected" ? 1 : 0);
+        : typeof outcome.retryCount === "number"
+          ? outcome.retryCount
+          : (claim.item.retryCount ?? 0) +
+            (claim.item.observedMutationResult === "Rejected" ? 1 : 0);
       return outcome;
     },
   };
