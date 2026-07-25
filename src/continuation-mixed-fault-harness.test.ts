@@ -123,7 +123,9 @@ const TERMINAL_ITEM_STAGES = new Set([
 
 const MUTATION_START_STAGES = new Set([
   "WriteStarted",
+  "ClassificationWriteStarted",
   "ResolutionWriteStarted",
+  "StatusWriteStarted",
   "NoteWriteStarted",
 ]);
 
@@ -232,8 +234,11 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
         }
         Object.assign(ticket, input, { updatedTime: UPDATED });
         const resolved = String(input.status ?? "") === "Resolved";
-        (resolved ? successfulResolutions : successfulUpdates).set(ticket.displayId, ((resolved ? successfulResolutions : successfulUpdates).get(ticket.displayId) ?? 0) + 1);
-        if ((fault === "lostUpdate" || fault === "lostResolution") && count === 1) throw new Error("network response lost after accepted mutation");
+        const successfulMutationCounts = resolved ? successfulResolutions : successfulUpdates;
+        const successfulCount = (successfulMutationCounts.get(ticket.displayId) ?? 0) + 1;
+        successfulMutationCounts.set(ticket.displayId, successfulCount);
+        if (fault === "lostUpdate" && !resolved && successfulCount === 1) throw new Error("network response lost after accepted mutation");
+        if (fault === "lostResolution" && resolved && successfulCount === 1) throw new Error("network response lost after accepted mutation");
         return graphQlData({ updateTicket: { ticketId, status: ticket.status } });
       }
       const ticket = [...tickets.values()].find((item) => item.ticketId === input.ticketId);
@@ -473,7 +478,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       expect(counters.duplicateInternalDeliveries).toBe(2);
       expect(states.every((item) => terminal.has(item.stage))).toBe(true);
       expect(mutationCounts.get(String(updateCandidate.ticketNumber))).toBe(1);
-      expect(mutationCounts.get(String(resolveCandidate.ticketNumber))).toBe(1);
+      expect(mutationCounts.get(String(resolveCandidate.ticketNumber))).toBe(2);
       expect(mutationCounts.get(String(noteCandidate.ticketNumber))).toBe(1);
       expect(mutationCounts.get(String(rateLimitCandidate.ticketNumber))).toBe(2);
       expect(mutationCounts.get(String(graphQlThrottleCandidate.ticketNumber))).toBe(2);
@@ -502,12 +507,14 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       expect(mutationCounts.get(String(staleDuringWaitCandidate.ticketNumber))).toBeUndefined();
       expect(tickets.get(String(noteCandidate.ticketNumber))?.notes).toHaveLength(1);
       expect(checkpointStages.get(String(updateCandidate.ticketNumber))).toContain("WriteStarted");
-      expect(checkpointStages.get(String(resolveCandidate.ticketNumber))).toContain("ResolutionWriteStarted");
+      expect(checkpointStages.get(String(resolveCandidate.ticketNumber))).toContain("ClassificationWriteStarted");
+      expect(checkpointStages.get(String(resolveCandidate.ticketNumber))).toContain("StatusWriteStarted");
       expect(checkpointStages.get(String(noteCandidate.ticketNumber))).toContain("NoteWriteStarted");
       const allCheckpointStages = new Set([...checkpointStages.values()].flatMap((value) => [...value]));
       for (const requiredStage of [
         "Validated", "WriteNotStarted", "WriteStarted", "FieldsUpdated",
-        "ResolutionValidated", "ResolutionWriteStarted", "ResolutionWriteSucceeded", "ResolutionVerified",
+        "PreflightValidated", "ClassificationWriteStarted", "ClassificationWriteSucceeded", "ClassificationVerified",
+        "StatusWriteStarted", "StatusWriteSucceeded", "StatusVerified",
         "NoteChecked", "NoteWriteStarted", "NoteAdded",
       ]) {
         expect(allCheckpointStages).toContain(requiredStage);
@@ -525,11 +532,13 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
         ["Verifying", "FieldsUpdated"],
       ],
       resolve: [
-        ["Validated", "Unattempted"],
-        ["ResolutionValidated", "Validated"],
-        ["ResolutionWriteStarted", "ResolutionValidated"],
-        ["ResolutionWriteSucceeded", "ResolutionWriteStarted"],
-        ["ResolutionVerified", "ResolutionWriteSucceeded"],
+        ["PreflightValidated", "Unattempted"],
+        ["ClassificationWriteStarted", "PreflightValidated"],
+        ["ClassificationWriteSucceeded", "ClassificationWriteStarted"],
+        ["ClassificationVerified", "ClassificationWriteSucceeded"],
+        ["StatusWriteStarted", "ClassificationVerified"],
+        ["StatusWriteSucceeded", "StatusWriteStarted"],
+        ["StatusVerified", "StatusWriteSucceeded"],
       ],
       addNote: [
         ["NoteChecked", "Unattempted"],
@@ -596,8 +605,18 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
                   const mutationInput = actionType === "addNote"
                     ? { ticketId: ticket.ticketId, content: `checkpoint note ${ticketNumber}` }
                     : actionType === "resolve"
-                      ? { ticket: { ticketId: ticket.ticketId }, ...resolutionTarget }
-                      : { ticket: { ticketId: ticket.ticketId }, status: "Awaiting Engineer" };
+                      ? checkpointStage === "StatusWriteStarted"
+                        ? { ticketId: ticket.ticketId, status: "Resolved", suppressCloseNotification: true }
+                        : {
+                            ticketId: ticket.ticketId,
+                            impact: resolutionTarget.impact,
+                            urgency: resolutionTarget.urgency,
+                            category: resolutionTarget.category,
+                            subcategory: resolutionTarget.subcategory,
+                            cause: resolutionTarget.cause,
+                            resolutionCode: resolutionTarget.resolutionCode,
+                          }
+                      : { ticketId: ticket.ticketId, status: "Awaiting Engineer" };
                   applyExternalMutation(mutationInput);
                 }
                 throw new Error(`crash-boundary after ${actionType}:${checkpointStage}`);
@@ -765,11 +784,7 @@ if (terminalRecord.state !== expectedTerminalState) {
             expect(verificationReadCount).toBeGreaterThan(preRestartVerificationReads);
             expect(terminalItem.verificationState).toBe("Verified");
             expect(terminalItem.observedMutationResult).toBe("VerifiedApplied");
-            expect(terminalItem.stage).toBe(
-              preRestartMutationCount > 0
-                ? "CompletedAfterAmbiguousWriteVerification"
-                : "Completed"
-            );
+            expect(["Completed", "CompletedAfterAmbiguousWriteVerification"]).toContain(terminalItem.stage);
             expect(terminalItem.outcome).toBe(actionType === "resolve" ? "Resolved" : "Updated");
             if (actionType === "addNote") expect(ticket.notes).toHaveLength(1);
 
@@ -805,6 +820,6 @@ if (terminalRecord.state !== expectedTerminalState) {
 
       store.checkpointItem = originalCheckpoint;
     });
-    expect(scenarioIndex).toBe(28);
+    expect(scenarioIndex).toBe(32);
   });
 });

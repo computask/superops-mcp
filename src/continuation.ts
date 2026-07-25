@@ -175,8 +175,10 @@ export async function runOperationContinuation(
         claim.item.stage === "NoteWriteAmbiguous";
       const resolutionWrite = claim.item.stage === "ResolutionWriteStarted" ||
         claim.item.stage === "ResolutionWriteAmbiguous";
+      const stagedWrite = claim.item.stage === "ClassificationWriteStarted" ||
+        claim.item.stage === "StatusWriteStarted";
       const mutationBoundary = claim.item.stage === "WriteStarted" ||
-        claim.item.stage === "WriteAmbiguous" || resolutionWrite || noteWrite;
+        claim.item.stage === "WriteAmbiguous" || resolutionWrite || noteWrite || stagedWrite;
       // Only an in-flight mutation boundary becomes explicitly ambiguous.
       // A later durable stage (for example FieldsUpdated) already records a
       // reliable response and must retain that exact progress instead.
@@ -411,8 +413,10 @@ export async function runOperationContinuation(
           currentItem?.stage === "NoteWriteAmbiguous";
         const resolutionWrite = currentItem?.stage === "ResolutionWriteStarted" ||
           currentItem?.stage === "ResolutionWriteAmbiguous";
+        const stagedWrite = currentItem?.stage === "ClassificationWriteStarted" ||
+          currentItem?.stage === "StatusWriteStarted";
         const mutationBoundary = currentItem?.stage === "WriteStarted" ||
-          currentItem?.stage === "WriteAmbiguous" || resolutionWrite || noteWrite;
+          currentItem?.stage === "WriteAmbiguous" || resolutionWrite || noteWrite || stagedWrite;
         const preservedStage = currentItem?.stage ?? "Rescheduled";
         record = await store.completeItem({
           operationId: params.operationId,

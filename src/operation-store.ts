@@ -22,20 +22,29 @@ export type OperationItemStage =
   | "Pending"
   | "Validating"
   | "Validated"
+  | "PreflightValidated"
   | "WriteNotStarted"
   | "WriteStarted"
   | "WriteAmbiguous"
   | "FieldsUpdated"
+  | "ClassificationWriteStarted"
+  | "ClassificationWriteSucceeded"
+  | "ClassificationVerified"
   | "ResolutionValidated"
   | "ResolutionWriteStarted"
   | "ResolutionWriteSucceeded"
   | "ResolutionWriteAmbiguous"
   | "ResolutionVerified"
+  | "StatusWriteStarted"
+  | "StatusWriteSucceeded"
+  | "StatusVerified"
   | "StatusUpdated"
   | "NoteChecked"
+  | "NoteDedupeChecked"
   | "NoteWriteStarted"
   | "NoteWriteAmbiguous"
   | "NoteAdded"
+  | "NoteVerified"
   | "Verifying"
   | "Completed"
   | "CompletedAfterRetry"
@@ -111,8 +120,8 @@ export interface OperationItemState {
   writeMayHaveSucceeded: boolean;
   partialWrite: boolean;
   ambiguousWrite?: boolean;
-  mutationType?: "update" | "resolution" | "note" | "resolveFallback";
-  mutationStartStage?: "WriteStarted" | "ResolutionWriteStarted" | "NoteWriteStarted";
+  mutationType?: "update" | "classification" | "resolution" | "status" | "note" | "resolveFallback";
+  mutationStartStage?: "WriteStarted" | "ClassificationWriteStarted" | "ResolutionWriteStarted" | "StatusWriteStarted" | "NoteWriteStarted";
   reliableResponseReceived?: boolean;
   observedMutationResult?: "Accepted" | "Rejected" | "VerifiedApplied" | "Ambiguous";
   canonicalTargetHash?: string;
@@ -515,20 +524,29 @@ const VALID_OPERATION_ITEM_STAGES = new Set<OperationItemStage>([
   "Pending",
   "Validating",
   "Validated",
+  "PreflightValidated",
   "WriteNotStarted",
   "WriteStarted",
   "WriteAmbiguous",
   "FieldsUpdated",
+  "ClassificationWriteStarted",
+  "ClassificationWriteSucceeded",
+  "ClassificationVerified",
   "ResolutionValidated",
   "ResolutionWriteStarted",
   "ResolutionWriteSucceeded",
   "ResolutionWriteAmbiguous",
   "ResolutionVerified",
+  "StatusWriteStarted",
+  "StatusWriteSucceeded",
+  "StatusVerified",
   "StatusUpdated",
   "NoteChecked",
+  "NoteDedupeChecked",
   "NoteWriteStarted",
   "NoteWriteAmbiguous",
   "NoteAdded",
+  "NoteVerified",
   "Verifying",
   "Completed",
   "CompletedAfterRetry",
@@ -859,29 +877,38 @@ function assertRecordOwner(record: OperationLedgerRecord, ownerHash: string): vo
   }
 }
 const EXPLICIT_STAGE_TRANSITIONS: Partial<Record<OperationItemStage, ReadonlySet<OperationItemStage>>> = {
-  Pending: new Set(["Validating", "Validated", "WriteNotStarted", "NoteChecked", "Rescheduled", "RateLimitedRescheduled"]),
-  Unattempted: new Set(["Validating", "Validated", "WriteNotStarted", "NoteChecked", "Rescheduled", "RateLimitedRescheduled"]),
-  Validating: new Set(["Validated", "WriteNotStarted"]),
-  Validated: new Set(["WriteNotStarted", "WriteStarted", "ResolutionValidated", "ResolutionWriteStarted", "Verifying"]),
+  Pending: new Set(["Validating", "Validated", "PreflightValidated", "WriteNotStarted", "NoteChecked", "NoteDedupeChecked", "Rescheduled", "RateLimitedRescheduled"]),
+  Unattempted: new Set(["Validating", "Validated", "PreflightValidated", "WriteNotStarted", "NoteChecked", "NoteDedupeChecked", "Rescheduled", "RateLimitedRescheduled"]),
+  Validating: new Set(["Validated", "PreflightValidated", "WriteNotStarted"]),
+  Validated: new Set(["PreflightValidated", "WriteNotStarted", "WriteStarted", "ClassificationWriteStarted", "ResolutionValidated", "ResolutionWriteStarted", "Verifying"]),
+  PreflightValidated: new Set(["ClassificationWriteStarted", "ClassificationVerified", "NoteDedupeChecked", "StatusWriteStarted", "Verifying"]),
   WriteNotStarted: new Set(["WriteStarted", "Verifying"]),
   WriteStarted: new Set(["FieldsUpdated", "StatusUpdated", "ResolutionValidated", "ResolutionWriteStarted", "NoteChecked", "NoteWriteStarted", "Verifying", "WriteAmbiguous", "RateLimitedRescheduled"]),
   WriteAmbiguous: new Set(["Verifying"]),
   FieldsUpdated: new Set(["StatusUpdated", "ResolutionValidated", "ResolutionWriteStarted", "NoteChecked", "Verifying"]),
+  ClassificationWriteStarted: new Set(["ClassificationWriteSucceeded", "ClassificationVerified", "RateLimitedRescheduled"]),
+  ClassificationWriteSucceeded: new Set(["ClassificationVerified", "NoteDedupeChecked", "StatusWriteStarted", "Verifying"]),
+  ClassificationVerified: new Set(["NoteDedupeChecked", "NoteWriteStarted", "NoteVerified", "StatusWriteStarted", "StatusVerified", "Verifying"]),
   ResolutionValidated: new Set(["ResolutionWriteStarted", "Verifying"]),
   ResolutionWriteStarted: new Set(["ResolutionWriteSucceeded", "ResolutionWriteAmbiguous", "ResolutionVerified", "RateLimitedRescheduled"]),
   ResolutionWriteSucceeded: new Set(["ResolutionVerified", "NoteChecked", "NoteWriteStarted", "Verifying"]),
   ResolutionWriteAmbiguous: new Set(["ResolutionVerified", "Verifying"]),
-  ResolutionVerified: new Set(["NoteChecked", "NoteWriteStarted", "Verifying"]),
+  ResolutionVerified: new Set(["NoteChecked", "NoteDedupeChecked", "NoteWriteStarted", "Verifying"]),
+  StatusWriteStarted: new Set(["StatusWriteSucceeded", "StatusVerified", "RateLimitedRescheduled"]),
+  StatusWriteSucceeded: new Set(["StatusVerified", "Verifying"]),
+  StatusVerified: new Set(["Verifying"]),
   StatusUpdated: new Set(["NoteChecked", "Verifying"]),
   NoteChecked: new Set(["Validated", "WriteNotStarted", "WriteStarted", "ResolutionValidated", "ResolutionWriteStarted", "NoteWriteStarted", "NoteAdded", "Verifying"]),
-  NoteWriteStarted: new Set(["NoteAdded", "NoteWriteAmbiguous", "Verifying", "RateLimitedRescheduled"]),
+  NoteDedupeChecked: new Set(["NoteWriteStarted", "NoteAdded", "NoteVerified", "StatusWriteStarted", "Verifying"]),
+  NoteWriteStarted: new Set(["NoteAdded", "NoteWriteAmbiguous", "NoteVerified", "Verifying", "RateLimitedRescheduled"]),
   NoteWriteAmbiguous: new Set(["Verifying"]),
-  NoteAdded: new Set(["Verifying"]),
-  Verifying: new Set(["NoteChecked"]),
+  NoteAdded: new Set(["NoteVerified", "Verifying", "StatusWriteStarted"]),
+  NoteVerified: new Set(["StatusWriteStarted", "StatusVerified", "Verifying"]),
+  Verifying: new Set(["NoteChecked", "NoteDedupeChecked"]),
   RateLimited: new Set(["RateLimitedRetrying", "RateLimitedRescheduled"]),
   RateLimitedRetrying: new Set(["RateLimitedRescheduled"]),
-  RateLimitedRescheduled: new Set(["Validating", "Validated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "ResolutionValidated", "ResolutionWriteStarted", "NoteChecked", "NoteWriteStarted", "Verifying"]),
-  Rescheduled: new Set(["Validating", "Validated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "NoteChecked", "Verifying"]),
+  RateLimitedRescheduled: new Set(["Validating", "Validated", "PreflightValidated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "ClassificationWriteStarted", "ResolutionValidated", "ResolutionWriteStarted", "StatusWriteStarted", "NoteChecked", "NoteDedupeChecked", "NoteWriteStarted", "Verifying"]),
+  Rescheduled: new Set(["Validating", "Validated", "PreflightValidated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "ClassificationWriteStarted", "NoteChecked", "NoteDedupeChecked", "StatusWriteStarted", "Verifying"]),
 };
 
 function assertTransition(current: OperationItemStage, next: OperationItemStage): void {
@@ -906,7 +933,7 @@ function assertTransition(current: OperationItemStage, next: OperationItemStage)
  * WriteStarted and release its lease.
  */
 function assertCheckpointTransition(current: OperationItemStage, next: OperationItemStage): void {
-  if ((current === "Pending" || current === "Unattempted") && next === "WriteStarted") {
+  if ((current === "Pending" || current === "Unattempted") && ["WriteStarted", "ClassificationWriteStarted", "ResolutionWriteStarted", "StatusWriteStarted", "NoteWriteStarted"].includes(next)) {
     return;
   }
   assertTransition(current, next);

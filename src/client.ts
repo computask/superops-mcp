@@ -173,7 +173,13 @@ export class SuperOpsClient {
         message,
         typeof error.extensions?.code === "string" ? error.extensions.code : undefined,
         retryAfterFromGraphQLError(error),
-        error.extensions
+        error.extensions,
+        {
+          httpStatus: response.status,
+          path: error.path,
+          graphQLDataPresent: Object.prototype.hasOwnProperty.call(result, "data"),
+          mutationPayloadReturned: mutationPayloadReturned(result.data, error.path),
+        }
       );
     }
 
@@ -196,18 +202,32 @@ export class SuperOpsError extends Error {
   readonly code?: string;
   readonly retryAfter?: number;
   readonly extensions?: Record<string, unknown>;
+  readonly httpStatus?: number;
+  readonly graphQLPath?: Array<string | number>;
+  readonly graphQLDataPresent?: boolean;
+  readonly mutationPayloadReturned?: boolean;
 
   constructor(
     message: string,
     code?: string,
     retryAfter?: number,
-    extensions?: Record<string, unknown>
+    extensions?: Record<string, unknown>,
+    metadata: {
+      httpStatus?: number;
+      path?: Array<string | number>;
+      graphQLDataPresent?: boolean;
+      mutationPayloadReturned?: boolean;
+    } = {}
   ) {
     super(message);
     this.name = "SuperOpsError";
     this.code = code;
     this.retryAfter = retryAfter;
     this.extensions = extensions;
+    this.httpStatus = metadata.httpStatus;
+    this.graphQLPath = metadata.path;
+    this.graphQLDataPresent = metadata.graphQLDataPresent;
+    this.mutationPayloadReturned = metadata.mutationPayloadReturned;
   }
 }
 
@@ -399,6 +419,18 @@ function retryDelayInfo(
 function delay(ms: number): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function mutationPayloadReturned(
+  data: unknown,
+  path: Array<string | number> | undefined
+): boolean {
+  const topLevel = path?.[0];
+  if (typeof topLevel !== "string" || typeof data !== "object" || data === null || Array.isArray(data)) {
+    return false;
+  }
+  const payload = (data as Record<string, unknown>)[topLevel];
+  return payload !== null && payload !== undefined;
 }
 
 function parseRetryAfter(value: string | null): number | undefined {

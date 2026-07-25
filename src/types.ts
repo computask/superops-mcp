@@ -20,7 +20,7 @@ export interface GraphQLResponse<T = unknown> {
 export interface GraphQLError {
   message: string;
   locations?: { line: number; column: number }[];
-  path?: string[];
+  path?: Array<string | number>;
   extensions?: {
     code?: string;
     retryAfter?: number | string;

@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { getCredentials, resetClient, SuperOpsClient } from "./client.js";
+import { getCredentials, resetClient, SuperOpsClient, SuperOpsError } from "./client.js";
 import {
   executionDiagnostics,
   runWithExecutionConfig,
@@ -87,6 +87,28 @@ describe("SuperOpsClient execution instrumentation", () => {
     expect(JSON.stringify(diagnostics)).not.toContain("secret-token");
   });
 
+  it("preserves safe GraphQL error metadata for mutation failures", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({
+        errors: [{
+          message: "SuperOps internal server error",
+          path: ["updateTicket"],
+          extensions: { code: "INTERNAL_SERVER_ERROR", classification: "DataFetchingException" },
+        }],
+      }), { status: 200 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new SuperOpsClient({ apiToken: "secret-token", subdomain: "example" });
+
+    await expect(client.mutate("mutation updateTicket { updateTicket { ticketId } }")).rejects.toMatchObject({
+      name: "SuperOpsError",
+      code: "INTERNAL_SERVER_ERROR",
+      httpStatus: 200,
+      graphQLPath: ["updateTicket"],
+      graphQLDataPresent: false,
+      mutationPayloadReturned: false,
+    } satisfies Partial<SuperOpsError>);
+  });
   it("counts SuperOps verification reads once", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ data: { getTicket: { id: "ticket-1" } } }), { status: 200 })
