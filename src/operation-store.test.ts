@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import stalledRateLimitFixture from "./test-fixtures/operation-13a1584b-rate-limit-running.json" with { type: "json" };
 import { getExecutionState, runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
 import {
   getOperationStore,
@@ -68,7 +69,10 @@ function record(overrides: Partial<OperationLedgerRecord> = {}): OperationLedger
   };
 }
 
-function ownerScopedDurableNamespace() {
+function ownerScopedDurableNamespace(options: {
+  failStoragePut?: (params: { ownerName: string; key: string; opKeyPutCount: number }) => boolean;
+} = {}) {
+  let opKeyPutCount = 0;
   const valuesByName = new Map<string, Map<string, unknown>>();
   const ledgers = new Map<string, SuperOpsOperationLedger>();
   const valuesFor = (name: string) => {
@@ -90,8 +94,15 @@ function ownerScopedDurableNamespace() {
           storage: {
             get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
             put: async (key: string | Record<string, unknown>, value?: unknown) => {
-              if (typeof key === "string") values.set(key, value);
-              else for (const [entryKey, entryValue] of Object.entries(key)) values.set(entryKey, entryValue);
+              const entries = typeof key === "string" ? [[key, value] as const] : Object.entries(key);
+              for (const [entryKey, entryValue] of entries) {
+                const nextOpKeyPutCount = entryKey.startsWith("op:") ? opKeyPutCount + 1 : opKeyPutCount;
+                if (options.failStoragePut?.({ ownerName: name, key: entryKey, opKeyPutCount: nextOpKeyPutCount })) {
+                  throw new Error("rate_limit_exceeded");
+                }
+                if (entryKey.startsWith("op:")) opKeyPutCount = nextOpKeyPutCount;
+                values.set(entryKey, entryValue);
+              }
             },
             delete: async (key: string) => values.delete(key),
             list: async <T = unknown>(options?: { prefix?: string }) => new Map(
@@ -104,10 +115,14 @@ function ownerScopedDurableNamespace() {
       return { fetch: (request: Request) => ledger!.fetch(request) };
     },
   };
-  return { namespace, valuesFor };
+  return { namespace, valuesFor, opKeyPutCount: () => opKeyPutCount };
 }
 
 describe("operation store", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("persists and lists operation records in the local store", async () => {
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();
@@ -222,6 +237,103 @@ describe("operation store", () => {
     expect(JSON.stringify(view)).not.toContain("public-result-secret");
   });
 
+  it("retries a transient Durable Object checkpoint rate limit without counting mutation attempts", async () => {
+    let checkpointPutAttempts = 0;
+    let failedOnce = false;
+    const ownerHash = stableHash("owner@example.com");
+    const durable = ownerScopedDurableNamespace({
+      failStoragePut: ({ key, opKeyPutCount }) => {
+        if (key !== "op:checkpoint-rate-limit-retry" || opKeyPutCount !== 3) return false;
+        checkpointPutAttempts += 1;
+        if (!failedOnce) {
+          failedOnce = true;
+          return true;
+        }
+        return false;
+      },
+    });
+
+    await runWithExecutionConfig({}, () => runWithExecutionContext("operation-store-rate-limit", () =>
+      runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+        const store = getOperationStore();
+        await store.put(record({
+          operationId: "checkpoint-rate-limit-retry",
+          ownerHash,
+          expectedItems: ["57401"],
+          completedItems: [],
+          pendingItems: ["57401"],
+          unattemptedItems: ["57401"],
+          itemStates: {
+            "57401": {
+              ...record().itemStates["57401"],
+              stage: "Unattempted",
+              attemptCount: 0,
+            },
+          },
+          compactResults: [],
+        }));
+        const claim = await store.claimNextItem({
+          operationId: "checkpoint-rate-limit-retry",
+          ownerHash,
+          leaseOwner: "test",
+          leaseMs: 60_000,
+          now: "2026-07-18T00:00:00.000Z",
+        });
+        if (!claim) throw new Error("claim missing");
+
+        const before = getExecutionState()?.requests.filter((request) => request.type === "write").length ?? 0;
+        const updated = await store.checkpointItem({
+          operationId: "checkpoint-rate-limit-retry",
+          ownerHash,
+          itemKey: "57401",
+          leaseId: claim.lease.leaseId,
+          patch: {
+            stage: "PreflightValidated",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+            partialWrite: false,
+            verificationState: "Pending",
+            attemptCount: 0,
+          },
+        });
+        const after = getExecutionState()?.requests.filter((request) => request.type === "write").length ?? 0;
+
+        expect(failedOnce).toBe(true);
+        expect(checkpointPutAttempts).toBe(2);
+        expect(after).toBe(before);
+        expect(updated.itemStates["57401"]).toMatchObject({
+          stage: "PreflightValidated",
+          attemptCount: 0,
+          writeAttempted: false,
+          writeMayHaveSucceeded: false,
+        });
+      })
+    ));
+  });
+
+  it("marks the 13a1584b rate-limit fixture as derived stalled without mutating it", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-25T08:10:01.000Z"));
+    const fixture = stalledRateLimitFixture as unknown as OperationLedgerRecord;
+    const view = operationResultView(fixture);
+
+    expect(view).toMatchObject({
+      operationId: "13a1584b-72b0-4d6c-ac82-4073be1ea4ce",
+      state: "Running",
+      derivedState: "Stalled",
+      stalled: true,
+      continuationCount: 0,
+      unattemptedCount: 1,
+    });
+    expect(view.items).toContainEqual(expect.objectContaining({
+      itemId: "fixture-ticket",
+      stage: "Unattempted",
+      attemptCount: 0,
+      writeAttempted: false,
+      writeMayHaveSucceeded: false,
+    }));
+    expect(fixture.state).toBe("Running");
+  });
   it("derives public category totals from item states rather than a caller summary", () => {
     const totals = operationTotals(record({
       summary: { updated: 9999 },

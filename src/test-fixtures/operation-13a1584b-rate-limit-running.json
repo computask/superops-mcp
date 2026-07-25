@@ -1,0 +1,66 @@
+{
+  "responseVersion": 1,
+  "operationId": "13a1584b-72b0-4d6c-ac82-4073be1ea4ce",
+  "toolName": "superops_tickets_apply_triage_plan",
+  "ownerHash": "fixture-owner-hash",
+  "createdAt": "2026-07-25T08:00:00.000Z",
+  "updatedAt": "2026-07-25T08:00:00.000Z",
+  "expiresAt": "2026-07-26T08:00:00.000Z",
+  "maxOperationLifetimeAt": "2026-07-25T09:00:00.000Z",
+  "originalRequestHash": "fixture-request-hash",
+  "operationRequest": {
+    "kind": "applyTriagePlan",
+    "batchId": "13a1584b-72b0-4d6c-ac82-4073be1ea4ce",
+    "expectedCandidateTicketNumbers": ["fixture-ticket"],
+    "actions": [
+      {
+        "ticketNumber": "fixture-ticket",
+        "action": "resolve",
+        "contentVerified": true,
+        "target": {
+          "status": "Resolved"
+        }
+      }
+    ],
+    "dryRun": false,
+    "verify": true,
+    "dedupeNotes": true,
+    "stopOnFirstFailure": false,
+    "allowResolveFullFallbackToUpdate": false,
+    "allowWriteIfUpdatedTimeChanged": false,
+    "allowWriteWithoutVerifiedContent": false
+  },
+  "state": "Running",
+  "expectedItems": ["fixture-ticket"],
+  "currentItem": "fixture-ticket",
+  "completedItems": [],
+  "failedItems": [],
+  "skippedItems": [],
+  "unattemptedItems": ["fixture-ticket"],
+  "pendingItems": ["fixture-ticket"],
+  "itemStates": {
+    "fixture-ticket": {
+      "itemKey": "fixture-ticket",
+      "stage": "Unattempted",
+      "outcome": "OperationStoreRateLimitBeforePreflight",
+      "idempotencyKey": "fixture-item-key",
+      "writeAttempted": false,
+      "writeMayHaveSucceeded": false,
+      "partialWrite": false,
+      "verificationState": "NotRequired",
+      "retryCount": 0,
+      "attemptCount": 0,
+      "failureReason": "operation-store error: rate_limit_exceeded"
+    }
+  },
+  "summary": {
+    "operationStoreError": "rate_limit_exceeded"
+  },
+  "compactResults": [],
+  "partialWriteCount": 0,
+  "ambiguousWriteCount": 0,
+  "rateLimitedItems": [],
+  "continuationCount": 0,
+  "schedulingAttempted": true,
+  "schedulingSucceeded": true
+}

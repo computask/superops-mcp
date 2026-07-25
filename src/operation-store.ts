@@ -322,6 +322,9 @@ const MAX_APPROVED_PRIVATE_NOTE_BYTES = 128 * 1024;
 const MAX_RECENT_OPERATION_INDEX_ENTRIES = 50;
 const MAX_RECENT_OPERATION_RESULTS = 20;
 const MAX_RECENT_OPERATION_OUTPUT_BYTES = 128 * 1024;
+const OPERATION_STORE_RATE_LIMIT_MAX_ATTEMPTS = 3;
+const OPERATION_STORE_RATE_LIMIT_BACKOFF_MS = [25, 75];
+const UNATTEMPTED_RUNNING_STALL_MS = 5 * 60 * 1000;
 
 interface RecentOperationIndexEntry {
   version: 1;
@@ -344,6 +347,16 @@ export class MalformedStoredOperationError extends Error {
   constructor(message = "Stored operation is malformed or exceeds configured bounds.") {
     super(message);
     this.name = "MalformedStoredOperationError";
+  }
+}
+
+class OperationStoreRateLimitError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number
+  ) {
+    super(message);
+    this.name = "OperationStoreRateLimitError";
   }
 }
 
@@ -1627,16 +1640,63 @@ class DurableObjectOperationStore implements OperationStore {
   }
 }
 
-async function operationStoreFailure(response: Response, message: string): Promise<Error> {
+function textMentionsOperationStoreRateLimit(value: unknown): boolean {
+  return typeof value === "string" && /rate[_ -]?limit|too_many_requests|throttl/i.test(value);
+}
+
+async function operationStoreResponseRateLimited(response: Response): Promise<boolean> {
+  if (response.status === 429) return true;
   try {
     const body = await response.clone().json();
-    if (isRecordObject(body) && body.errorClass === "MalformedStoredOperation") {
-      return new MalformedStoredOperationError(
-        typeof body.error === "string" ? body.error : undefined
+    if (!isRecordObject(body)) return false;
+    return [body.errorClass, body.error, body.code, body.reason, body.message].some(
+      textMentionsOperationStoreRateLimit
+    );
+  } catch {
+    return false;
+  }
+}
+
+function operationStoreExceptionRateLimited(error: unknown): boolean {
+  if (error instanceof OperationStoreRateLimitError) return true;
+  return error instanceof Error && textMentionsOperationStoreRateLimit(error.message);
+}
+
+function operationStoreRetryDelayMs(attempt: number, response?: Response): number {
+  const retryAfter = response?.headers.get("Retry-After");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(1_000, seconds * 1_000);
+    const dateDelay = Date.parse(retryAfter) - Date.now();
+    if (Number.isFinite(dateDelay) && dateDelay >= 0) return Math.min(1_000, dateDelay);
+  }
+  return OPERATION_STORE_RATE_LIMIT_BACKOFF_MS[Math.max(0, attempt - 1)] ??
+    OPERATION_STORE_RATE_LIMIT_BACKOFF_MS[OPERATION_STORE_RATE_LIMIT_BACKOFF_MS.length - 1] ?? 25;
+}
+
+async function waitForOperationStoreRetry(delayMs: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function operationStoreFailure(response: Response, message: string): Promise<Error> {
+  let rateLimited = response.status === 429;
+  try {
+    const body = await response.clone().json();
+    if (isRecordObject(body)) {
+      if (body.errorClass === "MalformedStoredOperation") {
+        return new MalformedStoredOperationError(
+          typeof body.error === "string" ? body.error : undefined
+        );
+      }
+      rateLimited ||= [body.errorClass, body.error, body.code, body.reason, body.message].some(
+        textMentionsOperationStoreRateLimit
       );
     }
   } catch {
     // Fall through to the stable status-based error below.
+  }
+  if (rateLimited) {
+    return new OperationStoreRateLimitError(`${message}: rate_limit_exceeded (HTTP ${response.status})`, response.status);
   }
   return new Error(`${message}: ${response.status}`);
 }
@@ -1645,17 +1705,27 @@ async function operationStoreFetch(
   stub: { fetch(request: Request): Promise<Response> },
   request: Request
 ): Promise<Response> {
-  const started = recordOperationStoreSubrequest(operationName);
-  try {
-    const response = await stub.fetch(request);
-    recordSubrequestFinish(started, response.status, response.ok);
-    return response;
-  } catch (error) {
-    recordSubrequestFinish(started, "operationStoreError", false);
-    throw error;
+  let lastRateLimitError: unknown;
+  for (let attempt = 1; attempt <= OPERATION_STORE_RATE_LIMIT_MAX_ATTEMPTS; attempt += 1) {
+    const started = recordOperationStoreSubrequest(operationName);
+    try {
+      const response = await stub.fetch(request.clone());
+      const rateLimited = await operationStoreResponseRateLimited(response);
+      recordSubrequestFinish(started, rateLimited ? "operationStoreRateLimited" : response.status, response.ok && !rateLimited);
+      if (!rateLimited || attempt >= OPERATION_STORE_RATE_LIMIT_MAX_ATTEMPTS) return response;
+      lastRateLimitError = await operationStoreFailure(response, `${operationName} rate limited`);
+      await waitForOperationStoreRetry(operationStoreRetryDelayMs(attempt, response));
+    } catch (error) {
+      recordSubrequestFinish(started, "operationStoreError", false);
+      if (!operationStoreExceptionRateLimited(error) || attempt >= OPERATION_STORE_RATE_LIMIT_MAX_ATTEMPTS) {
+        throw error;
+      }
+      lastRateLimitError = error;
+      await waitForOperationStoreRetry(operationStoreRetryDelayMs(attempt));
+    }
   }
+  throw lastRateLimitError instanceof Error ? lastRateLimitError : new OperationStoreRateLimitError(`${operationName}: rate_limit_exceeded`);
 }
-
 function recordOperationStoreSubrequest(operationName: string) {
   return recordTypedSubrequestStart({
     type: "custom",
@@ -1839,11 +1909,33 @@ function completedAfterDurableRetry(item: OperationItemState): boolean {
     (item.retryCount > 0 && item.observedMutationResult !== "Rejected");
 }
 
+function derivedUnattemptedStall(record: OperationLedgerRecord): Record<string, unknown> | undefined {
+  if (record.state !== "Running" || record.continuationCount !== 0 || record.nextEligibleTime) return undefined;
+  if (record.expectedItems.length === 0) return undefined;
+  const items = record.expectedItems.map((itemKey) => record.itemStates[itemKey]);
+  if (items.some((item) => !item || item.stage !== "Unattempted")) return undefined;
+  if (items.some((item) => item.writeAttempted || item.writeMayHaveSucceeded || item.partialWrite)) return undefined;
+  const updatedAtMs = Date.parse(record.updatedAt);
+  if (!Number.isFinite(updatedAtMs) || Date.now() - updatedAtMs < UNATTEMPTED_RUNNING_STALL_MS) return undefined;
+  return {
+    derivedState: "Stalled",
+    stalled: true,
+    stalledReason: "Operation is still Running with only Unattempted items, zero continuation progress, and no durable next stage beyond the allowed interval; submit a fresh operation.",
+    allowedStallMs: UNATTEMPTED_RUNNING_STALL_MS,
+    writeAttempted: false,
+    writeMayHaveSucceeded: false,
+  };
+}
 export function operationResultView(record: OperationLedgerRecord): Record<string, unknown> {
+  const stalled = derivedUnattemptedStall(record);
   return redactPublicOperationValue({
     operationId: record.operationId,
     toolName: record.toolName,
     state: record.state,
+    derivedState: stalled?.derivedState,
+    stalled: stalled?.stalled,
+    stalledReason: stalled?.stalledReason,
+    stalledAllowedMs: stalled?.allowedStallMs,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
     completedCount: record.completedItems.length,
@@ -1917,10 +2009,15 @@ function redactPublicOperationValue(value: unknown, depth = 0): unknown {
 }
 
 function operationRecentView(record: OperationLedgerRecord): Record<string, unknown> {
+  const stalled = derivedUnattemptedStall(record);
   return {
     operationId: sanitizeText(record.operationId),
     toolName: sanitizeText(record.toolName),
     state: record.state,
+    derivedState: stalled?.derivedState,
+    stalled: stalled?.stalled,
+    stalledReason: stalled?.stalledReason,
+    stalledAllowedMs: stalled?.allowedStallMs,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
     completedCount: record.completedItems.length,

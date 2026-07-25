@@ -5219,6 +5219,23 @@ function operationRequestApplyTriageParams(
     allowWriteWithoutVerifiedContent: request.allowWriteWithoutVerifiedContent === true,
   };
 }
+function applyTriageHasDurableContinuationState(record: OperationLedgerRecord): boolean {
+  if (record.toolName !== "superops_tickets_apply_triage_plan") return false;
+  if (record.continuationCount <= 0) return false;
+  if (record.state !== "ContinuationRequired" && record.state !== "Rescheduled") return false;
+  if (record.pendingItems.length === 0) return false;
+  const storedParams = operationRequestApplyTriageParams(record.operationRequest);
+  if (!storedParams || !Array.isArray(storedParams.expectedCandidateTicketNumbers)) return false;
+  const storedExpected = new Set(
+    storedParams.expectedCandidateTicketNumbers.map((ticketNumber) => normaliseTicketNumber(ticketNumber))
+  );
+  return record.pendingItems.every((itemKey) => {
+    const item = record.itemStates[itemKey];
+    if (!item) return false;
+    if (item.stage === "Unattempted") return storedExpected.has(itemKey);
+    return true;
+  });
+}
 function buildApplyTriageLedgerRecord(params: {
   operationId: string;
   request: ApplyTriagePlanParams;
@@ -7906,7 +7923,7 @@ export function getTicketsTools(): DomainTools {
               !continuationError.includes("crash-boundary after") &&
               (
                 conservativeOutcome?.errorClass === "OperationStoreFailure" ||
-                /Durable checkpoint failed|Invalid operation item transition|persistence failed|crash-boundary before/.test(continuationError)
+                /Operation store .*failed|rate_limit_exceeded|Invalid operation item transition|persistence failed|crash-boundary before/.test(continuationError)
               );
             if (checkpointFailureRequiresFreshOperation && !finalRecordReadFailed &&
                 !["Completed", "CompletedWithFailures", "Failed", "Cancelled"].includes(finalRecord.state)) {
@@ -7941,9 +7958,34 @@ export function getTicketsTools(): DomainTools {
                 continuationError = checkpointFailureReason + " Terminal failure persistence also failed: " + safeErrorMessage(error);
               }
             }
-            const continuationRequired = (continuation?.continuationRequired ??
+            let continuationRequired = (continuation?.continuationRequired ??
               finalRecord.pendingItems.length > 0) || finalRecordReadFailed || Boolean(conservativeOutcome);
-            if (continuationRequired && !finalRecord.nextEligibleTime && !finalRecordReadFailed && !conservativeOutcome) {
+            const durableContinuationReady = applyTriageHasDurableContinuationState(finalRecord);
+            if (continuationRequired && checkpointFailureRequiresFreshOperation &&
+                !finalRecordReadFailed && !conservativeOutcome &&
+                !finalRecord.nextEligibleTime && !durableContinuationReady) {
+              const reason = "Continuation was not scheduled because no resumable durable state was persisted after the operation-store failure; submit a fresh operation.";
+              continuationScheduling = { attempted: false, scheduled: false,
+                terminalized: false, reasonCode: "durableStateMissing", error: reason,
+                mechanism: "serviceBinding" };
+              continuationError ??= reason;
+              try {
+                finalRecord = await store.terminalizeContinuationFailure({
+                  operationId,
+                  ownerHash,
+                  errorClass: "OperationStoreFailure",
+                  outcome: "OperationStoreFailed",
+                  reason,
+                });
+                continuationScheduling.terminalized = true;
+                continuationRequired = false;
+              } catch (error) {
+                continuationScheduling.terminalized = false;
+                continuationScheduling.recovery = "operations_get reports a derived stalled state if this Running operation remains unadvanced.";
+                continuationError = reason + " Terminal failure persistence also failed: " + safeErrorMessage(error);
+              }
+            }
+            if (continuationRequired && durableContinuationReady && !finalRecord.nextEligibleTime && !finalRecordReadFailed && !conservativeOutcome) {
               let scheduled: Awaited<ReturnType<typeof scheduleApplyTriageContinuation>>;
               try {
                 scheduled = await scheduleApplyTriageContinuation(operationId, ownerHash);

@@ -399,6 +399,17 @@ describe("ChatGPT direct mutation policy", () => {
     expect(blocked.has("superops_scripts_execute_on_asset")).toBe(true);
     expect(blocked.has("superops_operations_results")).toBe(false);
   });
+
+  it("keeps the reviewed ChatGPT direct mutating surface to apply_triage_plan only", async () => {
+    const blocked = await chatGptDirectBlockedToolNames({
+      reviewedTriagePlanAllowed: true,
+    });
+    const allowedMutating = [...MUTATING_TOOL_NAMES]
+      .filter((toolName) => !blocked.has(toolName))
+      .sort();
+
+    expect(allowedMutating).toEqual(["superops_tickets_apply_triage_plan"]);
+  });
 });
 
 describe("Cloudflare Worker entrypoint", () => {

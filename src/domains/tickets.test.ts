@@ -4612,6 +4612,71 @@ describe("Tickets Domain", () => {
     });
   });
 
+  it("terminalizes a persistent operation-store rate limit before PreflightValidated without scheduling continuation", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS });
+
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const checkpoint = store.checkpointItem.bind(store);
+      store.checkpointItem = async (params) => {
+        if (params.patch.stage === "PreflightValidated") throw new Error("rate_limit_exceeded");
+        return checkpoint(params);
+      };
+      let serviceBindingDeliveries = 0;
+      const result = await runWithContinuationScheduler({
+        SUPEROPS_CONTINUATION_ENABLED: "true",
+        SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+        SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "test-internal-token",
+        SUPEROPS_CONTINUATION_SERVICE: {
+          fetch: async () => {
+            serviceBindingDeliveries += 1;
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          },
+        },
+      }, () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+        batchId: "preflight-store-rate-limit-terminal",
+        expectedCandidateTicketNumbers: ["57400"],
+        actions: [{
+          ticketNumber: "57400",
+          expectedStatus: "New Calls",
+          contentVerified: true,
+          action: "resolve",
+          target: { status: "Resolved", ...RESOLVED_CLASSIFICATION },
+        }],
+      }));
+      const parsed = JSON.parse(result.content[0].text);
+      const stored = await store.get("preflight-store-rate-limit-terminal");
+
+      expect(result.isError).toBe(true);
+      expect(serviceBindingDeliveries).toBe(0);
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+      expect(parsed.operation).toMatchObject({
+        complete: true,
+        continuationRequired: false,
+        state: "CompletedWithFailures",
+        errorClass: "OperationStoreFailure",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+      });
+      expect(parsed.operation.finalReason).toContain("fresh operation");
+      expect(parsed.operation.continuationScheduling).toBeUndefined();
+      expect(stored?.itemStates["57400"]).toMatchObject({
+        stage: "FailedBeforeWrite",
+        errorClass: "OperationStoreFailure",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+        partialWrite: false,
+      });
+    });
+  });
   it("counts two legitimate sequential durable mutation attempts", async () => {
     await runWithOperationStore({}, async () => {
       let getTicketReads = 0;
