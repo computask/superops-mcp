@@ -3784,14 +3784,16 @@ describe("Tickets Domain", () => {
         events.push(`notes:${variables?.input?.ticketId}`);
         return { getTicketNoteList: [
           {
-            noteId: "8656361040688640000",
-            addedOn: "2026-07-25T16:18:03.579",
-            content: "JUNK",
-            privacyType: "PRIVATE",
+            id: "8656361040688640000",
+            type: "note",
+            direction: "internal",
+            isInternal: true,
+            plainText: "JUNK",
+            createdTime: "2026-07-25T16:18:03.579",
           },
           {
-            noteId: "6987000510001594368",
-            addedOn: "2026-07-25T17:46:38.333",
+            noteId: "8656361040688640000",
+            addedOn: "2026-07-25T16:18:03.579",
             content: "JUNK",
             privacyType: "PRIVATE",
           },

@@ -22,6 +22,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:triage-harness": "vitest run src/triage-apply-harness.test.ts",
     "test:continuation-harness": "vitest run src/continuation-mixed-fault-harness.test.ts",
     "pack:mcpb": "node scripts/pack-mcpb.cjs",
     "validate:mcpb": "mcpb validate manifest.json"

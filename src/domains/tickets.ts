@@ -523,6 +523,17 @@ type SuperOpsClientInstance = ReturnType<typeof getClient>;
 const CANONICAL_NOTE_PAGE_SIZE = 50;
 const CANONICAL_NOTE_MAX_PAGES = 5;
 
+interface CanonicalTicketNote {
+  id: string;
+  type: "note";
+  direction: "internal" | "technician";
+  isInternal: boolean;
+  plainText: string;
+  createdTime?: string;
+  addedBy?: unknown;
+  attachments?: unknown;
+}
+
 interface SafeTicketParams {
   ticketNumber?: string | number;
   includeDescription?: boolean;
@@ -1079,13 +1090,18 @@ function parseTicketNotePage(value: GetTicketNoteListResponse["getTicketNoteList
   if (Array.isArray(value)) {
     return { notes: value, hasMore: false };
   }
-  const page = value as Record<string, unknown>;
+  const page = jsonRecord(value);
+  if (!page) {
+    throw new Error("Unsupported ticket note collection response.");
+  }
   const notes = ticketNoteArray(page.notes) ??
     ticketNoteArray(page.ticketNotes) ??
     ticketNoteArray(page.items) ??
     ticketNoteArray(page.data) ??
-    ticketNoteArray(page.list) ??
-    [];
+    ticketNoteArray(page.list);
+  if (!notes) {
+    throw new Error("Unsupported ticket note collection response.");
+  }
   const listInfo = jsonRecord(page.listInfo);
   return {
     notes,
@@ -1119,14 +1135,75 @@ async function getTicketNotes(
 }
 
 function collectionHasPrivateFingerprint(
-  notes: TicketNote[],
+  notes: CanonicalTicketNote[],
   fingerprint: string | undefined
 ): boolean {
   return Boolean(fingerprint) && notes.some(
-    (note) => note.privacyType === "PRIVATE" &&
-      normalizedNoteFingerprint(note.content) === fingerprint
+    (note) => isPrivateTicketNote(note) &&
+      normalizedNoteFingerprint(note.plainText) === fingerprint
   );
 }
+
+function isPrivateTicketNote(value: unknown): boolean {
+  const note = jsonRecord(value);
+  if (!note) return false;
+  if (note.privacyType === "PRIVATE") return true;
+  return typeof note.type === "string" &&
+    note.type.toLowerCase() === "note" &&
+    note.isInternal === true &&
+    typeof note.direction === "string" &&
+    note.direction.toLowerCase() === "internal";
+}
+
+function normalizedTicketNoteText(value: unknown): string | undefined {
+  const note = jsonRecord(value);
+  if (!note) return undefined;
+  const text = typeof note.plainText === "string"
+    ? note.plainText
+    : typeof note.content === "string"
+      ? note.content
+      : undefined;
+  return text === undefined ? undefined : normalizePlainText(text);
+}
+
+function normalizeCanonicalTicketNote(
+  value: unknown,
+  fallbackId: string
+): CanonicalTicketNote {
+  const note = jsonRecord(value);
+  if (!note) {
+    throw new Error("Unsupported ticket note object.");
+  }
+  const isPrivate = isPrivateTicketNote(note);
+  const isPublic = note.privacyType === "PUBLIC" ||
+    (
+      typeof note.type === "string" &&
+      note.type.toLowerCase() === "note" &&
+      note.isInternal === false &&
+      typeof note.direction === "string" &&
+      note.direction.toLowerCase() === "technician"
+    );
+  if (!isPrivate && !isPublic) {
+    throw new Error("Unsupported ticket note privacy shape.");
+  }
+  const plainText = normalizedTicketNoteText(note);
+  if (plainText === undefined) {
+    throw new Error("Unsupported ticket note text shape.");
+  }
+  const id = stringValue(note.id) ?? stringValue(note.noteId) ?? fallbackId;
+  const createdTime = stringValue(note.createdTime) ?? stringValue(note.addedOn);
+  return {
+    id,
+    type: "note",
+    direction: isPrivate ? "internal" : "technician",
+    isInternal: isPrivate,
+    plainText,
+    createdTime,
+    addedBy: note.addedBy,
+    attachments: note.attachments,
+  };
+}
+
 async function collectCanonicalTicketNotes(params: {
   client: SuperOpsClientInstance;
   ticketId: string;
@@ -1135,11 +1212,11 @@ async function collectCanonicalTicketNotes(params: {
   stopAfterPrivateFingerprint?: string;
 }): Promise<{
   available: boolean;
-  notes: TicketNote[];
+  notes: CanonicalTicketNote[];
   ticketIdsRead: string[];
   errors: string[];
 }> {
-  const notes: TicketNote[] = [];
+  const notes: CanonicalTicketNote[] = [];
   const seenNoteIds = new Set<string>();
   const ticketIdsRead: string[] = [];
   const errors: string[] = [];
@@ -1156,7 +1233,19 @@ async function collectCanonicalTicketNotes(params: {
     try {
       for (let page = 1; page <= CANONICAL_NOTE_MAX_PAGES; page += 1) {
         const result = await getTicketNotesPage(params.client, normalized, page);
-        for (const note of result.notes) {
+        for (const [index, rawNote] of result.notes.entries()) {
+          let note: CanonicalTicketNote;
+          try {
+            note = normalizeCanonicalTicketNote(
+              rawNote,
+              `note:${normalized}:${page}:${index + 1}`
+            );
+          } catch (error) {
+            errors.push(
+              `Notes contained an unsupported shape for ticketId ${normalized}: ${safeErrorMessage(error)}`
+            );
+            return false;
+          }
           addUniqueNote(notes, seenNoteIds, note);
         }
         if (hasRequestedPrivateFingerprint()) {
@@ -1707,10 +1796,6 @@ function safeContentTypeForConversation(
     : "conversation";
 }
 
-function noteDirection(note: TicketNote): SafeContentItem["direction"] {
-  return note.privacyType === "PRIVATE" ? "internal" : "technician";
-}
-
 function timestampOf(item: SafeContentItem): string {
   return item.createdTime ?? "";
 }
@@ -1759,12 +1844,12 @@ function addUniqueConversation(
 }
 
 function addUniqueNote(
-  notes: TicketNote[],
+  notes: CanonicalTicketNote[],
   seenNoteIds: Set<string>,
-  note: TicketNote
+  note: CanonicalTicketNote
 ): void {
-  if (seenNoteIds.has(note.noteId)) return;
-  seenNoteIds.add(note.noteId);
+  if (seenNoteIds.has(note.id)) return;
+  seenNoteIds.add(note.id);
   notes.push(note);
 }
 
@@ -1772,7 +1857,7 @@ function buildSafeTicketResult(params: {
   ticket: Ticket;
   safeParams: Required<SafeTicketParams>;
   conversations?: TicketConversation[];
-  notes?: TicketNote[];
+  notes?: CanonicalTicketNote[];
   contentErrors?: string[];
 }) {
   const { ticket, safeParams } = params;
@@ -1827,15 +1912,15 @@ function buildSafeTicketResult(params: {
 
   if (safeParams.includeNotes) {
     for (const note of params.notes ?? []) {
-      const safeText = sanitizeTicketText(note.content, safeParams);
+      const safeText = sanitizeTicketText(note.plainText, safeParams);
       mergeDiagnostics(sanitization, safeText.diagnostics);
       items.push({
-        id: note.noteId,
+        id: note.id,
         type: "note",
-        direction: noteDirection(note),
-        createdTime: note.addedOn,
+        direction: note.direction,
+        createdTime: note.createdTime,
         author: readableString(note.addedBy, ["name", "email"]),
-        isInternal: note.privacyType === "PRIVATE",
+        isInternal: note.isInternal,
         plainText: safeText.plainText,
         truncated: safeText.truncated,
       });
@@ -1965,7 +2050,7 @@ async function collectSafeTicketContent(params: {
   const { client, ticket, safeParams, displayId, displayIdMatches } = params;
   const contentErrors: string[] = [];
   const conversations: TicketConversation[] = [];
-  const notes: TicketNote[] = [];
+  const notes: CanonicalTicketNote[] = [];
   const seenConversationIds = new Set<string>();
   const seenNoteIds = new Set<string>();
   const readTicketIds = new Set<string>();
@@ -3456,8 +3541,8 @@ async function existingNoteMatchesFingerprint(
   // identical text is neither evidence that the approved private note was
   // written nor a reason to skip its private write.
   return collection.notes.some(
-    (existing) => existing.privacyType === "PRIVATE" &&
-      normalizedNoteFingerprint(existing.content) === fingerprint
+    (existing) => isPrivateTicketNote(existing) &&
+      normalizedNoteFingerprint(existing.plainText) === fingerprint
   );
 }
 
