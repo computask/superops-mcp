@@ -1262,10 +1262,15 @@ async function collectCanonicalTicketNotes(params: {
     }
   }
 
-  const initialTicketIds = uniqueTicketIds([
-    ...(params.additionalTicketIds ?? []),
+  const displayId = normaliseTicketNumber(params.ticketNumber);
+  const canonicalTicketIds = uniqueTicketIds([
     params.ticketId,
-  ]).slice(0, 3);
+    ...(params.additionalTicketIds ?? []),
+  ]).slice(0, 2);
+  const initialTicketIds = uniqueTicketIds([
+    ...canonicalTicketIds,
+    displayId,
+  ]);
   for (const ticketId of initialTicketIds) {
     if (!await readTicketId(ticketId)) {
       return { available: false, notes, ticketIdsRead, errors };
@@ -1273,9 +1278,8 @@ async function collectCanonicalTicketNotes(params: {
     if (matchedRequestedPrivateFingerprint) break;
   }
 
-  const displayId = normaliseTicketNumber(params.ticketNumber);
-  const probablyDisplayId = displayId && initialTicketIds.some((ticketId) => ticketId === displayId);
-  if (notes.length === 0 && displayId && probablyDisplayId) {
+  const hasCanonicalTicketId = canonicalTicketIds.some((ticketId) => ticketId !== displayId);
+  if (notes.length === 0 && displayId && !hasCanonicalTicketId) {
     try {
       const matches = await resolveTicketIdByDisplayId(params.client, displayId);
       if (matches.length !== 1) {
@@ -6336,7 +6340,7 @@ function createApplyTriageContinuationAdapter(
       if (!action) return 2;
       if (action.action === "leave" || action.action === "skip") return 3;
       if (action.action === "addNote") {
-        const validationAndDedupeReads = 2 + (storedParams?.dedupeNotes === false ? 0 : 1);
+        const validationAndDedupeReads = 2 + (storedParams?.dedupeNotes === false ? 0 : 2);
         const postMutationVerification = storedParams?.verify === false ? 0 : 2;
         return validationAndDedupeReads + 5 + postMutationVerification;
       }

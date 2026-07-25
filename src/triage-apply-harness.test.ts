@@ -243,6 +243,7 @@ type FakeSuperOpsOptions = {
   classified?: boolean;
   resolved?: boolean;
   initialNotes?: unknown[];
+  noteReadsRequireDisplayId?: boolean;
   canonicalTicketReadRateLimits?: number;
   noteReadUnavailable?: boolean;
   unsupportedNoteEnvelope?: boolean;
@@ -425,6 +426,9 @@ class FakeSuperOps {
       }
       if (this.options.unsupportedNoteEnvelope) {
         return graphQlData({ getTicketNoteList: { unexpectedItems: [] } });
+      }
+      if (this.options.noteReadsRequireDisplayId && input.ticketId !== TICKET_NUMBER) {
+        return graphQlData({ getTicketNoteList: [] });
       }
       return graphQlData({ getTicketNoteList: this.notesForRead() });
     }
@@ -783,6 +787,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
       "superops.write.classification",
       "superops.read.ticket",
       "superops.read.notes",
+      "superops.read.notes",
       "superops.write.note",
       "superops.read.notes",
       "superops.read.ticket",
@@ -807,6 +812,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
     const harness = new TriageHarness("recovery", {
       classified: true,
       initialNotes: [{ ...CANONICAL_PRIVATE_JUNK }],
+      noteReadsRequireDisplayId: true,
     });
     const { parsed } = await harness.invoke();
     const result = firstResult(parsed);
@@ -833,12 +839,21 @@ describe("deterministic end-to-end apply-triage harness", () => {
       "superops.read.ticket",
       "superops.read.notes",
       "superops.read.notes",
+      "superops.read.notes",
+      "superops.read.notes",
       "superops.read.ticket",
       "superops.write.status",
       "superops.read.ticket",
       "superops.read.notes",
+      "superops.read.notes",
     ]);
     expect(harness.history.first("superops.read.notes")).toBeLessThan(harness.history.first("superops.write.status"));
+    const noteReadTicketIds = harness.history.events
+      .filter((event) => event.kind === "superops.read.notes")
+      .map((event) => event.details?.ticketId);
+    expect(noteReadTicketIds).toEqual(expect.arrayContaining([TICKET_ID, TICKET_NUMBER]));
+    expect(harness.history.count("superops.write.note")).toBe(0);
+    expect(harness.history.count("superops.write.status")).toBe(1);
     expect(harness.superops.ticket.status).toBe("Resolved");
     harness.assertGlobalInvariants(record);
   });
@@ -922,7 +937,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
   });
 
   it("E: accepted note visibility delay reconciles by read without replay", async () => {
-    const harness = new TriageHarness("delayed-note", { noteVisibilityMisses: 1 });
+    const harness = new TriageHarness("delayed-note", { noteVisibilityMisses: 2 });
     const initial = await harness.invoke();
 
     expect(firstResult(initial.parsed)).toMatchObject({

@@ -3587,26 +3587,27 @@ describe("Tickets Domain", () => {
   });
 
   it("does not treat an identically worded public note as a private-note dedupe match", async () => {
-    mockClient.query
-      .mockResolvedValueOnce({
-        getTicketList: {
+    let privateNoteCreated = false;
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        return { getTicketList: {
           tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
           listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
-        },
-      })
-      .mockResolvedValueOnce({
-        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" },
-      })
-      .mockResolvedValueOnce({
-        getTicketNoteList: [{
-          noteId: "public-copy", content: "Approved private note", privacyType: "PUBLIC",
-        }],
-      })
-      .mockResolvedValueOnce({
-        getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" },
-      });
-    mockClient.mutate.mockResolvedValueOnce({
-      createTicketNote: { noteId: "private-copy", privacyType: "PRIVATE" },
+        } };
+      }
+      if (query.includes("getTicketNoteList")) {
+        return { getTicketNoteList: [
+          { noteId: "public-copy", content: "Approved private note", privacyType: "PUBLIC" },
+          ...(privateNoteCreated
+            ? [{ noteId: "private-copy", content: "Approved private note", privacyType: "PRIVATE" }]
+            : []),
+        ] };
+      }
+      return { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } };
+    });
+    mockClient.mutate.mockImplementation(async () => {
+      privateNoteCreated = true;
+      return { createTicketNote: { noteId: "private-copy", privacyType: "PRIVATE" } };
     });
 
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
@@ -3782,6 +3783,9 @@ describe("Tickets Domain", () => {
       }
       if (query.includes("getTicketNoteList")) {
         events.push(`notes:${variables?.input?.ticketId}`);
+        if (variables?.input?.ticketId !== displayTicketId) {
+          return { getTicketNoteList: [] };
+        }
         return { getTicketNoteList: [
           {
             id: "8656361040688640000",
@@ -3801,7 +3805,7 @@ describe("Tickets Domain", () => {
       }
       events.push(`ticket:${variables?.input?.ticketId}`);
       return { getTicket: {
-        ticketId: displayTicketId,
+        ticketId: internalTicketId,
         displayId: displayTicketId,
         status: statusResolved ? "Resolved" : "New Calls",
         updatedTime: statusResolved
@@ -3861,7 +3865,10 @@ describe("Tickets Domain", () => {
     ]);
     expect(mockClient.mutate).toHaveBeenCalledTimes(1);
     expect(events).toContain(`notes:${internalTicketId}`);
-    expect(events).not.toContain(`notes:${displayTicketId}`);
+    expect(events).toContain(`notes:${displayTicketId}`);
+    expect(events.indexOf(`notes:${internalTicketId}`)).toBeLessThan(
+      events.indexOf(`notes:${displayTicketId}`)
+    );
   });
   it("staged junk resolve dry-run reports planned stages and zero writes", async () => {
     installStagedResolveMocks({ note: "missing" });
@@ -4520,6 +4527,7 @@ describe("Tickets Domain", () => {
       queries: [
         { getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } },
         { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
+        { getTicketNoteList: [] },
         { getTicketNoteList: [] },
         { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
       ],
@@ -5608,6 +5616,7 @@ describe("Tickets Domain", () => {
         getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" },
       })
       .mockResolvedValueOnce({ getTicketNoteList: [] })
+      .mockResolvedValueOnce({ getTicketNoteList: [] })
       .mockResolvedValueOnce({
         getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" },
       });
@@ -6012,7 +6021,7 @@ describe("Tickets Domain", () => {
       noteVerificationAttempts: 4,
       terminalReason: "NoteVisibilityUnresolved",
     }));
-    expect(mocks.events).toEqual(["ticket-list", "notes"]);
+    expect(mocks.events).toEqual(["ticket-list", "notes", "notes"]);
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
