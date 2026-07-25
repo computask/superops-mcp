@@ -3766,7 +3766,7 @@ describe("Tickets Domain", () => {
     return { original, classified, final };
   }
 
-  it("dedupes ticket 59005 private JUNK via the canonical note collector before status-only close", async () => {
+  it("dedupes the exact live raw GraphQL private JUNK note proven by notes_list before status-only close", async () => {
     const events: string[] = [];
     const internalTicketId = LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketId;
     const displayTicketId = LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.ticketNumber;
@@ -3783,25 +3783,17 @@ describe("Tickets Domain", () => {
       }
       if (query.includes("getTicketNoteList")) {
         events.push(`notes:${variables?.input?.ticketId}`);
-        if (variables?.input?.ticketId !== displayTicketId) {
+        if (variables?.input?.ticketId !== internalTicketId) {
           return { getTicketNoteList: [] };
         }
-        return { getTicketNoteList: [
-          {
-            id: "8656361040688640000",
-            type: "note",
-            direction: "internal",
-            isInternal: true,
-            plainText: "JUNK",
-            createdTime: "2026-07-25T16:18:03.579",
-          },
-          {
-            noteId: "8656361040688640000",
-            addedOn: "2026-07-25T16:18:03.579",
-            content: "JUNK",
-            privacyType: "PRIVATE",
-          },
-        ] };
+        return { getTicketNoteList: [{
+          noteId: "8656361040688640000",
+          addedBy: { userId: "158888810903851008", name: "Sam Godfrey" },
+          addedOn: "2026-07-25T16:18:03.579",
+          content: "<html>JUNK</html>",
+          attachments: [],
+          privacyType: "PRIVATE",
+        }] };
       }
       events.push(`ticket:${variables?.input?.ticketId}`);
       return { getTicket: {
@@ -3835,7 +3827,27 @@ describe("Tickets Domain", () => {
       return { updateTicket: { ticketId: internalTicketId, status: "Resolved" } };
     });
 
-    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+    const domain = getTicketsTools();
+    const noteListByInternalId = await domain.handleCall(
+      "superops_tickets_notes_list",
+      { ticketId: internalTicketId }
+    );
+    expect(JSON.parse(noteListByInternalId.content[0].text)).toEqual([{
+      noteId: "8656361040688640000",
+      addedBy: { userId: "158888810903851008", name: "Sam Godfrey" },
+      addedOn: "2026-07-25T16:18:03.579",
+      content: "<html>JUNK</html>",
+      attachments: [],
+      privacyType: "PRIVATE",
+    }]);
+    const noteListByDisplayNumber = await domain.handleCall(
+      "superops_tickets_notes_list",
+      { ticketId: displayTicketId }
+    );
+    expect(JSON.parse(noteListByDisplayNumber.content[0].text)).toEqual([]);
+    events.length = 0;
+
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
       expectedCandidateTicketNumbers: [displayTicketId],
       actions: [{
         ticketNumber: displayTicketId,
@@ -3865,10 +3877,7 @@ describe("Tickets Domain", () => {
     ]);
     expect(mockClient.mutate).toHaveBeenCalledTimes(1);
     expect(events).toContain(`notes:${internalTicketId}`);
-    expect(events).toContain(`notes:${displayTicketId}`);
-    expect(events.indexOf(`notes:${internalTicketId}`)).toBeLessThan(
-      events.indexOf(`notes:${displayTicketId}`)
-    );
+    expect(events).not.toContain(`notes:${displayTicketId}`);
   });
   it("staged junk resolve dry-run reports planned stages and zero writes", async () => {
     installStagedResolveMocks({ note: "missing" });

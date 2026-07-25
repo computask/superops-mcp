@@ -1159,12 +1159,11 @@ function isPrivateTicketNote(value: unknown): boolean {
 function normalizedTicketNoteText(value: unknown): string | undefined {
   const note = jsonRecord(value);
   if (!note) return undefined;
-  const text = typeof note.plainText === "string"
-    ? note.plainText
-    : typeof note.content === "string"
-      ? note.content
-      : undefined;
-  return text === undefined ? undefined : normalizePlainText(text);
+  if (typeof note.plainText === "string") {
+    return normalizePlainText(note.plainText);
+  }
+  if (typeof note.content !== "string") return undefined;
+  return normalizePlainText(htmlToPlainText(note.content).text);
 }
 
 function normalizeCanonicalTicketNote(

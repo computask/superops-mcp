@@ -58,14 +58,16 @@ const CANONICAL_PRIVATE_JUNK = {
 const RAW_GRAPHQL_PRIVATE_JUNK = {
   noteId: "8656361040688640000",
   addedOn: NOTE_CREATED_TIME,
-  content: "JUNK",
+  addedBy: { userId: "158888810903851008", name: "Sam Godfrey" },
+  content: "<html>JUNK</html>",
+  attachments: [],
   privacyType: "PRIVATE",
 } as const;
 
 const RAW_GRAPHQL_PUBLIC_JUNK = {
   noteId: "public-junk",
   addedOn: NOTE_CREATED_TIME,
-  content: "JUNK",
+  content: "<html>JUNK</html>",
   privacyType: "PUBLIC",
 } as const;
 
@@ -243,7 +245,7 @@ type FakeSuperOpsOptions = {
   classified?: boolean;
   resolved?: boolean;
   initialNotes?: unknown[];
-  noteReadsRequireDisplayId?: boolean;
+  noteReadsRequireInternalId?: boolean;
   canonicalTicketReadRateLimits?: number;
   noteReadUnavailable?: boolean;
   unsupportedNoteEnvelope?: boolean;
@@ -365,9 +367,14 @@ class FakeSuperOps {
   private hasPrivateJunk(): boolean {
     return this.visibleNotes.some((value) => {
       const note = value as Record<string, unknown>;
+      const text = typeof note.plainText === "string"
+        ? note.plainText
+        : typeof note.content === "string"
+          ? note.content.replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ")
+          : "";
       return (note.privacyType === "PRIVATE" ||
         (note.type === "note" && note.isInternal === true && note.direction === "internal")) &&
-        (note.content === "JUNK" || note.plainText === "JUNK");
+        text.trim() === "JUNK";
     });
   }
 
@@ -427,7 +434,7 @@ class FakeSuperOps {
       if (this.options.unsupportedNoteEnvelope) {
         return graphQlData({ getTicketNoteList: { unexpectedItems: [] } });
       }
-      if (this.options.noteReadsRequireDisplayId && input.ticketId !== TICKET_NUMBER) {
+      if (this.options.noteReadsRequireInternalId && input.ticketId !== TICKET_ID) {
         return graphQlData({ getTicketNoteList: [] });
       }
       return graphQlData({ getTicketNoteList: this.notesForRead() });
@@ -808,11 +815,11 @@ describe("deterministic end-to-end apply-triage harness", () => {
     harness.assertGlobalInvariants(record);
   });
 
-  it("B: recovers ticket 59005 from the exact canonical private-note shape with one status write", async () => {
+  it("B: recovers ticket 59005 from the exact raw GraphQL private-note shape with one status write", async () => {
     const harness = new TriageHarness("recovery", {
       classified: true,
-      initialNotes: [{ ...CANONICAL_PRIVATE_JUNK }],
-      noteReadsRequireDisplayId: true,
+      initialNotes: [{ ...RAW_GRAPHQL_PRIVATE_JUNK }],
+      noteReadsRequireInternalId: true,
     });
     const { parsed } = await harness.invoke();
     const result = firstResult(parsed);
@@ -839,29 +846,26 @@ describe("deterministic end-to-end apply-triage harness", () => {
       "superops.read.ticket",
       "superops.read.notes",
       "superops.read.notes",
-      "superops.read.notes",
-      "superops.read.notes",
       "superops.read.ticket",
       "superops.write.status",
       "superops.read.ticket",
-      "superops.read.notes",
       "superops.read.notes",
     ]);
     expect(harness.history.first("superops.read.notes")).toBeLessThan(harness.history.first("superops.write.status"));
     const noteReadTicketIds = harness.history.events
       .filter((event) => event.kind === "superops.read.notes")
       .map((event) => event.details?.ticketId);
-    expect(noteReadTicketIds).toEqual(expect.arrayContaining([TICKET_ID, TICKET_NUMBER]));
+    expect(noteReadTicketIds).toEqual([TICKET_ID, TICKET_ID, TICKET_ID]);
     expect(harness.history.count("superops.write.note")).toBe(0);
     expect(harness.history.count("superops.write.status")).toBe(1);
     expect(harness.superops.ticket.status).toBe("Resolved");
     harness.assertGlobalInvariants(record);
   });
 
-  it("normalizes the raw GraphQL private-note representation through the same collector", async () => {
-    const harness = new TriageHarness("raw-private-note", {
+  it("normalizes the exact canonical safe-note representation through the same collector", async () => {
+    const harness = new TriageHarness("canonical-private-note", {
       classified: true,
-      initialNotes: [{ ...RAW_GRAPHQL_PRIVATE_JUNK }],
+      initialNotes: [{ ...CANONICAL_PRIVATE_JUNK }],
     });
     const { parsed } = await harness.invoke();
     const record = await harness.record();
