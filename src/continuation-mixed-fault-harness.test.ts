@@ -87,10 +87,13 @@ const classificationTarget = {
   urgency: "Low",
   category: "7. Sales call",
   subcategory: "No Action Needed",
+};
+const resolutionTarget = {
+  status: "Resolved",
+  ...classificationTarget,
   cause: "No Fault Found",
   resolutionCode: "Permanent Fix",
 };
-const resolutionTarget = { status: "Resolved", ...classificationTarget };
 
 function fields() {
   const options = (columnName: string, values: string[], parent?: { columnName: string; value: string }) => ({

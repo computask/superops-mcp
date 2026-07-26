@@ -355,16 +355,18 @@ Busiest hour over 90 days:
   "interval": "hour"
 }
 ```
-### Recommended New Calls Triage Workflow
+### Recommended Ticket Triage Workflow
 
-For New Calls triage, start with `superops_tickets_triage_snapshot` and treat
-its `candidateTicketNumbers` list as fixed. ChatGPT should assess only the safe
+For ticket triage, start with `superops_tickets_triage_snapshot` for an explicitly
+selected configured status queue and treat its `candidateTicketNumbers` list as
+fixed. ChatGPT should assess only the safe
 compact evidence returned by that snapshot when proposing a triage plan. Do not
 write changes while assessing the snapshot.
 
 Recommended flow:
 
-1. Call `superops_tickets_triage_snapshot` for `status: ["New Calls"]`.
+1. Call `superops_tickets_triage_snapshot` for the exact configured status
+   queue, for example `status: ["New Calls"]` or `status: ["Ticket on Hold"]`.
 2. Follow `pagination.nextPage` until `hasMore` is false; the tool uses a stable execution-safe page size so no listed candidate is knowingly starved of safe reads.
 3. Aggregate the page candidate lists into one fixed assessment set and analyse only the returned safe evidence.
 4. Present a pre-write proposed action table for user approval.
@@ -378,7 +380,7 @@ the user approves the table.
 
 The final outcome table must include every ticket from the snapshot, even when no
 change was made. Each ticket must have one final outcome from: `Resolved`,
-`Moved`, `Updated`, `Left in New Calls`, `Skipped`, `Blocked`, `Failed`, or
+`Moved`, `Updated`, `Left`, `Skipped`, `Blocked`, `Failed`, or
 `Not Found`. Do not omit tickets because they were skipped, blocked, failed, not
 found, or left unchanged.
 
@@ -390,7 +392,7 @@ final table and mark it as `Blocked`, `Failed`, or `Not Found` as appropriate.
 Suggested Custom GPT instruction:
 
 ```text
-For New Calls triage, use `superops_tickets_triage_snapshot` first and follow every execution-safe page until `pagination.hasMore` is false. Treat the aggregated candidate lists as fixed. Do not write changes until a proposed action table has been presented and approved. Every ticket from the snapshot pages must appear in the final report with a complete classification target and final outcome. Only `Resolved` and `Awaiting Engineer` may be proposed as status changes; a `leave` action retains status while applying classification.
+For ticket triage, call `superops_tickets_triage_snapshot` with the exact configured status queue requested by the user and follow every execution-safe page until `pagination.hasMore` is false. Treat the aggregated candidate lists as fixed. Do not write changes until a proposed action table has been presented and approved. Every ticket from the snapshot pages must appear in the final report with the required classification target and final outcome. Only `Resolved` and `Awaiting Engineer` may be proposed as status changes; a `leave` action retains its current status while applying classification.
 ```
 
 ### Approved Triage Plan Execution
@@ -410,11 +412,12 @@ set. Mutating actions require `contentVerified=true` unless
 `allowWriteWithoutVerifiedContent=true` is supplied.
 
 Supported actions are `resolve`, `update`, `addNote`, `leave`, and `skip`.
-Every `resolve`, `update`, and `leave` proposal publishes a complete target for
-impact, urgency, category, subcategory, cause, and resolution code. `leave` is a
-classification-only write that retains the current status. Status changes are
-closed to `Resolved` for resolve actions and `Awaiting Engineer` for update
-actions; other target statuses are rejected before any SuperOps read or write.
+`resolve` proposals require impact, urgency, category, subcategory, cause, and
+resolution code. `update` and `leave` require impact, urgency, category, and
+subcategory; cause is optional when known, and resolution code is prohibited.
+`leave` is a classification-only write that retains the current status. Status
+changes are closed to `Resolved` for resolve actions and `Awaiting Engineer` for
+update actions; other target statuses are rejected before any SuperOps read or write.
 `dryRun=true` performs validation and returns intended outcomes without writing.
 When `dedupeNotes=true`, existing notes are checked before adding a note, and a
 matching note is not duplicated. Resolve actions use the controlled resolve path;

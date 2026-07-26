@@ -187,13 +187,16 @@ const TRIAGE_TEST_CLASSIFICATION = {
   urgency: "Low",
   category: "7. Sales call",
   subcategory: "No Action Needed",
+};
+const TRIAGE_TEST_RESOLUTION_CLASSIFICATION = {
+  ...TRIAGE_TEST_CLASSIFICATION,
   cause: "No Fault Found",
   resolutionCode: "Permanent Fix",
 };
 
 const RESOLVED_CLASSIFICATION = {
   priority: "Very Low",
-  ...TRIAGE_TEST_CLASSIFICATION,
+  ...TRIAGE_TEST_RESOLUTION_CLASSIFICATION,
 };
 
 
@@ -400,7 +403,7 @@ describe("Tickets Domain", () => {
     );
     expect(update?.properties.target.properties.status.enum).toEqual(["Awaiting Engineer"]);
     expect(update?.properties.target.required).toEqual([
-      "status", "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
+      "status", "impact", "urgency", "category", "subcategory",
     ]);
     expect(update?.properties.target.properties).toEqual(
       expect.objectContaining({
@@ -410,7 +413,6 @@ describe("Tickets Domain", () => {
         category: expect.any(Object),
         subcategory: expect.any(Object),
         cause: expect.any(Object),
-        resolutionCode: expect.any(Object),
         techGroupName: expect.any(Object),
         clientName: expect.any(Object),
         clientId: expect.any(Object),
@@ -428,9 +430,12 @@ describe("Tickets Domain", () => {
       expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"])
     );
     expect(leave?.properties.target.required).toEqual([
-      "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
+      "impact", "urgency", "category", "subcategory",
     ]);
+    expect(update?.properties.target.properties).not.toHaveProperty("resolutionCode");
     expect(leave?.properties.target.properties).not.toHaveProperty("status");
+    expect(leave?.properties.target.properties).not.toHaveProperty("resolutionCode");
+    expect(leave?.properties.target.properties).toHaveProperty("cause");
     const addNote = variants.find((variant) => variant.properties.action.const === "addNote");
     expect(addNote?.required).toEqual(
       expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "note"])
@@ -1886,6 +1891,57 @@ describe("Tickets Domain", () => {
     );
   });
 
+  it("snapshots an explicitly selected Ticket on Hold queue", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{
+            ticketId: "ticket-59020",
+            displayId: "59020",
+            subject: "Held for review",
+            status: "Ticket on Hold",
+          }],
+          listInfo: { page: 1, pageSize: 32, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-59020",
+          displayId: "59020",
+          subject: "Held for review",
+          status: "Ticket on Hold",
+          updatedTime: "2026-07-26T08:00:00.000Z",
+        },
+      });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_triage_snapshot", {
+      status: ["Ticket on Hold"],
+      max: 50,
+      page: 1,
+      includeConversations: false,
+      includeNotes: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBeUndefined();
+    expect(mockClient.query.mock.calls[0][1]).toEqual({
+      input: {
+        page: 1,
+        pageSize: 32,
+        condition: { attribute: "status", operator: "is", value: "Ticket on Hold" },
+      },
+    });
+    expect(parsed.source).toEqual({
+      status: ["Ticket on Hold"], page: 1, max: 50, effectiveMax: 32,
+    });
+    expect(parsed.candidateTicketNumbers).toEqual(["59020"]);
+    expect(parsed.tickets[0]).toMatchObject({
+      ticketNumber: "59020",
+      status: "Ticket on Hold",
+      processingState: "MetadataOnly",
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
   it("paginates the exact 14-ticket New Calls shape before safe-read budget exhaustion", async () => {
     const candidates = Array.from({ length: 14 }, (_, index) => {
       const ticketNumber = String(59001 + index);
@@ -3385,8 +3441,6 @@ describe("Tickets Domain", () => {
           target: {
             impact: "Low",
             urgency: "Low",
-            cause: "No Fault Found",
-            resolutionCode: "Permanent Fix",
             status: "Awaiting Engineer",
             ...target,
           },
@@ -3499,7 +3553,7 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
-  it("classifies a leave ticket without changing its status and reports every expected candidate", async () => {
+  it("classifies a Ticket on Hold leave ticket without changing its status and reports every expected candidate", async () => {
     mockClient.query
       .mockResolvedValueOnce({
         getTicketList: {
@@ -3511,8 +3565,8 @@ describe("Tickets Domain", () => {
         getTicket: {
           ticketId: "ticket-57400",
           displayId: "57400",
-          subject: "Leave in New Calls",
-          status: "New Calls",
+          subject: "Leave on hold",
+          status: "Ticket on Hold",
           updatedTime: "2026-06-25T10:00:00Z",
         },
       })
@@ -3521,8 +3575,8 @@ describe("Tickets Domain", () => {
         getTicket: {
           ticketId: "ticket-57400",
           displayId: "57400",
-          subject: "Leave in New Calls",
-          status: "New Calls",
+          subject: "Leave on hold",
+          status: "Ticket on Hold",
           updatedTime: "2026-06-25T10:01:00Z",
           ...TRIAGE_TEST_CLASSIFICATION,
         },
@@ -3536,7 +3590,7 @@ describe("Tickets Domain", () => {
       expectedCandidateTicketNumbers: ["57400", "57401"],
       actions: [{
         ticketNumber: "57400",
-        expectedStatus: "New Calls",
+        expectedStatus: "Ticket on Hold",
         expectedUpdatedTime: "2026-06-25T10:00:00Z",
         contentVerified: true,
         action: "leave",
@@ -3552,7 +3606,7 @@ describe("Tickets Domain", () => {
         writeAttempted: true,
         verified: true,
         physicalWrites: [{ method: "updateTicket", outcome: "Accepted" }],
-        finalState: expect.objectContaining({ status: "New Calls" }),
+        finalState: expect.objectContaining({ status: "Ticket on Hold" }),
       }),
       expect.objectContaining({
         ticketNumber: "57401",
@@ -3567,6 +3621,68 @@ describe("Tickets Domain", () => {
       ...TRIAGE_TEST_CLASSIFICATION,
     });
     expect(mutationInput).not.toHaveProperty("status");
+  });
+  it("updates from Ticket on Hold with optional cause and no resolution code", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57402", displayId: "57402" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57402",
+          displayId: "57402",
+          status: "Ticket on Hold",
+          updatedTime: "2026-07-26T08:00:00.000Z",
+        },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57402",
+          displayId: "57402",
+          status: "Awaiting Engineer",
+          updatedTime: "2026-07-26T08:01:00.000Z",
+          ...TRIAGE_TEST_CLASSIFICATION,
+          cause: "User Request",
+        },
+      });
+    mockClient.mutate.mockResolvedValueOnce({
+      updateTicket: { ticketId: "ticket-57402", status: "Awaiting Engineer" },
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57402"],
+      actions: [{
+        ticketNumber: "57402",
+        expectedStatus: "Ticket on Hold",
+        expectedUpdatedTime: "2026-07-26T08:00:00.000Z",
+        contentVerified: true,
+        action: "update",
+        target: {
+          ...TRIAGE_TEST_CLASSIFICATION,
+          cause: "User Request",
+          status: "Awaiting Engineer",
+        },
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Updated",
+      verified: true,
+      finalState: expect.objectContaining({ status: "Awaiting Engineer", cause: "User Request" }),
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(mockClient.mutate.mock.calls[0][1].input).toEqual({
+      ticketId: "ticket-57402",
+      ...TRIAGE_TEST_CLASSIFICATION,
+      cause: "User Request",
+      status: "Awaiting Engineer",
+    });
+    expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("resolutionCode");
   });
   it("skips approved triage writes when updatedTime changed unless explicitly allowed", async () => {
     mockClient.query
@@ -3722,7 +3838,7 @@ describe("Tickets Domain", () => {
         expectedUpdatedTime: "2026-06-25T10:00:00Z",
         contentVerified: true,
         action: "resolve",
-        target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
+        target: { ...TRIAGE_TEST_RESOLUTION_CLASSIFICATION, status: "Awaiting Engineer" },
       }],
     });
     const leave = await domain.handleCall("superops_tickets_apply_triage_plan", {
@@ -3744,6 +3860,32 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it("rejects resolution code on update and leave before any read or write", async () => {
+    const domain = getTicketsTools();
+    for (const action of ["update", "leave"] as const) {
+      const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+        expectedCandidateTicketNumbers: ["57400"],
+        actions: [{
+          ticketNumber: "57400",
+          expectedUpdatedTime: "2026-06-25T10:00:00Z",
+          contentVerified: true,
+          action,
+          target: {
+            ...TRIAGE_TEST_CLASSIFICATION,
+            ...(action === "update" ? { status: "Awaiting Engineer" } : {}),
+            resolutionCode: "Permanent Fix",
+          },
+        }],
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain(
+        "target.resolutionCode is only allowed for a resolve action"
+      );
+    }
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
   it("rejects a leave action without every classification field", async () => {
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
       expectedCandidateTicketNumbers: ["57400"],
@@ -5102,6 +5244,13 @@ describe("Tickets Domain", () => {
         },
       });
       expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+      expect(mockClient.mutate.mock.calls[0][1].input).toEqual({
+        ticketId: "ticket-57400",
+        ...TRIAGE_TEST_CLASSIFICATION,
+        status: "Awaiting Engineer",
+      });
+      expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("cause");
+      expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("resolutionCode");
     });
   });
   it("persists conclusive rejection before retry scheduling", async () => {
@@ -5725,7 +5874,7 @@ describe("Tickets Domain", () => {
         expectedCandidateTicketNumbers: ["57400", "57401"],
         actions: [{
           ticketNumber: "57401", expectedUpdatedTime: "2026-07-18T10:00:00Z",
-          contentVerified: true, action: "resolve", target: { status: "Resolved", ...TRIAGE_TEST_CLASSIFICATION },
+          contentVerified: true, action: "resolve", target: { status: "Resolved", ...TRIAGE_TEST_RESOLUTION_CLASSIFICATION },
         }],
       })
     ));
@@ -5744,7 +5893,7 @@ describe("Tickets Domain", () => {
       })
       .mockResolvedValueOnce({
         getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "Resolved",
-          updatedTime: "2026-07-18T10:01:00Z", ...TRIAGE_TEST_CLASSIFICATION },
+          updatedTime: "2026-07-18T10:01:00Z", ...TRIAGE_TEST_RESOLUTION_CLASSIFICATION },
       });
     await runWithExecutionConfig({}, async () => {
       await runWithExecutionContext("superops_tickets_apply_triage_plan", async () =>

@@ -708,11 +708,18 @@ interface ApplyTriagePlanParams {
 
 const TRIAGE_PLAN_ACTION_TYPES = ["resolve", "update", "addNote", "leave", "skip"] as const;
 const TRIAGE_PLAN_MUTABLE_STATUSES = ["Resolved", "Awaiting Engineer"] as const;
-const TRIAGE_PLAN_CLASSIFICATION_FIELDS = [
+const TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS = [
   "impact",
   "urgency",
   "category",
   "subcategory",
+] as const;
+const TRIAGE_PLAN_NON_RESOLUTION_CLASSIFICATION_FIELDS = [
+  ...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS,
+  "cause",
+] as const;
+const TRIAGE_PLAN_RESOLVE_REQUIRED_CLASSIFICATION_FIELDS = [
+  ...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS,
   "cause",
   "resolutionCode",
 ] as const;
@@ -830,14 +837,22 @@ const TRIAGE_PLAN_UPDATE_TARGET_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
-    ...TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES,
     status: {
       type: "string",
       enum: ["Awaiting Engineer"],
       description: "Update actions may only move a ticket to Awaiting Engineer.",
     },
+    impact: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.impact,
+    urgency: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.urgency,
+    category: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.category,
+    subcategory: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.subcategory,
+    cause: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.cause,
+    techGroupName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.techGroupName,
+    clientName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientName,
+    clientId: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientId,
+    suppressCloseNotification: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.suppressCloseNotification,
   },
-  required: ["status", ...TRIAGE_PLAN_CLASSIFICATION_FIELDS],
+  required: ["status", ...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS],
 } as const;
 
 const TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA = {
@@ -852,7 +867,7 @@ const TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA = {
       description: "Resolve actions may only close to Resolved.",
     },
   },
-  required: [...TRIAGE_PLAN_CLASSIFICATION_FIELDS],
+  required: [...TRIAGE_PLAN_RESOLVE_REQUIRED_CLASSIFICATION_FIELDS],
 } as const;
 
 const TRIAGE_PLAN_LEAVE_TARGET_SCHEMA = {
@@ -864,9 +879,8 @@ const TRIAGE_PLAN_LEAVE_TARGET_SCHEMA = {
     category: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.category,
     subcategory: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.subcategory,
     cause: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.cause,
-    resolutionCode: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.resolutionCode,
   },
-  required: [...TRIAGE_PLAN_CLASSIFICATION_FIELDS],
+  required: [...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS],
 } as const;
 
 const TRIAGE_PLAN_ACTION_SCHEMA = {
@@ -1408,12 +1422,19 @@ function validateTriagePlanActionShape(rawAction: unknown, index: number): strin
     if (!target) {
       return `${label} ${action.action} action requires a complete classification target.`;
     }
-    const missingClassificationFields = TRIAGE_PLAN_CLASSIFICATION_FIELDS.filter(
+    const requiredClassificationFields = action.action === "resolve"
+      ? TRIAGE_PLAN_RESOLVE_REQUIRED_CLASSIFICATION_FIELDS
+      : TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS;
+    const missingClassificationFields = requiredClassificationFields.filter(
       (field) => typeof target[field] !== "string" || String(target[field]).trim().length === 0
     );
     if (missingClassificationFields.length > 0) {
       return `${label} ${action.action} action requires classification field(s): ${missingClassificationFields.join(", ")}.`;
     }
+  }
+
+  if ((action.action === "update" || action.action === "leave") && target && "resolutionCode" in target) {
+    return `${label}.target.resolutionCode is only allowed for a resolve action.`;
   }
 
   if (action.action === "resolve" && target?.status !== undefined && target.status !== "Resolved") {
@@ -1434,7 +1455,7 @@ function validateTriagePlanActionShape(rawAction: unknown, index: number): strin
 
   if (action.action === "leave" && target) {
     const unsupportedLeaveFields = Object.keys(target).filter(
-      (field) => !(TRIAGE_PLAN_CLASSIFICATION_FIELDS as readonly string[]).includes(field)
+      (field) => !(TRIAGE_PLAN_NON_RESOLUTION_CLASSIFICATION_FIELDS as readonly string[]).includes(field)
     );
     if (unsupportedLeaveFields.length > 0) {
       return `${label}.target contains field(s) not allowed for a classification-only leave action: ${unsupportedLeaveFields.join(", ")}.`;
@@ -3765,13 +3786,27 @@ async function buildApprovedUpdateInput(
   const target = action.target ?? {};
   const input: Record<string, unknown> = { ticketId };
   if (action.action === "resolve" || action.action === "update" || action.action === "leave") {
-    const missingClassificationFields = TRIAGE_PLAN_CLASSIFICATION_FIELDS.filter(
+    const requiredClassificationFields = action.action === "resolve"
+      ? TRIAGE_PLAN_RESOLVE_REQUIRED_CLASSIFICATION_FIELDS
+      : TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS;
+    const missingClassificationFields = requiredClassificationFields.filter(
       (field) => typeof target[field] !== "string" || String(target[field]).trim().length === 0
     );
     if (missingClassificationFields.length > 0) {
       return {
         error: `${action.action} action requires classification field(s): ${missingClassificationFields.join(", ")}.`,
       };
+    }
+  }
+  if ((action.action === "update" || action.action === "leave") && "resolutionCode" in target) {
+    return { error: "Resolution code is only allowed for a resolve action." };
+  }
+  if (action.action === "leave") {
+    const unsupportedLeaveFields = Object.keys(target).filter(
+      (field) => !(TRIAGE_PLAN_NON_RESOLUTION_CLASSIFICATION_FIELDS as readonly string[]).includes(field)
+    );
+    if (unsupportedLeaveFields.length > 0) {
+      return { error: `Leave action contains unsupported target field(s): ${unsupportedLeaveFields.join(", ")}.` };
     }
   }
 
@@ -7174,7 +7209,7 @@ export function getTicketsTools(): DomainTools {
       {
         name: "superops_tickets_triage_snapshot",
         description:
-          "Read-only New Calls triage snapshot. Returns one execution-safe page of fixed candidates with safe compact metadata and sanitized conversation/note evidence. Follow pagination.nextPage until hasMore is false before proposing a complete queue plan.",
+          "Read-only ticket triage snapshot for an explicitly selected configured status queue. Returns one execution-safe page of fixed candidates with safe compact metadata and sanitized conversation/note evidence. Follow pagination.nextPage until hasMore is false before proposing a complete queue plan.",
         inputSchema: {
           type: "object",
           properties: {
@@ -7244,7 +7279,7 @@ export function getTicketsTools(): DomainTools {
       },      {
         name: "superops_tickets_apply_triage_plan",
         description:
-          "Write/high-risk tool. Applies an approved fixed-candidate New Calls plan. Resolve, update, and leave targets require complete classification; leave retains status while writing classification, and status changes are restricted to Resolved or Awaiting Engineer.",
+          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer.",
         inputSchema: {
           type: "object",
           properties: {
