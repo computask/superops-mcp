@@ -5495,6 +5495,24 @@ function applyTriageHasDurableContinuationState(record: OperationLedgerRecord): 
     return true;
   });
 }
+function applyTriageOriginalRequestHash(
+  request: ApplyTriagePlanParams,
+  expected: string[]
+): string {
+  return stableHash({
+    batchId: request.batchId,
+    expectedCandidateTicketNumbers: expected,
+    actions: Array.isArray(request.actions)
+      ? request.actions.map((action) => ({
+          ...action,
+          note: action.note ? normalizedNoteFingerprint(action.note) : undefined,
+        }))
+      : [],
+    dryRun: request.dryRun ?? false,
+    verify: request.verify ?? true,
+  });
+}
+
 function buildApplyTriageLedgerRecord(params: {
   operationId: string;
   request: ApplyTriagePlanParams;
@@ -5598,18 +5616,7 @@ function buildApplyTriageLedgerRecord(params: {
     updatedAt: now.toISOString(),
     expiresAt: expiresAt.toISOString(),
     maxOperationLifetimeAt: maxOperationLifetimeAt.toISOString(),
-    originalRequestHash: stableHash({
-      batchId: params.request.batchId,
-      expectedCandidateTicketNumbers: params.expected,
-      actions: Array.isArray(params.request.actions)
-        ? params.request.actions.map((action) => ({
-            ...action,
-            note: action.note ? normalizedNoteFingerprint(action.note) : undefined,
-          }))
-        : [],
-      dryRun: params.request.dryRun ?? false,
-      verify: params.request.verify ?? true,
-    }),
+    originalRequestHash: applyTriageOriginalRequestHash(params.request, params.expected),
     operationRequest: serializableApplyTriageRequest(params.request, params.expected),
     state: pendingExists
       ? params.continuationRequired ? "ContinuationRequired" : "Running"
@@ -8225,8 +8232,18 @@ export function getTicketsTools(): DomainTools {
             try {
               const existing = await store.get(operationId, ownerHash);
               if (existing) {
+                const storedRequest = operationRequestApplyTriageParams(existing.operationRequest);
+                const recoveryRequest = params.batchId === existing.operationId &&
+                    storedRequest?.batchId === undefined
+                  ? serializableApplyTriageRequest({ ...params, batchId: undefined }, expected)
+                  : undefined;
+                const exactGeneratedIdRecovery = recoveryRequest !== undefined &&
+                  stableHash(existing.operationRequest) === stableHash(recoveryRequest);
                 if (existing.ownerHash !== ownerHash ||
-                    existing.originalRequestHash !== initialRecord.originalRequestHash) {
+                    (
+                      existing.originalRequestHash !== initialRecord.originalRequestHash &&
+                      !exactGeneratedIdRecovery
+                    )) {
                   return errorResult("The requested operation ID already exists with different ownership or approved input.");
                 }
               } else {

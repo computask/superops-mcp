@@ -47,10 +47,14 @@ import {
   type ToolCategory,
 } from "./audit.js";
 import { finishExecution, runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
-import { runWithContinuationScheduler } from "./continuation-scheduler.js";
+import {
+  runWithContinuationScheduler,
+  scheduleApplyTriageContinuation,
+} from "./continuation-scheduler.js";
 import {
   envTenantOwnerHash,
   gatewayOwnerHash,
+  getOperationStore,
   runWithOperationStore,
   SuperOpsOperationLedger,
 } from "./operation-store.js";
@@ -595,7 +599,8 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
 
 async function handleInternalContinuation(
   request: Request,
-  env: Env
+  env: Env,
+  executionContext?: WorkerExecutionContext
 ): Promise<Response> {
   if (env.SUPEROPS_CONTINUATION_ENABLED !== "true") {
     return json({ error: "Continuation disabled" }, 403);
@@ -628,6 +633,7 @@ async function handleInternalContinuation(
     region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
   };
 
+  let schedulingPromise: Promise<Record<string, unknown> | undefined> | undefined;
   const result = await runWithContinuationScheduler(env, () =>
     runWithOperationStore(env, () =>
       runWithExecutionConfig(env, () =>
@@ -638,27 +644,137 @@ async function handleInternalContinuation(
               ownerHash: body.ownerHash as string,
               leaseOwner: globalThis.crypto?.randomUUID?.() ?? `worker-${Date.now()}`,
             });
+            if (continuation.continuationRequired) {
+              schedulingPromise = scheduleImmediateInternalContinuation(
+                body.operationId as string,
+                body.ownerHash as string
+              );
+            }
             finishExecution(continuation.continuationRequired ? "continuationRequired" : "completed");
-            return continuation;
+            if (schedulingPromise && !executionContext) {
+              return {
+                ...continuation,
+                continuationScheduling: await schedulingPromise,
+              };
+            }
+            return schedulingPromise
+              ? {
+                  ...continuation,
+                  continuationScheduling: {
+                    attempted: true,
+                    queued: true,
+                    mechanism: "serviceBinding",
+                  },
+                }
+              : continuation;
           })
         )
       )
     )
   );
 
+  if (schedulingPromise && executionContext) {
+    executionContext.waitUntil(schedulingPromise);
+  }
   return json({ ok: true, result });
 }
+
+async function scheduleImmediateInternalContinuation(
+  operationId: string,
+  ownerHash: string
+): Promise<Record<string, unknown> | undefined> {
+  const store = getOperationStore();
+  const record = await store.get(operationId, ownerHash);
+  if (
+    !record ||
+    record.ownerHash !== ownerHash ||
+    record.state !== "ContinuationRequired" ||
+    record.pendingItems.length === 0 ||
+    record.nextEligibleTime
+  ) {
+    return undefined;
+  }
+
+  let scheduled: Awaited<ReturnType<typeof scheduleApplyTriageContinuation>>;
+  try {
+    scheduled = await scheduleApplyTriageContinuation(operationId, ownerHash);
+  } catch (error) {
+    scheduled = {
+      scheduled: false,
+      reason: error instanceof Error ? error.message : String(error),
+      reasonCode: "exceptionDuringScheduling",
+    };
+  }
+
+  if (scheduled.scheduled) {
+    let persistenceError: string | undefined;
+    try {
+      await store.update(operationId, ownerHash, (current) => ({
+        ...current,
+        schedulingAttempted: true,
+        schedulingSucceeded: true,
+        schedulingError: undefined,
+        schedulingAttemptCount: (current.schedulingAttemptCount ?? 0) + 1,
+      }));
+    } catch (error) {
+      persistenceError = error instanceof Error ? error.message : String(error);
+    }
+    return {
+      attempted: true,
+      scheduled: true,
+      status: scheduled.status,
+      persistenceError,
+      mechanism: "serviceBinding",
+    };
+  }
+
+  const reason = scheduled.status
+    ? `Immediate continuation delivery failed with status ${scheduled.status}.`
+    : scheduled.reason ?? "Immediate continuation delivery failed or is not configured.";
+  let terminalizationError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      await store.terminalizeContinuationFailure({
+        operationId,
+        ownerHash,
+        errorClass: "ContinuationSchedulingFailure",
+        outcome: "ContinuationSchedulingFailed",
+        reason,
+        schedulingFailure: true,
+      });
+      terminalizationError = undefined;
+      break;
+    } catch (error) {
+      terminalizationError = error;
+    }
+  }
+
+  return {
+    attempted: true,
+    scheduled: false,
+    status: scheduled.status,
+    error: reason,
+    reasonCode: scheduled.reasonCode,
+    terminalized: terminalizationError === undefined,
+    terminalizationError: terminalizationError instanceof Error
+      ? terminalizationError.message
+      : terminalizationError === undefined ? undefined : String(terminalizationError),
+    mechanism: "serviceBinding",
+  };
+}
+
 async function handleBaseWorkerFetch(
   request: Request,
   env: Env,
   props?: unknown,
   auditContextApplied = false,
-  blockedToolNames?: ReadonlySet<string>
+  blockedToolNames?: ReadonlySet<string>,
+  executionContext?: WorkerExecutionContext
 ): Promise<Response> {
   const url = new URL(request.url);
 
   if (url.pathname === "/internal/operations/continue") {
-    return handleInternalContinuation(request, env);
+    return handleInternalContinuation(request, env, executionContext);
   }
 
   // CORS preflight
@@ -745,7 +861,7 @@ const chatGptMcpApiHandler = {
         return blockedToolCall;
       }
 
-      return handleBaseWorkerFetch(request, env, ctx?.props, true, blockedToolNames);
+      return handleBaseWorkerFetch(request, env, ctx?.props, true, blockedToolNames, ctx);
     });
   },
 };
@@ -761,7 +877,7 @@ const chatGptDefaultHandler = {
       return handleAuthorize(request, env);
     }
 
-    return handleBaseWorkerFetch(request, env, ctx?.props);
+    return handleBaseWorkerFetch(request, env, ctx?.props, false, undefined, ctx);
   },
 };
 
@@ -810,6 +926,6 @@ export default {
       );
     }
 
-    return handleBaseWorkerFetch(request, env, ctx?.props);
+    return handleBaseWorkerFetch(request, env, ctx?.props, false, undefined, ctx);
   },
 };

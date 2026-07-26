@@ -4502,6 +4502,93 @@ describe("Tickets Domain", () => {
     });
   });
 
+  it("resumes a generated durable operation by batchId without replaying completed items", async () => {
+    const operationId = "legacy-generated-operation-recovery";
+    const expectedCandidateTicketNumbers = ["59009", "59012"];
+
+    await runWithOperationStore({}, async () => {
+      const first = await withSuccessfulContinuationScheduling(() =>
+        runWithExecutionConfig(
+          { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+          () => runWithExecutionContext(
+            "superops_tickets_apply_triage_plan",
+            () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+              expectedCandidateTicketNumbers,
+              actions: [],
+            }),
+            operationId
+          )
+        )
+      );
+      const firstParsed = JSON.parse(first.content[0].text);
+      const afterFirst = await getOperationStore().get(operationId, currentOwnerHash());
+
+      expect(firstParsed.operation).toMatchObject({
+        operationId,
+        complete: false,
+        continuationRequired: true,
+        state: "ContinuationRequired",
+      });
+      expect(afterFirst).toMatchObject({
+        operationId,
+        state: "ContinuationRequired",
+        completedItems: [],
+        skippedItems: ["59009"],
+        pendingItems: ["59012"],
+        itemStates: {
+          "59009": { stage: "Skipped", writeAttempted: false },
+          "59012": { stage: "Unattempted", writeAttempted: false },
+        },
+      });
+
+      const recovered = await runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: operationId,
+          expectedCandidateTicketNumbers,
+          actions: [],
+        })
+      );
+      const recoveredParsed = JSON.parse(recovered.content[0].text);
+      const terminal = await getOperationStore().get(operationId, currentOwnerHash());
+
+      expect(recovered.isError).not.toBe(true);
+      expect(recoveredParsed.operation).toMatchObject({
+        operationId,
+        complete: true,
+        continuationRequired: false,
+        state: "Completed",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+      });
+      expect(terminal).toMatchObject({
+        state: "Completed",
+        skippedItems: ["59009", "59012"],
+        pendingItems: [],
+        itemStates: {
+          "59009": { stage: "Skipped", retryCount: 0, writeAttempted: false },
+          "59012": { stage: "Skipped", retryCount: 0, writeAttempted: false },
+        },
+      });
+      expect(mockClient.query).not.toHaveBeenCalled();
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+
+      const changedInput = await runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: operationId,
+          expectedCandidateTicketNumbers,
+          actions: [],
+          dryRun: true,
+        })
+      );
+      expect(changedInput.isError).toBe(true);
+      expect(changedInput.content[0].text).toContain(
+        "already exists with different ownership or approved input"
+      );
+    });
+  });
+
   it("staged resolve persists preflight before already-correct classification and only closes status", async () => {
     const checkpointStages: string[] = [];
 

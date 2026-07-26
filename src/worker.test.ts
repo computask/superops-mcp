@@ -183,6 +183,83 @@ function auditRecords(spy: { mock: { calls: unknown[][] } }) {
     );
 }
 
+function internalBudgetStopRecord(
+  operationId: string,
+  ownerHash: string
+): OperationLedgerRecord {
+  const ticketNumber = "59021";
+  const target = {
+    status: "Awaiting Engineer",
+    impact: "High",
+    urgency: "High",
+    category: "3. Security Incident",
+    subcategory: "Security alert",
+    cause: "Security Event",
+  };
+  return {
+    responseVersion: 1,
+    operationId,
+    toolName: "superops_tickets_apply_triage_plan",
+    ownerHash,
+    createdAt: "2026-07-26T09:49:07.577Z",
+    updatedAt: "2026-07-26T09:49:16.249Z",
+    expiresAt: "2999-07-27T00:00:00.000Z",
+    originalRequestHash: stableHash({ operationId }),
+    operationRequest: {
+      kind: "applyTriagePlan",
+      schemaVersion: 1,
+      expectedCandidateTicketNumbers: [ticketNumber],
+      actions: [{
+        ticketNumber,
+        expectedTicketId: "447747060408930304",
+        expectedSubjectHash: stableHash("Huntress escalation"),
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T01:33:27.195",
+        contentVerified: true,
+        action: "update",
+        target,
+      }],
+      dryRun: false,
+      verify: true,
+      dedupeNotes: true,
+      stopOnFirstFailure: false,
+      allowResolveFullFallbackToUpdate: false,
+      allowWriteIfUpdatedTimeChanged: false,
+      allowWriteWithoutVerifiedContent: false,
+    },
+    state: "ContinuationRequired",
+    expectedItems: [ticketNumber],
+    currentItem: ticketNumber,
+    completedItems: [],
+    failedItems: [],
+    skippedItems: [],
+    unattemptedItems: [ticketNumber],
+    pendingItems: [ticketNumber],
+    itemStates: {
+      [ticketNumber]: {
+        itemKey: ticketNumber,
+        stage: "Unattempted",
+        idempotencyKey: stableHash({ operationId, ticketNumber }),
+        mutationType: "update",
+        canonicalTargetHash: stableHash({ action: "update", target, ticketNumber }),
+        targetFields: target,
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+        partialWrite: false,
+        verificationState: "NotRequired",
+        retryCount: 0,
+      },
+    },
+    summary: {},
+    compactResults: [],
+    partialWriteCount: 0,
+    ambiguousWriteCount: 0,
+    rateLimitedItems: [],
+    continuationCount: 2,
+    terminalFailureReason: "ContinuationRequiredBeforeItem",
+  };
+}
+
 
 type ToolSafetyAnnotations = {
   readOnlyHint?: boolean;
@@ -814,6 +891,161 @@ describe("Cloudflare Worker entrypoint", () => {
       });
     });
   });
+
+  it("schedules another internal hop after ContinuationRequiredBeforeItem", async () => {
+    const operationId = "op-internal-before-item";
+    const ownerHash = stableHash("internal-before-item-owner");
+    await runWithOperationStore({}, () =>
+      getOperationStore().put(internalBudgetStopRecord(operationId, ownerHash))
+    );
+
+    const serviceRequests: Request[] = [];
+    const waitUntilPromises: Promise<unknown>[] = [];
+    const response = await worker.fetch(
+      new Request(`https://${INTERNAL_HOST}/internal/operations/continue`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-SuperOps-Internal-Continuation": "secret-token",
+        },
+        body: JSON.stringify({
+          toolName: "superops_tickets_apply_triage_plan",
+          operationId,
+          ownerHash,
+        }),
+      }),
+      {
+        SUPEROPS_API_TOKEN: "test-token",
+        SUPEROPS_SUBDOMAIN: "computaskltd",
+        SUPEROPS_CONTINUATION_ENABLED: "true",
+        SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+        SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
+        SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "3",
+        SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "0",
+        SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+        SUPEROPS_CONTINUATION_SERVICE: {
+          fetch: async (request: Request) => {
+            serviceRequests.push(request);
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          },
+        },
+      } as Env,
+      {
+        props: undefined,
+        waitUntil: (promise: Promise<unknown>) => waitUntilPromises.push(promise),
+      }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      result: {
+        operationId,
+        continuationRequired: true,
+        stopReason: "ContinuationRequiredBeforeItem",
+        continuationScheduling: {
+          attempted: true,
+          queued: true,
+          mechanism: "serviceBinding",
+        },
+      },
+    });
+    expect(waitUntilPromises).toHaveLength(1);
+    await Promise.all(waitUntilPromises);
+    expect(serviceRequests).toHaveLength(1);
+    await expect(serviceRequests[0].json()).resolves.toEqual({
+      toolName: "superops_tickets_apply_triage_plan",
+      operationId,
+      ownerHash,
+    });
+    await runWithOperationStore({}, async () => {
+      await expect(getOperationStore().get(operationId, ownerHash)).resolves.toMatchObject({
+        state: "ContinuationRequired",
+        continuationCount: 3,
+        schedulingAttempted: true,
+        schedulingSucceeded: true,
+        terminalFailureReason: "ContinuationRequiredBeforeItem",
+        pendingItems: ["59021"],
+        itemStates: {
+          "59021": {
+            stage: "Rescheduled",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+          },
+        },
+      });
+    });
+  });
+
+  it("terminalizes an internal continuation when the next hop is rejected", async () => {
+    const operationId = "op-internal-schedule-rejected";
+    const ownerHash = stableHash("internal-schedule-rejected-owner");
+    await runWithOperationStore({}, () =>
+      getOperationStore().put(internalBudgetStopRecord(operationId, ownerHash))
+    );
+
+    const response = await worker.fetch(
+      new Request(`https://${INTERNAL_HOST}/internal/operations/continue`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-SuperOps-Internal-Continuation": "secret-token",
+        },
+        body: JSON.stringify({
+          toolName: "superops_tickets_apply_triage_plan",
+          operationId,
+          ownerHash,
+        }),
+      }),
+      {
+        SUPEROPS_API_TOKEN: "test-token",
+        SUPEROPS_SUBDOMAIN: "computaskltd",
+        SUPEROPS_CONTINUATION_ENABLED: "true",
+        SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+        SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
+        SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "3",
+        SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "0",
+        SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+        SUPEROPS_CONTINUATION_SERVICE: {
+          fetch: async () => new Response("unavailable", { status: 503 }),
+        },
+      } as Env
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      result: {
+        operationId,
+        continuationRequired: true,
+        stopReason: "ContinuationRequiredBeforeItem",
+        continuationScheduling: {
+          attempted: true,
+          scheduled: false,
+          status: 503,
+          terminalized: true,
+        },
+      },
+    });
+    await runWithOperationStore({}, async () => {
+      await expect(getOperationStore().get(operationId, ownerHash)).resolves.toMatchObject({
+        state: "CompletedWithFailures",
+        schedulingAttempted: true,
+        schedulingSucceeded: false,
+        terminalFailureReason: "Immediate continuation delivery failed with status 503.",
+        pendingItems: [],
+        itemStates: {
+          "59021": {
+            stage: "FailedBeforeWrite",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+            errorClass: "ContinuationSchedulingFailure",
+          },
+        },
+      });
+    });
+  });
+
   it("returns a graceful error for a credential-requiring tool when unconfigured", async () => {
     const res = await mcp({
       jsonrpc: "2.0",
