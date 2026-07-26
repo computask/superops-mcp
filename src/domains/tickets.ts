@@ -92,6 +92,7 @@ const MAX_RECENT_TICKETS_COUNT = 50;
 const MAX_RECENT_TICKETS_WITH_CONTENT = 10;
 const DEFAULT_TRIAGE_SNAPSHOT_MAX = 50;
 const MAX_TRIAGE_SNAPSHOT_MAX = 500;
+const TRIAGE_SNAPSHOT_SUBREQUEST_HEADROOM = 4;
 const DEFAULT_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET = 3000;
 const MAX_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET = 10000;
 const DEFAULT_TRIAGE_MAX_ITEMS_PER_TICKET = 8;
@@ -706,6 +707,15 @@ interface ApplyTriagePlanParams {
 }
 
 const TRIAGE_PLAN_ACTION_TYPES = ["resolve", "update", "addNote", "leave", "skip"] as const;
+const TRIAGE_PLAN_MUTABLE_STATUSES = ["Resolved", "Awaiting Engineer"] as const;
+const TRIAGE_PLAN_CLASSIFICATION_FIELDS = [
+  "impact",
+  "urgency",
+  "category",
+  "subcategory",
+  "cause",
+  "resolutionCode",
+] as const;
 const TRIAGE_PLAN_WRITABLE_TARGET_FIELDS = [
   "status",
   "impact",
@@ -801,8 +811,8 @@ const TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES = {
 const TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES = {
   status: {
     type: "string",
-    enum: [...VALID_TICKET_STATUSES],
-    description: "Target ticket status, e.g. Awaiting Engineer.",
+    enum: [...TRIAGE_PLAN_MUTABLE_STATUSES],
+    description: "Approved triage status. Only Resolved or Awaiting Engineer may be written.",
   },
   impact: { type: "string", description: "Target impact display value from SuperOps field options." },
   urgency: { type: "string", description: "Target urgency display value from SuperOps field options." },
@@ -819,8 +829,15 @@ const TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES = {
 const TRIAGE_PLAN_UPDATE_TARGET_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  properties: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES,
-  anyOf: TRIAGE_PLAN_WRITABLE_TARGET_FIELDS.map((field) => ({ required: [field] })),
+  properties: {
+    ...TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES,
+    status: {
+      type: "string",
+      enum: ["Awaiting Engineer"],
+      description: "Update actions may only move a ticket to Awaiting Engineer.",
+    },
+  },
+  required: ["status", ...TRIAGE_PLAN_CLASSIFICATION_FIELDS],
 } as const;
 
 const TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA = {
@@ -830,12 +847,26 @@ const TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA = {
     ...TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES,
     status: {
       type: "string",
-      enum: [...VALID_TICKET_STATUSES],
+      enum: ["Resolved"],
       default: DEFAULT_RESOLVE_TICKET_STATUS,
-      description: "Final resolve status. Defaults to Resolved.",
+      description: "Resolve actions may only close to Resolved.",
     },
   },
-  required: ["category", "impact", "subcategory", "cause", "resolutionCode"],
+  required: [...TRIAGE_PLAN_CLASSIFICATION_FIELDS],
+} as const;
+
+const TRIAGE_PLAN_LEAVE_TARGET_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    impact: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.impact,
+    urgency: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.urgency,
+    category: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.category,
+    subcategory: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.subcategory,
+    cause: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.cause,
+    resolutionCode: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.resolutionCode,
+  },
+  required: [...TRIAGE_PLAN_CLASSIFICATION_FIELDS],
 } as const;
 
 const TRIAGE_PLAN_ACTION_SCHEMA = {
@@ -886,9 +917,13 @@ const TRIAGE_PLAN_ACTION_SCHEMA = {
       properties: {
         ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
         action: { type: "string", const: "leave" },
-        reason: { type: "string", description: "Optional reason for leaving the ticket unchanged." },
+        target: TRIAGE_PLAN_LEAVE_TARGET_SCHEMA,
+        reason: {
+          type: "string",
+          description: "Optional reason for retaining the current status after classification.",
+        },
       },
-      required: ["ticketNumber", "action"],
+      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"],
     },
     {
       type: "object",
@@ -1369,15 +1404,40 @@ function validateTriagePlanActionShape(rawAction: unknown, index: number): strin
     }
   }
 
-  if (action.action === "update") {
+  if (action.action === "resolve" || action.action === "update" || action.action === "leave") {
     if (!target) {
-      return `${label} update action requires target with at least one mutable ticket field.`;
+      return `${label} ${action.action} action requires a complete classification target.`;
     }
-    const hasRecognizedTarget = TRIAGE_PLAN_WRITABLE_TARGET_FIELDS.some(
-      (field) => target[field] !== undefined
+    const missingClassificationFields = TRIAGE_PLAN_CLASSIFICATION_FIELDS.filter(
+      (field) => typeof target[field] !== "string" || String(target[field]).trim().length === 0
     );
-    if (!hasRecognizedTarget) {
-      return `${label} update action requires at least one recognised mutable target field.`;
+    if (missingClassificationFields.length > 0) {
+      return `${label} ${action.action} action requires classification field(s): ${missingClassificationFields.join(", ")}.`;
+    }
+  }
+
+  if (action.action === "resolve" && target?.status !== undefined && target.status !== "Resolved") {
+    return `${label}.target.status must be Resolved for a resolve action.`;
+  }
+  if (action.action === "update" && target?.status !== "Awaiting Engineer") {
+    return `${label}.target.status must be Awaiting Engineer for an update action.`;
+  }
+  if (action.action === "leave" && target && "status" in target) {
+    return `${label}.target.status is not allowed for a leave action; leave retains the current status.`;
+  }
+  if (
+    target?.status !== undefined &&
+    !(TRIAGE_PLAN_MUTABLE_STATUSES as readonly unknown[]).includes(target.status)
+  ) {
+    return `${label}.target.status must be one of: ${TRIAGE_PLAN_MUTABLE_STATUSES.join(", ")}.`;
+  }
+
+  if (action.action === "leave" && target) {
+    const unsupportedLeaveFields = Object.keys(target).filter(
+      (field) => !(TRIAGE_PLAN_CLASSIFICATION_FIELDS as readonly string[]).includes(field)
+    );
+    if (unsupportedLeaveFields.length > 0) {
+      return `${label}.target contains field(s) not allowed for a classification-only leave action: ${unsupportedLeaveFields.join(", ")}.`;
     }
   }
 
@@ -1445,6 +1505,21 @@ function safeTicketParams(args: SafeTicketParams): Required<SafeTicketParams> {
     stripHeaders: args.stripHeaders ?? true,
     attachments,
   };
+}
+
+function triageSnapshotEffectivePageSize(
+  params: NormalizedTriageSnapshotParams
+): number {
+  const config = getExecutionConfig();
+  const usableSubrequests = Math.max(
+    1,
+    config.subrequestBudget - config.subrequestSafetyMargin -
+      1 - TRIAGE_SNAPSHOT_SUBREQUEST_HEADROOM
+  );
+  const candidateReadCost = 1 +
+    (params.includeConversations ? 2 : 0) +
+    (params.includeNotes ? 1 : 0);
+  return Math.max(1, Math.min(params.max, Math.floor(usableSubrequests / candidateReadCost)));
 }
 
 function triageSnapshotParams(
@@ -3689,10 +3764,30 @@ async function buildApprovedUpdateInput(
 ): Promise<Record<string, unknown> | { error: string }> {
   const target = action.target ?? {};
   const input: Record<string, unknown> = { ticketId };
+  if (action.action === "resolve" || action.action === "update" || action.action === "leave") {
+    const missingClassificationFields = TRIAGE_PLAN_CLASSIFICATION_FIELDS.filter(
+      (field) => typeof target[field] !== "string" || String(target[field]).trim().length === 0
+    );
+    if (missingClassificationFields.length > 0) {
+      return {
+        error: `${action.action} action requires classification field(s): ${missingClassificationFields.join(", ")}.`,
+      };
+    }
+  }
+
   const status = target.status ?? defaultStatus;
+  if (action.action === "resolve" && status !== undefined && status !== "Resolved") {
+    return { error: `Resolve action can only set status to Resolved; got ${status}.` };
+  }
+  if (action.action === "update" && status !== "Awaiting Engineer") {
+    return { error: `Update action can only set status to Awaiting Engineer; got ${status ?? "no status"}.` };
+  }
+  if (action.action === "leave" && status !== undefined) {
+    return { error: `Leave action cannot change status; got ${status}.` };
+  }
   if (status) {
-    if (invalidValues([status], VALID_TICKET_STATUSES).length > 0) {
-      return { error: `Invalid ticket status: ${status}` };
+    if (!(TRIAGE_PLAN_MUTABLE_STATUSES as readonly string[]).includes(status)) {
+      return { error: `Invalid approved triage status: ${status}` };
     }
     input.status = status;
   }
@@ -5195,11 +5290,10 @@ function validationErrorClassForApplyResult(
 
 function compactApplyResult(
   result: ApplyTriagePlanResult,
-  options: { trimStagedSuccessDetails?: boolean } = {}
+  options: { trimVerifiedSuccessDetails?: boolean } = {}
 ): Record<string, unknown> {
-  const stagedVerifiedSuccess = options.trimStagedSuccessDetails === true &&
-    result.workflowMode === "staged" &&
-    result.finalOutcome === "Resolved" &&
+  const trimmedVerifiedSuccess = options.trimVerifiedSuccessDetails === true &&
+    ["Resolved", "Updated", "Left"].includes(result.finalOutcome) &&
     result.verified === true &&
     result.partialWrite !== true;
   return {
@@ -5222,50 +5316,50 @@ function compactApplyResult(
     noteVerificationAttempts: result.noteVerificationAttempts,
     noteVerifiedAfterDelay: result.noteVerifiedAfterDelay,
     continuationRequired: result.continuationRequired,
-    plannedMutations: stagedVerifiedSuccess ? undefined : result.plannedMutations,
+    plannedMutations: trimmedVerifiedSuccess ? undefined : result.plannedMutations,
     workflowMode: result.workflowMode,
-    completedStages: stagedVerifiedSuccess ? undefined : result.completedStages,
-    currentStage: stagedVerifiedSuccess ? undefined : result.currentStage,
-    classificationWriteMethod: stagedVerifiedSuccess ? undefined : result.classificationWriteMethod,
-    classificationWriteOutcome: stagedVerifiedSuccess ? undefined : result.classificationWriteOutcome,
-    statusWriteMethod: stagedVerifiedSuccess ? undefined : result.statusWriteMethod,
-    statusWriteOutcome: stagedVerifiedSuccess ? undefined : result.statusWriteOutcome,
-    suppressCloseNotificationRequested: stagedVerifiedSuccess ? undefined : result.suppressCloseNotificationRequested,
-    suppressCloseNotificationIncluded: stagedVerifiedSuccess ? undefined : result.suppressCloseNotificationIncluded,
+    completedStages: trimmedVerifiedSuccess ? undefined : result.completedStages,
+    currentStage: trimmedVerifiedSuccess ? undefined : result.currentStage,
+    classificationWriteMethod: trimmedVerifiedSuccess ? undefined : result.classificationWriteMethod,
+    classificationWriteOutcome: trimmedVerifiedSuccess ? undefined : result.classificationWriteOutcome,
+    statusWriteMethod: trimmedVerifiedSuccess ? undefined : result.statusWriteMethod,
+    statusWriteOutcome: trimmedVerifiedSuccess ? undefined : result.statusWriteOutcome,
+    suppressCloseNotificationRequested: trimmedVerifiedSuccess ? undefined : result.suppressCloseNotificationRequested,
+    suppressCloseNotificationIncluded: trimmedVerifiedSuccess ? undefined : result.suppressCloseNotificationIncluded,
     verified: result.verified,
     failureStage: result.failureStage,
     failureReason: result.failureReason,
     primaryWriteMethod: result.primaryWriteMethod,
     primaryWriteOutcome: result.primaryWriteOutcome,
-    primaryFailureDiagnostics: result.primaryFailureDiagnostics,
-    primaryGraphqlClassification: result.primaryGraphqlClassification,
-    primaryGraphqlCode: result.primaryGraphqlCode,
-    primaryGraphqlPath: result.primaryGraphqlPath,
-    primaryResponseHadData: result.primaryResponseHadData,
-    primarySynchronousFailure: result.primarySynchronousFailure,
-    updatedTimeChanged: result.updatedTimeChanged,
-    requestedFieldsObserved: result.requestedFieldsObserved,
-    noChangeObserved: result.noChangeObserved,
-    retrySafe: result.retrySafe,
-    partialFieldsObserved: result.partialFieldsObserved,
-    statusObserved: result.statusObserved,
-    fallbackEligible: result.fallbackEligible,
-    fallbackAttempted: result.fallbackAttempted,
-    fallbackWriteMethod: result.fallbackWriteMethod,
-    fallbackOutcome: result.fallbackOutcome,
-    fallbackResult: result.fallbackResult,
+    primaryFailureDiagnostics: trimmedVerifiedSuccess ? undefined : result.primaryFailureDiagnostics,
+    primaryGraphqlClassification: trimmedVerifiedSuccess ? undefined : result.primaryGraphqlClassification,
+    primaryGraphqlCode: trimmedVerifiedSuccess ? undefined : result.primaryGraphqlCode,
+    primaryGraphqlPath: trimmedVerifiedSuccess ? undefined : result.primaryGraphqlPath,
+    primaryResponseHadData: trimmedVerifiedSuccess ? undefined : result.primaryResponseHadData,
+    primarySynchronousFailure: trimmedVerifiedSuccess ? undefined : result.primarySynchronousFailure,
+    updatedTimeChanged: trimmedVerifiedSuccess ? undefined : result.updatedTimeChanged,
+    requestedFieldsObserved: trimmedVerifiedSuccess ? undefined : result.requestedFieldsObserved,
+    noChangeObserved: trimmedVerifiedSuccess ? undefined : result.noChangeObserved,
+    retrySafe: trimmedVerifiedSuccess ? undefined : result.retrySafe,
+    partialFieldsObserved: trimmedVerifiedSuccess ? undefined : result.partialFieldsObserved,
+    statusObserved: trimmedVerifiedSuccess ? undefined : result.statusObserved,
+    fallbackEligible: trimmedVerifiedSuccess ? undefined : result.fallbackEligible,
+    fallbackAttempted: trimmedVerifiedSuccess ? undefined : result.fallbackAttempted,
+    fallbackWriteMethod: trimmedVerifiedSuccess ? undefined : result.fallbackWriteMethod,
+    fallbackOutcome: trimmedVerifiedSuccess ? undefined : result.fallbackOutcome,
+    fallbackResult: trimmedVerifiedSuccess ? undefined : result.fallbackResult,
     physicalWrites: result.physicalWrites,
     finalVerificationState: result.finalVerificationState,
     terminalReason: result.terminalReason,
     partialWrite: result.partialWrite,
-    requestedState: result.requestedState,
-    attemptedState: result.attemptedState,
-    writableTargetState: result.writableTargetState,
-    derivedReadOnlyState: result.derivedReadOnlyState,
-    ignoredTargetFields: result.ignoredTargetFields,
-    observedFinalState: result.observedFinalState,
-    verifiedState: result.verifiedState,
-    finalState: result.finalState,
+    requestedState: trimmedVerifiedSuccess ? undefined : result.requestedState,
+    attemptedState: trimmedVerifiedSuccess ? undefined : result.attemptedState,
+    writableTargetState: trimmedVerifiedSuccess ? undefined : result.writableTargetState,
+    derivedReadOnlyState: trimmedVerifiedSuccess ? undefined : result.derivedReadOnlyState,
+    ignoredTargetFields: trimmedVerifiedSuccess ? undefined : result.ignoredTargetFields,
+    observedFinalState: trimmedVerifiedSuccess ? undefined : result.observedFinalState,
+    verifiedState: trimmedVerifiedSuccess ? undefined : result.verifiedState,
+    finalState: trimmedVerifiedSuccess ? undefined : result.finalState,
   };
 }
 function serializableApplyTriageRequest(
@@ -5386,7 +5480,7 @@ function buildApplyTriageLedgerRecord(params: {
           ? "resolution"
           : action?.action === "addNote"
             ? "note"
-            : action?.action === "update"
+            : action?.action === "update" || action?.action === "leave"
               ? "update"
               : undefined,
         reliableResponseReceived: result?.writeAttempted ? result.writeMayHaveSucceeded === false || result.partialWrite === false : undefined,
@@ -5490,7 +5584,7 @@ function buildApplyTriageLedgerRecord(params: {
     itemStates,
     summary: params.summary,
     compactResults: params.results.map((result) => compactApplyResult(result, {
-      trimStagedSuccessDetails: params.expected.length > 50,
+      trimVerifiedSuccessDetails: params.expected.length > 50,
     })),
     partialWriteCount: params.results.filter((result) => result.partialWrite).length,
     ambiguousWriteCount: 0,
@@ -5699,12 +5793,8 @@ async function applyApprovedTriageAction(params: {
     result.failureReason = action.reason ?? "Approved action was skip.";
     return result;
   }
-  if (action.action === "leave") {
-    result.finalOutcome = "Left";
-    return result;
-  }
-
-  const mutating = action.action === "resolve" || action.action === "update" || action.action === "addNote";
+  const mutating = action.action === "resolve" || action.action === "update" ||
+    action.action === "leave" || action.action === "addNote";
   const allowUnverified = action.allowWriteWithoutVerifiedContent ?? params.allowWriteWithoutVerifiedContent;
   if (mutating && action.contentVerified !== true && !allowUnverified) {
     result.finalOutcome = "Blocked";
@@ -5741,7 +5831,7 @@ async function applyApprovedTriageAction(params: {
       result.statusWriteOutcome = "Planned";
       result.suppressCloseNotificationRequested = true;
       result.suppressCloseNotificationIncluded = true;
-    } else if (action.action === "update") {
+    } else if (action.action === "update" || action.action === "leave") {
       const dryRunInput = await buildApprovedUpdateInput(client, ticket.ticketId, action);
       const dryRunError = (dryRunInput as { error?: unknown }).error;
       if (typeof dryRunError === "string") {
@@ -5760,7 +5850,11 @@ async function applyApprovedTriageAction(params: {
         result.plannedMutations = [...(result.plannedMutations ?? []), "createTicketNote"];
       }
     }
-    result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
+    result.finalOutcome = action.action === "resolve"
+      ? "Resolved"
+      : action.action === "leave"
+        ? "Left"
+        : "Updated";
     result.writeMethod = "dryRun";
     return result;
   }
@@ -5958,7 +6052,7 @@ async function applyApprovedTriageAction(params: {
         result.writeMayHaveSucceeded = true;
         return result;
       }
-      result.finalOutcome = "Updated";
+      result.finalOutcome = action.action === "leave" ? "Left" : "Updated";
     }
     return result;
   } catch (error) {
@@ -6002,7 +6096,7 @@ function applyResultToContinuationOutcome(
   result: ApplyTriagePlanResult,
   stage: OperationItemState["stage"] = triageStageForResult(result),
   priorObservedMutationResult?: OperationItemState["observedMutationResult"],
-  compactOptions: { trimStagedSuccessDetails?: boolean } = {}
+  compactOptions: { trimVerifiedSuccessDetails?: boolean } = {}
 ): ContinuationItemOutcome {
   const rateLimitReschedule = result.failureStage === "rateLimit" &&
     result.rateLimitConclusiveRejection === true;
@@ -6216,7 +6310,11 @@ async function ambiguityCheckedTriageResult(params: {
     const result = baseApplyResult(ticketNumber, action, ticket);
     result.writeAttempted = true;
     result.writeMethod = action.action === "resolve" ? "resolve_full" : "update";
-    result.finalOutcome = action.action === "resolve" ? "Resolved" : "Updated";
+    result.finalOutcome = action.action === "resolve"
+      ? "Resolved"
+      : action.action === "leave"
+        ? "Left"
+        : "Updated";
     result.finalState = ticketFinalState(ticket);
     result.observedFinalState = result.finalState;
     result.verifiedState = result.finalState;
@@ -6337,7 +6435,7 @@ function createApplyTriageContinuationAdapter(
       const storedParams = operationRequestApplyTriageParams(record.operationRequest);
       const action = actionByTicketFromApplyParams(storedParams ?? {}).get(itemKey);
       if (!action) return 2;
-      if (action.action === "leave" || action.action === "skip") return 3;
+      if (action.action === "skip") return 3;
       if (action.action === "addNote") {
         const validationAndDedupeReads = 2 + (storedParams?.dedupeNotes === false ? 0 : 2);
         const postMutationVerification = storedParams?.verify === false ? 0 : 2;
@@ -6814,13 +6912,13 @@ for (const stage of remainingStages) {
         markStagedNoteVerifiedAfterDelay(applied.result, noteVerifiedAfterDelayAttempts);
       }
 
-      const trimStagedSuccessDetails = Array.isArray(storedParams.expectedCandidateTicketNumbers) &&
+      const trimVerifiedSuccessDetails = Array.isArray(storedParams.expectedCandidateTicketNumbers) &&
         storedParams.expectedCandidateTicketNumbers.length > 50;
       const outcome = applyResultToContinuationOutcome(
         applied.result,
         applied.stage,
         observedMutationResult,
-        { trimStagedSuccessDetails }
+        { trimVerifiedSuccessDetails }
       );
       outcome.retryCount = typeof applied.retryCount === "number"
         ? applied.retryCount
@@ -7076,7 +7174,7 @@ export function getTicketsTools(): DomainTools {
       {
         name: "superops_tickets_triage_snapshot",
         description:
-          "Read-only New Calls triage snapshot. Lists a queue once, freezes the candidate ticket numbers and IDs, then returns safe compact metadata, sanitized conversation/note evidence, and attachment metadata only for ChatGPT assessment.",
+          "Read-only New Calls triage snapshot. Returns one execution-safe page of fixed candidates with safe compact metadata and sanitized conversation/note evidence. Follow pagination.nextPage until hasMore is false before proposing a complete queue plan.",
         inputSchema: {
           type: "object",
           properties: {
@@ -7093,7 +7191,7 @@ export function getTicketsTools(): DomainTools {
             max: {
               type: "number",
               default: DEFAULT_TRIAGE_SNAPSHOT_MAX,
-              description: "Maximum candidates to list before freezing the snapshot (default: 50, max: 500)",
+              description: "Requested candidates per page (default: 50, max: 500). The tool automatically uses a smaller stable page size when required to preserve safe metadata and content reads; follow pagination.nextPage until hasMore is false.",
             },
             page: {
               type: "number",
@@ -7146,7 +7244,7 @@ export function getTicketsTools(): DomainTools {
       },      {
         name: "superops_tickets_apply_triage_plan",
         description:
-          "Write/high-risk tool. Applies an approved New Calls triage plan to a fixed expected ticket set with metadata validation, updatedTime safety checks, dry-run support, note dedupe, controlled fallback, and verification.",
+          "Write/high-risk tool. Applies an approved fixed-candidate New Calls plan. Resolve, update, and leave targets require complete classification; leave retains status while writing classification, and status changes are restricted to Resolved or Awaiting Engineer.",
         inputSchema: {
           type: "object",
           properties: {
@@ -7889,14 +7987,16 @@ export function getTicketsTools(): DomainTools {
               );
             }
 
+            const effectiveMax = triageSnapshotEffectivePageSize(snapshotParams);
             const response = await client.query<ListTicketsResponse>(LIST_TICKETS_QUERY, {
               input: buildTicketListInput({
                 status: snapshotParams.status,
-                max: snapshotParams.max,
+                max: effectiveMax,
                 page: snapshotParams.page,
               }),
             });
             const candidates = response.getTicketList.tickets;
+            const listInfo = response.getTicketList.listInfo;
             const candidateTicketNumbers = candidates.map(
               (ticket) => ticket.displayId ?? ticket.ticketId
             );
@@ -7918,6 +8018,15 @@ export function getTicketsTools(): DomainTools {
                         status: snapshotParams.status,
                         page: snapshotParams.page,
                         max: snapshotParams.max,
+                        effectiveMax,
+                      },
+                      pagination: {
+                        page: snapshotParams.page,
+                        pageSize: effectiveMax,
+                        hasMore: listInfo.hasMore,
+                        totalCount: listInfo.totalCount,
+                        nextPage: listInfo.hasMore ? snapshotParams.page + 1 : null,
+                        budgetCapped: effectiveMax < snapshotParams.max,
                       },
                       initialCandidateCount: candidates.length,
                       candidateTicketNumbers,

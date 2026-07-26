@@ -182,14 +182,18 @@ const RESOLVED_OPTION_FIELDS = [
   }),
 ];
 
-const RESOLVED_CLASSIFICATION = {
-  priority: "Very Low",
+const TRIAGE_TEST_CLASSIFICATION = {
   impact: "Low",
   urgency: "Low",
   category: "7. Sales call",
   subcategory: "No Action Needed",
   cause: "No Fault Found",
   resolutionCode: "Permanent Fix",
+};
+
+const RESOLVED_CLASSIFICATION = {
+  priority: "Very Low",
+  ...TRIAGE_TEST_CLASSIFICATION,
 };
 
 
@@ -394,8 +398,10 @@ describe("Tickets Domain", () => {
     expect(update?.required).toEqual(
       expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"])
     );
-    expect(update?.properties.target.properties.status.enum).toContain("Awaiting Engineer");
-    expect(update?.properties.target.anyOf).toContainEqual({ required: ["status"] });
+    expect(update?.properties.target.properties.status.enum).toEqual(["Awaiting Engineer"]);
+    expect(update?.properties.target.required).toEqual([
+      "status", "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
+    ]);
     expect(update?.properties.target.properties).toEqual(
       expect.objectContaining({
         status: expect.any(Object),
@@ -413,9 +419,18 @@ describe("Tickets Domain", () => {
     );
 
     const resolve = variants.find((variant) => variant.properties.action.const === "resolve");
+    expect(resolve?.properties.target.properties.status.enum).toEqual(["Resolved"]);
     expect(resolve?.properties.target.required).toEqual([
-      "category", "impact", "subcategory", "cause", "resolutionCode",
+      "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
     ]);
+    const leave = variants.find((variant) => variant.properties.action.const === "leave");
+    expect(leave?.required).toEqual(
+      expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"])
+    );
+    expect(leave?.properties.target.required).toEqual([
+      "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
+    ]);
+    expect(leave?.properties.target.properties).not.toHaveProperty("status");
     const addNote = variants.find((variant) => variant.properties.action.const === "addNote");
     expect(addNote?.required).toEqual(
       expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "note"])
@@ -1790,7 +1805,7 @@ describe("Tickets Domain", () => {
     expect(mockClient.query.mock.calls[0][1]).toEqual({
       input: {
         page: 1,
-        pageSize: 50,
+        pageSize: 8,
         condition: { attribute: "status", operator: "is", value: "New Calls" },
       },
     });
@@ -1802,7 +1817,17 @@ describe("Tickets Domain", () => {
     );
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("sort");
     expect(mockClient.mutate).not.toHaveBeenCalled();
-    expect(parsed.source).toEqual({ status: ["New Calls"], page: 1, max: 50 });
+    expect(parsed.source).toEqual({
+      status: ["New Calls"], page: 1, max: 50, effectiveMax: 8,
+    });
+    expect(parsed.pagination).toEqual({
+      page: 1,
+      pageSize: 8,
+      hasMore: false,
+      totalCount: 2,
+      nextPage: null,
+      budgetCapped: true,
+    });
     expect(parsed.initialCandidateCount).toBe(2);
     expect(parsed.candidateTicketNumbers).toEqual(["57400", "57401"]);
     expect(parsed.tickets).toHaveLength(2);
@@ -1861,6 +1886,127 @@ describe("Tickets Domain", () => {
     );
   });
 
+  it("paginates the exact 14-ticket New Calls shape before safe-read budget exhaustion", async () => {
+    const candidates = Array.from({ length: 14 }, (_, index) => {
+      const ticketNumber = String(59001 + index);
+      return {
+        ticketId: `ticket-${ticketNumber}`,
+        displayId: ticketNumber,
+        subject: `Candidate ${ticketNumber}`,
+        status: "New Calls",
+        impact: "Low",
+        urgency: "Low",
+        category: "1. Support request",
+        createdTime: "2026-07-25T08:00:00.000Z",
+        updatedTime: `2026-07-25T08:${String(index).padStart(2, "0")}:00.000Z`,
+      };
+    });
+    const listRequests: Array<{ page: number; pageSize: number }> = [];
+
+    mockClient.query.mockImplementation(async (
+      query: string,
+      variables?: { input?: { page?: number; pageSize?: number; ticketId?: string } }
+    ) => {
+      const input = variables?.input ?? {};
+      if (query.includes("getTicketList")) {
+        const page = input.page ?? 1;
+        const pageSize = input.pageSize ?? 50;
+        listRequests.push({ page, pageSize });
+        const start = (page - 1) * pageSize;
+        const tickets = candidates.slice(start, start + pageSize);
+        return {
+          getTicketList: {
+            tickets,
+            listInfo: {
+              page,
+              pageSize,
+              hasMore: start + tickets.length < candidates.length,
+              totalCount: candidates.length,
+            },
+          },
+        };
+      }
+      const ticketId = input.ticketId ?? "";
+      const candidate = candidates.find((item) => item.ticketId === ticketId);
+      if (!candidate) throw new Error(`Unexpected ticket ID ${ticketId}`);
+      if (query.includes("getTicket(input")) {
+        return {
+          getTicket: {
+            ...candidate,
+            subcategory: "No Action Needed",
+            cause: "Unknown",
+            resolutionCode: "Permanent Fix",
+          },
+        };
+      }
+      if (query.includes("getTicketConversationList")) {
+        return {
+          getTicketConversationList: [{
+            conversationId: `description-${candidate.displayId}`,
+            type: "DESCRIPTION",
+            time: candidate.createdTime,
+            content: `Verified safe evidence for ${candidate.displayId}.`,
+          }],
+        };
+      }
+      if (query.includes("getTicketNoteList")) {
+        return {
+          getTicketNoteList: [{
+            noteId: `note-${candidate.displayId}`,
+            addedOn: candidate.updatedTime,
+            content: `<html>Private context for ${candidate.displayId}.</html>`,
+            privacyType: "PRIVATE",
+          }],
+        };
+      }
+      throw new Error(`Unexpected query ${query}`);
+    });
+
+    const domain = getTicketsTools();
+    const pages = [];
+    for (const page of [1, 2]) {
+      const result = await runWithExecutionConfig({
+        SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "45",
+        SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8",
+      }, () => domain.handleCall("superops_tickets_triage_snapshot", {
+        status: ["New Calls"],
+        max: 500,
+        page,
+        includeNotes: true,
+        includeConversations: true,
+      }));
+      expect(result.isError).toBeUndefined();
+      pages.push(JSON.parse(result.content[0].text));
+    }
+
+    expect(listRequests).toEqual([
+      { page: 1, pageSize: 8 },
+      { page: 2, pageSize: 8 },
+    ]);
+    expect(pages[0].pagination).toMatchObject({
+      page: 1, pageSize: 8, hasMore: true, nextPage: 2, budgetCapped: true,
+    });
+    expect(pages[1].pagination).toMatchObject({
+      page: 2, pageSize: 8, hasMore: false, nextPage: null, budgetCapped: true,
+    });
+    expect(pages.flatMap((page) => page.candidateTicketNumbers)).toEqual(
+      candidates.map((candidate) => candidate.displayId)
+    );
+    const tickets = pages.flatMap((page) => page.tickets);
+    expect(tickets).toHaveLength(14);
+    expect(tickets).toEqual(tickets.map((_ticket: Record<string, unknown>) =>
+      expect.objectContaining({
+        processingState: "SnapshotRead",
+        warnings: [],
+        contentAvailability: expect.objectContaining({
+          metadata: "available",
+          conversations: "available",
+          notes: "available",
+        }),
+      })
+    ));
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
   it("returns the same canonical DESCRIPTION evidence from safe-by-number and triage snapshot", async () => {
     const automatedAcknowledgement = {
       conversationId: "5059118458555555840",
@@ -3222,7 +3368,10 @@ describe("Tickets Domain", () => {
           updatedTime: "2026-06-25T10:00:00",
         },
       })
-      .mockResolvedValueOnce({ getFields: [field] });
+      .mockResolvedValueOnce({ getFields: [
+        ...RESOLVED_OPTION_FIELDS.filter((optionField) => optionField.columnName !== "subcategory"),
+        field,
+      ] });
 
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
       expectedCandidateTicketNumbers: ["57400"],
@@ -3233,12 +3382,21 @@ describe("Tickets Domain", () => {
           expectedUpdatedTime: "2026-06-25T10:00:00",
           contentVerified: true,
           action: "update",
-          target,
+          target: {
+            impact: "Low",
+            urgency: "Low",
+            cause: "No Fault Found",
+            resolutionCode: "Permanent Fix",
+            status: "Awaiting Engineer",
+            ...target,
+          },
         },
       ],
     });
 
-    return JSON.parse(result.content[0].text);
+    return result.isError
+      ? { validationError: result.content[0].text }
+      : JSON.parse(result.content[0].text);
   }
 
   it.each([
@@ -3275,20 +3433,13 @@ describe("Tickets Domain", () => {
     }
   );
 
-  it("blocks duplicate Access subcategory without category as ambiguous before write", async () => {
+  it("rejects a triage classification target missing category before any read or write", async () => {
     const parsed = await runTriageSubcategoryDryRun(duplicateAccessSubcategoryField(), {
       subcategory: "Access",
     });
 
-    expect(parsed.results[0]).toMatchObject({
-      finalOutcome: "Blocked",
-      failureStage: "validation",
-      writeAttempted: false,
-    });
-    expect(parsed.results[0].failureReason).toContain("ambiguous");
-    expect(parsed.results[0].failureReason).toContain("Include category");
-    expect(parsed.results[0].failureReason).toContain("2. Change request");
-    expect(parsed.results[0].failureReason).toContain("3. Security Incident");
+    expect(parsed.validationError).toContain("requires classification field(s): category");
+    expect(mockClient.query).not.toHaveBeenCalled();
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
@@ -3348,7 +3499,7 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
-  it("returns a result for every expected triage ticket and marks missing actions", async () => {
+  it("classifies a leave ticket without changing its status and reports every expected candidate", async () => {
     mockClient.query
       .mockResolvedValueOnce({
         getTicketList: {
@@ -3360,29 +3511,63 @@ describe("Tickets Domain", () => {
         getTicket: {
           ticketId: "ticket-57400",
           displayId: "57400",
-          subject: "Leave alone",
+          subject: "Leave in New Calls",
           status: "New Calls",
+          updatedTime: "2026-06-25T10:00:00Z",
+        },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57400",
+          displayId: "57400",
+          subject: "Leave in New Calls",
+          status: "New Calls",
+          updatedTime: "2026-06-25T10:01:00Z",
+          ...TRIAGE_TEST_CLASSIFICATION,
         },
       });
+    mockClient.mutate.mockResolvedValueOnce({
+      updateTicket: { ticketId: "ticket-57400" },
+    });
 
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
       expectedCandidateTicketNumbers: ["57400", "57401"],
-      actions: [{ ticketNumber: "57400", action: "leave", expectedStatus: "New Calls" }],
+      actions: [{
+        ticketNumber: "57400",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
     });
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.results).toEqual([
-      expect.objectContaining({ ticketNumber: "57400", finalOutcome: "Left" }),
+      expect.objectContaining({
+        ticketNumber: "57400",
+        finalOutcome: "Left",
+        writeAttempted: true,
+        verified: true,
+        physicalWrites: [{ method: "updateTicket", outcome: "Accepted" }],
+        finalState: expect.objectContaining({ status: "New Calls" }),
+      }),
       expect.objectContaining({
         ticketNumber: "57401",
         finalOutcome: "NoApprovedAction",
         writeAttempted: false,
       }),
     ]);
-    expect(mockClient.mutate).not.toHaveBeenCalled();
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    const mutationInput = mockClient.mutate.mock.calls[0][1].input;
+    expect(mutationInput).toEqual({
+      ticketId: "ticket-57400",
+      ...TRIAGE_TEST_CLASSIFICATION,
+    });
+    expect(mutationInput).not.toHaveProperty("status");
   });
-
   it("skips approved triage writes when updatedTime changed unless explicitly allowed", async () => {
     mockClient.query
       .mockResolvedValueOnce({
@@ -3410,7 +3595,7 @@ describe("Tickets Domain", () => {
           expectedUpdatedTime: "2026-06-25T10:00:00",
           contentVerified: true,
           action: "update",
-          target: { status: "Worked on" },
+          target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
         },
       ],
     });
@@ -3441,7 +3626,8 @@ describe("Tickets Domain", () => {
           priority: "Low",
           updatedTime: "2026-06-25T10:00:00",
         },
-      });
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS });
 
     const domain = getTicketsTools();
     const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
@@ -3453,7 +3639,7 @@ describe("Tickets Domain", () => {
           expectedUpdatedTime: "2026-06-25T10:00:00",
           contentVerified: true,
           action: "update",
-          target: { status: "Awaiting Engineer" },
+          target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
         },
       ],
     });
@@ -3484,7 +3670,7 @@ describe("Tickets Domain", () => {
     expect(stored.terminalFailureReason).toBeUndefined();
   });
 
-  it("rejects an approved triage update with no recognised mutable target fields", async () => {
+  it("rejects an approved triage update without a complete classification target", async () => {
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
       expectedCandidateTicketNumbers: ["57400"],
       dryRun: true,
@@ -3500,11 +3686,81 @@ describe("Tickets Domain", () => {
     });
 
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("recognised mutable target field");
+    expect(result.content[0].text).toContain("update action requires classification field(s)");
     expect(mockClient.query).not.toHaveBeenCalled();
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it.each(VALID_TICKET_STATUSES.filter(
+    (status) => status !== "Resolved" && status !== "Awaiting Engineer"
+  ))("rejects disallowed triage status %s before any read or write", async (status) => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "update",
+        target: { ...TRIAGE_TEST_CLASSIFICATION, status },
+      }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain(
+      "target.status must be Awaiting Engineer for an update action"
+    );
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects Awaiting Engineer on resolve and any status on leave", async () => {
+    const domain = getTicketsTools();
+    const resolve = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "resolve",
+        target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
+      }],
+    });
+    const leave = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Resolved" },
+      }],
+    });
+
+    expect(resolve.isError).toBe(true);
+    expect(resolve.content[0].text).toContain("target.status must be Resolved");
+    expect(leave.isError).toBe(true);
+    expect(leave.content[0].text).toContain("target.status is not allowed for a leave action");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a leave action without every classification field", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        target: { category: "1. Support request" },
+      }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("leave action requires classification field(s)");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
   it("rejects unknown approved triage action fields instead of reporting an update no-op", async () => {
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
       expectedCandidateTicketNumbers: ["57400"],
@@ -3664,6 +3920,7 @@ describe("Tickets Domain", () => {
         tickets: [{ ticketId: "ticket-57403", displayId: "57403" }],
         listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
       } };
+      if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
       if (query.includes("getTicketNoteList")) throw new Error("note read unavailable");
       return { getTicket: { ticketId: "ticket-57403", displayId: "57403", status: "New Calls" } };
     });
@@ -3675,7 +3932,7 @@ describe("Tickets Domain", () => {
         contentVerified: true,
         action: "update",
         note: "JUNK",
-        target: { status: "Awaiting Engineer" },
+        target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
       }],
     });
     const parsed = JSON.parse(result.content[0].text);
@@ -4496,7 +4753,7 @@ describe("Tickets Domain", () => {
         expectedCandidateTicketNumbers: ["57400"],
         actions: [{
           ticketNumber: "57400", contentVerified: true, action: "update",
-          target: { status: "Awaiting Engineer" },
+          target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
         }],
         })
       );
@@ -4513,11 +4770,12 @@ describe("Tickets Domain", () => {
 
   it.each([
     ["accepted update", {
-      action: { ticketNumber: "57400", contentVerified: true, action: "update", target: { status: "Awaiting Engineer" } },
+      action: { ticketNumber: "57400", contentVerified: true, action: "update", target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" } },
       queries: [
         { getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } },
         { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
-        { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "Awaiting Engineer" } },
+        { getFields: RESOLVED_OPTION_FIELDS },
+        { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "Awaiting Engineer", ...TRIAGE_TEST_CLASSIFICATION } },
       ],
       mutation: { updateTicket: { ticketId: "ticket-57400", status: "Awaiting Engineer" } },
     }],
@@ -4584,7 +4842,8 @@ describe("Tickets Domain", () => {
       })
       .mockResolvedValueOnce({
         getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" },
-      });
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS });
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();
       const checkpoint = store.checkpointItem.bind(store);
@@ -4598,7 +4857,7 @@ describe("Tickets Domain", () => {
           expectedCandidateTicketNumbers: ["57400"],
           actions: [{
             ticketNumber: "57400", expectedStatus: "New Calls",
-            contentVerified: true, action: "update", target: { status: "Awaiting Engineer" },
+            contentVerified: true, action: "update", target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
           }],
         })
       );
@@ -4704,11 +4963,13 @@ describe("Tickets Domain", () => {
           return { getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
             listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } };
         }
+        if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
         if (query.includes("getTicketNoteList")) return { getTicketNoteList: [] };
         getTicketReads += 1;
         return { getTicket: { ticketId: "ticket-57400", displayId: "57400",
           status: getTicketReads === 1 ? "New Calls" : "Awaiting Engineer",
-          updatedTime: getTicketReads === 1 ? "2026-07-18T10:00:00Z" : "2026-07-18T10:01:00Z" } };
+          updatedTime: getTicketReads === 1 ? "2026-07-18T10:00:00Z" : "2026-07-18T10:01:00Z",
+          ...(getTicketReads === 1 ? {} : TRIAGE_TEST_CLASSIFICATION) } };
       });
       mockClient.mutate
         .mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-57400", status: "Awaiting Engineer" } })
@@ -4723,7 +4984,7 @@ describe("Tickets Domain", () => {
           expectedUpdatedTime: "2026-07-18T10:00:00Z",
           contentVerified: true,
           action: "update",
-          target: { status: "Awaiting Engineer" },
+          target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
           note: "Approved private follow-up",
         }],
       });
@@ -4765,12 +5026,14 @@ describe("Tickets Domain", () => {
             updatedTime: "2026-07-18T10:00:00Z",
           },
         })
+        .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
         .mockResolvedValueOnce({
           getTicket: {
             ticketId: "ticket-57400",
             displayId: "57400",
             status: "Awaiting Engineer",
             updatedTime: "2026-07-18T10:01:00Z",
+            ...TRIAGE_TEST_CLASSIFICATION,
           },
         });
       mockClient.mutate.mockImplementationOnce(async () => {
@@ -4794,7 +5057,7 @@ describe("Tickets Domain", () => {
               expectedUpdatedTime: "2026-07-18T10:00:00Z",
               contentVerified: true,
               action: "update",
-              target: { status: "Awaiting Engineer" },
+              target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
             }],
           })
         )
@@ -4991,7 +5254,7 @@ describe("Tickets Domain", () => {
               expectedUpdatedTime: "2026-07-18T10:00:00Z",
               contentVerified: true,
               action: "update",
-              target: { status: "Awaiting Engineer" },
+              target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
             },
           ],
         })
@@ -5017,12 +5280,14 @@ describe("Tickets Domain", () => {
           updatedTime: "2026-07-18T10:00:00Z",
         },
       })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
       .mockResolvedValueOnce({
         getTicket: {
           ticketId: "ticket-57401",
           displayId: "57401",
           status: "Awaiting Engineer",
           updatedTime: "2026-07-18T10:01:00Z",
+          ...TRIAGE_TEST_CLASSIFICATION,
         },
       });
     mockClient.mutate.mockResolvedValueOnce({
@@ -5163,7 +5428,7 @@ describe("Tickets Domain", () => {
               expectedUpdatedTime: "2026-07-18T10:00:00Z",
               contentVerified: true,
               action: "update",
-              target: { status: "Awaiting Engineer" },
+              target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
             },
           ],
         })
@@ -5221,7 +5486,7 @@ describe("Tickets Domain", () => {
           ticketNumber: "57401",
           contentVerified: true,
           action: "update",
-          target: { status: "Not a SuperOps status" },
+          target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer", category: "Not a SuperOps category" },
         }],
       })
     ));
@@ -5284,7 +5549,7 @@ describe("Tickets Domain", () => {
               expectedUpdatedTime: "2026-07-18T10:00:00Z",
               contentVerified: true,
               action: "update",
-              target: { status: "Awaiting Engineer" },
+              target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
             },
           ],
         })
@@ -5314,6 +5579,7 @@ describe("Tickets Domain", () => {
           displayId: "57401",
           status: "Awaiting Engineer",
           updatedTime: "2026-07-18T10:01:00Z",
+          ...TRIAGE_TEST_CLASSIFICATION,
         },
       });
 
@@ -5351,14 +5617,14 @@ describe("Tickets Domain", () => {
               expectedUpdatedTime: "2026-07-18T10:00:00Z",
               contentVerified: true,
               action: "update",
-              target: { status: "Awaiting Engineer" },
+              target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
             },
             {
               ticketNumber: "57402",
               expectedUpdatedTime: "2026-07-18T10:00:00Z",
               contentVerified: true,
               action: "update",
-              target: { status: "Awaiting Engineer" },
+              target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
             },
           ],
         })
@@ -5390,6 +5656,7 @@ describe("Tickets Domain", () => {
           displayId: "57401",
           status: "Awaiting Engineer",
           updatedTime: "2026-07-18T10:01:00Z",
+          ...TRIAGE_TEST_CLASSIFICATION,
         },
       })
       .mockResolvedValueOnce({
@@ -5406,12 +5673,14 @@ describe("Tickets Domain", () => {
           updatedTime: "2026-07-18T10:00:00Z",
         },
       })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
       .mockResolvedValueOnce({
         getTicket: {
           ticketId: "ticket-57402",
           displayId: "57402",
           status: "Awaiting Engineer",
           updatedTime: "2026-07-18T10:01:00Z",
+          ...TRIAGE_TEST_CLASSIFICATION,
         },
       });
     mockClient.mutate.mockResolvedValueOnce({
@@ -5456,7 +5725,7 @@ describe("Tickets Domain", () => {
         expectedCandidateTicketNumbers: ["57400", "57401"],
         actions: [{
           ticketNumber: "57401", expectedUpdatedTime: "2026-07-18T10:00:00Z",
-          contentVerified: true, action: "resolve", target: { status: "Resolved" },
+          contentVerified: true, action: "resolve", target: { status: "Resolved", ...TRIAGE_TEST_CLASSIFICATION },
         }],
       })
     ));
@@ -5475,7 +5744,7 @@ describe("Tickets Domain", () => {
       })
       .mockResolvedValueOnce({
         getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "Resolved",
-          updatedTime: "2026-07-18T10:01:00Z" },
+          updatedTime: "2026-07-18T10:01:00Z", ...TRIAGE_TEST_CLASSIFICATION },
       });
     await runWithExecutionConfig({}, async () => {
       await runWithExecutionContext("superops_tickets_apply_triage_plan", async () =>
@@ -6080,7 +6349,7 @@ describe("Tickets Domain", () => {
           expectedUpdatedTime: "2026-07-18T10:00:00Z",
           contentVerified: true,
           action: "update",
-          target: { status: "Awaiting Engineer" },
+          target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
         }],
       })
     ));
@@ -6102,7 +6371,8 @@ describe("Tickets Domain", () => {
           status: "New Calls",
           updatedTime: "2026-07-18T10:00:00Z",
         },
-      });
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS });
 
     await runWithExecutionConfig({}, () =>
       runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
@@ -6389,7 +6659,7 @@ describe("Tickets triage execution budget", () => {
               expectedUpdatedTime: "2026-07-22T08:30:00.000Z",
               contentVerified: true,
               action: "update",
-              target: { status: "Awaiting Engineer" },
+              target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
             }],
           })
         )
@@ -6452,7 +6722,8 @@ describe("Tickets triage execution budget", () => {
             status: "New Calls",
             updatedTime: "2026-07-22T08:30:00.000Z",
           },
-        });
+        })
+        .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS });
 
       const resumed = await runWithExecutionConfig(
         {
@@ -6498,7 +6769,8 @@ describe("Tickets triage execution budget", () => {
         writeAttempted: false,
         writeMethod: "dryRun",
       }));
-      expect(mockClient.query).toHaveBeenCalledTimes(2);
+      expect(mockClient.query).toHaveBeenCalledTimes(3);
+      expect(mockClient.query.mock.calls.some(([query]) => String(query).includes("getFields"))).toBe(true);
       expect(mockClient.mutate).not.toHaveBeenCalled();
     });
   });
@@ -6530,7 +6802,12 @@ describe("Tickets triage execution budget", () => {
         }
         if (query.includes("getFields")) {
           clock.advanceTo(21_702);
-          return { getFields: [ticketField("impact", ["High"])] };
+          return {
+            getFields: [
+              ...RESOLVED_OPTION_FIELDS.filter((field) => field.columnName !== "impact"),
+              ticketField("impact", ["High"]),
+            ],
+          };
         }
         throw new Error("unexpected query");
       });
@@ -6552,7 +6829,7 @@ describe("Tickets triage execution budget", () => {
               expectedUpdatedTime: "2026-07-22T08:30:00.000Z",
               contentVerified: true,
               action: "update",
-              target: { impact: "High" },
+              target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer", impact: "High" },
             }],
           })
         )
@@ -6621,7 +6898,7 @@ describe("Tickets triage execution budget", () => {
               ticketNumber: "58824",
               contentVerified: true,
               action: "update",
-              target: { status: "Awaiting Engineer" },
+              target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
             }],
           })
         )
@@ -6673,7 +6950,7 @@ describe("Tickets triage execution budget", () => {
       expectedUpdatedTime: "2026-07-18T10:00:00Z",
       contentVerified: true,
       action: "update" as const,
-      target: { status: "Awaiting Engineer" },
+      target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
     }));
 
     const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
@@ -6717,6 +6994,9 @@ describe("Tickets triage execution budget", () => {
           },
         };
       }
+      if (query.includes("getFields")) {
+        return { getFields: RESOLVED_OPTION_FIELDS };
+      }
       if (query.includes("getTicket")) {
         const ticketId = String(variables.input?.ticketId ?? "");
         const ticket = [...ticketState.values()].find((item) => item.ticketId === ticketId);
@@ -6738,6 +7018,7 @@ describe("Tickets triage execution budget", () => {
       mutationCounts.set(ticket.displayId, (mutationCounts.get(ticket.displayId) ?? 0) + 1);
       ticket.status = String(variables.input?.status ?? ticket.status);
       ticket.updatedTime = "2026-07-18T10:01:00Z";
+      Object.assign(ticket, TRIAGE_TEST_CLASSIFICATION);
       return { updateTicket: { ticketId, status: ticket.status } };
     });
 

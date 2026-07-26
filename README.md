@@ -365,10 +365,11 @@ write changes while assessing the snapshot.
 Recommended flow:
 
 1. Call `superops_tickets_triage_snapshot` for `status: ["New Calls"]`.
-2. Analyse only the fixed snapshot returned by that call.
-3. Present a pre-write proposed action table for user approval.
-4. After approval, submit the fixed candidates and approved actions to durable `superops_tickets_apply_triage_plan`.
-5. Inspect the authoritative operation result until every fixed candidate is terminal, then report every outcome.
+2. Follow `pagination.nextPage` until `hasMore` is false; the tool uses a stable execution-safe page size so no listed candidate is knowingly starved of safe reads.
+3. Aggregate the page candidate lists into one fixed assessment set and analyse only the returned safe evidence.
+4. Present a pre-write proposed action table for user approval.
+5. After approval, submit the fixed candidates and approved actions to durable `superops_tickets_apply_triage_plan`.
+6. Inspect the authoritative operation result until every fixed candidate is terminal, then report every outcome.
 
 The pre-write approval table should include every proposed write or intentional
 non-write. Suggested columns: ticket number, subject, client, evidence summary,
@@ -389,7 +390,7 @@ final table and mark it as `Blocked`, `Failed`, or `Not Found` as appropriate.
 Suggested Custom GPT instruction:
 
 ```text
-For New Calls triage, use `superops_tickets_triage_snapshot` first. Treat the snapshot candidate list as fixed. Do not write changes until a proposed action table has been presented and approved. Every ticket from the snapshot must appear in the final report with a final outcome.
+For New Calls triage, use `superops_tickets_triage_snapshot` first and follow every execution-safe page until `pagination.hasMore` is false. Treat the aggregated candidate lists as fixed. Do not write changes until a proposed action table has been presented and approved. Every ticket from the snapshot pages must appear in the final report with a complete classification target and final outcome. Only `Resolved` and `Awaiting Engineer` may be proposed as status changes; a `leave` action retains status while applying classification.
 ```
 
 ### Approved Triage Plan Execution
@@ -409,6 +410,11 @@ set. Mutating actions require `contentVerified=true` unless
 `allowWriteWithoutVerifiedContent=true` is supplied.
 
 Supported actions are `resolve`, `update`, `addNote`, `leave`, and `skip`.
+Every `resolve`, `update`, and `leave` proposal publishes a complete target for
+impact, urgency, category, subcategory, cause, and resolution code. `leave` is a
+classification-only write that retains the current status. Status changes are
+closed to `Resolved` for resolve actions and `Awaiting Engineer` for update
+actions; other target statuses are rejected before any SuperOps read or write.
 `dryRun=true` performs validation and returns intended outcomes without writing.
 When `dedupeNotes=true`, existing notes are checked before adding a note, and a
 matching note is not duplicated. Resolve actions use the controlled resolve path;

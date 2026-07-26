@@ -82,11 +82,15 @@ function withSuccessfulContinuationScheduling<T>(fn: () => T): T {
   }, fn);
 }
 
-const resolutionTarget = {
-  status: "Resolved", priority: "Very Low", impact: "Low", urgency: "Low",
-  category: "7. Sales call", subcategory: "No Action Needed", cause: "No Fault Found",
+const classificationTarget = {
+  impact: "Low",
+  urgency: "Low",
+  category: "7. Sales call",
+  subcategory: "No Action Needed",
+  cause: "No Fault Found",
   resolutionCode: "Permanent Fix",
 };
+const resolutionTarget = { status: "Resolved", ...classificationTarget };
 
 function fields() {
   const options = (columnName: string, values: string[], parent?: { columnName: string; value: string }) => ({
@@ -158,16 +162,16 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       } else if (index === 37) {
         actions.push({ ...common, action: "skip" });
       } else if (index % 29 === 0) {
-        actions.push({ ...common, action: "update", target: { impact: "not-a-live-option" } });
+        actions.push({ ...common, action: "update", target: { ...classificationTarget, status: "Awaiting Engineer", impact: "not-a-live-option" } });
       } else if (index % 31 === 0) {
         tickets.get(ticketNumber)!.updatedTime = "2026-07-18T10:00:01.000Z";
-        actions.push({ ...common, action: "update", target: { status: "Awaiting Engineer" } });
+        actions.push({ ...common, action: "update", target: { ...classificationTarget, status: "Awaiting Engineer" } });
       } else if (index % 7 === 0) {
         actions.push({ ...common, action: "resolve", target: resolutionTarget });
       } else if (index % 5 === 0) {
         actions.push({ ...common, action: "addNote", note: `private harness note ${ticketNumber}`, isPublicNote: false });
       } else {
-        actions.push({ ...common, action: "update", target: { status: "Awaiting Engineer" } });
+        actions.push({ ...common, action: "update", target: { ...classificationTarget, status: "Awaiting Engineer" } });
       }
     }
     // Deterministic representative injected transport faults, selected after
@@ -616,7 +620,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
                             cause: resolutionTarget.cause,
                             resolutionCode: resolutionTarget.resolutionCode,
                           }
-                      : { ticketId: ticket.ticketId, status: "Awaiting Engineer" };
+                      : { ticketId: ticket.ticketId, ...classificationTarget, status: "Awaiting Engineer" };
                   applyExternalMutation(mutationInput);
                 }
                 throw new Error(`crash-boundary after ${actionType}:${checkpointStage}`);
@@ -631,7 +635,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
               contentVerified: true,
             };
             const action = actionType === "update"
-              ? { ...common, action: "update", target: { status: "Awaiting Engineer" } }
+              ? { ...common, action: "update", target: { ...classificationTarget, status: "Awaiting Engineer" } }
               : actionType === "resolve"
                 ? { ...common, action: "resolve", target: resolutionTarget }
                 : { ...common, action: "addNote", note: `checkpoint note ${ticketNumber}`, isPublicNote: false };
