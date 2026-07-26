@@ -930,6 +930,10 @@ function assertTransition(current: OperationItemStage, next: OperationItemStage)
   if (TERMINAL_STAGES.has(current)) {
     throw new Error(`Invalid operation item transition from ${current} to ${next}.`);
   }
+  // A required read can be throttled at every unfinished checkpoint. The
+  // continuation retains mutation history separately and revalidates before
+  // advancing from this scheduling state.
+  if (next === "RateLimitedRescheduled") return;
   // Any unfinished stage may finish in an explicit terminal outcome. Non-terminal
   // transitions must follow the persisted processing lifecycle, never claim state.
   if (TERMINAL_STAGES.has(next)) return;
@@ -1000,6 +1004,9 @@ function mergeCompactResultHistory(previous: unknown, next: unknown): unknown {
   for (const field of ["physicalWrites", "completedStages"] as const) {
     const history = mergeArrayHistory(previous[field], next[field]);
     if (history) merged[field] = history;
+  }
+  for (const field of ["noteAdded", "noteDeduped", "noteDedupeChecked"] as const) {
+    if (previous[field] === true || next[field] === true) merged[field] = true;
   }
   for (const field of [
     "classificationWriteMethod",

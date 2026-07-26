@@ -3470,6 +3470,27 @@ function rateLimitRetryMetadata(error: unknown): {
   };
 }
 
+function markRateLimitedReadResult(
+  result: ApplyTriagePlanResult,
+  error: unknown,
+  operationName: string
+): ApplyTriagePlanResult {
+  const rateLimit = rateLimitRetryMetadata(error);
+  result.finalOutcome = "Failed";
+  result.failureStage = "rateLimit";
+  result.failureReason = safeErrorMessage(error);
+  result.retrySafe = true;
+  result.rateLimitRetryAfterMs = rateLimit.delayMs;
+  result.rateLimitRequestedDelayMs = rateLimit.requestedDelayMs;
+  result.rateLimitRetryAfterSupplied = rateLimit.retryAfterSupplied;
+  result.rateLimitDelaySource = rateLimit.delaySource;
+  // A throttled read cannot have changed SuperOps state. This flag feeds the
+  // durable rate-limit continuation path without implying a mutation rejection.
+  result.rateLimitConclusiveRejection = true;
+  result.rateLimitOperationName = operationName;
+  return result;
+}
+
 function preWriteReadFailureResult(params: {
   ticketNumber: string;
   action: TriagePlanAction;
@@ -3480,22 +3501,9 @@ function preWriteReadFailureResult(params: {
   result.finalOutcome = "Failed";
   result.failureStage = "readMetadata";
   result.failureReason = safeErrorMessage(params.error);
-  if (!isRateLimitError(params.error)) {
-    return result;
-  }
-
-  const rateLimit = rateLimitRetryMetadata(params.error);
-  result.failureStage = "rateLimit";
-  result.retrySafe = true;
-  result.rateLimitRetryAfterMs = rateLimit.delayMs;
-  result.rateLimitRequestedDelayMs = rateLimit.requestedDelayMs;
-  result.rateLimitRetryAfterSupplied = rateLimit.retryAfterSupplied;
-  result.rateLimitDelaySource = rateLimit.delaySource;
-  // A throttled read cannot have changed SuperOps state. This flag feeds the
-  // existing durable rate-limit continuation path without implying a write.
-  result.rateLimitConclusiveRejection = true;
-  result.rateLimitOperationName = params.operationName;
-  return result;
+  return isRateLimitError(params.error)
+    ? markRateLimitedReadResult(result, params.error, params.operationName)
+    : result;
 }
 
 function ticketClientName(ticket: Ticket): string | undefined {
@@ -4680,6 +4688,9 @@ async function applyStagedResolveAction(params: {
       preStatusTicket = await getTicketByInternalId(client, params.resolvedTicketId);
     } catch (error) {
       if (isExecutionStopError(error)) throw error;
+      if (isRateLimitError(error)) {
+        return markRateLimitedReadResult(result, error, "getTicket");
+      }
       return markStagedFailure({
         result,
         stage: "concurrencyRecheck",
@@ -6434,6 +6445,9 @@ function applyResultToContinuationOutcome(
 ): ContinuationItemOutcome {
   const rateLimitReschedule = result.failureStage === "rateLimit" &&
     result.rateLimitConclusiveRejection === true;
+  const readRateLimitReschedule = rateLimitReschedule && result.retrySafe === true;
+  const preserveReadCheckpoint = readRateLimitReschedule &&
+    !["Pending", "Unattempted", "Rescheduled", "RateLimitedRescheduled"].includes(stage);
   const noteVisibilityPending = result.terminalReason === "NoteVisibilityPending";
   const noteVisibilityUnresolved = result.terminalReason === "NoteVisibilityUnresolved";
   const ambiguousMutation = result.writeAttempted && result.partialWrite && (
@@ -6455,16 +6469,20 @@ function applyResultToContinuationOutcome(
         : "WriteAmbiguous"
     : stage;
   return {
-    stage: rateLimitReschedule ? "RateLimitedRescheduled" : persistedStage,
+    stage: rateLimitReschedule
+      ? preserveReadCheckpoint ? stage : "RateLimitedRescheduled"
+      : persistedStage,
     outcome: rateLimitReschedule ? "SuperOpsRateLimitRescheduled" :
       noteVisibilityPending ? "NoteVisibilityPending" :
       noteVisibilityUnresolved ? "NoteVisibilityUnresolved" :
       result.failureStage === "ambiguousWrite" ? "AmbiguousWriteUnresolved" : result.finalOutcome,
     writeAttempted: result.writeAttempted,
-    // A conclusive throttle proves this mutation was not accepted. Ambiguous
-    // transports remain conservative; only a reliable rejection can clear
-    // possible-write state and authorise a checked retry.
-    writeMayHaveSucceeded: rateLimitReschedule ? false : result.writeMayHaveSucceeded === true,
+    // A mutation throttle reliably rejects that mutation attempt. A read-only
+    // throttle preserves the latest verified mutation state and merely delays
+    // the next stage.
+    writeMayHaveSucceeded: rateLimitReschedule
+      ? readRateLimitReschedule && result.writeMayHaveSucceeded === true
+      : result.writeMayHaveSucceeded === true,
     reliableResponseReceived: rateLimitReschedule || noteVisibilityPending || noteVisibilityUnresolved ? true : result.writeAttempted && result.writeMayHaveSucceeded === false ? true : undefined,
     retryDelaySource: result.rateLimitDelaySource,
     retryAfterSupplied: result.rateLimitRetryAfterSupplied,
@@ -6476,7 +6494,7 @@ function applyResultToContinuationOutcome(
     retryEndpoint: "SuperOps GraphQL /msp",
     retryCount: noteVisibilityPending || noteVisibilityUnresolved ? result.noteVerificationAttempts : undefined,
     observedMutationResult: rateLimitReschedule
-      ? "Rejected"
+      ? readRateLimitReschedule ? priorObservedMutationResult : "Rejected"
       : noteVisibilityPending || noteVisibilityUnresolved
         ? "Accepted"
       : result.verified
@@ -7299,7 +7317,9 @@ for (const stage of remainingStages) {
         storedParams.expectedCandidateTicketNumbers.length > 50;
       const outcome = applyResultToContinuationOutcome(
         applied.result,
-        applied.stage,
+        applied.result.failureStage === "rateLimit" && applied.result.retrySafe === true
+          ? checkpointStage
+          : applied.stage,
         observedMutationResult,
         { trimVerifiedSuccessDetails }
       );

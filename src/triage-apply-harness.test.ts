@@ -255,6 +255,7 @@ type FakeSuperOpsOptions = {
   initialNotes?: unknown[];
   noteReadsRequireInternalId?: boolean;
   canonicalTicketReadRateLimits?: number;
+  canonicalTicketReadRateLimitReads?: number[];
   noteReadUnavailable?: boolean;
   unsupportedNoteEnvelope?: boolean;
   noteVisibilityMisses?: number;
@@ -334,6 +335,7 @@ class FakeSuperOps {
   private pendingNote: Record<string, unknown> | undefined;
   private remainingVisibilityMisses: number;
   private remainingCanonicalTicketReadRateLimits: number;
+  private readonly canonicalTicketReadRateLimitReads: Set<number>;
   private readonly classificationFaults: MutationFault[];
   private updatedSequence = 0;
   private ticketReadCount = 0;
@@ -350,6 +352,7 @@ class FakeSuperOps {
     this.visibleNotes = [...(options.initialNotes ?? [])];
     this.remainingVisibilityMisses = options.noteVisibilityMisses ?? 0;
     this.remainingCanonicalTicketReadRateLimits = options.canonicalTicketReadRateLimits ?? 0;
+    this.canonicalTicketReadRateLimitReads = new Set(options.canonicalTicketReadRateLimitReads ?? []);
     this.classificationFaults = [...(options.classificationFaults ?? [])];
     if (options.classified) this.setClassified();
   }
@@ -494,8 +497,11 @@ class FakeSuperOps {
     }
     if (query.includes("getTicket")) {
       this.ticketReadCount += 1;
-      if (this.remainingCanonicalTicketReadRateLimits > 0) {
-        this.remainingCanonicalTicketReadRateLimits -= 1;
+      if (this.remainingCanonicalTicketReadRateLimits > 0 ||
+          this.canonicalTicketReadRateLimitReads.delete(this.ticketReadCount)) {
+        if (this.remainingCanonicalTicketReadRateLimits > 0) {
+          this.remainingCanonicalTicketReadRateLimits -= 1;
+        }
         this.history.add("superops.read.ticket", {
           ticketId: input.ticketId,
           read: this.ticketReadCount,
@@ -1243,6 +1249,67 @@ describe("deterministic end-to-end apply-triage harness", () => {
     expect(harness.history.count("superops.write.note")).toBe(1);
     expect(harness.history.count("superops.write.status")).toBe(1);
     expect(harness.history.count("continuation.resume")).toBe(2);
+  });
+
+  it("reschedules a throttled pre-status concurrency read without replaying verified writes", async () => {
+    const harness = new TriageHarness("pre-status-read-rate-limit", {
+      canonicalTicketReadRateLimitReads: [3, 4, 5],
+    });
+    await harness.invoke({}, {
+      SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "3",
+    });
+
+    const throttled = await harness.record();
+    expect(throttled).toMatchObject({
+      state: "Rescheduled",
+      itemStates: {
+        [TICKET_NUMBER]: {
+          stage: "NoteVerified",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          observedMutationResult: "VerifiedApplied",
+          partialWrite: false,
+          errorClass: "SuperOpsRateLimit",
+          rateLimit: {
+            operationName: "getTicket",
+          },
+        },
+      },
+    });
+    expect(itemResult(throttled)).toMatchObject({
+      finalOutcome: "Failed",
+      failureStage: "rateLimit",
+      completedStages: expect.arrayContaining([
+        "ClassificationVerified",
+        "NoteVerified",
+      ]),
+    });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(1);
+    expect(harness.history.count("superops.write.status")).toBe(0);
+
+    const terminal = await harness.resumeUntilTerminal();
+    const result = itemResult(terminal);
+    expect(result).toMatchObject({
+      classificationWriteOutcome: "NotRequired",
+      noteDedupeChecked: true,
+      noteAdded: true,
+      statusWriteMethod: "updateTicket.statusOnly",
+      suppressCloseNotificationIncluded: true,
+      finalOutcome: "Resolved",
+      finalVerificationState: "Verified",
+      verified: true,
+    });
+    expect(terminal.state).toBe("Completed");
+    expect(result.physicalWrites).toEqual([
+      { method: "updateTicket.classification", outcome: "Accepted" },
+      { method: "createTicketNote", outcome: "Accepted" },
+      { method: "updateTicket.statusOnly", outcome: "Accepted" },
+    ]);
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(1);
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
   });
 
   it("terminalizes persistent pre-write getTicket throttling at the durable ceiling without any write", async () => {
