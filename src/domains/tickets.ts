@@ -932,6 +932,8 @@ const TRIAGE_PLAN_ACTION_SCHEMA = {
         ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
         action: { type: "string", const: "leave" },
         target: TRIAGE_PLAN_LEAVE_TARGET_SCHEMA,
+        note: { type: "string", description: "Optional private triage-summary note to add after classification succeeds." },
+        isPublicNote: { type: "boolean", default: false, description: "Whether the optional note is client-visible." },
         reason: {
           type: "string",
           description: "Optional reason for retaining the current status after classification.",
@@ -3748,12 +3750,23 @@ async function createNoteForPlan(params: {
   const note = noteBodyForPlan(params.note);
   if (!note) return;
   await params.beforeCreate?.();
-  const created = await createTicketNote(
-    params.client,
-    params.ticketId,
-    note,
-    params.isPublic ?? false
-  );
+  let created: TicketNote;
+  try {
+    created = await createTicketNote(
+      params.client,
+      params.ticketId,
+      note,
+      params.isPublic ?? false
+    );
+  } catch (error) {
+    recordPhysicalWrite(
+      params.result,
+      "createTicketNote",
+      isReliableSynchronousMutationRejection(error) ? "Rejected" : "Ambiguous"
+    );
+    throw error;
+  }
+  recordPhysicalWrite(params.result, "createTicketNote", "Accepted");
   await params.afterCreate?.(created);
   params.result.noteAdded = true;
   params.result.writeMayHaveSucceeded = true;
@@ -4082,7 +4095,7 @@ function markStagedNoteVisibilityPending(params: {
 }): ApplyTriagePlanResult {
   params.result.finalOutcome = "NoteVisibilityPending";
   params.result.failureStage = "noteVisibility";
-  params.result.failureReason = "Accepted private-note write is not visible yet; status resolution is deferred to read-only reconciliation.";
+  params.result.failureReason = "The submitted private-note write is not visible yet; completion is deferred to read-only reconciliation.";
   params.result.terminalReason = "NoteVisibilityPending";
   params.result.partialWrite = true;
   params.result.writeMayHaveSucceeded = true;
@@ -4104,7 +4117,7 @@ function markStagedNoteVisibilityUnresolved(params: {
   const result = markStagedFailure({
     result: params.result,
     stage: "noteVisibility",
-    reason: "Accepted private-note write remained invisible after " + params.attempts + " read-only verification attempts; status resolution was not attempted.",
+    reason: "The submitted private-note write remained invisible after " + params.attempts + " read-only verification attempts; no further mutation was attempted.",
     terminalReason: "NoteVisibilityUnresolved",
     partialWrite: true,
     writeMayHaveSucceeded: true,
@@ -6087,6 +6100,41 @@ async function applyApprovedTriageAction(params: {
         result.writeMayHaveSucceeded = true;
         return result;
       }
+
+      if (notePlan === "pending") {
+        const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
+        let noteVerified = false;
+        try {
+          noteVerified = await existingNoteMatchesFingerprint(client, ticket.ticketId, fingerprint, {
+            ticketNumber,
+            additionalTicketIds: [resolved.ticketId, ticket.ticketId],
+          });
+          result.noteDedupeChecked = true;
+        } catch {
+          result.noteDedupeChecked = false;
+        }
+        result.initialNoteVerificationObserved = noteVerified;
+        result.noteVerificationAttempts = 1;
+        if (!noteVerified) {
+          return markStagedNoteVisibilityPending({
+            result,
+            stage: "NoteAdded",
+            attempts: 1,
+            initialObserved: false,
+          });
+        }
+        result.noteWriteOutcome = "AcceptedAndVerified";
+        result.noteVerifiedAfterDelay = false;
+        result.continuationRequired = false;
+        await params.afterVerification?.("note");
+      } else if (notePlan === "deduped") {
+        result.noteWriteOutcome = "VerifiedExistingPrivateNote";
+        result.initialNoteVerificationObserved = true;
+        result.noteVerificationAttempts = 1;
+        result.noteVerifiedAfterDelay = false;
+        result.continuationRequired = false;
+      }
+
       result.finalOutcome = action.action === "leave" ? "Left" : "Updated";
     }
     return result;
@@ -6483,10 +6531,14 @@ function createApplyTriageContinuationAdapter(
       const clientLookup = target.clientName && !target.clientId ? 1 : 0;
       const techGroupLookup = target.techGroupName ? 1 : 0;
       const validationReads = 2 + optionLookup + clientLookup + techGroupLookup;
+      const noteWork = noteExpectedForAction(action)
+        ? storedParams?.dedupeNotes === false ? 6 : 8
+        : 0;
       // Each read retry is separately budget-checked by SuperOpsClient. This
       // estimate reserves the required first attempt; the mutation hook then
-      // reserves all required checkpoints, one write, and one read-back.
-      return validationReads + 8;
+      // reserves every durable checkpoint, write, and read-back, including
+      // private-note dedupe and visibility verification when requested.
+      return validationReads + 8 + noteWork;
     },
     async processItem({ record, claim, checkpoint }) {
       const storedParams = operationRequestApplyTriageParams(record.operationRequest);
@@ -6827,12 +6879,12 @@ for (const stage of remainingStages) {
       };
       let resumeStageOverride: OperationItemState["stage"] | undefined = claim.item.stage;
       let noteVerifiedAfterDelayAttempts: number | undefined;
-      if (action?.action === "resolve" &&
+      if (action && noteExpectedForAction(action) &&
           (claim.item.stage === "NoteWriteStarted" || claim.item.stage === "NoteAdded")) {
         const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
         const visibilityResult = baseApplyResult(claim.itemKey, action);
-        visibilityResult.workflowMode = "staged";
-        visibilityResult.writeMethod = "staged";
+        visibilityResult.workflowMode = action.action === "resolve" ? "staged" : undefined;
+        visibilityResult.writeMethod = action.action === "resolve" ? "staged" : "update";
         visibilityResult.writeAttempted = true;
         visibilityResult.writeMayHaveSucceeded = true;
         visibilityResult.partialWrite = true;
@@ -6859,11 +6911,16 @@ for (const stage of remainingStages) {
           );
         }
 
-        const noteObserved = await existingNoteMatchesFingerprint(client, resolvedForNotes.ticketId, fingerprint, {
-          ticketNumber: claim.itemKey,
-          additionalTicketIds: [resolvedForNotes.ticketId],
-        });
-        visibilityResult.noteDedupeChecked = true;
+        let noteObserved = false;
+        try {
+          noteObserved = await existingNoteMatchesFingerprint(client, resolvedForNotes.ticketId, fingerprint, {
+            ticketNumber: claim.itemKey,
+            additionalTicketIds: [resolvedForNotes.ticketId],
+          });
+          visibilityResult.noteDedupeChecked = true;
+        } catch {
+          visibilityResult.noteDedupeChecked = false;
+        }
         visibilityResult.initialNoteVerificationObserved = false;
         const attempts = (claim.item.retryCount ?? 0) + 1;
         visibilityResult.noteVerificationAttempts = attempts;
@@ -6886,11 +6943,50 @@ for (const stage of remainingStages) {
           );
         }
 
-        await afterVerification("note");
         noteVerifiedAfterDelayAttempts = attempts;
-        resumeStageOverride = "NoteVerified";
-      }
+        if (action.action === "resolve") {
+          await afterVerification("note");
+          resumeStageOverride = "NoteVerified";
+        } else {
+          const verifiedTicket = await getTicketByInternalId(client, resolvedForNotes.ticketId);
+          const identityFailure = validateExpectedTicket(
+            claim.itemKey,
+            { ...action, expectedStatus: undefined, expectedUpdatedTime: undefined },
+            verifiedTicket,
+            true
+          );
+          const targetVerification = verifyFinalTargetState(action, verifiedTicket);
+          visibilityResult.finalState = ticketFinalState(verifiedTicket);
+          visibilityResult.observedFinalState = visibilityResult.finalState;
+          if (identityFailure || targetVerification.mismatches.length > 0) {
+            visibilityResult.finalOutcome = identityFailure?.outcome ?? "Failed";
+            visibilityResult.failureStage = identityFailure?.stage ?? "verifyFinalState";
+            visibilityResult.failureReason = identityFailure?.reason ??
+              `Final state did not match requested target fields: ${JSON.stringify(targetVerification.mismatches)}`;
+            visibilityResult.terminalReason = "PostNoteTargetVerificationMismatch";
+            visibilityResult.finalVerificationState = "Failed";
+            visibilityResult.verified = false;
+            return applyResultToContinuationOutcome(
+              visibilityResult,
+              "FailedAfterPartialWrite",
+              observedMutationResult
+            );
+          }
 
+          await afterVerification("note");
+          visibilityResult.finalOutcome = action.action === "leave" ? "Left" : "Updated";
+          visibilityResult.partialWrite = false;
+          visibilityResult.verified = true;
+          visibilityResult.verifiedState = visibilityResult.finalState;
+          visibilityResult.finalVerificationState = "Verified";
+          markStagedNoteVerifiedAfterDelay(visibilityResult, attempts);
+          return applyResultToContinuationOutcome(
+            visibilityResult,
+            "CompletedAfterAmbiguousWriteVerification",
+            observedMutationResult
+          );
+        }
+      }
       const stagedResolveResume = action?.action === "resolve" &&
         stagedResolveResumeSkipsSnapshotExpectations(resumeStageOverride);
       const shouldResolveAmbiguity = !stagedResolveResume && (

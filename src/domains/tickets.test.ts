@@ -436,6 +436,8 @@ describe("Tickets Domain", () => {
     expect(leave?.properties.target.properties).not.toHaveProperty("status");
     expect(leave?.properties.target.properties).not.toHaveProperty("resolutionCode");
     expect(leave?.properties.target.properties).toHaveProperty("cause");
+    expect(leave?.properties).toHaveProperty("note");
+    expect(leave?.properties).toHaveProperty("isPublicNote");
     const addNote = variants.find((variant) => variant.properties.action.const === "addNote");
     expect(addNote?.required).toEqual(
       expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "note"])
@@ -3622,6 +3624,204 @@ describe("Tickets Domain", () => {
     });
     expect(mutationInput).not.toHaveProperty("status");
   });
+  it("adds and verifies one deduplicated private triage-summary note for a leave action", async () => {
+    const triageNote = [
+      "Ticket goal: Confirm the reported availability issue and route it safely.",
+      "What needs to be known: This is an automated device-down alert.",
+      "Next step: Service desk reviews and assigns the ticket.",
+      "When: At the next New Calls review.",
+    ].join("\n");
+    const ticketState: Record<string, unknown> = {
+      ticketId: "ticket-57403",
+      displayId: "57403",
+      subject: "Server is down",
+      status: "New Calls",
+      updatedTime: "2026-07-26T09:00:00Z",
+    };
+    const notes: Array<Record<string, unknown>> = [];
+
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        return { getTicketList: {
+          tickets: [{ ticketId: "ticket-57403", displayId: "57403" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        } };
+      }
+      if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
+      if (query.includes("getTicketNoteList")) return { getTicketNoteList: [...notes] };
+      return { getTicket: { ...ticketState } };
+    });
+    mockClient.mutate.mockImplementation(async (mutation: string, variables: { input: Record<string, unknown> }) => {
+      if (mutation.includes("createTicketNote")) {
+        expect(variables.input).toEqual({
+          ticket: { ticketId: "ticket-57403" },
+          content: triageNote,
+          privacyType: "PRIVATE",
+        });
+        notes.push({ noteId: "note-57403", content: triageNote, privacyType: "PRIVATE" });
+        return { createTicketNote: { noteId: "note-57403", privacyType: "PRIVATE" } };
+      }
+      Object.assign(ticketState, variables.input, { updatedTime: "2026-07-26T09:01:00Z" });
+      return { updateTicket: { ticketId: "ticket-57403" } };
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      batchId: "leave-private-triage-summary",
+      expectedCandidateTicketNumbers: ["57403"],
+      actions: [{
+        ticketNumber: "57403",
+        expectedTicketId: "ticket-57403",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T09:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+        note: triageNote,
+        isPublicNote: false,
+      }],
+      verify: true,
+      dedupeNotes: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Left",
+      notePlanned: true,
+      noteDedupeChecked: true,
+      noteDeduped: false,
+      noteAdded: true,
+      noteWriteOutcome: "AcceptedAndVerified",
+      finalVerificationState: "Verified",
+      verified: true,
+    });
+    expect(parsed.results[0].physicalWrites).toEqual([
+      { method: "updateTicket", outcome: "Accepted" },
+      { method: "createTicketNote", outcome: "Accepted" },
+    ]);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    const updateInput = mockClient.mutate.mock.calls
+      .find(([mutation]) => !String(mutation).includes("createTicketNote"))?.[1].input;
+    expect(updateInput).not.toHaveProperty("status");
+    expect(updateInput).not.toHaveProperty("resolutionCode");
+  });
+  it("reconciles delayed leave-note visibility without replaying either write", async () => {
+    await runWithOperationStore({}, async () => {
+      const triageNote = [
+        "Ticket goal: Confirm the server-down alert and route it safely.",
+        "What needs to be known: The monitoring message reports lost connectivity.",
+        "Next step: Service desk reviews and assigns the ticket.",
+        "When: At the next New Calls review.",
+      ].join("\n");
+      const ticketState: Record<string, unknown> = {
+        ticketId: "ticket-57404",
+        displayId: "57404",
+        subject: "#Asset Name is down",
+        status: "New Calls",
+        updatedTime: "2026-07-26T10:00:00Z",
+      };
+      let noteSubmitted = false;
+      let noteVisible = false;
+      let updateWrites = 0;
+      let noteWrites = 0;
+
+      mockClient.query.mockImplementation(async (query: string) => {
+        if (query.includes("getTicketList")) {
+          return { getTicketList: {
+            tickets: [{ ticketId: "ticket-57404", displayId: "57404" }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          } };
+        }
+        if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
+        if (query.includes("getTicketNoteList")) {
+          return { getTicketNoteList: noteSubmitted && noteVisible
+            ? [{ noteId: "note-57404", content: triageNote, privacyType: "PRIVATE" }]
+            : [] };
+        }
+        return { getTicket: { ...ticketState } };
+      });
+      mockClient.mutate.mockImplementation(async (mutation: string, variables: { input: Record<string, unknown> }) => {
+        if (mutation.includes("createTicketNote")) {
+          noteWrites += 1;
+          noteSubmitted = true;
+          return { createTicketNote: { noteId: "note-57404", privacyType: "PRIVATE" } };
+        }
+        updateWrites += 1;
+        Object.assign(ticketState, variables.input, { updatedTime: "2026-07-26T10:01:00Z" });
+        return { updateTicket: { ticketId: "ticket-57404" } };
+      });
+
+      const initial = await withSuccessfulContinuationScheduling(() =>
+        getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: "leave-note-delayed-visibility",
+          expectedCandidateTicketNumbers: ["57404"],
+          actions: [{
+            ticketNumber: "57404",
+            expectedTicketId: "ticket-57404",
+            expectedStatus: "New Calls",
+            expectedUpdatedTime: "2026-07-26T10:00:00Z",
+            contentVerified: true,
+            action: "leave",
+            target: { ...TRIAGE_TEST_CLASSIFICATION },
+            note: triageNote,
+            isPublicNote: false,
+          }],
+          verify: true,
+          dedupeNotes: true,
+        })
+      );
+      const initialParsed = JSON.parse(initial.content[0].text);
+      const pending = await getOperationStore().get("leave-note-delayed-visibility");
+
+      expect(initialParsed.results[0]).toMatchObject({
+        finalOutcome: "NoteVisibilityPending",
+        noteAdded: true,
+        noteVerificationAttempts: 1,
+        continuationRequired: true,
+      });
+      expect(pending?.itemStates["57404"]).toMatchObject({
+        stage: "NoteAdded",
+        outcome: "NoteVisibilityPending",
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+      });
+      expect(updateWrites).toBe(1);
+      expect(noteWrites).toBe(1);
+
+      noteVisible = true;
+      await runWithExecutionConfig({}, () => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => resumeApplyTriageOperation({
+          operationId: "leave-note-delayed-visibility",
+          ownerHash: pending?.ownerHash ?? stableHash("anonymous"),
+          leaseOwner: "leave-note-visibility-worker",
+          now: new Date(Date.now() + 60_000).toISOString(),
+        })
+      ));
+
+      const completed = await getOperationStore().get("leave-note-delayed-visibility");
+      expect(completed?.state).toBe("Completed");
+      expect(completed?.itemStates["57404"]).toMatchObject({
+        stage: "CompletedAfterAmbiguousWriteVerification",
+        outcome: "Left",
+        verificationState: "Verified",
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+        partialWrite: false,
+      });
+      const completedView = operationResultView(completed!) as {
+        results: Array<Record<string, unknown>>;
+      };
+      expect(completedView.results[0]).toMatchObject({
+        finalOutcome: "Left",
+        noteAdded: true,
+        noteWriteOutcome: "NoteVerifiedAfterDelay",
+        noteVerifiedAfterDelay: true,
+        finalVerificationState: "Verified",
+      });
+      expect(updateWrites).toBe(1);
+      expect(noteWrites).toBe(1);
+    });
+  });
   it("updates from Ticket on Hold with optional cause and no resolution code", async () => {
     mockClient.query
       .mockResolvedValueOnce({
@@ -5100,13 +5300,16 @@ describe("Tickets Domain", () => {
   it("counts two legitimate sequential durable mutation attempts", async () => {
     await runWithOperationStore({}, async () => {
       let getTicketReads = 0;
+      let noteCreated = false;
       mockClient.query.mockImplementation(async (query: string) => {
         if (query.includes("getTicketList")) {
           return { getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
             listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } };
         }
         if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
-        if (query.includes("getTicketNoteList")) return { getTicketNoteList: [] };
+        if (query.includes("getTicketNoteList")) return { getTicketNoteList: noteCreated
+          ? [{ noteId: "note-57400", content: "Approved private follow-up", privacyType: "PRIVATE" }]
+          : [] };
         getTicketReads += 1;
         return { getTicket: { ticketId: "ticket-57400", displayId: "57400",
           status: getTicketReads === 1 ? "New Calls" : "Awaiting Engineer",
@@ -5115,7 +5318,10 @@ describe("Tickets Domain", () => {
       });
       mockClient.mutate
         .mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-57400", status: "Awaiting Engineer" } })
-        .mockResolvedValueOnce({ createTicketNote: { noteId: "note-57400", privacyType: "PRIVATE" } });
+        .mockImplementationOnce(async () => {
+          noteCreated = true;
+          return { createTicketNote: { noteId: "note-57400", privacyType: "PRIVATE" } };
+        });
 
       const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
         batchId: "sequential-attempt-count",
@@ -5995,11 +6201,11 @@ describe("Tickets Domain", () => {
           listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } },
       })
       .mockResolvedValueOnce({
-        getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "Awaiting Engineer",
-          updatedTime: "2026-07-18T10:01:00Z" },
+        getTicketNoteList: [{ noteId: "note-1", content: "Approved private note", privacyType: "PRIVATE" }],
       })
       .mockResolvedValueOnce({
-        getTicketNoteList: [{ noteId: "note-1", content: "Approved private note", privacyType: "PRIVATE" }],
+        getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "Awaiting Engineer",
+          updatedTime: "2026-07-18T10:01:00Z" },
       });
     await runWithExecutionConfig({}, async () => {
       await runWithExecutionContext("superops_tickets_apply_triage_plan", async () =>
