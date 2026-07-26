@@ -718,6 +718,11 @@ const TRIAGE_PLAN_NON_RESOLUTION_CLASSIFICATION_FIELDS = [
   ...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS,
   "cause",
 ] as const;
+const TRIAGE_PLAN_LEAVE_TARGET_FIELDS = [
+  ...TRIAGE_PLAN_NON_RESOLUTION_CLASSIFICATION_FIELDS,
+  "clientName",
+  "clientId",
+] as const;
 const TRIAGE_PLAN_RESOLVE_REQUIRED_CLASSIFICATION_FIELDS = [
   ...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS,
   "cause",
@@ -879,6 +884,8 @@ const TRIAGE_PLAN_LEAVE_TARGET_SCHEMA = {
     category: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.category,
     subcategory: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.subcategory,
     cause: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.cause,
+    clientName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientName,
+    clientId: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientId,
   },
   required: [...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS],
 } as const;
@@ -1457,7 +1464,7 @@ function validateTriagePlanActionShape(rawAction: unknown, index: number): strin
 
   if (action.action === "leave" && target) {
     const unsupportedLeaveFields = Object.keys(target).filter(
-      (field) => !(TRIAGE_PLAN_NON_RESOLUTION_CLASSIFICATION_FIELDS as readonly string[]).includes(field)
+      (field) => !(TRIAGE_PLAN_LEAVE_TARGET_FIELDS as readonly string[]).includes(field)
     );
     if (unsupportedLeaveFields.length > 0) {
       return `${label}.target contains field(s) not allowed for a classification-only leave action: ${unsupportedLeaveFields.join(", ")}.`;
@@ -3816,7 +3823,7 @@ async function buildApprovedUpdateInput(
   }
   if (action.action === "leave") {
     const unsupportedLeaveFields = Object.keys(target).filter(
-      (field) => !(TRIAGE_PLAN_NON_RESOLUTION_CLASSIFICATION_FIELDS as readonly string[]).includes(field)
+      (field) => !(TRIAGE_PLAN_LEAVE_TARGET_FIELDS as readonly string[]).includes(field)
     );
     if (unsupportedLeaveFields.length > 0) {
       return { error: `Leave action contains unsupported target field(s): ${unsupportedLeaveFields.join(", ")}.` };

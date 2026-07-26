@@ -392,7 +392,7 @@ final table and mark it as `Blocked`, `Failed`, or `Not Found` as appropriate.
 Suggested Custom GPT instruction:
 
 ```text
-For ticket triage, call `superops_tickets_triage_snapshot` with the exact configured status queue requested by the user and follow every execution-safe page until `pagination.hasMore` is false. Treat the aggregated candidate lists as fixed. Do not write changes until a proposed action table has been presented and approved. Every ticket from the snapshot pages must appear in the final report with the required classification target and final outcome. Only `Resolved` and `Awaiting Engineer` may be proposed as status changes; a `leave` action retains its current status while applying classification.
+For ticket triage, call `superops_tickets_triage_snapshot` with the exact configured status queue requested by the user and follow every execution-safe page until `pagination.hasMore` is false. Treat the aggregated candidate lists as fixed. Do not write changes until a proposed action table has been presented and approved. Every ticket from the snapshot pages must appear in the final report with the required classification target and final outcome. Only `Resolved` and `Awaiting Engineer` may be proposed as status changes; a `leave` action retains its current status while applying classification. When the canonical snapshot proves that a ticket has no client, explicitly target `clientName: "TaskGroup"` and `clientId: "2993553194649526272"` and show that assignment in the approval table. Preserve every proven non-null client. If client retrieval is unavailable, skip rather than guessing.
 ```
 
 ### Approved Triage Plan Execution
@@ -423,6 +423,8 @@ subcategory; cause is optional when known, and resolution code is prohibited.
 `leave` is a classification-only write that retains the current status. Status
 changes are closed to `Resolved` for resolve actions and `Awaiting Engineer` for
 update actions; other target statuses are rejected before any SuperOps read or write.
+For a ticket already resolved by an approved plan that omitted a required client, do not replay the resolve action or amend its durable operation. Take a fresh safe snapshot and propose a separate `leave` action with the expected current `Resolved` status, the existing classification fields, and the explicit client name/ID. `leave` applies only the approved classification/client correction and retains `Resolved`; omit any already-created note.
+
 `dryRun=true` performs validation and returns intended outcomes without writing.
 When `dedupeNotes=true`, existing notes are checked before adding a note, and a
 matching note is not duplicated. Resolve actions use the controlled resolve path;

@@ -156,6 +156,60 @@ describe("SuperOps continuation Workflow", () => {
     expect(JSON.stringify(requests)).not.toContain("note");
   });
 
+  it("retries a Too Early internal wake and records only the successful delivery", async () => {
+    const initial = activeRecord();
+    await runWithOperationStore({}, () => getOperationStore().put(initial));
+    let calls = 0;
+    const workflow = new SuperOpsContinuationWorkflow(undefined, {
+      SUPEROPS_CONTINUATION_SERVICE: {
+        fetch: vi.fn(async () => {
+          calls += 1;
+          return calls === 1
+            ? new Response(JSON.stringify({ ok: false, retryable: true }), { status: 425 })
+            : new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }),
+      },
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "internal-token",
+    });
+    const step = {
+      sleepUntil: vi.fn(async () => undefined),
+      do: vi.fn(async (
+        name: string,
+        configOrCallback: unknown,
+        maybeCallback?: () => Promise<unknown>
+      ) => {
+        const callback = typeof configOrCallback === "function"
+          ? configOrCallback as () => Promise<unknown>
+          : maybeCallback!;
+        if (name !== "deliver-checked-continuation") return callback();
+        try {
+          return await callback();
+        } catch {
+          return callback();
+        }
+      }),
+    };
+
+    await expect(workflow.run({
+      payload: {
+        operationId: initial.operationId,
+        ownerHash: initial.ownerHash,
+        nextEligibleTime: "2026-07-18T00:05:00.000Z",
+        scheduleIdentity: "wf-too-early",
+      },
+      timestamp: new Date(),
+      instanceId: "wf-too-early",
+      workflowName: "test",
+    }, step)).resolves.toEqual({ operationId: initial.operationId, delivered: true });
+
+    expect(calls).toBe(2);
+    await expect(getOperationStore().get(initial.operationId)).resolves.toMatchObject({
+      wakeAttemptCount: 2,
+      wakeDeliveryCount: 1,
+      lastWakeAttemptAt: expect.any(String),
+      lastWakeSucceededAt: expect.any(String),
+    });
+  });
   it("creates a fresh accounting context for each Workflow delivery", async () => {
     const firstRecord = { ...terminalRecord(), operationId: "workflow-fresh-1", originalRequestHash: stableHash("workflow-fresh-1") };
     const secondRecord = { ...terminalRecord(), operationId: "workflow-fresh-2", originalRequestHash: stableHash("workflow-fresh-2") };

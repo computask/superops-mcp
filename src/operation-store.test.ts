@@ -220,9 +220,18 @@ describe("operation store", () => {
     });
   });
 
-  it("returns a compact result view without sensitive operational internals", () => {
+  it("returns safe continuation scheduling and wake telemetry", () => {
     const view = operationResultView(record({
       terminalFailureReason: "Authorization: Bearer public-result-secret",
+      continuationMechanism: "workflow",
+      continuationInstanceId: "wf-status",
+      schedulingAttempted: true,
+      schedulingSucceeded: true,
+      schedulingAttemptCount: 2,
+      wakeAttemptCount: 1,
+      wakeDeliveryCount: 1,
+      lastWakeAttemptAt: "2026-07-18T00:05:00.000Z",
+      lastWakeSucceededAt: "2026-07-18T00:05:01.000Z",
     }));
 
     expect(view).toMatchObject({
@@ -231,12 +240,46 @@ describe("operation store", () => {
       completedCount: 1,
       unattemptedCount: 1,
       continuationCount: 1,
+      continuationMechanism: "workflow",
+      continuationInstanceId: "wf-status",
+      schedulingAttempted: true,
+      schedulingSucceeded: true,
+      schedulingAttemptCount: 2,
+      wakeAttemptCount: 1,
+      wakeDeliveryCount: 1,
+      lastWakeAttemptAt: "2026-07-18T00:05:00.000Z",
+      lastWakeSucceededAt: "2026-07-18T00:05:01.000Z",
     });
     expect(JSON.stringify(view)).not.toContain("originalRequestHash");
     expect(JSON.stringify(view)).not.toContain("idempotencyKey");
     expect(JSON.stringify(view)).not.toContain("public-result-secret");
   });
 
+  it("derives an overdue Workflow wait as stalled without mutating the ledger", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-18T00:07:01.000Z"));
+    const stored = record({
+      state: "Rescheduled",
+      nextEligibleTime: "2026-07-18T00:05:00.000Z",
+      continuationMechanism: "workflow",
+      continuationInstanceId: "wf-overdue",
+      schedulingAttempted: true,
+      schedulingSucceeded: true,
+      wakeAttemptCount: 0,
+      wakeDeliveryCount: 0,
+    });
+
+    expect(operationResultView(stored)).toMatchObject({
+      state: "Rescheduled",
+      derivedState: "Stalled",
+      stalled: true,
+      stalledReason: expect.stringContaining("no Workflow wake attempt"),
+      nextEligibleTime: "2026-07-18T00:05:00.000Z",
+      continuationInstanceId: "wf-overdue",
+    });
+    expect(stored.state).toBe("Rescheduled");
+    expect(stored.nextEligibleTime).toBe("2026-07-18T00:05:00.000Z");
+  });
   it("retries a transient Durable Object checkpoint rate limit without counting mutation attempts", async () => {
     let checkpointPutAttempts = 0;
     let failedOnce = false;
@@ -1397,6 +1440,52 @@ describe("operation store", () => {
     expect(workflowCalls).toBe(1);
   });
 
+  it("fails closed when Workflow creation does not acknowledge the requested instance", async () => {
+    const values = new Map<string, unknown>();
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+      },
+    }, {
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+      SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS: "1",
+      SUPEROPS_CONTINUATION_WORKFLOW: {
+        createBatch: async () => [],
+      },
+    });
+    await durableObject.fetch(new Request("https://operation.local/operations/op-workflow-no-ack", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record({ operationId: "op-workflow-no-ack" })),
+    }));
+
+    const response = await durableObject.fetch(new Request(
+      "https://operation.local/operations/op-workflow-no-ack/schedule-continuation",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          operationId: "op-workflow-no-ack",
+          ownerHash: stableHash("owner@example.com"),
+          reason: "RateLimitedRescheduled",
+          nextEligibleTime: "2026-07-18T00:05:00.000Z",
+        }),
+      }
+    ));
+
+    await expect(response.json()).resolves.toMatchObject({
+      state: "CompletedWithFailures",
+      schedulingAttempted: true,
+      schedulingSucceeded: false,
+      schedulingAttemptCount: 1,
+      schedulingError: expect.stringContaining("did not acknowledge"),
+      terminalFailureReason: expect.stringContaining("did not acknowledge"),
+    });
+  });
   it("counts one failed Workflow scheduling attempt and stops at the invocation limit", async () => {
     const values = new Map<string, unknown>();
     let attempts = 0;

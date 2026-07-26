@@ -325,6 +325,7 @@ const MAX_RECENT_OPERATION_OUTPUT_BYTES = 128 * 1024;
 const OPERATION_STORE_RATE_LIMIT_MAX_ATTEMPTS = 3;
 const OPERATION_STORE_RATE_LIMIT_BACKOFF_MS = [25, 75];
 const UNATTEMPTED_RUNNING_STALL_MS = 5 * 60 * 1000;
+const RESCHEDULED_STALL_GRACE_MS = 2 * 60 * 1000;
 
 interface RecentOperationIndexEntry {
   version: 1;
@@ -1926,8 +1927,37 @@ function derivedUnattemptedStall(record: OperationLedgerRecord): Record<string, 
     writeMayHaveSucceeded: false,
   };
 }
+
+function derivedRescheduledStall(record: OperationLedgerRecord): Record<string, unknown> | undefined {
+  if (record.state !== "Rescheduled" || !record.nextEligibleTime || record.pendingItems.length === 0) {
+    return undefined;
+  }
+  const eligibleAtMs = Date.parse(record.nextEligibleTime);
+  if (!Number.isFinite(eligibleAtMs) || Date.now() - eligibleAtMs < RESCHEDULED_STALL_GRACE_MS) {
+    return undefined;
+  }
+  const stalledReason = (record.wakeAttemptCount ?? 0) === 0
+    ? "The durable eligibility time passed but no Workflow wake attempt was recorded."
+    : (record.wakeDeliveryCount ?? 0) === 0
+      ? "The Workflow wake was attempted but no successful continuation delivery was recorded."
+      : "The Workflow delivered a continuation after eligibility, but the operation remained Rescheduled.";
+  const items = Object.values(record.itemStates);
+  return {
+    derivedState: "Stalled",
+    stalled: true,
+    stalledReason,
+    allowedStallMs: RESCHEDULED_STALL_GRACE_MS,
+    writeAttempted: items.some((item) => item.writeAttempted),
+    writeMayHaveSucceeded: items.some((item) => item.writeMayHaveSucceeded),
+  };
+}
+
+function derivedOperationStall(record: OperationLedgerRecord): Record<string, unknown> | undefined {
+  return derivedUnattemptedStall(record) ?? derivedRescheduledStall(record);
+}
+
 export function operationResultView(record: OperationLedgerRecord): Record<string, unknown> {
-  const stalled = derivedUnattemptedStall(record);
+  const stalled = derivedOperationStall(record);
   return redactPublicOperationValue({
     operationId: record.operationId,
     toolName: record.toolName,
@@ -1952,6 +1982,18 @@ export function operationResultView(record: OperationLedgerRecord): Record<strin
     continuationCount: record.continuationCount,
     terminalFailureReason: record.terminalFailureReason,
     workflowId: record.workflowId,
+    continuationMechanism: record.continuationMechanism,
+    continuationInstanceId: record.continuationInstanceId,
+    schedulingAttempted: record.schedulingAttempted,
+    schedulingSucceeded: record.schedulingSucceeded,
+    schedulingError: record.schedulingError,
+    schedulingAttemptCount: record.schedulingAttemptCount,
+    wakeAttemptCount: record.wakeAttemptCount,
+    wakeDeliveryCount: record.wakeDeliveryCount,
+    lastWakeAttemptAt: record.lastWakeAttemptAt,
+    lastWakeSucceededAt: record.lastWakeSucceededAt,
+    wakeDeliveryError: record.wakeDeliveryError,
+    wakeDeliveryExhaustedAt: record.wakeDeliveryExhaustedAt,
     lastInvocationId: record.lastInvocationId,
     totals: operationTotals(record),
     summary: record.summary,
@@ -2009,7 +2051,7 @@ function redactPublicOperationValue(value: unknown, depth = 0): unknown {
 }
 
 function operationRecentView(record: OperationLedgerRecord): Record<string, unknown> {
-  const stalled = derivedUnattemptedStall(record);
+  const stalled = derivedOperationStall(record);
   return {
     operationId: sanitizeText(record.operationId),
     toolName: sanitizeText(record.toolName),
@@ -2183,7 +2225,7 @@ export class SuperOpsOperationLedger {
       let started: ReturnType<typeof recordWorkflowSchedulingSubrequest> | undefined;
       try {
         started = recordWorkflowSchedulingSubrequest();
-        await this.env.SUPEROPS_CONTINUATION_WORKFLOW!.createBatch([{
+        const created = await this.env.SUPEROPS_CONTINUATION_WORKFLOW!.createBatch([{
           id: scheduleIdentity,
           params: {
             operationId: record.operationId,
@@ -2192,6 +2234,12 @@ export class SuperOpsOperationLedger {
             scheduleIdentity,
           },
         }]);
+        const acknowledged = Array.isArray(created) && created.some((instance) =>
+          instance && instance.id === scheduleIdentity
+        );
+        if (!acknowledged) {
+          throw new Error(`Workflow createBatch did not acknowledge ${scheduleIdentity}.`);
+        }
         recordSubrequestFinish(started, "workflowCreated", true);
         return {
           ...record,

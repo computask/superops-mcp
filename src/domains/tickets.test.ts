@@ -3624,6 +3624,91 @@ describe("Tickets Domain", () => {
     });
     expect(mutationInput).not.toHaveProperty("status");
   });
+
+  it("assigns TaskGroup to an already-resolved ticket without replaying its resolve or note writes", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57402", displayId: "57402" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57402",
+          displayId: "57402",
+          subject: "Already resolved without a client",
+          status: "Resolved",
+          client: null,
+          updatedTime: "2026-07-26T09:00:00Z",
+          ...TRIAGE_TEST_CLASSIFICATION,
+        },
+      })
+      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57402",
+          displayId: "57402",
+          subject: "Already resolved without a client",
+          status: "Resolved",
+          client: {
+            accountId: "2993553194649526272",
+            name: "TaskGroup",
+          },
+          updatedTime: "2026-07-26T09:01:00Z",
+          ...TRIAGE_TEST_CLASSIFICATION,
+        },
+      });
+    mockClient.mutate.mockResolvedValueOnce({
+      updateTicket: { ticketId: "ticket-57402" },
+    });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57402"],
+      actions: [{
+        ticketNumber: "57402",
+        expectedTicketId: "ticket-57402",
+        expectedStatus: "Resolved",
+        expectedUpdatedTime: "2026-07-26T09:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        target: {
+          ...TRIAGE_TEST_CLASSIFICATION,
+          clientName: "TaskGroup",
+          clientId: "2993553194649526272",
+        },
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results).toEqual([
+      expect.objectContaining({
+        ticketNumber: "57402",
+        finalOutcome: "Left",
+        writeAttempted: true,
+        noteAdded: false,
+        verified: true,
+        physicalWrites: [{ method: "updateTicket", outcome: "Accepted" }],
+        finalState: expect.objectContaining({
+          status: "Resolved",
+          clientName: "TaskGroup",
+          clientId: "2993553194649526272",
+        }),
+      }),
+    ]);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    const mutationInput = mockClient.mutate.mock.calls[0][1].input;
+    expect(mutationInput).toEqual({
+      ticketId: "ticket-57402",
+      ...TRIAGE_TEST_CLASSIFICATION,
+      client: { accountId: "2993553194649526272" },
+    });
+    expect(mutationInput).not.toHaveProperty("status");
+    expect(mutationInput).not.toHaveProperty("resolutionCode");
+    expect(mockClient.mutate.mock.calls[0][0]).not.toContain("createTicketNote");
+  });
+
   it("adds and verifies one deduplicated private triage-summary note for a leave action", async () => {
     const triageNote = [
       "Ticket goal: Confirm the reported availability issue and route it safely.",

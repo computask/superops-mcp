@@ -676,6 +676,13 @@ async function handleInternalContinuation(
   if (schedulingPromise && executionContext) {
     executionContext.waitUntil(schedulingPromise);
   }
+  if (result.stopReason === "NotEligibleYet") {
+    return json(
+      { ok: false, retryable: true, result },
+      425,
+      { "Retry-After": "1" }
+    );
+  }
   return json({ ok: true, result });
 }
 

@@ -892,6 +892,71 @@ describe("Cloudflare Worker entrypoint", () => {
     });
   });
 
+  it("returns retryable Too Early when a Workflow wake precedes durable eligibility", async () => {
+    const operationId = "op-internal-too-early";
+    const ownerHash = stableHash("internal-too-early-owner");
+    const nextEligibleTime = "2999-07-26T11:42:39.040Z";
+    const stored = internalBudgetStopRecord(operationId, ownerHash);
+    stored.state = "Rescheduled";
+    stored.nextEligibleTime = nextEligibleTime;
+    stored.rateLimitedItems = ["59021"];
+    stored.itemStates["59021"] = {
+      ...stored.itemStates["59021"],
+      stage: "RateLimitedRescheduled",
+      observedMutationResult: "Rejected",
+      writeAttempted: true,
+      writeMayHaveSucceeded: false,
+      nextEligibleTime,
+    };
+    await runWithOperationStore({}, () => getOperationStore().put(stored));
+
+    const response = await worker.fetch(
+      new Request(`https://${INTERNAL_HOST}/internal/operations/continue`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-SuperOps-Internal-Continuation": "secret-token",
+        },
+        body: JSON.stringify({
+          toolName: "superops_tickets_apply_triage_plan",
+          operationId,
+          ownerHash,
+        }),
+      }),
+      {
+        SUPEROPS_API_TOKEN: "test-token",
+        SUPEROPS_SUBDOMAIN: "computaskltd",
+        SUPEROPS_CONTINUATION_ENABLED: "true",
+        SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+        SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
+      } as Env
+    );
+
+    expect(response.status).toBe(425);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: false,
+      retryable: true,
+      result: {
+        operationId,
+        state: "Rescheduled",
+        continuationRequired: true,
+        stopReason: "NotEligibleYet",
+      },
+    });
+    await runWithOperationStore({}, async () => {
+      await expect(getOperationStore().get(operationId, ownerHash)).resolves.toMatchObject({
+        state: "Rescheduled",
+        nextEligibleTime,
+        itemStates: {
+          "59021": {
+            stage: "RateLimitedRescheduled",
+            writeAttempted: true,
+            writeMayHaveSucceeded: false,
+          },
+        },
+      });
+    });
+  });
   it("schedules another internal hop after ContinuationRequiredBeforeItem", async () => {
     const operationId = "op-internal-before-item";
     const ownerHash = stableHash("internal-before-item-owner");

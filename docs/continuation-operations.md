@@ -39,6 +39,12 @@ Every expected candidate has a ledger item before processing begins.
 
 Mutation-start state is acknowledged before the outbound mutation. Successful response state is acknowledged before later work; `NoteAdded` includes the created note ID. A crash at any possible-write boundary resumes with reconciliation, never a blind replay. Terminal items cannot reopen, write truth cannot move backwards, and stale lease tokens cannot commit.
 
+## Workflow wake diagnostics
+
+`superops_operations_get` exposes the safe scheduling and delivery fields required to distinguish creation, wake, delivery, and execution: `continuationMechanism`, `continuationInstanceId`, `schedulingAttempted`, `schedulingSucceeded`, `schedulingError`, `schedulingAttemptCount`, `wakeAttemptCount`, `wakeDeliveryCount`, `lastWakeAttemptAt`, `lastWakeSucceededAt`, `wakeDeliveryError`, and `wakeDeliveryExhaustedAt`. A `Rescheduled` operation more than two minutes beyond `nextEligibleTime` is reported with `derivedState: "Stalled"` and a reason based on those durable counters; this projection does not mutate the ledger.
+
+Workflow batch creation is successful only when `createBatch` acknowledges the requested deterministic instance ID. A Workflow delivery that reaches the internal continuation route before the exact durable eligibility instant receives retryable HTTP 425 rather than false HTTP 200 success, so the configured Workflow retry executes it again without replaying a possible write.
+
 ## Limits, waits, and retention
 
 Committed defaults keep `ENABLE_WRITE_TOOLS=false`, `ENABLE_CUSTOM_MUTATION=false`, `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=false`, `SUPEROPS_CONTINUATION_ENABLED=false`, and `SUPEROPS_DURABLE_RETRY_ENABLED=false`. The reviewed durable apply-triage tool is allowed by the central policy even while unreviewed synchronous writes are blocked.
