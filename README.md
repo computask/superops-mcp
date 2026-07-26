@@ -395,11 +395,34 @@ Suggested Custom GPT instruction:
 For ticket triage, call `superops_tickets_triage_snapshot` with the exact configured status queue requested by the user and follow every execution-safe page until `pagination.hasMore` is false. Treat the aggregated candidate lists as fixed. Do not write changes until a proposed action table has been presented and approved. Every ticket from the snapshot pages must appear in the final report with the required classification target and final outcome. Only `Resolved` and `Awaiting Engineer` may be proposed as status changes; a `leave` action retains its current status while applying classification. When the canonical snapshot proves that a ticket has no client, explicitly target `clientName: "TaskGroup"` and `clientId: "2993553194649526272"` and show that assignment in the approval table. Preserve every proven non-null client. If client retrieval is unavailable, skip rather than guessing.
 ```
 
+### Scheduled New Calls Triage
+
+The standing daily New Calls workflow uses the same public mutation with
+`policyMode: "scheduled-new-calls-v1"`; it does not add or expose another write
+tool. This mode is intended for a separately authorised scheduled ChatGPT task
+and does not pause for a per-ticket approval table. Production rejects the whole
+submission before operation creation or SuperOps access unless actions exactly
+cover the fixed snapshot and every action has verified evidence, immutable New
+Calls expectations, full classification, an allowed policy disposition, client
+preservation or the exact TaskGroup fallback, and a structured private triage
+note. It prohibits skips, public notes, technician/group assignment, unsafe
+overrides, unsupported statuses, and stop-on-first-failure execution.
+
+The exact scheduled task instruction is maintained in
+[`docs/scheduled-new-calls-triage.md`](docs/scheduled-new-calls-triage.md). It
+requires complete pagination/evidence recovery before mutation, deterministic
+reuse of an accurate existing private triage summary for note dedupe, one full
+submission, and durable follow-through or same-operation compact recovery until
+terminal.
+
 ### Approved Triage Plan Execution
 
 `superops_tickets_apply_triage_plan` is a write/high-risk Phase 3 tool for
-applying a user-approved plan to a fixed snapshot candidate set. Use it only
-after the Phase 2 pre-write table has been approved. The tool requires
+applying a fixed snapshot candidate set. In manual mode, use it only after the
+Phase 2 pre-write table has been approved. The separately configured
+`scheduled-new-calls-v1` mode uses the standing policy authorization above and
+must satisfy its stricter production gate instead of pausing for per-ticket
+approval. The tool requires
 `expectedCandidateTicketNumbers` and returns a result for every
 expected ticket even when no action is supplied. To resume an existing nonterminal
 operation without reconstructing its approved payload, call the same tool with only

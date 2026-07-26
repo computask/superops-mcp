@@ -1498,6 +1498,7 @@ describe("Cloudflare Worker entrypoint", () => {
             name: "superops_tickets_apply_triage_plan",
             arguments: {
               batchId: "batch-1",
+              policyMode: "scheduled-new-calls-v1",
               expectedCandidateTicketNumbers: ["57400"],
               dryRun: false,
               verify: true,
@@ -1506,6 +1507,7 @@ describe("Cloudflare Worker entrypoint", () => {
                 {
                   ticketNumber: "57400",
                   action: "addNote",
+                  policyDisposition: "resolve_no_action",
                   note: "Sensitive approved note body",
                   contentVerified: true,
                 },
@@ -1530,6 +1532,8 @@ describe("Cloudflare Worker entrypoint", () => {
           candidateCount: 1,
           ticketNumbers: ["57400"],
           actionTypes: ["addNote"],
+          policyMode: "scheduled-new-calls-v1",
+          policyDispositions: ["resolve_no_action"],
           dryRun: false,
           verify: true,
           fallbackAllowed: true,

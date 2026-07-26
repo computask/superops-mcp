@@ -38,6 +38,8 @@ export interface AuditMetadata {
     candidateCount?: unknown;
     ticketNumbers?: unknown;
     actionTypes?: unknown;
+    policyMode?: unknown;
+    policyDispositions?: unknown;
     dryRun?: unknown;
     verify?: unknown;
     fallbackAllowed?: unknown;
@@ -349,6 +351,16 @@ export function toolAuditMetadata(
           .filter(Boolean)
           .slice(0, 100)
       : undefined;
+    const policyDispositions = Array.isArray(args.actions)
+      ? args.actions
+          .map((action) =>
+            typeof action === "object" && action !== null
+              ? (action as Record<string, unknown>).policyDisposition
+              : undefined
+          )
+          .filter(Boolean)
+          .slice(0, 100)
+      : undefined;
     return {
       triagePlan: {
         batchId: args.batchId,
@@ -357,6 +369,8 @@ export function toolAuditMetadata(
           : undefined,
         ticketNumbers,
         actionTypes,
+        policyMode: args.policyMode,
+        policyDispositions,
         dryRun: args.dryRun ?? false,
         verify: args.verify ?? true,
         fallbackAllowed: args.allowResolveFullFallbackToUpdate ?? false,

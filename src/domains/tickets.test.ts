@@ -193,6 +193,13 @@ const TRIAGE_TEST_RESOLUTION_CLASSIFICATION = {
   cause: "No Fault Found",
   resolutionCode: "Permanent Fix",
 };
+const SCHEDULED_TRIAGE_TEST_NOTE = [
+  "TRIAGE SUMMARY",
+  "Ticket goal: Route the ticket under the standing New Calls policy.",
+  "What needs to be known: The safe evidence was fully retrieved and assessed.",
+  "Next step: Apply the approved policy outcome.",
+  "When: During this scheduled triage run.",
+].join("\n");
 
 const RESOLVED_CLASSIFICATION = {
   priority: "Very Low",
@@ -4059,6 +4066,103 @@ describe("Tickets Domain", () => {
       failureStage: "validateUpdatedTime",
       writeAttempted: false,
     });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unknown scheduled policy mode before any read, ledger write, or mutation", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("policyMode must be one of");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a partial scheduled New Calls batch before any read or write", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v1",
+      expectedCandidateTicketNumbers: ["57400", "57401"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        note: SCHEDULED_TRIAGE_TEST_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("exactly one action for every fixed candidate");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects missing structured private notes and unsafe scheduled overrides before any read or write", async () => {
+    const domain = getTicketsTools();
+    const baseAction = {
+      ticketNumber: "57400",
+      expectedTicketId: "ticket-57400",
+      expectedSubject: "Customer request",
+      expectedStatus: "New Calls",
+      expectedUpdatedTime: "2026-06-25T10:00:00Z",
+      contentVerified: true,
+      action: "leave",
+      policyDisposition: "customer_request",
+      isPublicNote: false,
+      target: { ...TRIAGE_TEST_CLASSIFICATION },
+    };
+    const missingNote = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v1",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [baseAction],
+    });
+    const unsafeOverride = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v1",
+      expectedCandidateTicketNumbers: ["57400"],
+      allowWriteIfUpdatedTimeChanged: true,
+      actions: [{ ...baseAction, note: SCHEDULED_TRIAGE_TEST_NOTE }],
+    });
+
+    expect(missingNote.isError).toBe(true);
+    expect(missingNote.content[0].text).toContain("TRIAGE SUMMARY note is required");
+    expect(unsafeOverride.isError).toBe(true);
+    expect(unsafeOverride.content[0].text).toContain("prohibits unsafe write overrides");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("forces obvious server-down notifications to remain in New Calls", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v1",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "#Asset Name is down",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "update",
+        policyDisposition: "engineer_review",
+        note: SCHEDULED_TRIAGE_TEST_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
+      }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("must use server_down with leave");
+    expect(mockClient.query).not.toHaveBeenCalled();
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 

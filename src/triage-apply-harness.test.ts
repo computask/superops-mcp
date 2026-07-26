@@ -46,6 +46,14 @@ const RESOLVE_TARGET = {
   suppressCloseNotification: true,
 } as const;
 
+const SCHEDULED_TRIAGE_NOTE = [
+  "TRIAGE SUMMARY",
+  "Ticket goal: Close an unsolicited sales message with no customer action required.",
+  "What needs to be known: JUNK: the message is an unsolicited sales approach.",
+  "Next step: Resolve without customer contact or close notification.",
+  "When: Now; no further action unless new evidence is received.",
+].join("\n");
+
 const CANONICAL_PRIVATE_JUNK = {
   id: "8656361040688640000",
   type: "note",
@@ -322,7 +330,7 @@ function ticketFields() {
 class FakeSuperOps {
   readonly ticket: FakeTicket;
   readonly visibleNotes: unknown[];
-  private pendingNote: typeof RAW_GRAPHQL_PRIVATE_JUNK | undefined;
+  private pendingNote: Record<string, unknown> | undefined;
   private remainingVisibilityMisses: number;
   private remainingCanonicalTicketReadRateLimits: number;
   private updatedSequence = 0;
@@ -445,7 +453,8 @@ class FakeSuperOps {
       if (fault === "rateLimit") return this.rateLimitResponse();
       if (fault === "graphqlReject") return graphQlError("createTicketNote");
       if (fault !== "timeoutNoApply") {
-        this.pendingNote = { ...RAW_GRAPHQL_PRIVATE_JUNK };
+        const content = typeof input.content === "string" ? input.content : "";
+        this.pendingNote = { ...RAW_GRAPHQL_PRIVATE_JUNK, content: `<html>${content}</html>` };
         if (this.options.noteChangesUpdatedTime) this.ticket.updatedTime = this.nextUpdatedTime();
       }
       if (fault === "timeoutApply" || fault === "timeoutNoApply") {
@@ -520,6 +529,16 @@ function resolveAction() {
     action: "resolve",
     note: "JUNK",
     target: { ...RESOLVE_TARGET },
+  };
+}
+
+function scheduledResolveAction() {
+  return {
+    ...resolveAction(),
+    expectedSubject: "Anonymised junk call",
+    policyDisposition: "resolve_no_action",
+    note: SCHEDULED_TRIAGE_NOTE,
+    isPublicNote: false,
   };
 }
 
@@ -812,6 +831,60 @@ describe("deterministic end-to-end apply-triage harness", () => {
       priority: "Very Low",
       ...CLASSIFICATION,
     });
+    harness.assertGlobalInvariants(record);
+  });
+
+  it("scheduled policy survives delayed visibility continuation without duplicating any write", async () => {
+    const harness = new TriageHarness("scheduled-policy", { noteVisibilityMisses: 2 });
+    const initial = await harness.invoke({
+      policyMode: "scheduled-new-calls-v1",
+      actions: [scheduledResolveAction()],
+    });
+    const stored = await harness.record();
+
+    expect(firstResult(initial.parsed)).toMatchObject({
+      finalOutcome: "NoteVisibilityPending",
+      continuationRequired: true,
+    });
+    expect(stored.operationRequest).toMatchObject({
+      policyMode: "scheduled-new-calls-v1",
+      actions: [{ policyDisposition: "resolve_no_action", isPublicNote: false }],
+    });
+
+    const terminal = await harness.resumeUntilTerminal();
+    expect(terminal.state).toBe("Completed");
+    expect(itemResult(terminal)).toMatchObject({
+      finalOutcome: "Resolved",
+      noteVerifiedAfterDelay: true,
+      finalVerificationState: "Verified",
+    });
+    expect(harness.superops.ticket).toMatchObject({
+      status: "Resolved",
+      client: { accountId: CLIENT_ID, name: "TaskGroup" },
+      ...CLASSIFICATION,
+    });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(1);
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
+  });
+
+  it("scheduled policy blocks a null-client ticket unless the exact TaskGroup target is supplied", async () => {
+    const harness = new TriageHarness("scheduled-client-guard");
+    const scheduled = scheduledResolveAction();
+    const action = { ...scheduled, target: { ...scheduled.target, clientId: "wrong-client" } };
+    const { parsed } = await harness.invoke({
+      policyMode: "scheduled-new-calls-v1",
+      actions: [action],
+    });
+    const record = await harness.record();
+
+    expect(firstResult(parsed)).toMatchObject({
+      finalOutcome: "Blocked",
+      failureStage: "clientAssignment",
+      writeAttempted: false,
+    });
+    expect(harness.history.kinds("superops.write.")).toEqual([]);
     harness.assertGlobalInvariants(record);
   });
 

@@ -650,6 +650,13 @@ interface ResolveFullParams extends TicketClassificationParams {
 
 
 type TriagePlanActionType = "resolve" | "update" | "addNote" | "leave" | "skip";
+type TriagePolicyMode = "scheduled-new-calls-v1";
+type TriagePolicyDisposition =
+  | "customer_request"
+  | "server_down"
+  | "manual_intake"
+  | "engineer_review"
+  | "resolve_no_action";
 type TriageFinalOutcome =
   | "Resolved"
   | "Updated"
@@ -678,6 +685,7 @@ interface TriagePlanAction {
   expectedUpdatedTime?: string;
   contentVerified?: boolean;
   action: TriagePlanActionType;
+  policyDisposition?: TriagePolicyDisposition;
   reason?: string;
   note?: string;
   noteFingerprint?: string;
@@ -695,6 +703,7 @@ interface TriagePlanAction {
 
 interface ApplyTriagePlanParams {
   batchId?: string;
+  policyMode?: TriagePolicyMode;
   expectedCandidateTicketNumbers?: string[];
   actions?: TriagePlanAction[];
   dryRun?: boolean;
@@ -707,6 +716,17 @@ interface ApplyTriagePlanParams {
 }
 
 const TRIAGE_PLAN_ACTION_TYPES = ["resolve", "update", "addNote", "leave", "skip"] as const;
+const TRIAGE_POLICY_MODES = ["scheduled-new-calls-v1"] as const;
+const TRIAGE_POLICY_DISPOSITIONS = [
+  "customer_request",
+  "server_down",
+  "manual_intake",
+  "engineer_review",
+  "resolve_no_action",
+] as const;
+const SCHEDULED_NEW_CALLS_POLICY: TriagePolicyMode = "scheduled-new-calls-v1";
+const SCHEDULED_TRIAGE_TASKGROUP_NAME = "TaskGroup";
+const SCHEDULED_TRIAGE_TASKGROUP_ID = "2993553194649526272";
 const TRIAGE_PLAN_MUTABLE_STATUSES = ["Resolved", "Awaiting Engineer"] as const;
 const TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS = [
   "impact",
@@ -758,6 +778,7 @@ const TRIAGE_PLAN_ACTION_FIELD_NAMES = [
   "expectedUpdatedTime",
   "contentVerified",
   "action",
+  "policyDisposition",
   "reason",
   "note",
   "noteFingerprint",
@@ -807,6 +828,11 @@ const TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES = {
   contentVerified: {
     type: "boolean",
     description: "Required true for mutating actions unless an explicit override is supplied.",
+  },
+  policyDisposition: {
+    type: "string",
+    enum: [...TRIAGE_POLICY_DISPOSITIONS],
+    description: "Standing scheduled-triage disposition that determines whether the ticket stays in New Calls, moves to Awaiting Engineer, or resolves.",
   },
   allowWriteIfUpdatedTimeChanged: {
     type: "boolean",
@@ -1412,6 +1438,13 @@ function validateTriagePlanActionShape(rawAction: unknown, index: number): strin
   ) {
     return `${label}.action must be one of: ${TRIAGE_PLAN_ACTION_TYPES.join(", ")}.`;
   }
+  if (
+    action.policyDisposition !== undefined &&
+    (typeof action.policyDisposition !== "string" ||
+      !(TRIAGE_POLICY_DISPOSITIONS as readonly string[]).includes(action.policyDisposition))
+  ) {
+    return `${label}.policyDisposition must be one of: ${TRIAGE_POLICY_DISPOSITIONS.join(", ")}.`;
+  }
 
   const target = action.target === undefined ? undefined : jsonRecord(action.target);
   if (action.target !== undefined && !target) {
@@ -1483,6 +1516,116 @@ function validateTriagePlanActions(actions: unknown[]): string | undefined {
   for (const [index, action] of actions.entries()) {
     const validationError = validateTriagePlanActionShape(action, index);
     if (validationError) return validationError;
+  }
+}
+
+const SCHEDULED_TRIAGE_NOTE_SECTIONS = [
+  "Ticket goal:",
+  "What needs to be known:",
+  "Next step:",
+  "When:",
+] as const;
+
+function scheduledTriageNoteValidation(note: unknown): string | undefined {
+  if (typeof note !== "string" || note.trim().length === 0) {
+    return "a non-empty private TRIAGE SUMMARY note is required";
+  }
+  const lines = note.replace(/\r\n?/g, "\n").split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines[0] !== "TRIAGE SUMMARY") {
+    return "the private note must start with TRIAGE SUMMARY";
+  }
+  for (const section of SCHEDULED_TRIAGE_NOTE_SECTIONS) {
+    const line = lines.find((candidate) => candidate.startsWith(section));
+    if (!line || line.slice(section.length).trim().length === 0) {
+      return `the private note requires a non-empty ${section} section`;
+    }
+  }
+}
+
+function looksLikeServerDownSubject(subject: string): boolean {
+  const normalized = subject.toLowerCase().replace(/\s+/g, " ").trim();
+  const actor = "(?:server|asset|agent|device|host)";
+  const failure = "(?:is down|down|offline|not responding|disconnected)";
+  return new RegExp(`\\b${actor}\\b.*\\b${failure}\\b`).test(normalized) ||
+    new RegExp(`\\b${failure}\\b.*\\b${actor}\\b`).test(normalized);
+}
+
+function validateScheduledNewCallsPolicy(
+  request: ApplyTriagePlanParams,
+  expected: string[],
+  actions: TriagePlanAction[]
+): string | undefined {
+  if (request.policyMode !== SCHEDULED_NEW_CALLS_POLICY) return undefined;
+
+  if (actions.length !== expected.length) {
+    return "scheduled-new-calls-v1 requires exactly one action for every fixed candidate.";
+  }
+  const actionNumbers = actions.map((action) => normaliseTicketNumber(action.ticketNumber));
+  if (new Set(actionNumbers).size !== actionNumbers.length) {
+    return "scheduled-new-calls-v1 actions must not contain duplicate ticket numbers.";
+  }
+  if (expected.some((ticketNumber) => !actionNumbers.includes(ticketNumber)) ||
+      actionNumbers.some((ticketNumber) => !expected.includes(ticketNumber))) {
+    return "scheduled-new-calls-v1 actions must exactly cover the fixed candidate set.";
+  }
+  if (request.verify === false || request.dedupeNotes === false || request.stopOnFirstFailure === true ||
+      request.allowResolveFullFallbackToUpdate === true || request.allowWriteIfUpdatedTimeChanged === true ||
+      request.allowWriteWithoutVerifiedContent === true) {
+    return "scheduled-new-calls-v1 requires verification and note dedupe, processes all candidates, and prohibits unsafe write overrides.";
+  }
+
+  const expectedActionByDisposition: Record<TriagePolicyDisposition, TriagePlanActionType> = {
+    customer_request: "leave",
+    server_down: "leave",
+    manual_intake: "leave",
+    engineer_review: "update",
+    resolve_no_action: "resolve",
+  };
+  for (const [index, action] of actions.entries()) {
+    const label = `actions[${index}]`;
+    if (!action.policyDisposition ||
+        !(TRIAGE_POLICY_DISPOSITIONS as readonly string[]).includes(action.policyDisposition)) {
+      return `${label}.policyDisposition is required for scheduled-new-calls-v1.`;
+    }
+    if (action.action !== expectedActionByDisposition[action.policyDisposition]) {
+      return `${label}.action does not match policyDisposition ${action.policyDisposition}.`;
+    }
+    if (typeof action.expectedTicketId !== "string" || action.expectedTicketId.trim().length === 0 ||
+        typeof action.expectedSubject !== "string" || action.expectedSubject.trim().length === 0 ||
+        action.expectedStatus !== "New Calls" ||
+        typeof action.expectedUpdatedTime !== "string" || action.expectedUpdatedTime.trim().length === 0 ||
+        action.contentVerified !== true) {
+      return `${label} requires expectedTicketId, expectedSubject, expectedStatus New Calls, expectedUpdatedTime, and contentVerified=true.`;
+    }
+    const noteError = scheduledTriageNoteValidation(action.note);
+    if (noteError) return `${label}: ${noteError}.`;
+    if (action.isPublicNote !== false) {
+      return `${label}.isPublicNote must be explicitly false.`;
+    }
+    if (action.allowResolveFullFallbackToUpdate === true ||
+        action.allowWriteIfUpdatedTimeChanged === true ||
+        action.allowWriteWithoutVerifiedContent === true) {
+      return `${label} cannot enable a write override in scheduled-new-calls-v1.`;
+    }
+    if (action.target?.techGroupName !== undefined) {
+      return `${label}.target.techGroupName is not allowed; scheduled triage never assigns a technician or technician group.`;
+    }
+    const hasClientName = typeof action.target?.clientName === "string" && action.target.clientName.trim().length > 0;
+    const hasClientId = typeof action.target?.clientId === "string" && action.target.clientId.trim().length > 0;
+    if (hasClientName !== hasClientId) {
+      return `${label}.target.clientName and clientId must be supplied together.`;
+    }
+    if (action.action === "resolve" &&
+        (action.target?.status !== "Resolved" || action.target.suppressCloseNotification !== true)) {
+      return `${label} resolve requires status Resolved and suppressCloseNotification=true.`;
+    }
+    if (action.action === "update" && action.target?.status !== "Awaiting Engineer") {
+      return `${label} update requires status Awaiting Engineer.`;
+    }
+    if (looksLikeServerDownSubject(action.expectedSubject) &&
+        (action.policyDisposition !== "server_down" || action.action !== "leave")) {
+      return `${label} is an obvious server-down notification and must use server_down with leave.`;
+    }
   }
 }
 
@@ -3369,6 +3512,38 @@ function ticketClientAccountId(ticket: Ticket): string | undefined {
 
 function ticketTechGroupName(ticket: Ticket): string | undefined {
   return readableString(ticket.techGroup, ["name", "groupName"]);
+}
+
+function scheduledPolicyClientFailure(
+  policyMode: TriagePolicyMode | undefined,
+  action: TriagePlanAction,
+  ticket: Ticket
+): string | undefined {
+  if (policyMode !== SCHEDULED_NEW_CALLS_POLICY ||
+      !(action.action === "resolve" || action.action === "update" || action.action === "leave")) {
+    return undefined;
+  }
+
+  const targetName = action.target?.clientName?.trim();
+  const targetId = action.target?.clientId?.trim();
+  if (ticket.client === null) {
+    if (targetName !== SCHEDULED_TRIAGE_TASKGROUP_NAME || targetId !== SCHEDULED_TRIAGE_TASKGROUP_ID) {
+      return `A scheduled New Calls ticket with no client must target ${SCHEDULED_TRIAGE_TASKGROUP_NAME} (${SCHEDULED_TRIAGE_TASKGROUP_ID}).`;
+    }
+    return undefined;
+  }
+  if (ticket.client === undefined) {
+    return "Scheduled New Calls triage requires a canonical client result; unavailable client data cannot be treated as no client.";
+  }
+
+  const currentName = ticketClientName(ticket);
+  const currentId = ticketClientAccountId(ticket);
+  if (!currentName || !currentId) {
+    return "Scheduled New Calls triage requires both the existing client name and account ID before writing.";
+  }
+  if ((targetName || targetId) && (targetName !== currentName || targetId !== currentId)) {
+    return "Scheduled New Calls triage must preserve the ticket's existing client; a different or partial client target is not allowed.";
+  }
 }
 
 
@@ -5425,6 +5600,7 @@ function serializableApplyTriageRequest(
     kind: "applyTriagePlan",
     schemaVersion: 1,
     batchId: request.batchId,
+    policyMode: request.policyMode,
     expectedCandidateTicketNumbers: expected,
     actions: Array.isArray(request.actions)
       ? request.actions.map((action) => ({
@@ -5440,6 +5616,7 @@ function serializableApplyTriageRequest(
           expectedUpdatedTime: action.expectedUpdatedTime,
           contentVerified: action.contentVerified,
           action: action.action,
+          policyDisposition: action.policyDisposition,
           noteFingerprint: action.note
             ? normalizedNoteFingerprint(action.note)
             : action.noteFingerprint,
@@ -5466,6 +5643,9 @@ function operationRequestApplyTriageParams(
   if (!request || request.kind !== "applyTriagePlan") return undefined;
   return {
     batchId: typeof request.batchId === "string" ? request.batchId : undefined,
+    policyMode: request.policyMode === SCHEDULED_NEW_CALLS_POLICY
+      ? SCHEDULED_NEW_CALLS_POLICY
+      : undefined,
     expectedCandidateTicketNumbers: Array.isArray(request.expectedCandidateTicketNumbers)
       ? request.expectedCandidateTicketNumbers.map((value) => String(value))
       : [],
@@ -5508,6 +5688,7 @@ function applyTriageOriginalRequestHash(
 ): string {
   return stableHash({
     batchId: request.batchId,
+    policyMode: request.policyMode,
     expectedCandidateTicketNumbers: expected,
     actions: Array.isArray(request.actions)
       ? request.actions.map((action) => ({
@@ -5533,6 +5714,7 @@ function isCompactStoredApplyTriageRecovery(
     !["Running", "ContinuationRequired", "Rescheduled"].includes(record.state)
   ) return false;
   if ([
+    request.policyMode,
     request.dryRun,
     request.verify,
     request.dedupeNotes,
@@ -5807,6 +5989,7 @@ async function applyApprovedTriageAction(params: {
   dryRun: boolean;
   verify: boolean;
   dedupeNotes: boolean;
+  policyMode?: TriagePolicyMode;
   allowResolveFullFallbackToUpdate: boolean;
   allowWriteIfUpdatedTimeChanged: boolean;
   allowWriteWithoutVerifiedContent: boolean;
@@ -5893,6 +6076,15 @@ async function applyApprovedTriageAction(params: {
     result.finalOutcome = "Blocked";
     result.failureStage = "contentVerification";
     result.failureReason = "Mutating action requires contentVerified=true or allowWriteWithoutVerifiedContent=true.";
+    return result;
+  }
+
+  const policyClientFailure = scheduledPolicyClientFailure(params.policyMode, action, ticket);
+  if (policyClientFailure) {
+    result.finalOutcome = "Blocked";
+    result.writeMayHaveSucceeded = false;
+    result.failureStage = "clientAssignment";
+    result.failureReason = policyClientFailure;
     return result;
   }
 
@@ -7081,6 +7273,7 @@ for (const stage of remainingStages) {
               dryRun: storedParams.dryRun ?? false,
               verify: storedParams.verify ?? true,
               dedupeNotes: storedParams.dedupeNotes ?? true,
+              policyMode: storedParams.policyMode,
               allowResolveFullFallbackToUpdate:
                 storedParams.allowResolveFullFallbackToUpdate ?? false,
               allowWriteIfUpdatedTimeChanged:
@@ -7434,13 +7627,18 @@ export function getTicketsTools(): DomainTools {
       },      {
         name: "superops_tickets_apply_triage_plan",
         description:
-          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer.",
+          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. scheduled-new-calls-v1 enforces a complete standing-policy batch with classification, client assignment, private structured notes, safe routing, verification, dedupe, and no unsafe overrides. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer.",
         inputSchema: {
           type: "object",
           properties: {
             batchId: {
               type: "string",
               description: "Optional batch identifier. To resume an existing nonterminal operation, send its exact expectedCandidateTicketNumbers and omit actions and override flags.",
+            },
+            policyMode: {
+              type: "string",
+              enum: [...TRIAGE_POLICY_MODES],
+              description: "Standing scheduled New Calls contract. Requires an exact complete candidate/action set and rejects the entire submission before any SuperOps work when an invariant is missing.",
             },
             expectedCandidateTicketNumbers: {
               type: "array",
@@ -8237,6 +8435,11 @@ export function getTicketsTools(): DomainTools {
           }
           case "superops_tickets_apply_triage_plan": {
             const params = args as ApplyTriagePlanParams;
+            const rawPolicyMode = (args as { policyMode?: unknown }).policyMode;
+            if (rawPolicyMode !== undefined &&
+                !(TRIAGE_POLICY_MODES as readonly unknown[]).includes(rawPolicyMode)) {
+              return errorResult(`policyMode must be one of: ${TRIAGE_POLICY_MODES.join(", ")}.`);
+            }
             const expected = Array.isArray(params.expectedCandidateTicketNumbers)
               ? params.expectedCandidateTicketNumbers
                   .map((ticketNumber) => normaliseTicketNumber(ticketNumber))
@@ -8267,6 +8470,10 @@ export function getTicketsTools(): DomainTools {
             }
             if (new Set(expected).size !== expected.length) {
               return errorResult("expectedCandidateTicketNumbers must not contain duplicates.");
+            }
+            const scheduledPolicyError = validateScheduledNewCallsPolicy(params, expected, actions);
+            if (scheduledPolicyError) {
+              return errorResult(scheduledPolicyError);
             }
 
             const diagnosticsBefore = executionDiagnostics();
