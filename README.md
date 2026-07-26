@@ -423,6 +423,8 @@ subcategory; cause is optional when known, and resolution code is prohibited.
 `leave` is a classification-only write that retains the current status. Status
 changes are closed to `Resolved` for resolve actions and `Awaiting Engineer` for
 update actions; other target statuses are rejected before any SuperOps read or write.
+When the canonical ticket has `client: null`, resolve, update, and leave actions are blocked before any field-option read, mutation-stage checkpoint, note check, or write unless both `clientName` and `clientId` are explicitly approved.
+
 For a ticket already resolved by an approved plan that omitted a required client, do not replay the resolve action or amend its durable operation. Take a fresh safe snapshot and propose a separate `leave` action with the expected current `Resolved` status, the existing classification fields, and the explicit client name/ID. `leave` applies only the approved classification/client correction and retains `Resolved`; omit any already-created note.
 
 `dryRun=true` performs validation and returns intended outcomes without writing.

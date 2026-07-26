@@ -5896,6 +5896,20 @@ async function applyApprovedTriageAction(params: {
     return result;
   }
 
+  const requiresApprovedClientTarget = ticket.client === null &&
+    (action.action === "resolve" || action.action === "update" || action.action === "leave");
+  const hasApprovedClientTarget = typeof action.target?.clientName === "string" &&
+    action.target.clientName.trim().length > 0 &&
+    typeof action.target.clientId === "string" &&
+    action.target.clientId.trim().length > 0;
+  if (requiresApprovedClientTarget && !hasApprovedClientTarget) {
+    result.finalOutcome = "Blocked";
+    result.writeMayHaveSucceeded = false;
+    result.failureStage = "clientAssignment";
+    result.failureReason = "A ticket with no client requires an explicitly approved clientName and clientId before triage can write.";
+    return result;
+  }
+
   if (noteBodyForPlan(action.note) && action.isPublicNote === true) {
     result.finalOutcome = "Blocked";
     result.failureStage = "notePrivacy";

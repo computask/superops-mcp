@@ -3625,6 +3625,58 @@ describe("Tickets Domain", () => {
     expect(mutationInput).not.toHaveProperty("status");
   });
 
+  it("blocks a null-client triage write unless the approved target includes client name and ID", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ticket-57402-blocked", displayId: "57402" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ticket-57402-blocked",
+          displayId: "57402",
+          subject: "Null-client resolve",
+          status: "New Calls",
+          client: null,
+          updatedTime: "2026-07-26T08:59:00Z",
+        },
+      });
+
+    const domain = getTicketsTools();
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57402"],
+      actions: [{
+        ticketNumber: "57402",
+        expectedTicketId: "ticket-57402-blocked",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T08:59:00Z",
+        contentVerified: true,
+        action: "resolve",
+        target: {
+          status: "Resolved",
+          ...TRIAGE_TEST_RESOLUTION_CLASSIFICATION,
+          suppressCloseNotification: true,
+        },
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results).toEqual([
+      expect.objectContaining({
+        ticketNumber: "57402",
+        finalOutcome: "Blocked",
+        failureStage: "clientAssignment",
+        failureReason: expect.stringContaining("clientName and clientId"),
+        writeAttempted: false,
+        physicalWrites: [],
+      }),
+    ]);
+    expect(mockClient.query).toHaveBeenCalledTimes(2);
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
   it("assigns TaskGroup to an already-resolved ticket without replaying its resolve or note writes", async () => {
     mockClient.query
       .mockResolvedValueOnce({
