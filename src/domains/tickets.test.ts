@@ -4502,12 +4502,12 @@ describe("Tickets Domain", () => {
     });
   });
 
-  it("resumes a generated durable operation by batchId without replaying completed items", async () => {
-    const operationId = "legacy-generated-operation-recovery";
+  it("resumes an exact generated operation payload by batchId", async () => {
+    const operationId = "exact-generated-operation-recovery";
     const expectedCandidateTicketNumbers = ["59009", "59012"];
 
     await runWithOperationStore({}, async () => {
-      const first = await withSuccessfulContinuationScheduling(() =>
+      await withSuccessfulContinuationScheduling(() =>
         runWithExecutionConfig(
           { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
           () => runWithExecutionContext(
@@ -4515,6 +4515,87 @@ describe("Tickets Domain", () => {
             () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
               expectedCandidateTicketNumbers,
               actions: [],
+            }),
+            operationId
+          )
+        )
+      );
+
+      const recovered = await runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: operationId,
+          expectedCandidateTicketNumbers,
+          actions: [],
+        })
+      );
+      const recoveredParsed = JSON.parse(recovered.content[0].text);
+      const terminal = await getOperationStore().get(operationId, currentOwnerHash());
+
+      expect(recovered.isError).not.toBe(true);
+      expect(recoveredParsed.operation).toMatchObject({
+        operationId,
+        complete: true,
+        continuationRequired: false,
+        state: "Completed",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+      });
+      expect(terminal).toMatchObject({
+        state: "Completed",
+        skippedItems: ["59009", "59012"],
+        pendingItems: [],
+      });
+      expect(mockClient.query).not.toHaveBeenCalled();
+      expect(mockClient.mutate).not.toHaveBeenCalled();
+    });
+  });
+
+  it("resumes a stored approved operation from a compact batch envelope without replay", async () => {
+    const operationId = "legacy-generated-operation-recovery";
+    const expectedCandidateTicketNumbers = ["59009", "59012"];
+    const approvedActions = [
+      { ticketNumber: "59009", contentVerified: false, action: "skip", reason: "Approved skip one." },
+      { ticketNumber: "59012", contentVerified: false, action: "skip", reason: "Approved skip two." },
+    ];
+    const durable = ownerScopedDurableNamespaceForTickets();
+    const ticketReads: string[] = [];
+    mockClient.query.mockImplementation(async (
+      query: string,
+      variables?: { input?: { condition?: { value?: string }; ticketId?: string } }
+    ) => {
+      if (query.includes("getTicketList")) {
+        const ticketNumber = String(variables?.input?.condition?.value ?? "");
+        ticketReads.push(`list:${ticketNumber}`);
+        return {
+          getTicketList: {
+            tickets: [{ ticketId: `ticket-${ticketNumber}`, displayId: ticketNumber }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        };
+      }
+      const ticketId = String(variables?.input?.ticketId ?? "");
+      const ticketNumber = ticketId.replace(/^ticket-/, "");
+      ticketReads.push(`ticket:${ticketNumber}`);
+      return {
+        getTicket: {
+          ticketId,
+          displayId: ticketNumber,
+          status: "New Calls",
+          updatedTime: "2026-07-26T09:00:00.000",
+        },
+      };
+    });
+
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, async () => {
+      const first = await withSuccessfulContinuationScheduling(() =>
+        runWithExecutionConfig(
+          { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
+          () => runWithExecutionContext(
+            "superops_tickets_apply_triage_plan",
+            () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+              expectedCandidateTicketNumbers,
+              actions: approvedActions,
             }),
             operationId
           )
@@ -4541,12 +4622,40 @@ describe("Tickets Domain", () => {
         },
       });
 
+      const changedCandidateSet = await runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: operationId,
+          expectedCandidateTicketNumbers: [...expectedCandidateTicketNumbers].reverse(),
+        })
+      );
+      expect(changedCandidateSet.isError).toBe(true);
+      expect(changedCandidateSet.content[0].text).toContain(
+        "already exists with different ownership or approved input"
+      );
+      await expect(getOperationStore().get(operationId, currentOwnerHash())).resolves.toMatchObject({
+        state: "ContinuationRequired",
+        pendingItems: ["59012"],
+      });
+
+      const changedFlags = await runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: operationId,
+          expectedCandidateTicketNumbers,
+          verify: true,
+        })
+      );
+      expect(changedFlags.isError).toBe(true);
+      expect(changedFlags.content[0].text).toContain(
+        "already exists with different ownership or approved input"
+      );
+
       const recovered = await runWithExecutionContext(
         "superops_tickets_apply_triage_plan",
         () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
           batchId: operationId,
           expectedCandidateTicketNumbers,
-          actions: [],
         })
       );
       const recoveredParsed = JSON.parse(recovered.content[0].text);
@@ -4570,22 +4679,14 @@ describe("Tickets Domain", () => {
           "59012": { stage: "Skipped", retryCount: 0, writeAttempted: false },
         },
       });
-      expect(mockClient.query).not.toHaveBeenCalled();
+      expect(ticketReads).toEqual([
+        "list:59009",
+        "ticket:59009",
+        "list:59012",
+        "ticket:59012",
+      ]);
       expect(mockClient.mutate).not.toHaveBeenCalled();
 
-      const changedInput = await runWithExecutionContext(
-        "superops_tickets_apply_triage_plan",
-        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
-          batchId: operationId,
-          expectedCandidateTicketNumbers,
-          actions: [],
-          dryRun: true,
-        })
-      );
-      expect(changedInput.isError).toBe(true);
-      expect(changedInput.content[0].text).toContain(
-        "already exists with different ownership or approved input"
-      );
     });
   });
 

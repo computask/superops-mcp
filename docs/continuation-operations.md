@@ -16,6 +16,19 @@ The Durable Object owns operation identity, owner hash, exact candidates, claims
 
 Use durable apply-triage as the primary production write path. Do not enable a synchronous mutation merely to bypass its missing durable adapter.
 
+## Compact recovery envelope
+
+If an existing owner-scoped operation is nonterminal and automatic delivery has not advanced it, call `superops_tickets_apply_triage_plan` with only the stored operation ID and its exact ordered candidate list:
+
+```json
+{
+  "batchId": "existing-operation-id",
+  "expectedCandidateTicketNumbers": ["ticket-1", "ticket-2"]
+}
+```
+
+Omit `actions`, `dryRun`, `verify`, `dedupeNotes`, `stopOnFirstFailure`, and every override flag. The Durable Object supplies the already-approved plan and encrypted private-note recovery content. Candidate order is part of the approval identity. Wrong ownership, a changed candidate list, any supplied flag, missing pending items, or a terminal operation fails closed. The adapter claims only pending durable items, so completed writes cannot be replayed. This is recovery through the existing public mutation; it does not add a public resume or cancel tool.
+
 ## Checkpoint lifecycle
 
 Every expected candidate has a ledger item before processing begins.

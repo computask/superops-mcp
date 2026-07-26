@@ -400,9 +400,14 @@ For ticket triage, call `superops_tickets_triage_snapshot` with the exact config
 `superops_tickets_apply_triage_plan` is a write/high-risk Phase 3 tool for
 applying a user-approved plan to a fixed snapshot candidate set. Use it only
 after the Phase 2 pre-write table has been approved. The tool requires
-`expectedCandidateTicketNumbers` unless a safe stored batch mechanism is added in
-the future, and it returns a result for every expected ticket even when no action
-is supplied.
+`expectedCandidateTicketNumbers` and returns a result for every
+expected ticket even when no action is supplied. To resume an existing nonterminal
+operation without reconstructing its approved payload, call the same tool with only
+`batchId` and the exact ordered `expectedCandidateTicketNumbers`. Omit `actions` and
+all override flags. The owner-scoped ledger remains authoritative for the stored
+approved actions, flags, fingerprints, and encrypted private-note recovery content.
+A different candidate order, any supplied override flag, wrong ownership, or a
+terminal operation is rejected before SuperOps work begins.
 
 Before writing each ticket, the tool re-reads metadata and validates the display
 number, internal ticket ID, subject, client, status, and `updatedTime` where the

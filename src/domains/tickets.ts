@@ -5513,6 +5513,37 @@ function applyTriageOriginalRequestHash(
   });
 }
 
+function isCompactStoredApplyTriageRecovery(
+  request: ApplyTriagePlanParams,
+  expected: string[],
+  actions: TriagePlanAction[],
+  record: OperationLedgerRecord
+): boolean {
+  if (
+    request.batchId !== record.operationId ||
+    actions.length !== 0 ||
+    record.pendingItems.length === 0 ||
+    !["Running", "ContinuationRequired", "Rescheduled"].includes(record.state)
+  ) return false;
+  if ([
+    request.dryRun,
+    request.verify,
+    request.dedupeNotes,
+    request.stopOnFirstFailure,
+    request.allowResolveFullFallbackToUpdate,
+    request.allowWriteIfUpdatedTimeChanged,
+    request.allowWriteWithoutVerifiedContent,
+  ].some((value) => value !== undefined)) return false;
+
+  const storedRequest = operationRequestApplyTriageParams(record.operationRequest);
+  const storedExpected = storedRequest?.expectedCandidateTicketNumbers?.map((ticketNumber) =>
+    normaliseTicketNumber(ticketNumber)
+  );
+  return Array.isArray(storedExpected) &&
+    storedExpected.length === expected.length &&
+    storedExpected.every((ticketNumber, index) => ticketNumber === expected[index]);
+}
+
 function buildApplyTriageLedgerRecord(params: {
   operationId: string;
   request: ApplyTriagePlanParams;
@@ -7388,7 +7419,7 @@ export function getTicketsTools(): DomainTools {
           properties: {
             batchId: {
               type: "string",
-              description: "Optional batch identifier from an external workflow. Phase 3 requires expectedCandidateTicketNumbers unless a stored batch exists.",
+              description: "Optional batch identifier. To resume an existing nonterminal operation, send its exact expectedCandidateTicketNumbers and omit actions and override flags.",
             },
             expectedCandidateTicketNumbers: {
               type: "array",
@@ -8239,10 +8270,17 @@ export function getTicketsTools(): DomainTools {
                   : undefined;
                 const exactGeneratedIdRecovery = recoveryRequest !== undefined &&
                   stableHash(existing.operationRequest) === stableHash(recoveryRequest);
+                const compactStoredRecovery = isCompactStoredApplyTriageRecovery(
+                  params,
+                  expected,
+                  actions,
+                  existing
+                );
                 if (existing.ownerHash !== ownerHash ||
                     (
                       existing.originalRequestHash !== initialRecord.originalRequestHash &&
-                      !exactGeneratedIdRecovery
+                      !exactGeneratedIdRecovery &&
+                      !compactStoredRecovery
                     )) {
                   return errorResult("The requested operation ID already exists with different ownership or approved input.");
                 }
