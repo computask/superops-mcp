@@ -1136,6 +1136,67 @@ describe("deterministic end-to-end apply-triage harness", () => {
     harness.assertGlobalInvariants(record);
   });
 
+  it("reschedules a budget-deferred item when its resumed metadata read is rate-limited", async () => {
+    const harness = new TriageHarness("rescheduled-read-rate-limit", {
+      canonicalTicketReadRateLimits: 3,
+    });
+    await harness.invoke({
+      expectedCandidateTicketNumbers: ["control-no-action", TICKET_NUMBER],
+      actions: [resolveAction()],
+    }, {
+      SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1",
+      SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "3",
+    });
+    await harness.updateRecord((record) => {
+      const item = record.itemStates[TICKET_NUMBER];
+      record.state = "ContinuationRequired";
+      record.pendingItems = [TICKET_NUMBER];
+      record.nextEligibleTime = undefined;
+      record.currentLease = undefined;
+      record.terminalFailureReason = "Seeded deterministic budget continuation.";
+      record.itemStates[TICKET_NUMBER] = {
+        ...item,
+        stage: "Rescheduled",
+        outcome: "NotAttemptedExecutionBudget",
+        writeAttempted: false,
+        writeMayHaveSucceeded: false,
+        partialWrite: false,
+        verificationState: "Pending",
+        lease: undefined,
+      };
+      return record;
+    });
+
+    await harness.resume();
+    const throttled = await harness.record();
+    expect(throttled).toMatchObject({
+      state: "Rescheduled",
+      itemStates: {
+        [TICKET_NUMBER]: {
+          stage: "RateLimitedRescheduled",
+          outcome: "SuperOpsRateLimitRescheduled",
+          writeAttempted: false,
+          writeMayHaveSucceeded: false,
+          partialWrite: false,
+          errorClass: "SuperOpsRateLimit",
+        },
+      },
+    });
+    expect(harness.history.events.filter((event) => event.kind.startsWith("superops.write."))).toHaveLength(0);
+
+    const terminal = await harness.resumeUntilTerminal();
+    expect(terminal.state).toBe("Completed");
+    expect(itemResult(terminal)).toMatchObject({
+      finalOutcome: "Resolved",
+      finalVerificationState: "Verified",
+      verified: true,
+    });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(1);
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
+  });
+
   it("terminalizes persistent pre-write getTicket throttling at the durable ceiling without any write", async () => {
     const harness = new TriageHarness("persistent-preflight-ticket-rate-limit", {
       classified: true,

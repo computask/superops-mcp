@@ -986,6 +986,56 @@ describe("operation store", () => {
     });
   });
 
+  it("allows an unfinished rescheduled item to persist a later read rate limit", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const ownerHash = stableHash("owner@example.com");
+      const initial = record({ operationId: "op-rescheduled-rate-limit" });
+      initial.itemStates["57401"] = {
+        ...initial.itemStates["57401"],
+        stage: "Rescheduled",
+        outcome: "NotAttemptedExecutionBudget",
+      };
+      await store.put(initial);
+      const claim = await store.claimNextItem({
+        operationId: initial.operationId,
+        ownerHash,
+        leaseOwner: "rate-limit-resume",
+        leaseMs: 60_000,
+      });
+      if (!claim) throw new Error("expected rate-limit-resume claim");
+
+      const rescheduled = await store.completeItem({
+        operationId: initial.operationId,
+        ownerHash,
+        itemKey: claim.itemKey,
+        leaseId: claim.lease.leaseId,
+        patch: {
+          stage: "RateLimitedRescheduled",
+          outcome: "SuperOpsRateLimitRescheduled",
+          writeAttempted: false,
+          writeMayHaveSucceeded: false,
+          partialWrite: false,
+          verificationState: "Pending",
+          errorClass: "SuperOpsRateLimit",
+          nextEligibleTime: "2026-07-18T00:05:00.000Z",
+        },
+      });
+
+      expect(rescheduled).toMatchObject({
+        itemStates: {
+          "57401": {
+            stage: "RateLimitedRescheduled",
+            outcome: "SuperOpsRateLimitRescheduled",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+            partialWrite: false,
+          },
+        },
+      });
+    });
+  });
+
   it("requires preflight before no-write staged classification verification", async () => {
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();

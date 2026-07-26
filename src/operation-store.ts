@@ -922,7 +922,7 @@ const EXPLICIT_STAGE_TRANSITIONS: Partial<Record<OperationItemStage, ReadonlySet
   RateLimited: new Set(["RateLimitedRetrying", "RateLimitedRescheduled"]),
   RateLimitedRetrying: new Set(["RateLimitedRescheduled"]),
   RateLimitedRescheduled: new Set(["Validating", "Validated", "PreflightValidated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "ClassificationWriteStarted", "ResolutionValidated", "ResolutionWriteStarted", "StatusWriteStarted", "NoteChecked", "NoteDedupeChecked", "NoteWriteStarted", "Verifying"]),
-  Rescheduled: new Set(["Validating", "Validated", "PreflightValidated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "ClassificationWriteStarted", "NoteChecked", "NoteDedupeChecked", "StatusWriteStarted", "Verifying"]),
+  Rescheduled: new Set(["Validating", "Validated", "PreflightValidated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "ClassificationWriteStarted", "NoteChecked", "NoteDedupeChecked", "StatusWriteStarted", "Verifying", "RateLimitedRescheduled"]),
 };
 
 function assertTransition(current: OperationItemStage, next: OperationItemStage): void {
