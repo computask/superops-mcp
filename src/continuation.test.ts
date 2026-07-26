@@ -156,6 +156,76 @@ describe("durable continuation runner", () => {
     expect([...processed.values()].filter((count) => count !== 1)).toHaveLength(0);
   });
 
+  it("yields without terminalizing when a newer continuation owns the item lease", async () => {
+    const ownerHash = stableHash("owner@example.com");
+    let replacementLeaseId: string | undefined;
+    const adapter: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      estimateItemSubrequests: () => 1,
+      async processItem({ claim, checkpoint }) {
+        const replacement = await getOperationStore().claimNextItem({
+          operationId: claim.operationId,
+          ownerHash,
+          leaseOwner: "newer-continuation",
+          leaseMs: 60_000,
+          now: "2026-07-18T00:00:01.000Z",
+        });
+        replacementLeaseId = replacement?.lease.leaseId;
+        await checkpoint({
+          stage: "Validating",
+          writeAttempted: false,
+          writeMayHaveSucceeded: false,
+          partialWrite: false,
+          verificationState: "Pending",
+        });
+        throw new Error("obsolete continuation checkpoint unexpectedly succeeded");
+      },
+    };
+
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      await store.put(ledgerRecord({
+        operationId: "op-lease-handoff",
+        ownerHash,
+        itemKeys: ["ticket-lease"],
+      }));
+
+      const result = await runWithExecutionConfig({}, () =>
+        runWithExecutionContext("test_batch_tool", () =>
+          runOperationContinuation({
+            operationId: "op-lease-handoff",
+            ownerHash,
+            adapter,
+            leaseOwner: "obsolete-continuation",
+            leaseMs: 1,
+            now: "2026-07-18T00:00:00.000Z",
+          })
+        )
+      );
+
+      expect(result).toMatchObject({
+        state: "Running",
+        continuationRequired: true,
+        stopReason: "OperationItemLeaseLost",
+      });
+      const stored = await store.get("op-lease-handoff", ownerHash);
+      expect(stored?.terminalFailureReason).toBeUndefined();
+      expect(stored).toMatchObject({
+        state: "Running",
+        failedItems: [],
+        pendingItems: ["ticket-lease"],
+        itemStates: {
+          "ticket-lease": {
+            stage: "Pending",
+            lease: {
+              leaseId: replacementLeaseId,
+              owner: "newer-continuation",
+            },
+          },
+        },
+      });
+    });
+  });
   it("reschedules a long Retry-After item and resumes only after it is eligible", async () => {
     const ownerHash = stableHash("owner@example.com");
     const attempts = new Map<string, number>();

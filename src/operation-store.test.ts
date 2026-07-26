@@ -1366,6 +1366,91 @@ describe("operation store", () => {
     });
   });
 
+  it("retries a stale metadata update without erasing a concurrent item lease", async () => {
+    const durable = ownerScopedDurableNamespace();
+    const ownerHash = stableHash("owner@example.com");
+    let releaseFirstPut: (() => void) | undefined;
+    let signalFirstPut: (() => void) | undefined;
+    const firstPutStarted = new Promise<void>((resolve) => { signalFirstPut = resolve; });
+    const releaseFirstPutPromise = new Promise<void>((resolve) => { releaseFirstPut = resolve; });
+    let guardedPutCount = 0;
+    let firstGuardedPutHeld = false;
+    const namespace = {
+      idFromName: durable.namespace.idFromName,
+      get: (id: unknown) => {
+        const stub = durable.namespace.get(id);
+        return {
+          fetch: async (request: Request) => {
+            if (request.method === "PUT") {
+              const payload = await request.clone().json() as {
+                record?: OperationLedgerRecord;
+                expectedRecordHash?: unknown;
+              };
+              if (
+                typeof payload.expectedRecordHash === "string" &&
+                payload.record?.wakeAttemptCount === 1
+              ) {
+                guardedPutCount += 1;
+                if (!firstGuardedPutHeld) {
+                  firstGuardedPutHeld = true;
+                  signalFirstPut?.();
+                  await releaseFirstPutPromise;
+                }
+              }
+            }
+            return stub.fetch(request);
+          },
+        };
+      },
+    };
+
+    await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: namespace }, async () => {
+      const store = getOperationStore();
+      await store.put(record({ operationId: "op-metadata-claim-race", ownerHash }));
+
+      const metadataUpdate = store.update(
+        "op-metadata-claim-race",
+        ownerHash,
+        (current) => ({ ...current, wakeAttemptCount: 1 })
+      );
+      await firstPutStarted;
+
+      const claim = await store.claimNextItem({
+        operationId: "op-metadata-claim-race",
+        ownerHash,
+        leaseOwner: "continuation-owner",
+        leaseMs: 60_000,
+        now: "2026-07-18T00:00:02.000Z",
+      });
+      expect(claim?.itemKey).toBe("57401");
+
+      releaseFirstPut?.();
+      const updated = await metadataUpdate;
+      expect(guardedPutCount).toBe(2);
+      expect(updated).toMatchObject({
+        wakeAttemptCount: 1,
+        currentLease: { leaseId: claim?.lease.leaseId },
+        itemStates: {
+          "57401": { lease: { leaseId: claim?.lease.leaseId } },
+        },
+      });
+
+      await expect(store.completeItem({
+        operationId: "op-metadata-claim-race",
+        ownerHash,
+        itemKey: "57401",
+        leaseId: claim?.lease.leaseId,
+        patch: {
+          stage: "Skipped",
+          outcome: "TestComplete",
+          writeAttempted: false,
+          writeMayHaveSucceeded: false,
+          partialWrite: false,
+          verificationState: "NotRequired",
+        },
+      })).resolves.toMatchObject({ skippedItems: ["57401"] });
+    });
+  });
   it("counts Durable Object store calls through the central execution context", async () => {
     const durable = ownerScopedDurableNamespace();
     let subrequests = 0;

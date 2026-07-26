@@ -204,6 +204,8 @@ export interface ApprovedPrivateNoteContent {
 
 export interface OperationPutOptions {
   approvedPrivateNotes?: ApprovedPrivateNoteContent[];
+  /** Internal optimistic-concurrency guard for Durable Object metadata updates. */
+  expectedRecordHash?: string;
 }
 
 export interface OperationTerminalFailureParams {
@@ -324,6 +326,7 @@ const MAX_RECENT_OPERATION_RESULTS = 20;
 const MAX_RECENT_OPERATION_OUTPUT_BYTES = 128 * 1024;
 const OPERATION_STORE_RATE_LIMIT_MAX_ATTEMPTS = 3;
 const OPERATION_STORE_RATE_LIMIT_BACKOFF_MS = [25, 75];
+const OPERATION_STORE_CONFLICT_MAX_ATTEMPTS = 5;
 const UNATTEMPTED_RUNNING_STALL_MS = 5 * 60 * 1000;
 const RESCHEDULED_STALL_GRACE_MS = 2 * 60 * 1000;
 
@@ -358,6 +361,13 @@ class OperationStoreRateLimitError extends Error {
   ) {
     super(message);
     this.name = "OperationStoreRateLimitError";
+  }
+}
+
+class OperationStoreConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OperationStoreConflictError";
   }
 }
 
@@ -1456,6 +1466,7 @@ class DurableObjectOperationStore implements OperationStore {
         body: JSON.stringify({
           record,
           approvedPrivateNotes: options?.approvedPrivateNotes,
+          expectedRecordHash: options?.expectedRecordHash,
         }),
       })
     );
@@ -1514,17 +1525,33 @@ class DurableObjectOperationStore implements OperationStore {
     ownerHash: string,
     updater: (record: OperationLedgerRecord) => OperationLedgerRecord
   ): Promise<OperationLedgerRecord> {
-    const existing = await this.get(operationId, ownerHash);
-    if (!existing) {
-      throw new Error("Operation was not found or is not visible to this caller.");
+    let lastConflict: OperationStoreConflictError | undefined;
+    for (let attempt = 1; attempt <= OPERATION_STORE_CONFLICT_MAX_ATTEMPTS; attempt += 1) {
+      const existing = await this.get(operationId, ownerHash);
+      if (!existing) {
+        throw new Error("Operation was not found or is not visible to this caller.");
+      }
+      assertRecordOwner(existing, ownerHash);
+      const expectedRecordHash = stableHash(existing);
+      const updated = startTerminalRetention(
+        existing,
+        normalizeOperationRecord(updater(cloneRecord(existing)))
+      );
+      updated.updatedAt = nowIso();
+      try {
+        await this.put(updated, { expectedRecordHash });
+        return updated;
+      } catch (error) {
+        if (!(error instanceof OperationStoreConflictError) ||
+            attempt >= OPERATION_STORE_CONFLICT_MAX_ATTEMPTS) {
+          throw error;
+        }
+        lastConflict = error;
+      }
     }
-    assertRecordOwner(existing, ownerHash);
-    const updated = startTerminalRetention(
-      existing,
-      normalizeOperationRecord(updater(existing))
+    throw lastConflict ?? new OperationStoreConflictError(
+      "Operation store update conflict retry limit reached."
     );
-    await this.put(updated);
-    return updated;
   }
 
   async getApprovedPrivateNote(
@@ -1691,6 +1718,11 @@ async function operationStoreFailure(response: Response, message: string): Promi
   try {
     const body = await response.clone().json();
     if (isRecordObject(body)) {
+      if (body.errorClass === "OperationStoreConflict") {
+        return new OperationStoreConflictError(
+          typeof body.error === "string" ? body.error : `${message}: concurrent update`
+        );
+      }
       if (body.errorClass === "MalformedStoredOperation") {
         return new MalformedStoredOperationError(
           typeof body.error === "string" ? body.error : undefined
@@ -2350,6 +2382,21 @@ export class SuperOpsOperationLedger {
         }
         const record = startTerminalRetention(candidate, normalizeOperationRecord(candidate));
         assertOperationRecord(record);
+        const expectedRecordHash = wrapped ? payload.expectedRecordHash : undefined;
+        if (expectedRecordHash !== undefined && typeof expectedRecordHash !== "string") {
+          throw new MalformedStoredOperationError("Expected operation record hash is invalid.");
+        }
+        if (typeof expectedRecordHash === "string") {
+          const current = await this.state.storage.get<OperationLedgerRecord>(
+            "op:" + record.operationId
+          );
+          if (!current || stableHash(current) !== expectedRecordHash) {
+            return json({
+              errorClass: "OperationStoreConflict",
+              error: "Operation changed during metadata update.",
+            }, 409);
+          }
+        }
         const approvedPrivateNotes = validateApprovedPrivateNotes(
           record,
           wrapped && Array.isArray(payload.approvedPrivateNotes)

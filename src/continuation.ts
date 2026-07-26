@@ -78,6 +78,10 @@ export interface RunOperationContinuationResult {
 
 const DEFAULT_LEASE_MS = 180_000;
 
+function isOperationItemLeaseMismatch(error: Error): boolean {
+  return /Operation item lease mismatch:/.test(error.message);
+}
+
 export async function runOperationContinuation(
   params: RunOperationContinuationParams
 ): Promise<RunOperationContinuationResult> {
@@ -123,8 +127,8 @@ export async function runOperationContinuation(
     return continuationResult(record, false, "ContinuationLimitExceeded");
   }
 
-  const now = params.now ?? new Date().toISOString();
-  if (record.nextEligibleTime && record.nextEligibleTime > now) {
+  const eligibilityNow = params.now ?? new Date().toISOString();
+  if (record.nextEligibleTime && record.nextEligibleTime > eligibilityNow) {
     return continuationResult(record, true, "NotEligibleYet");
   }
 
@@ -155,7 +159,9 @@ export async function runOperationContinuation(
       ownerHash: params.ownerHash,
       leaseOwner: params.leaseOwner,
       leaseMs: params.leaseMs ?? DEFAULT_LEASE_MS,
-      now,
+      // Injected test clocks remain fixed. Production claims use the current
+      // time so later items do not inherit a lease expiry from invocation start.
+      now: params.now ?? new Date().toISOString(),
     });
     if (!claim) {
       record = (await store.get(params.operationId, params.ownerHash)) ?? record;
@@ -401,6 +407,16 @@ export async function runOperationContinuation(
       }
     } catch (error) {
       const caughtError = error instanceof Error ? error : new Error(String(error));
+      if (isOperationItemLeaseMismatch(caughtError)) {
+        // A newer continuation owns this item. This invocation must not
+        // terminalize or overwrite its durable progress.
+        record = (await store.get(params.operationId, params.ownerHash)) ?? record;
+        return continuationResult(
+          record,
+          record.pendingItems.length > 0,
+          "OperationItemLeaseLost"
+        );
+      }
       const platformLimit = classifyCloudflarePlatformLimit(caughtError);
       if (
         caughtError instanceof ExecutionBudgetExceededError ||
