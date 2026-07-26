@@ -259,6 +259,7 @@ type FakeSuperOpsOptions = {
   unsupportedNoteEnvelope?: boolean;
   noteVisibilityMisses?: number;
   classificationFault?: MutationFault;
+  classificationFaults?: MutationFault[];
   noteFault?: MutationFault;
   statusFault?: MutationFault;
   noteChangesUpdatedTime?: boolean;
@@ -333,6 +334,7 @@ class FakeSuperOps {
   private pendingNote: Record<string, unknown> | undefined;
   private remainingVisibilityMisses: number;
   private remainingCanonicalTicketReadRateLimits: number;
+  private readonly classificationFaults: MutationFault[];
   private updatedSequence = 0;
   private ticketReadCount = 0;
 
@@ -348,6 +350,7 @@ class FakeSuperOps {
     this.visibleNotes = [...(options.initialNotes ?? [])];
     this.remainingVisibilityMisses = options.noteVisibilityMisses ?? 0;
     this.remainingCanonicalTicketReadRateLimits = options.canonicalTicketReadRateLimits ?? 0;
+    this.classificationFaults = [...(options.classificationFaults ?? [])];
     if (options.classified) this.setClassified();
   }
 
@@ -468,7 +471,7 @@ class FakeSuperOps {
       this.history.add(`superops.write.${kind}`, { input: structuredClone(input) });
       const fault = isStatusOnly
         ? this.options.statusFault ?? "accepted"
-        : this.options.classificationFault ?? "accepted";
+        : this.classificationFaults.shift() ?? this.options.classificationFault ?? "accepted";
       if (fault === "rateLimit") return this.rateLimitResponse();
       if (fault === "graphqlReject") return graphQlError("updateTicket");
       if (fault === "graphqlPartial") {
@@ -1195,6 +1198,51 @@ describe("deterministic end-to-end apply-triage harness", () => {
     expect(harness.history.count("superops.write.note")).toBe(1);
     expect(harness.history.count("superops.write.status")).toBe(1);
     harness.assertGlobalInvariants(terminal);
+  });
+
+  it("retries consecutive reliable classification throttles and applies each staged write once", async () => {
+    const harness = new TriageHarness("repeated-classification-rate-limit", {
+      classificationFaults: ["rateLimit", "rateLimit", "accepted"],
+    });
+    await harness.invoke();
+
+    const firstThrottle = await harness.record();
+    expect(firstThrottle).toMatchObject({
+      state: "Rescheduled",
+      itemStates: {
+        [TICKET_NUMBER]: {
+          stage: "RateLimitedRescheduled",
+          writeAttempted: true,
+          writeMayHaveSucceeded: false,
+          observedMutationResult: "Rejected",
+          partialWrite: false,
+          errorClass: "SuperOpsRateLimit",
+        },
+      },
+    });
+
+    const terminal = await harness.resumeUntilTerminal();
+    const result = itemResult(terminal);
+    expect(terminal.state).toBe("Completed");
+    expect(result).toMatchObject({
+      classificationWriteOutcome: "Accepted",
+      noteAdded: true,
+      noteDeduped: false,
+      statusWriteMethod: "updateTicket.statusOnly",
+      suppressCloseNotificationIncluded: true,
+      finalOutcome: "Resolved",
+      finalVerificationState: "Verified",
+      verified: true,
+    });
+    expect(result.physicalWrites).toEqual([
+      { method: "updateTicket.classification", outcome: "Accepted" },
+      { method: "createTicketNote", outcome: "Accepted" },
+      { method: "updateTicket.statusOnly", outcome: "Accepted" },
+    ]);
+    expect(harness.history.count("superops.write.classification")).toBe(3);
+    expect(harness.history.count("superops.write.note")).toBe(1);
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    expect(harness.history.count("continuation.resume")).toBe(2);
   });
 
   it("terminalizes persistent pre-write getTicket throttling at the durable ceiling without any write", async () => {

@@ -242,6 +242,124 @@ describe("durable continuation runner", () => {
     expect(attempts.get("ticket-rate")).toBe(2);
   });
 
+  it("preserves same-invocation write checkpoints across repeated reliable throttles", async () => {
+    const ownerHash = stableHash("owner@example.com");
+    let attempts = 0;
+    let acceptedWrites = 0;
+    const adapter: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      estimateItemSubrequests: () => 1,
+      async processItem({ checkpoint }) {
+        attempts += 1;
+        if (attempts === 1) {
+          await checkpoint({
+            stage: "WriteStarted",
+            outcome: "WriteStarted",
+            mutationType: "update",
+            mutationStartStage: "WriteStarted",
+            writeAttempted: true,
+            writeMayHaveSucceeded: true,
+            reliableResponseReceived: false,
+            observedMutationResult: "Ambiguous",
+            partialWrite: true,
+            verificationState: "Pending",
+          });
+          await checkpoint({
+            stage: "RateLimitedRescheduled",
+            outcome: "SuperOpsRateLimitRescheduled",
+            mutationType: "update",
+            writeAttempted: true,
+            writeMayHaveSucceeded: false,
+            reliableResponseReceived: true,
+            observedMutationResult: "Rejected",
+            partialWrite: false,
+            verificationState: "Pending",
+          });
+        }
+        if (attempts <= 2) {
+          return {
+            stage: "RateLimitedRescheduled",
+            outcome: "SuperOpsRateLimitRescheduled",
+            writeAttempted: false,
+            writeMayHaveSucceeded: false,
+            reliableResponseReceived: true,
+            observedMutationResult: "Rejected" as const,
+            partialWrite: false,
+            nextEligibleTime: new Date(Date.now() + 10).toISOString(),
+            rateLimited: true,
+            errorClass: "SuperOpsRateLimit" as const,
+            result: {
+              itemKey: "ticket-rate-history",
+              finalOutcome: "SuperOpsRateLimitRescheduled",
+              writeAttempted: false,
+              writeMayHaveSucceeded: false,
+              partialWrite: false,
+            },
+          };
+        }
+        acceptedWrites += 1;
+        return {
+          stage: "CompletedAfterRetry",
+          outcome: "CompletedAfterRetry",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          partialWrite: false,
+          verified: true,
+        };
+      },
+    };
+
+    await runWithOperationStore({}, async () => {
+      await getOperationStore().put(ledgerRecord({
+        operationId: "op-rate-write-history",
+        ownerHash,
+        itemKeys: ["ticket-rate-history"],
+      }));
+
+      for (let invocation = 1; invocation <= 3; invocation += 1) {
+        await runWithExecutionConfig({}, () => runWithExecutionContext(
+          "test_batch_tool",
+          () => runOperationContinuation({
+            operationId: "op-rate-write-history",
+            ownerHash,
+            adapter,
+            leaseOwner: `rate-history-${invocation}`,
+            now: new Date(Date.now() + invocation * 1_000).toISOString(),
+          })
+        ));
+        const current = await getOperationStore().get("op-rate-write-history");
+        if (invocation < 3) {
+          expect(current).toMatchObject({
+            state: "Rescheduled",
+            itemStates: {
+              "ticket-rate-history": {
+                stage: "RateLimitedRescheduled",
+                writeAttempted: true,
+                writeMayHaveSucceeded: false,
+                observedMutationResult: "Rejected",
+              },
+            },
+          });
+        }
+      }
+
+      await expect(getOperationStore().get("op-rate-write-history")).resolves.toMatchObject({
+        state: "Completed",
+        itemStates: {
+          "ticket-rate-history": {
+            stage: "CompletedAfterRetry",
+            writeAttempted: true,
+            writeMayHaveSucceeded: true,
+            verificationState: "Verified",
+          },
+        },
+      });
+    });
+
+    expect(attempts).toBe(3);
+    expect(acceptedWrites).toBe(1);
+  });
+
   it("keeps ambiguous accepted writes terminal and unrepeated", async () => {
     const ownerHash = stableHash("owner@example.com");
     let writeAttempts = 0;

@@ -232,17 +232,22 @@ export async function runOperationContinuation(
 
     try {
       const currentRecord = record;
+      let latestDurableItem = claim.item;
       const outcome = await withExecutionItem(claim.itemKey, () =>
         params.adapter.processItem({
           record: currentRecord,
           claim,
-          checkpoint: (patch) => store.checkpointItem({
-            operationId: params.operationId,
-            ownerHash: params.ownerHash,
-            itemKey: claim.itemKey,
-            leaseId: claim.lease.leaseId,
-            patch,
-          }),
+          checkpoint: async (patch) => {
+            const checkpointed = await store.checkpointItem({
+              operationId: params.operationId,
+              ownerHash: params.ownerHash,
+              itemKey: claim.itemKey,
+              leaseId: claim.lease.leaseId,
+              patch,
+            });
+            latestDurableItem = checkpointed.itemStates[claim.itemKey] ?? latestDurableItem;
+            return checkpointed;
+          },
         })
       );
       const config = getExecutionConfig();
@@ -275,19 +280,23 @@ export async function runOperationContinuation(
             failureReason: "Durable rate-limit retry ceiling was reached.",
           }
         : outcome;
-      const writeAttempted = claim.item.writeAttempted || adapterOutcome.writeAttempted;
-      const writeMayHaveSucceeded = claim.item.writeMayHaveSucceeded ||
-        adapterOutcome.writeMayHaveSucceeded;
+      const writeAttempted = latestDurableItem.writeAttempted || adapterOutcome.writeAttempted;
+      const conclusiveRejection = adapterOutcome.reliableResponseReceived === true &&
+        adapterOutcome.observedMutationResult === "Rejected" &&
+        adapterOutcome.partialWrite !== true;
+      const writeMayHaveSucceeded = conclusiveRejection
+        ? adapterOutcome.writeMayHaveSucceeded
+        : latestDurableItem.writeMayHaveSucceeded || adapterOutcome.writeMayHaveSucceeded;
       const effectiveOutcome: ContinuationItemOutcome = {
         ...adapterOutcome,
-        // These flags are durable historical facts. A resumed adapter may
-        // finish through validation or dedupe without issuing a new mutation,
-        // but that must not erase an earlier mutation-start checkpoint.
+        // writeAttempted is durable history and cannot be erased by a fresh
+        // adapter result. writeMayHaveSucceeded can clear only when the current
+        // outcome proves a reliable rejection.
         writeAttempted,
         writeMayHaveSucceeded,
         result: typeof adapterOutcome.result === "object" && adapterOutcome.result !== null &&
             !Array.isArray(adapterOutcome.result)
-          ? { ...adapterOutcome.result as Record<string, unknown>, writeAttempted }
+          ? { ...adapterOutcome.result as Record<string, unknown>, writeAttempted, writeMayHaveSucceeded }
           : adapterOutcome.result,
       };
       if (outcome.rateLimited && outcome.nextEligibleTime && cappedDelayMs !== requestedDelayMs) {
