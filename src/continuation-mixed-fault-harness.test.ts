@@ -415,6 +415,19 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       const totals = operationTotals(finalRecord);
       const rateLimitTelemetry = states.map((item) => item.rateLimit).filter(Boolean);
       const terminalCount = states.filter((item) => terminal.has(item.stage)).length;
+      const authoritativeAmbiguous = states.filter((item) =>
+        item.ambiguousWrite === true ||
+        item.stage === "WriteAmbiguous" ||
+        item.stage === "ResolutionWriteAmbiguous" ||
+        item.stage === "NoteWriteAmbiguous" ||
+        item.stage === "AmbiguousWriteUnresolved" ||
+        (item.observedMutationResult === "Ambiguous" && item.writeMayHaveSucceeded && item.verificationState !== "Verified")
+      ).length;
+      const authoritativeVerifiedSuccess = states.filter((item) =>
+        terminal.has(item.stage) &&
+        !["AmbiguousWriteUnresolved", "Stale", "Skipped", "FailedBeforeWrite", "FailedAfterPartialWrite", "RateLimitExceeded", "StaleAfterRateLimitWait"].includes(item.stage) &&
+        (item.verificationState === "Verified" || item.verificationState === "NotRequired")
+      ).length;
       const totalRetries = states.reduce((sum, item) => sum + Math.max(0, (item.attemptCount ?? 0) - 1), 0);
       const counters = {
         seed: SEED,
@@ -428,6 +441,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
         noteOnly: totals.noteOnly,
         skipped: totals.skipped,
         completed: totals.completed,
+        successfulVerified: totals.successfulVerified,
         failed: totals.failed,
         stale: totals.stale,
         validationFailed: totals.validationFailed,
@@ -452,6 +466,10 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       expect(counters.itemsAccounted).toBe(250);
       expect(counters.terminalCount).toBe(250);
       expect(counters.unaccounted).toBe(0);
+      expect(finalRecord.partialWriteCount).toBe(totals.partialWrite);
+      expect(finalRecord.ambiguousWriteCount).toBe(authoritativeAmbiguous);
+      expect(finalRecord.rateLimitedItems).toHaveLength(totals.waitingForRateLimit);
+      expect(counters.successfulVerified).toBe(authoritativeVerifiedSuccess);
       expect(counters.updated).toBeGreaterThan(0);
       expect(counters.resolved).toBeGreaterThan(0);
       expect(counters.noteOnly).toBeGreaterThan(0);
@@ -819,7 +837,17 @@ if (terminalRecord.state !== expectedTerminalState) {
             expect(terminalItem.writeAttempted).toBe((crashedItem?.writeAttempted ?? false) || mutationCount > 0);
             expect(terminalItem.writeMayHaveSucceeded).toBe((crashedItem?.writeMayHaveSucceeded ?? false) || mutationCount > 0);
             expect(terminalItem.attemptCount ?? 0).toBe(mutationCount);
-            expect(verificationReadCount).toBeGreaterThan(preRestartVerificationReads);
+            if (actionType === "addNote" && checkpointStage === "Verifying" && timing === "after") {
+              expect(
+                verificationReadCount,
+                `${actionType}:${checkpointStage}:${timing} already has a durable verified checkpoint`
+              ).toBe(preRestartVerificationReads);
+            } else {
+              expect(
+                verificationReadCount,
+                `${actionType}:${checkpointStage}:${timing} should re-read durable state after restart`
+              ).toBeGreaterThan(preRestartVerificationReads);
+            }
             expect(terminalItem.verificationState).toBe("Verified");
             expect(terminalItem.observedMutationResult).toBe("VerifiedApplied");
             expect(["Completed", "CompletedAfterAmbiguousWriteVerification"]).toContain(terminalItem.stage);

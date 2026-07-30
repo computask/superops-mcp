@@ -1058,6 +1058,15 @@ interface ApplyTriagePlanResult {
   rateLimitDelaySource?: "retry-after" | "backoff";
   rateLimitConclusiveRejection?: boolean;
   rateLimitOperationName?: string;
+  identityResolution?: "displayNumber" | "expectedTicketId" | "confirmedNotFound";
+  immutableIdentityRecovered?: boolean;
+  ambiguousVerificationAttempts?: number;
+  initialFailureReason?: string | null;
+  initialFailureClass?: string | null;
+  terminalFailureReason?: string | null;
+  terminalFailureClass?: string | null;
+  replaySafe?: boolean;
+  humanReconciliationRequired?: boolean;
 }
 interface StructuredValidationFailure {
   ok: false;
@@ -3330,6 +3339,115 @@ async function resolveTicketId(
   return { ticketId: matches[0].ticketId };
 }
 
+interface ApprovedTicketLookup {
+  ticket?: Ticket;
+  ticketId?: string;
+  error?: string;
+  confirmedNotFound?: boolean;
+  immutableIdentityRecovered: boolean;
+  operationName: "getTicket" | "getTicketList";
+}
+
+function isConfirmedTicketNotFoundError(error: unknown): boolean {
+  return /(?:ticket[^.]*not found|no ticket was found|does not exist|unknown ticket)/i.test(
+    safeErrorMessage(error)
+  );
+}
+
+async function lookupApprovedTicket(
+  client: SuperOpsClientInstance,
+  ticketNumber: string,
+  expectedTicketId?: string,
+  options: { requireTicket?: boolean } = {}
+): Promise<ApprovedTicketLookup> {
+  const requireTicket = options.requireTicket ?? true;
+  const immutableTicketId = expectedTicketId?.trim();
+  if (immutableTicketId) {
+    if (!requireTicket) {
+      return {
+        ticket: { ticketId: immutableTicketId, displayId: ticketNumber, subject: "" },
+        ticketId: immutableTicketId,
+        immutableIdentityRecovered: true,
+        operationName: "getTicket",
+      };
+    }
+    try {
+      const ticket = await getTicketByInternalId(client, immutableTicketId);
+      if (!ticket || typeof ticket.ticketId !== "string" || !ticket.ticketId.trim()) {
+        return {
+          error: `Ticket ${ticketNumber} was not found by its approved immutable ID.`,
+          confirmedNotFound: true,
+          immutableIdentityRecovered: false,
+          operationName: "getTicket",
+        };
+      }
+      return {
+        ticket,
+        ticketId: immutableTicketId,
+        immutableIdentityRecovered: true,
+        operationName: "getTicket",
+      };
+    } catch (error) {
+      if (isExecutionStopError(error) || isRateLimitError(error)) throw error;
+      if (isConfirmedTicketNotFoundError(error)) {
+        return {
+          error: `Ticket ${ticketNumber} was not found by its approved immutable ID.`,
+          confirmedNotFound: true,
+          immutableIdentityRecovered: false,
+          operationName: "getTicket",
+        };
+      }
+      throw error;
+    }
+  }
+
+  const resolved = await resolveTicketId(client, { ticketNumber });
+  if (resolved.error || !resolved.ticketId) {
+    return {
+      error: resolved.error ?? "Ticket was not found.",
+      confirmedNotFound: /no ticket was found/i.test(resolved.error ?? ""),
+      immutableIdentityRecovered: false,
+      operationName: "getTicketList",
+    };
+  }
+  if (!requireTicket) {
+    return {
+      ticket: { ticketId: resolved.ticketId, displayId: ticketNumber, subject: "" },
+      ticketId: resolved.ticketId,
+      immutableIdentityRecovered: false,
+      operationName: "getTicketList",
+    };
+  }
+  try {
+    const ticket = await getTicketByInternalId(client, resolved.ticketId);
+    if (!ticket || typeof ticket.ticketId !== "string" || !ticket.ticketId.trim()) {
+      return {
+        error: `Ticket ${ticketNumber} disappeared before processing.`,
+        confirmedNotFound: true,
+        immutableIdentityRecovered: false,
+        operationName: "getTicket",
+      };
+    }
+    return {
+      ticket,
+      ticketId: resolved.ticketId,
+      immutableIdentityRecovered: false,
+      operationName: "getTicketList",
+    };
+  } catch (error) {
+    if (isExecutionStopError(error) || isRateLimitError(error)) throw error;
+    if (isConfirmedTicketNotFoundError(error)) {
+      return {
+        error: `Ticket ${ticketNumber} disappeared before processing.`,
+        confirmedNotFound: true,
+        immutableIdentityRecovered: false,
+        operationName: "getTicket",
+      };
+    }
+    throw error;
+  }
+}
+
 async function resolveClientAccountId(
   client: SuperOpsClientInstance,
   params: { clientId?: string; clientName?: string }
@@ -3488,6 +3606,12 @@ function markRateLimitedReadResult(
   // durable rate-limit continuation path without implying a mutation rejection.
   result.rateLimitConclusiveRejection = true;
   result.rateLimitOperationName = operationName;
+  result.initialFailureReason ??= result.failureReason;
+  result.initialFailureClass ??= "SuperOpsRateLimit";
+  result.terminalFailureReason = null;
+  result.terminalFailureClass = null;
+  result.replaySafe = result.writeAttempted !== true && result.writeMayHaveSucceeded !== true;
+  result.humanReconciliationRequired = false;
   return result;
 }
 
@@ -4073,6 +4197,8 @@ async function buildApprovedUpdateInput(
 
 const STAGED_NOTE_VISIBILITY_RECONCILIATION_DELAY_MS = 15_000;
 const STAGED_NOTE_VISIBILITY_MAX_ATTEMPTS = 4;
+const AMBIGUOUS_WRITE_RECONCILIATION_DELAY_MS = 15_000;
+const AMBIGUOUS_WRITE_RECONCILIATION_MAX_ATTEMPTS = 4;
 
 const STAGED_RESOLVE_CLASSIFICATION_FIELDS = [
   "impact",
@@ -4148,6 +4274,12 @@ function stagedResolveResumeHasVerifiedClassification(stage: OperationItemState[
     stage === "StatusWriteStarted" ||
     stage === "StatusWriteSucceeded" ||
     stage === "StatusVerified";
+}
+
+function stagedResolveResumeAfterClassificationMutation(stage: OperationItemState["stage"] | undefined): boolean {
+  return stage === "ClassificationWriteStarted" ||
+    stage === "ClassificationWriteSucceeded" ||
+    stagedResolveResumeHasVerifiedClassification(stage);
 }
 
 function stagedResolveResumeHasPreflightValidation(stage: OperationItemState["stage"] | undefined): boolean {
@@ -4329,6 +4461,49 @@ function markStagedNoteVerifiedAfterDelay(result: ApplyTriagePlanResult, attempt
   result.continuationRequired = false;
 }
 
+function ambiguousWriteNextEligibleTime(): string {
+  return new Date(Date.now() + AMBIGUOUS_WRITE_RECONCILIATION_DELAY_MS).toISOString();
+}
+
+function markAmbiguousWritePending(params: {
+  result: ApplyTriagePlanResult;
+  attempts: number;
+  reason: string;
+}): ApplyTriagePlanResult {
+  params.result.finalOutcome = "Failed";
+  params.result.failureStage = "ambiguousWrite";
+  params.result.failureReason = params.reason;
+  params.result.initialFailureReason ??= params.reason;
+  params.result.initialFailureClass ??= "AmbiguousWrite";
+  params.result.terminalFailureReason = null;
+  params.result.terminalFailureClass = null;
+  params.result.terminalReason = "AmbiguousWritePending";
+  params.result.partialWrite = true;
+  params.result.writeMayHaveSucceeded = true;
+  params.result.verified = false;
+  params.result.finalVerificationState = "Pending";
+  params.result.ambiguousVerificationAttempts = params.attempts;
+  params.result.continuationRequired = true;
+  params.result.retrySafe = false;
+  params.result.replaySafe = false;
+  params.result.humanReconciliationRequired = false;
+  return params.result;
+}
+
+function markAmbiguousWriteUnresolved(params: {
+  result: ApplyTriagePlanResult;
+  attempts: number;
+  reason: string;
+}): ApplyTriagePlanResult {
+  const result = markAmbiguousWritePending(params);
+  result.terminalReason = "AmbiguousWriteUnresolved";
+  result.terminalFailureReason = params.reason;
+  result.terminalFailureClass = "AmbiguousWrite";
+  result.continuationRequired = false;
+  result.humanReconciliationRequired = true;
+  return result;
+}
+
 function markStagedFailure(params: {
   result: ApplyTriagePlanResult;
   stage: string;
@@ -4348,6 +4523,12 @@ function markStagedFailure(params: {
   params.result.verified = false;
   params.result.finalVerificationState = params.verificationState ?? "Failed";
   params.result.currentStage = params.stage;
+  params.result.initialFailureReason ??= params.reason;
+  params.result.initialFailureClass ??= params.terminalReason;
+  params.result.terminalFailureReason = params.reason;
+  params.result.terminalFailureClass = params.terminalReason;
+  params.result.replaySafe = params.result.writeMayHaveSucceeded !== true;
+  params.result.humanReconciliationRequired = /Ambiguous|Unresolved/.test(params.terminalReason);
   return params.result;
 }
 
@@ -4362,9 +4543,13 @@ async function applyStagedResolveAction(params: {
   dedupeNotes: boolean;
   resumeStage?: OperationItemState["stage"];
   noteVisibilityPriorAttempts?: number;
+  resumeUpdatedTimeExpectation?: string;
   beforeNoteCheck?: () => Promise<void>;
   afterPreflightValidation?: () => Promise<void>;
-  beforeMutation?: (mutationType: DurableMutationType) => Promise<void>;
+  beforeMutation?: (
+    mutationType: DurableMutationType,
+    updatedTimeExpectation?: string
+  ) => Promise<void>;
   afterMutation?: (
     mutationType: DurableMutationType,
     observed: { ticketId?: string; noteId?: string }
@@ -4405,7 +4590,7 @@ async function applyStagedResolveAction(params: {
   const stagedNoteTicketIds = () => [params.resolvedTicketId, params.ticket.ticketId, trustedTicket.ticketId];
   const classificationWriteRequired = classificationInputHasWritableFields(classificationInput as Record<string, unknown>) &&
     classificationMismatches.length > 0 &&
-    !stagedResolveResumeHasVerifiedClassification(params.resumeStage);
+    !stagedResolveResumeAfterClassificationMutation(params.resumeStage);
   result.classificationWriteMethod = "updateTicket.classification";
   result.classificationWriteOutcome = classificationWriteRequired ? "Pending" : "NotRequired";
 
@@ -4457,6 +4642,10 @@ async function applyStagedResolveAction(params: {
       try {
         reread = await getTicketByInternalId(client, params.resolvedTicketId);
       } catch (verifyError) {
+        if (isExecutionStopError(verifyError)) throw verifyError;
+        if (isRateLimitError(verifyError)) {
+          return markRateLimitedReadResult(result, verifyError, "getTicket.ambiguousClassificationVerification");
+        }
         return markStagedFailure({
           result,
           stage: "classificationAmbiguousVerification",
@@ -4517,42 +4706,42 @@ async function applyStagedResolveAction(params: {
     }
   }
 
-  if (params.resumeStage === "ClassificationWriteStarted" || params.resumeStage === "ClassificationWriteSucceeded" ||
-      params.resumeStage === "ClassificationVerified" || !classificationWriteRequired) {
-    const verifiedClassification = !classificationWriteRequired && !params.resumeStage
+  let verifiedClassification: Ticket;
+  try {
+    verifiedClassification = !classificationWriteRequired && !params.resumeStage
       ? params.ticket
       : await getTicketByInternalId(client, params.resolvedTicketId);
-    const verification = verifyFinalTargetState(classificationAction, verifiedClassification);
-    result.finalState = ticketFinalState(verifiedClassification);
-    result.observedFinalState = result.finalState;
-    if (verification.mismatches.length > 0) {
-      return markStagedFailure({
-        result,
-        stage: "classificationVerification",
-        reason: `Classification/client verification mismatched requested fields: ${JSON.stringify(verification.mismatches)}`,
-        terminalReason: "ClassificationVerificationMismatch",
-        partialWrite: result.writeAttempted || params.resumeStage === "ClassificationWriteStarted",
-        writeMayHaveSucceeded: result.writeMayHaveSucceeded ?? (params.resumeStage === "ClassificationWriteStarted" ? true : undefined),
-      });
+  } catch (error) {
+    if (isExecutionStopError(error)) throw error;
+    if (isRateLimitError(error)) {
+      return markRateLimitedReadResult(result, error, "getTicket.classificationVerification");
     }
-    trustedTicket = verifiedClassification;
-  } else {
-    const verifiedClassification = await getTicketByInternalId(client, params.resolvedTicketId);
-    const verification = verifyFinalTargetState(classificationAction, verifiedClassification);
-    result.finalState = ticketFinalState(verifiedClassification);
-    result.observedFinalState = result.finalState;
-    if (verification.mismatches.length > 0) {
-      return markStagedFailure({
-        result,
-        stage: "classificationVerification",
-        reason: `Classification/client verification mismatched requested fields: ${JSON.stringify(verification.mismatches)}`,
-        terminalReason: "ClassificationVerificationMismatch",
-        partialWrite: result.writeAttempted,
-        writeMayHaveSucceeded: result.writeMayHaveSucceeded,
-      });
-    }
-    trustedTicket = verifiedClassification;
+    return markStagedFailure({
+      result,
+      stage: "classificationVerification",
+      reason: safeErrorMessage(error),
+      terminalReason: "ClassificationVerificationUnavailable",
+      partialWrite: result.writeAttempted || stagedResolveResumeAfterClassificationMutation(params.resumeStage),
+      writeMayHaveSucceeded: result.writeMayHaveSucceeded ??
+        (stagedResolveResumeAfterClassificationMutation(params.resumeStage) ? true : undefined),
+      verificationState: "Pending",
+    });
   }
+  const classificationVerification = verifyFinalTargetState(classificationAction, verifiedClassification);
+  result.finalState = ticketFinalState(verifiedClassification);
+  result.observedFinalState = result.finalState;
+  if (classificationVerification.mismatches.length > 0) {
+    return markStagedFailure({
+      result,
+      stage: "classificationVerification",
+      reason: `Classification/client verification mismatched requested fields: ${JSON.stringify(classificationVerification.mismatches)}`,
+      terminalReason: "ClassificationVerificationMismatch",
+      partialWrite: result.writeAttempted || stagedResolveResumeAfterClassificationMutation(params.resumeStage),
+      writeMayHaveSucceeded: result.writeMayHaveSucceeded ??
+        (stagedResolveResumeAfterClassificationMutation(params.resumeStage) ? true : undefined),
+    });
+  }
+  trustedTicket = verifiedClassification;
   result.verifiedState = ticketFinalState(trustedTicket);
   result.updatedTimeChanged = updatedTimeChanged(params.ticket, trustedTicket);
   result.classificationWriteOutcome = result.classificationWriteOutcome === "Pending" ? "Verified" : result.classificationWriteOutcome;
@@ -4578,6 +4767,9 @@ async function applyStagedResolveAction(params: {
       markWorkflowStage(result, "NoteDedupeChecked");
     } catch (error) {
       if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
+      if (isRateLimitError(error)) {
+        return markRateLimitedReadResult(result, error, "getTicketNoteList.noteDedupe");
+      }
       return markStagedFailure({
         result,
         stage: "noteCheck",
@@ -4628,13 +4820,17 @@ async function applyStagedResolveAction(params: {
             additionalTicketIds: stagedNoteTicketIds(),
           });
           result.noteDedupeChecked = true;
-        } catch {
+        } catch (verifyError) {
+          if (isExecutionStopError(verifyError)) throw verifyError;
+          if (isRateLimitError(verifyError)) {
+            return markRateLimitedReadResult(result, verifyError, "getTicketNoteList.ambiguousNoteVerification");
+          }
           observed = false;
         }
         if (!observed) {
           return markStagedFailure({
             result,
-            stage: "createTicketNote",
+            stage: rejected ? "createTicketNote" : "ambiguousWrite",
             reason: rejected
               ? "Private note creation was rejected: " + safeErrorMessage(error)
               : "Private note creation is ambiguous and was not observed; status resolution was not attempted.",
@@ -4648,10 +4844,27 @@ async function applyStagedResolveAction(params: {
       }
     }
     const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
-    const noteVerified = await existingNoteMatchesFingerprint(client, trustedTicket.ticketId, fingerprint, {
-      ticketNumber: params.ticketNumber,
-      additionalTicketIds: stagedNoteTicketIds(),
-    });
+    let noteVerified: boolean;
+    try {
+      noteVerified = await existingNoteMatchesFingerprint(client, trustedTicket.ticketId, fingerprint, {
+        ticketNumber: params.ticketNumber,
+        additionalTicketIds: stagedNoteTicketIds(),
+      });
+    } catch (error) {
+      if (isExecutionStopError(error)) throw error;
+      if (isRateLimitError(error)) {
+        return markRateLimitedReadResult(result, error, "getTicketNoteList.noteVisibility");
+      }
+      return markStagedFailure({
+        result,
+        stage: "noteVisibility",
+        reason: safeErrorMessage(error),
+        terminalReason: "NoteVisibilityReadFailed",
+        partialWrite: result.writeAttempted,
+        writeMayHaveSucceeded: result.writeMayHaveSucceeded,
+        verificationState: "Pending",
+      });
+    }
     result.noteDedupeChecked = true;
     result.initialNoteVerificationObserved ??= noteVerified;
     result.noteVerificationAttempts = (params.noteVisibilityPriorAttempts ?? 0) + 1;
@@ -4770,9 +4983,42 @@ async function applyStagedResolveAction(params: {
   if (statusAlreadyResolved) {
     result.statusWriteOutcome = "NotRequired";
   }
+  if (!statusAlreadyResolved && params.resumeStage === "StatusWriteStarted") {
+    const attempts = (params.noteVisibilityPriorAttempts ?? 0) + 1;
+    if (
+      params.resumeUpdatedTimeExpectation &&
+      trustedTicket.updatedTime !== params.resumeUpdatedTimeExpectation
+    ) {
+      return markStagedFailure({
+        result,
+        stage: "statusCloseVerification",
+        reason: "Ticket updatedTime changed concurrently while the ambiguous status-only close was being reconciled.",
+        terminalReason: "ConcurrentModificationDetected",
+        partialWrite: true,
+        writeMayHaveSucceeded: true,
+        finalOutcome: "SkippedChangedSinceSnapshot",
+      });
+    }
+    if (action.expectedStatus && trustedTicket.status !== action.expectedStatus) {
+      return markStagedFailure({
+        result,
+        stage: "statusCloseVerification",
+        reason: `Ticket status changed concurrently while the ambiguous status-only close was being reconciled: ${trustedTicket.status ?? "unknown"}.`,
+        terminalReason: "ConcurrentModificationDetected",
+        partialWrite: true,
+        writeMayHaveSucceeded: true,
+        finalOutcome: "SkippedChangedSinceSnapshot",
+      });
+    }
+    const reason = "Ambiguous status-only close remains unobserved after a read-only reconciliation attempt; the close mutation was not replayed.";
+    return attempts >= AMBIGUOUS_WRITE_RECONCILIATION_MAX_ATTEMPTS
+      ? markAmbiguousWriteUnresolved({ result, attempts, reason })
+      : markAmbiguousWritePending({ result, attempts, reason });
+  }
+  const statusWriteBaseline = trustedTicket;
   if (!statusAlreadyResolved && params.resumeStage !== "StatusWriteStarted" && params.resumeStage !== "StatusWriteSucceeded" && params.resumeStage !== "StatusVerified") {
     try {
-      await params.beforeMutation?.("status");
+      await params.beforeMutation?.("status", trustedTicket.updatedTime);
       result.writeAttempted = true;
       const mutationResult = await mutateTicketUpdate(client, statusInput as Record<string, unknown>);
       result.writeMayHaveSucceeded = true;
@@ -4792,6 +5038,10 @@ async function applyStagedResolveAction(params: {
       try {
         statusReread = await getTicketByInternalId(client, params.resolvedTicketId);
       } catch (verifyError) {
+        if (isExecutionStopError(verifyError)) throw verifyError;
+        if (!rejected && isRateLimitError(verifyError)) {
+          return markRateLimitedReadResult(result, verifyError, "getTicket.ambiguousStatusVerification");
+        }
         return markStagedFailure({
           result,
           stage: "statusCloseVerification",
@@ -4806,24 +5056,57 @@ async function applyStagedResolveAction(params: {
       result.finalState = ticketFinalState(trustedTicket);
       result.observedFinalState = result.finalState;
       if (!compareTicketValue(DEFAULT_RESOLVE_TICKET_STATUS, ticketVerificationValue(trustedTicket, "status"))) {
-        return markStagedFailure({
-          result,
-          stage: "statusCloseVerification",
-          reason: rejected
-            ? "Status-only close with suppressCloseNotification=true was rejected."
-            : "Ambiguous status-only close was not observed; it will not be retried automatically.",
-          terminalReason: rejected ? "StatusCloseSuppressionRejected" : "AmbiguousStatusCloseUnresolved",
-          partialWrite: !rejected,
-          writeMayHaveSucceeded: !rejected,
-          verificationState: rejected ? "Failed" : "Pending",
-        });
+        if (rejected) {
+          return markStagedFailure({
+            result,
+            stage: "statusCloseVerification",
+            reason: "Status-only close with suppressCloseNotification=true was rejected.",
+            terminalReason: "StatusCloseSuppressionRejected",
+            partialWrite: false,
+            writeMayHaveSucceeded: false,
+            verificationState: "Failed",
+          });
+        }
+        if (updatedTimeChanged(statusWriteBaseline, statusReread)) {
+          return markStagedFailure({
+            result,
+            stage: "statusCloseVerification",
+            reason: "Ticket changed concurrently while the ambiguous status-only close was being reconciled.",
+            terminalReason: "ConcurrentModificationDetected",
+            partialWrite: true,
+            writeMayHaveSucceeded: true,
+            finalOutcome: "SkippedChangedSinceSnapshot",
+          });
+        }
+        const attempts = (params.noteVisibilityPriorAttempts ?? 0) + 1;
+        const reason = "Ambiguous status-only close was not observed on the immediate read; delayed read-only reconciliation is required and the close mutation will not be replayed.";
+        return attempts >= AMBIGUOUS_WRITE_RECONCILIATION_MAX_ATTEMPTS
+          ? markAmbiguousWriteUnresolved({ result, attempts, reason })
+          : markAmbiguousWritePending({ result, attempts, reason });
       }
     }
   }
 
-  const finalTicket = statusAlreadyResolved
-    ? trustedTicket
-    : await getTicketByInternalId(client, params.resolvedTicketId);
+  let finalTicket: Ticket;
+  try {
+    finalTicket = statusAlreadyResolved
+      ? trustedTicket
+      : await getTicketByInternalId(client, params.resolvedTicketId);
+  } catch (error) {
+    if (isExecutionStopError(error)) throw error;
+    if (isRateLimitError(error)) {
+      return markRateLimitedReadResult(result, error, "getTicket.finalStagedVerification");
+    }
+    return markStagedFailure({
+      result,
+      stage: "finalVerification",
+      reason: safeErrorMessage(error),
+      terminalReason: "FinalVerificationUnavailable",
+      partialWrite: result.writeAttempted,
+      writeMayHaveSucceeded: result.writeMayHaveSucceeded,
+      verificationState: "Pending",
+    });
+  }
   const finalVerification = verifyFinalTargetState(finalAction, finalTicket);
   result.finalState = ticketFinalState(finalTicket);
   result.observedFinalState = result.finalState;
@@ -4839,15 +5122,32 @@ async function applyStagedResolveAction(params: {
     });
   }
   if (noteExpectedForAction(action)) {
-    const noteVerified = await existingNoteMatchesFingerprint(
-      client,
-      finalTicket.ticketId,
-      action.noteFingerprint ?? normalizedNoteFingerprint(action.note),
-      {
-        ticketNumber: params.ticketNumber,
-        additionalTicketIds: [params.resolvedTicketId, params.ticket.ticketId, finalTicket.ticketId],
+    let noteVerified: boolean;
+    try {
+      noteVerified = await existingNoteMatchesFingerprint(
+        client,
+        finalTicket.ticketId,
+        action.noteFingerprint ?? normalizedNoteFingerprint(action.note),
+        {
+          ticketNumber: params.ticketNumber,
+          additionalTicketIds: [params.resolvedTicketId, params.ticket.ticketId, finalTicket.ticketId],
+        }
+      );
+    } catch (error) {
+      if (isExecutionStopError(error)) throw error;
+      if (isRateLimitError(error)) {
+        return markRateLimitedReadResult(result, error, "getTicketNoteList.finalStagedVerification");
       }
-    );
+      return markStagedFailure({
+        result,
+        stage: "finalVerification",
+        reason: safeErrorMessage(error),
+        terminalReason: "FinalNoteVerificationUnavailable",
+        partialWrite: result.writeAttempted,
+        writeMayHaveSucceeded: result.writeMayHaveSucceeded,
+        verificationState: "Pending",
+      });
+    }
     result.noteDedupeChecked = true;
     if (!noteVerified) {
       return markStagedFailure({
@@ -5601,6 +5901,15 @@ function compactApplyResult(
     observedFinalState: trimmedVerifiedSuccess ? undefined : result.observedFinalState,
     verifiedState: trimmedVerifiedSuccess ? undefined : result.verifiedState,
     finalState: trimmedVerifiedSuccess ? undefined : result.finalState,
+    identityResolution: result.identityResolution,
+    immutableIdentityRecovered: result.immutableIdentityRecovered,
+    ambiguousVerificationAttempts: result.ambiguousVerificationAttempts,
+    initialFailureReason: result.initialFailureReason,
+    initialFailureClass: result.initialFailureClass,
+    terminalFailureReason: result.terminalFailureReason,
+    terminalFailureClass: result.terminalFailureClass,
+    replaySafe: result.replaySafe,
+    humanReconciliationRequired: result.humanReconciliationRequired,
   };
 }
 function serializableApplyTriageRequest(
@@ -5802,7 +6111,9 @@ function buildApplyTriageLedgerRecord(params: {
             : "NotRequired",
         retryCount: 0,
         failureReason: result?.failureReason ?? undefined,
-        errorClass: result ? validationErrorClassForApplyResult(result) : undefined,
+        errorClass: result?.failureStage === "rateLimit"
+          ? "SuperOpsRateLimit"
+          : result ? validationErrorClassForApplyResult(result) : undefined,
         updatedTimeExpectation: action?.expectedUpdatedTime,
         targetFields: action?.target ? { ...action.target } : undefined,
       };
@@ -5872,11 +6183,18 @@ function buildApplyTriageLedgerRecord(params: {
     compactResults: params.results.map((result) => compactApplyResult(result, {
       trimVerifiedSuccessDetails: params.expected.length > 50,
     })),
-    partialWriteCount: params.results.filter((result) => result.partialWrite).length,
-    ambiguousWriteCount: 0,
-    rateLimitedItems: params.results
-      .filter((result) => result.failureStage === "rateLimit")
-      .map((result) => result.ticketNumber),
+    partialWriteCount: Object.values(itemStates).filter((item) => item.partialWrite).length,
+    ambiguousWriteCount: Object.values(itemStates).filter((item) =>
+      item.ambiguousWrite === true ||
+      item.stage === "WriteAmbiguous" ||
+      item.stage === "ResolutionWriteAmbiguous" ||
+      item.stage === "NoteWriteAmbiguous" ||
+      item.stage === "AmbiguousWriteUnresolved" ||
+      (item.observedMutationResult === "Ambiguous" && item.writeMayHaveSucceeded)
+    ).length,
+    rateLimitedItems: Object.values(itemStates)
+      .filter((item) => item.errorClass === "SuperOpsRateLimit" && item.stage !== "RateLimitExceeded")
+      .map((item) => item.itemKey),
     continuationCount: 0,
     terminalFailureReason: terminalFailure,
   };
@@ -6006,9 +6324,16 @@ async function applyApprovedTriageAction(params: {
   allowWriteWithoutVerifiedContent: boolean;
   resumeStage?: OperationItemState["stage"];
   noteVisibilityPriorAttempts?: number;
+  resumeUpdatedTimeExpectation?: string;
+  resumeWriteAttempted?: boolean;
+  resumeWriteMayHaveSucceeded?: boolean;
+  resumePartialWrite?: boolean;
   beforeNoteCheck?: () => Promise<void>;
   afterPreflightValidation?: () => Promise<void>;
-  beforeMutation?: (mutationType: DurableMutationType) => Promise<void>;
+  beforeMutation?: (
+    mutationType: DurableMutationType,
+    updatedTimeExpectation?: string
+  ) => Promise<void>;
   afterMutation?: (
     mutationType: DurableMutationType,
     observed: { ticketId?: string; noteId?: string }
@@ -6021,6 +6346,13 @@ async function applyApprovedTriageAction(params: {
   afterVerification?: (mutationType: "update" | "classification" | "resolution" | "status" | "note") => Promise<void>;
 }): Promise<ApplyTriagePlanResult> {
   const { client, ticketNumber, action } = params;
+  const preserveResumedWriteProgress = (result: ApplyTriagePlanResult): ApplyTriagePlanResult => {
+    if (params.resumeWriteAttempted === true) result.writeAttempted = true;
+    if (params.resumeWriteMayHaveSucceeded === true) result.writeMayHaveSucceeded = true;
+    if (params.resumePartialWrite === true) result.partialWrite = true;
+    if (result.writeMayHaveSucceeded === true) result.replaySafe = false;
+    return result;
+  };
   if (!action) {
     const result = baseApplyResult(ticketNumber);
     result.finalOutcome = "NoApprovedAction";
@@ -6029,40 +6361,37 @@ async function applyApprovedTriageAction(params: {
     return result;
   }
 
-  let resolved: Awaited<ReturnType<typeof resolveTicketId>>;
+  let approvedLookup: ApprovedTicketLookup;
   try {
-    resolved = await resolveTicketId(client, { ticketNumber });
+    approvedLookup = await lookupApprovedTicket(client, ticketNumber, action.expectedTicketId);
   } catch (error) {
     if (isExecutionStopError(error)) throw error;
-    return preWriteReadFailureResult({
+    return preserveResumedWriteProgress(preWriteReadFailureResult({
       ticketNumber,
       action,
       error,
-      operationName: "getTicketList",
-    });
+      operationName: action.expectedTicketId ? "getTicket" : "getTicketList",
+    }));
   }
-  if (resolved.error || !resolved.ticketId) {
-    const result = baseApplyResult(ticketNumber, action);
-    result.finalOutcome = "NotFound";
+  if (approvedLookup.error || !approvedLookup.ticketId || !approvedLookup.ticket) {
+    const result = preserveResumedWriteProgress(baseApplyResult(ticketNumber, action));
+    result.finalOutcome = approvedLookup.confirmedNotFound ? "NotFound" : "Blocked";
     result.failureStage = "readMetadata";
-    result.failureReason = resolved.error ?? "Ticket was not found.";
+    result.failureReason = approvedLookup.error ?? "Ticket was not found.";
+    result.identityResolution = approvedLookup.confirmedNotFound ? "confirmedNotFound" : undefined;
+    result.immutableIdentityRecovered = false;
+    result.replaySafe = result.writeMayHaveSucceeded !== true;
+    result.humanReconciliationRequired = result.writeMayHaveSucceeded === true;
     return result;
   }
 
-  let ticket: Ticket;
-  try {
-    ticket = await getTicketByInternalId(client, resolved.ticketId);
-  } catch (error) {
-    if (isExecutionStopError(error)) throw error;
-    return preWriteReadFailureResult({
-      ticketNumber,
-      action,
-      error,
-      operationName: "getTicket",
-    });
-  }
-
-  const result = baseApplyResult(ticketNumber, action, ticket);
+  const resolved = { ticketId: approvedLookup.ticketId };
+  const ticket = approvedLookup.ticket;
+  const result = preserveResumedWriteProgress(baseApplyResult(ticketNumber, action, ticket));
+  result.identityResolution = approvedLookup.immutableIdentityRecovered
+    ? "expectedTicketId"
+    : "displayNumber";
+  result.immutableIdentityRecovered = approvedLookup.immutableIdentityRecovered;
   const allowChanged = action.allowWriteIfUpdatedTimeChanged ?? params.allowWriteIfUpdatedTimeChanged;
   const stagedResume = action.action === "resolve" && stagedResolveResumeSkipsSnapshotExpectations(params.resumeStage);
   const validationAction = stagedResume ? actionWithSnapshotExpectationsRelaxedForStagedResume(action) : action;
@@ -6202,6 +6531,9 @@ async function applyApprovedTriageAction(params: {
           await params.afterVerification?.("note");
         } catch (error) {
           if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
+          if (isRateLimitError(error)) {
+            return markRateLimitedReadResult(result, error, "getTicket.noteOnlyVerification");
+          }
           result.finalOutcome = "Failed";
           result.partialWrite = result.writeAttempted || result.noteAdded;
           result.failureStage = "verify";
@@ -6222,6 +6554,7 @@ async function applyApprovedTriageAction(params: {
           dedupeNotes: params.dedupeNotes,
           resumeStage: params.resumeStage,
           noteVisibilityPriorAttempts: params.noteVisibilityPriorAttempts,
+          resumeUpdatedTimeExpectation: params.resumeUpdatedTimeExpectation,
           beforeNoteCheck: params.beforeNoteCheck,
           afterPreflightValidation: params.afterPreflightValidation,
           beforeMutation: params.beforeMutation,
@@ -6253,6 +6586,9 @@ async function applyApprovedTriageAction(params: {
         });
       } catch (error) {
         if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
+        if (isRateLimitError(error)) {
+          return markRateLimitedReadResult(result, error, "getTicketNoteList.duplicateNoteCheck");
+        }
         result.finalOutcome = "Failed";
         result.failureStage = "duplicateNoteCheck";
         result.failureReason = safeErrorMessage(error);
@@ -6297,18 +6633,68 @@ async function applyApprovedTriageAction(params: {
           }
           return result;
         }
-        result.finalOutcome = "Failed";
-        result.failureStage = "update";
+        const rejected = isReliableSynchronousMutationRejection(error);
+        result.primaryWriteOutcome = rejected ? "Rejected" : "Ambiguous";
+        applyPrimaryFailureDiagnostics(result, error);
+        recordPhysicalWrite(result, result.primaryWriteMethod ?? "updateTicket", result.primaryWriteOutcome);
+        result.finalOutcome = rejected ? "RejectedOrNoChange" : "Failed";
+        result.failureStage = rejected ? "update" : "ambiguousWrite";
         result.failureReason = safeErrorMessage(error);
-        result.partialWrite = result.writeAttempted || result.noteAdded;
-        result.writeMayHaveSucceeded = result.partialWrite;
-        return result;
+        result.writeAttempted = true;
+        result.partialWrite = !rejected;
+        result.writeMayHaveSucceeded = !rejected;
+        result.initialFailureReason = result.failureReason;
+        result.initialFailureClass = rejected ? "ConclusiveRejection" : "AmbiguousWrite";
+        result.replaySafe = rejected;
+        if (rejected) {
+          result.terminalReason = "RejectedOrNoChange";
+          result.terminalFailureReason = result.failureReason;
+          result.terminalFailureClass = "ConclusiveRejection";
+          return result;
+        }
+        let immediateReread: Ticket;
+        try {
+          immediateReread = await getTicketByInternalId(client, ticket.ticketId);
+        } catch (verifyError) {
+          if (isExecutionStopError(verifyError)) throw verifyError;
+          if (isRateLimitError(verifyError)) {
+            return markRateLimitedReadResult(result, verifyError, "getTicket.ambiguousUpdateVerification");
+          }
+          return markAmbiguousWritePending({
+            result,
+            attempts: 1,
+            reason: "Ambiguous update could not be reconciled immediately: " + safeErrorMessage(verifyError),
+          });
+        }
+        result.finalState = ticketFinalState(immediateReread);
+        result.observedFinalState = result.finalState;
+        if (!targetAppliedToTicket(action, immediateReread)) {
+          if (updatedTimeChanged(ticket, immediateReread)) {
+            return markStagedFailure({
+              result,
+              stage: "ambiguousWriteVerification",
+              reason: "Ticket changed concurrently while the ambiguous update was being reconciled.",
+              terminalReason: "ConcurrentModificationDetected",
+              partialWrite: true,
+              writeMayHaveSucceeded: true,
+              finalOutcome: "SkippedChangedSinceSnapshot",
+            });
+          }
+          return markAmbiguousWritePending({
+            result,
+            attempts: 1,
+            reason: "Ambiguous update was not observed on the immediate read; delayed read-only reconciliation is required and the mutation will not be replayed.",
+          });
+        }
       }
       let verified: Ticket;
       try {
         verified = await getTicketByInternalId(client, ticket.ticketId);
       } catch (error) {
         if (isExecutionStopError(error)) throw error;
+        if (isRateLimitError(error)) {
+          return markRateLimitedReadResult(result, error, "getTicket.verifyFinalState");
+        }
         result.finalOutcome = "Failed";
         result.partialWrite = true;
         result.writeMayHaveSucceeded = true;
@@ -6333,6 +6719,14 @@ async function applyApprovedTriageAction(params: {
       result.writeMayHaveSucceeded = true;
       result.verifiedState = result.finalState;
       result.finalVerificationState = "Verified";
+      result.partialWrite = false;
+      result.failureStage = null;
+      result.failureReason = null;
+      result.terminalReason = null;
+      result.terminalFailureReason = null;
+      result.terminalFailureClass = null;
+      result.humanReconciliationRequired = false;
+      result.replaySafe = false;
       await params.afterVerification?.("update");
 
       try {
@@ -6372,7 +6766,11 @@ async function applyApprovedTriageAction(params: {
             additionalTicketIds: [resolved.ticketId, ticket.ticketId],
           });
           result.noteDedupeChecked = true;
-        } catch {
+        } catch (error) {
+          if (isExecutionStopError(error)) throw error;
+          if (isRateLimitError(error)) {
+            return markRateLimitedReadResult(result, error, "getTicketNoteList.postWriteVerification");
+          }
           result.noteDedupeChecked = false;
         }
         result.initialNoteVerificationObserved = noteVerified;
@@ -6408,13 +6806,16 @@ async function applyApprovedTriageAction(params: {
       ? "rateLimit"
       : result.writeMethod === "createTicketNote" ? "createTicketNote" : "write";
     result.failureReason = safeErrorMessage(error);
+    if (rateLimited && !result.writeAttempted && !result.noteAdded) {
+      return markRateLimitedReadResult(result, error, "getTicketNoteList.noteOnlyDedupe");
+    }
     if (rateLimited) {
       const rateLimit = rateLimitRetryMetadata(error);
       result.rateLimitRetryAfterMs = rateLimit.delayMs;
-          result.rateLimitRequestedDelayMs = rateLimit.requestedDelayMs;
-          result.rateLimitRetryAfterSupplied = rateLimit.retryAfterSupplied;
-          result.rateLimitDelaySource = rateLimit.delaySource;
-          result.rateLimitConclusiveRejection = rateLimit.conclusiveRejection;
+      result.rateLimitRequestedDelayMs = rateLimit.requestedDelayMs;
+      result.rateLimitRetryAfterSupplied = rateLimit.retryAfterSupplied;
+      result.rateLimitDelaySource = rateLimit.delaySource;
+      result.rateLimitConclusiveRejection = rateLimit.conclusiveRejection;
       // NoteWriteStarted remains the durable mutation boundary. A reliable
       // rejection permits only a later re-read/dedupe/revalidation cycle; an
       // ambiguous transport or upstream failure remains possible-write truth.
@@ -6450,6 +6851,9 @@ function applyResultToContinuationOutcome(
     !["Pending", "Unattempted", "Rescheduled", "RateLimitedRescheduled"].includes(stage);
   const noteVisibilityPending = result.terminalReason === "NoteVisibilityPending";
   const noteVisibilityUnresolved = result.terminalReason === "NoteVisibilityUnresolved";
+  const ambiguousWritePending = result.terminalReason === "AmbiguousWritePending";
+  const ambiguousWriteUnresolved = result.terminalReason === "AmbiguousWriteUnresolved" ||
+    result.terminalReason === "AmbiguousNoteCreationUnresolved";
   const ambiguousMutation = result.writeAttempted && result.partialWrite && (
     result.failureStage === "update" || result.failureStage === "resolve_full" ||
     result.failureStage === "createTicketNote" || result.failureStage === "write" ||
@@ -6457,17 +6861,21 @@ function applyResultToContinuationOutcome(
   );
   const persistedStage = noteVisibilityPending
     ? stage === "NoteWriteStarted" ? "NoteWriteStarted" : "NoteAdded"
-    : noteVisibilityUnresolved
+    : noteVisibilityUnresolved || ambiguousWriteUnresolved
       ? "AmbiguousWriteUnresolved"
-      : result.failureStage === "ambiguousWrite"
-    ? "AmbiguousWriteUnresolved"
-    : ambiguousMutation
-      ? result.failureStage === "createTicketNote"
-      ? "NoteWriteAmbiguous"
-      : result.failureStage === "resolve_full"
-        ? "ResolutionWriteAmbiguous"
-        : "WriteAmbiguous"
-    : stage;
+      : ambiguousWritePending
+        ? stage === "StatusWriteStarted" || stage === "ResolutionWriteAmbiguous" || stage === "NoteWriteAmbiguous"
+          ? stage
+          : "WriteAmbiguous"
+      : result.finalOutcome === "SkippedChangedSinceSnapshot"
+        ? stage === "RateLimitedRescheduled" ? "StaleAfterRateLimitWait" : "Stale"
+      : ambiguousMutation
+        ? result.failureStage === "createTicketNote"
+          ? "NoteWriteAmbiguous"
+          : result.failureStage === "resolve_full"
+            ? "ResolutionWriteAmbiguous"
+            : "WriteAmbiguous"
+        : stage;
   return {
     stage: rateLimitReschedule
       ? preserveReadCheckpoint ? stage : "RateLimitedRescheduled"
@@ -6475,7 +6883,8 @@ function applyResultToContinuationOutcome(
     outcome: rateLimitReschedule ? "SuperOpsRateLimitRescheduled" :
       noteVisibilityPending ? "NoteVisibilityPending" :
       noteVisibilityUnresolved ? "NoteVisibilityUnresolved" :
-      result.failureStage === "ambiguousWrite" ? "AmbiguousWriteUnresolved" : result.finalOutcome,
+      ambiguousWritePending ? "AmbiguousWritePending" :
+      ambiguousWriteUnresolved ? "AmbiguousWriteUnresolved" : result.finalOutcome,
     writeAttempted: result.writeAttempted,
     // A mutation throttle reliably rejects that mutation attempt. A read-only
     // throttle preserves the latest verified mutation state and merely delays
@@ -6492,13 +6901,17 @@ function applyResultToContinuationOutcome(
         ? "CreateTicketNote"
         : "UpdateTicket"),
     retryEndpoint: "SuperOps GraphQL /msp",
-    retryCount: noteVisibilityPending || noteVisibilityUnresolved ? result.noteVerificationAttempts : undefined,
+    retryCount: noteVisibilityPending || noteVisibilityUnresolved
+      ? result.noteVerificationAttempts
+      : ambiguousWritePending || ambiguousWriteUnresolved
+        ? result.ambiguousVerificationAttempts
+        : undefined,
     observedMutationResult: rateLimitReschedule
       ? readRateLimitReschedule ? priorObservedMutationResult : "Rejected"
       : noteVisibilityPending || noteVisibilityUnresolved
         ? "Accepted"
       : result.verified
-        ? priorObservedMutationResult === "Rejected" && !result.writeAttempted
+        ? priorObservedMutationResult === "Rejected" && (result.physicalWrites?.length ?? 0) === 0
           ? "Rejected"
           : "VerifiedApplied"
         : result.writeAttempted && result.writeMayHaveSucceeded === false
@@ -6514,7 +6927,9 @@ function applyResultToContinuationOutcome(
       ? new Date(Date.now() + (result.rateLimitRetryAfterMs ?? 0)).toISOString()
       : noteVisibilityPending
         ? stagedNoteVisibilityNextEligibleTime()
-        : undefined,
+        : ambiguousWritePending
+          ? ambiguousWriteNextEligibleTime()
+          : undefined,
     verificationFailed: result.failureStage === "verify" || result.failureStage === "verifyFinalState",
     stale: result.finalOutcome === "SkippedChangedSinceSnapshot",
     failureReason: result.failureReason ?? undefined,
@@ -6523,7 +6938,7 @@ function applyResultToContinuationOutcome(
       ? "SuperOpsRateLimit"
       : noteVisibilityPending
         ? undefined
-      : noteVisibilityUnresolved
+      : noteVisibilityUnresolved || ambiguousWritePending || ambiguousWriteUnresolved
         ? "AmbiguousWrite"
       : result.finalOutcome === "SkippedChangedSinceSnapshot"
         ? "StaleData"
@@ -6586,26 +7001,68 @@ async function ambiguityCheckedTriageResult(params: {
   afterVerification?: (mutationType: "update" | "classification" | "resolution" | "status" | "note") => Promise<void>;
 }): Promise<{ result: ApplyTriagePlanResult; stage?: OperationItemState["stage"]; retryCount?: number }> {
   const { client, ticketNumber, action, applyParams } = params;
+  const noteOnlyReconciliation = action.action === "addNote" ||
+    params.ambiguityStage === "NoteWriteStarted" ||
+    params.ambiguityStage === "NoteWriteAmbiguous";
   if (action.isPublicNote === true && Boolean(action.noteFingerprint ?? normalizedNoteFingerprint(action.note))) {
     return { result: publicNoteBlockedResult(ticketNumber, action) };
   }
 
-  const resolved = await resolveTicketId(client, { ticketNumber });
-  if (resolved.error || !resolved.ticketId) {
+  let approvedLookup: ApprovedTicketLookup;
+  try {
+    approvedLookup = await lookupApprovedTicket(client, ticketNumber, action.expectedTicketId, {
+      requireTicket: !noteOnlyReconciliation,
+    });
+  } catch (error) {
+    if (isExecutionStopError(error)) throw error;
+    const result = baseApplyResult(ticketNumber, action);
+    result.writeAttempted = true;
+    result.writeMayHaveSucceeded = true;
+    result.partialWrite = true;
+    if (isRateLimitError(error)) {
+      return {
+        result: markRateLimitedReadResult(result, error, "getTicket.ambiguityReconciliation"),
+        stage: params.ambiguityStage,
+      };
+    }
+    const attempts = params.previousRetryCount + 1;
+    const reason = "Ambiguous write reconciliation read failed: " + safeErrorMessage(error);
+    return {
+      result: attempts >= AMBIGUOUS_WRITE_RECONCILIATION_MAX_ATTEMPTS
+        ? markAmbiguousWriteUnresolved({ result, attempts, reason })
+        : markAmbiguousWritePending({ result, attempts, reason }),
+      stage: params.ambiguityStage,
+      retryCount: attempts,
+    };
+  }
+  if (approvedLookup.error || !approvedLookup.ticketId || !approvedLookup.ticket) {
     const result = baseApplyResult(ticketNumber, action);
     result.finalOutcome = "NotFound";
     result.failureStage = "ambiguityRead";
-    result.failureReason = resolved.error ?? "Ticket was not found while resolving an ambiguous write.";
-    return { result };
+    result.failureReason = approvedLookup.error ?? "Ticket was not found while resolving an ambiguous write.";
+    result.identityResolution = approvedLookup.confirmedNotFound ? "confirmedNotFound" : undefined;
+    result.writeAttempted = true;
+    result.writeMayHaveSucceeded = true;
+    result.partialWrite = true;
+    result.replaySafe = false;
+    result.humanReconciliationRequired = true;
+    result.terminalFailureReason = result.failureReason;
+    result.terminalFailureClass = "AmbiguousWrite";
+    return { result, stage: "AmbiguousWriteUnresolved" };
   }
 
-  const ticket = await getTicketByInternalId(client, resolved.ticketId);
-  if (
-    action.action === "addNote" ||
-    params.ambiguityStage === "NoteWriteStarted" ||
-    params.ambiguityStage === "NoteWriteAmbiguous"
-  ) {
+  const resolved = { ticketId: approvedLookup.ticketId };
+  const ticket = approvedLookup.ticket;
+  const baseAmbiguityResult = (): ApplyTriagePlanResult => {
     const result = baseApplyResult(ticketNumber, action, ticket);
+    result.identityResolution = approvedLookup.immutableIdentityRecovered
+      ? "expectedTicketId"
+      : "displayNumber";
+    result.immutableIdentityRecovered = approvedLookup.immutableIdentityRecovered;
+    return result;
+  };
+  if (noteOnlyReconciliation) {
+    const result = baseAmbiguityResult();
     result.writeAttempted = true;
     result.writeMethod = "createTicketNote";
     const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
@@ -6614,10 +7071,24 @@ async function ambiguityCheckedTriageResult(params: {
       result.noteDedupePlanned = true;
       result.noteDedupeChecked = false;
     }
-    const noteDeduped = await existingNoteMatchesFingerprint(client, ticket.ticketId, fingerprint, {
-      ticketNumber,
-      additionalTicketIds: [resolved.ticketId, ticket.ticketId],
-    });
+    let noteDeduped: boolean;
+    try {
+      noteDeduped = await existingNoteMatchesFingerprint(client, ticket.ticketId, fingerprint, {
+        ticketNumber,
+        additionalTicketIds: [resolved.ticketId, ticket.ticketId],
+      });
+    } catch (error) {
+      if (isExecutionStopError(error)) throw error;
+      if (isRateLimitError(error)) {
+        result.writeMayHaveSucceeded = true;
+        result.partialWrite = true;
+        return {
+          result: markRateLimitedReadResult(result, error, "getTicketNoteList.ambiguousNoteVerification"),
+          stage: params.ambiguityStage,
+        };
+      }
+      throw error;
+    }
     if (fingerprint) {
       result.noteDedupeChecked = true;
     }
@@ -6628,11 +7099,13 @@ async function ambiguityCheckedTriageResult(params: {
       result.verifiedState = ticketFinalState(ticket);
       return { result, stage: "CompletedAfterAmbiguousWriteVerification" };
     }
-    result.finalOutcome = "Failed";
-    result.failureStage = "ambiguousWrite";
-    result.failureReason = "Ambiguous private-note write was not observed; it will not be retried automatically.";
-    result.partialWrite = true;
-    return { result, stage: "AmbiguousWriteUnresolved" };
+    const attempts = params.previousRetryCount + 1;
+    const reason = "Ambiguous private-note write was not observed; it will not be retried automatically.";
+    return {
+      result: markAmbiguousWriteUnresolved({ result, attempts, reason }),
+      stage: "AmbiguousWriteUnresolved",
+      retryCount: attempts,
+    };
   }
   const targetApplied = targetAppliedToTicket(action, ticket);
   const statusMissingAfterResolve = action.action === "resolve"
@@ -6645,7 +7118,7 @@ async function ambiguityCheckedTriageResult(params: {
       ? undefined
       : validateExpectedTicket(ticketNumber, action, ticket, allowChanged);
   if (validationFailure) {
-    const result = baseApplyResult(ticketNumber, action, ticket);
+    const result = baseAmbiguityResult();
     result.finalOutcome = validationFailure.outcome ?? "Blocked";
     result.failureStage = validationFailure.stage;
     result.failureReason = validationFailure.reason;
@@ -6659,7 +7132,7 @@ async function ambiguityCheckedTriageResult(params: {
   }
 
   if (targetApplied) {
-    const result = baseApplyResult(ticketNumber, action, ticket);
+    const result = baseAmbiguityResult();
     result.writeAttempted = true;
     result.writeMethod = action.action === "resolve" ? "resolve_full" : "update";
     result.finalOutcome = action.action === "resolve"
@@ -6673,6 +7146,7 @@ async function ambiguityCheckedTriageResult(params: {
     result.verified = true;
     await params.afterVerification?.(action.action === "resolve" ? "resolution" : "update");
 
+    let noteWriteStarted = false;
     try {
       await addNoteForPlan({
         client,
@@ -6686,6 +7160,7 @@ async function ambiguityCheckedTriageResult(params: {
         beforeCheck: params.beforeNoteCheck,
         beforeCreate: async () => {
           await (params.beforeMutation?.("note") ?? Promise.resolve());
+          noteWriteStarted = true;
           result.writeAttempted = true;
         },
         afterCreate: (note) => params.afterMutation?.("note", {
@@ -6694,6 +7169,13 @@ async function ambiguityCheckedTriageResult(params: {
         }) ?? Promise.resolve(),
       });
     } catch (error) {
+      if (isExecutionStopError(error)) throw error;
+      if (isRateLimitError(error) && !noteWriteStarted) {
+        return {
+          result: markRateLimitedReadResult(result, error, "getTicketNoteList.postAmbiguousUpdateCheck"),
+          stage: params.ambiguityStage,
+        };
+      }
       result.finalOutcome = "Failed";
       result.failureStage = "createTicketNote";
       result.failureReason = safeErrorMessage(error);
@@ -6707,7 +7189,7 @@ async function ambiguityCheckedTriageResult(params: {
   if (action.action === "resolve") {
     const analysis = resolveStatusAnalysis(action, ticket);
     if (analysis.statusMissing) {
-      const result = baseApplyResult(ticketNumber, action, ticket);
+      const result = baseAmbiguityResult();
       result.writeAttempted = true;
       result.writeMethod = "resolve_full";
       result.primaryWriteMethod = "updateTicket.resolve_full";
@@ -6767,14 +7249,23 @@ async function ambiguityCheckedTriageResult(params: {
   // SuperOps even when no matching target is visible on this read.  Retrying
   // would replay a possible successful mutation and requires a backward stage
   // transition, so retain an explicit unresolved ambiguity instead.
-  const result = baseApplyResult(ticketNumber, action, ticket);
-  result.finalOutcome = "Failed";
-  result.failureStage = "ambiguousWrite";
-  result.failureReason = "Ambiguous write was not observed; it will not be retried automatically.";
+  const result = baseAmbiguityResult();
+  result.identityResolution = approvedLookup.immutableIdentityRecovered
+    ? "expectedTicketId"
+    : "displayNumber";
+  result.immutableIdentityRecovered = approvedLookup.immutableIdentityRecovered;
   result.writeAttempted = true;
   result.writeMayHaveSucceeded = true;
   result.partialWrite = true;
-  return { result, stage: "AmbiguousWriteUnresolved" };
+  const attempts = params.previousRetryCount + 1;
+  const reason = "Ambiguous write remained unobserved after read-only reconciliation; the mutation was not replayed.";
+  return {
+    result: attempts >= AMBIGUOUS_WRITE_RECONCILIATION_MAX_ATTEMPTS
+      ? markAmbiguousWriteUnresolved({ result, attempts, reason })
+      : markAmbiguousWritePending({ result, attempts, reason }),
+    stage: params.ambiguityStage === "WriteStarted" ? "WriteAmbiguous" : params.ambiguityStage,
+    retryCount: attempts,
+  };
 }
 
 function createApplyTriageContinuationAdapter(
@@ -6938,7 +7429,8 @@ function createApplyTriageContinuationAdapter(
         }
       };
       const beforeMutation = async (
-        mutationType: DurableMutationType
+        mutationType: DurableMutationType,
+        updatedTimeExpectation?: string
       ) => {
         const checkpointCount = mutationType === "note" ? 2 : mutationType === "resolveFallback" || mutationType === "status" ? 1 : mutationType === "classification" ? 2 : 3;
         const verificationReserve = mutationType === "note"
@@ -6960,15 +7452,15 @@ function createApplyTriageContinuationAdapter(
               : mutationType === "resolveFallback"
                 ? ["ResolutionWriteStarted"]
                 : ["Validated", "WriteNotStarted", "WriteStarted"];
-const completedStageIndex = mutationType === "resolveFallback"
-  ? -1
-  : stages.indexOf(checkpointStage);
+          const completedStageIndex = mutationType === "resolveFallback"
+            ? -1
+            : stages.indexOf(checkpointStage);
 
-const remainingStages = completedStageIndex >= 0
-  ? stages.slice(completedStageIndex + 1)
-  : stages;
+          const remainingStages = completedStageIndex >= 0
+            ? stages.slice(completedStageIndex + 1)
+            : stages;
 
-for (const stage of remainingStages) {
+          for (const stage of remainingStages) {
             const mutationStarted = stage === "WriteStarted" ||
               stage === "ClassificationWriteStarted" || stage === "ResolutionWriteStarted" ||
               stage === "StatusWriteStarted" || stage === "NoteWriteStarted";
@@ -6991,6 +7483,7 @@ for (const stage of remainingStages) {
               reliableResponseReceived: nextReliableResponseReceived,
               observedMutationResult: nextObservedMutationResult,
               canonicalTargetHash,
+              updatedTimeExpectation: updatedTimeExpectation ?? claim.item.updatedTimeExpectation,
               noteFingerprint: action?.noteFingerprint ?? normalizedNoteFingerprint(action?.note),
               fallbackAllowed: action?.allowResolveFullFallbackToUpdate ??
                 storedParams.allowResolveFullFallbackToUpdate ?? false,
@@ -7163,11 +7656,27 @@ for (const stage of remainingStages) {
         visibilityResult.physicalWrites = [];
         markWorkflowStage(visibilityResult, claim.item.stage);
 
-        const resolvedForNotes = await resolveTicketId(client, { ticketNumber: claim.itemKey });
-        if (resolvedForNotes.error || !resolvedForNotes.ticketId) {
+        let resolvedForNotes: ApprovedTicketLookup;
+        try {
+          resolvedForNotes = await lookupApprovedTicket(client, claim.itemKey, action.expectedTicketId, {
+            requireTicket: false,
+          });
+        } catch (error) {
+          if (isExecutionStopError(error)) throw error;
+          if (isRateLimitError(error)) {
+            return applyResultToContinuationOutcome(
+              markRateLimitedReadResult(visibilityResult, error, "getTicket.noteVisibilityIdentity"),
+              claim.item.stage,
+              observedMutationResult
+            );
+          }
+          throw error;
+        }
+        if (resolvedForNotes.error || !resolvedForNotes.ticketId || !resolvedForNotes.ticket) {
           visibilityResult.finalOutcome = "Failed";
           visibilityResult.failureStage = "noteVisibilityRead";
           visibilityResult.failureReason = resolvedForNotes.error ?? "Ticket was not found while reconciling private-note visibility.";
+          visibilityResult.identityResolution = resolvedForNotes.confirmedNotFound ? "confirmedNotFound" : undefined;
           visibilityResult.terminalReason = "NoteVisibilityUnresolved";
           visibilityResult.finalVerificationState = "Pending";
           return applyResultToContinuationOutcome(
@@ -7179,6 +7688,10 @@ for (const stage of remainingStages) {
             observedMutationResult
           );
         }
+        visibilityResult.identityResolution = resolvedForNotes.immutableIdentityRecovered
+          ? "expectedTicketId"
+          : "displayNumber";
+        visibilityResult.immutableIdentityRecovered = resolvedForNotes.immutableIdentityRecovered;
 
         let noteObserved = false;
         try {
@@ -7187,7 +7700,15 @@ for (const stage of remainingStages) {
             additionalTicketIds: [resolvedForNotes.ticketId],
           });
           visibilityResult.noteDedupeChecked = true;
-        } catch {
+        } catch (error) {
+          if (isExecutionStopError(error)) throw error;
+          if (isRateLimitError(error)) {
+            return applyResultToContinuationOutcome(
+              markRateLimitedReadResult(visibilityResult, error, "getTicketNoteList.noteVisibilityContinuation"),
+              claim.item.stage,
+              observedMutationResult
+            );
+          }
           visibilityResult.noteDedupeChecked = false;
         }
         visibilityResult.initialNoteVerificationObserved = false;
@@ -7217,7 +7738,20 @@ for (const stage of remainingStages) {
           await afterVerification("note");
           resumeStageOverride = "NoteVerified";
         } else {
-          const verifiedTicket = await getTicketByInternalId(client, resolvedForNotes.ticketId);
+          let verifiedTicket: Ticket;
+          try {
+            verifiedTicket = await getTicketByInternalId(client, resolvedForNotes.ticketId);
+          } catch (error) {
+            if (isExecutionStopError(error)) throw error;
+            if (isRateLimitError(error)) {
+              return applyResultToContinuationOutcome(
+                markRateLimitedReadResult(visibilityResult, error, "getTicket.postNoteTargetVerification"),
+                claim.item.stage,
+                observedMutationResult
+              );
+            }
+            throw error;
+          }
           const identityFailure = validateExpectedTicket(
             claim.itemKey,
             { ...action, expectedStatus: undefined, expectedUpdatedTime: undefined },
@@ -7300,6 +7834,10 @@ for (const stage of remainingStages) {
                 storedParams.allowWriteWithoutVerifiedContent ?? false,
               resumeStage: resumeStageOverride,
               noteVisibilityPriorAttempts: claim.item.retryCount,
+              resumeUpdatedTimeExpectation: claim.item.updatedTimeExpectation,
+              resumeWriteAttempted: claim.item.writeAttempted,
+              resumeWriteMayHaveSucceeded: claim.item.writeMayHaveSucceeded,
+              resumePartialWrite: claim.item.partialWrite,
               beforeNoteCheck,
               afterPreflightValidation,
               beforeMutation,
@@ -7317,7 +7855,8 @@ for (const stage of remainingStages) {
         storedParams.expectedCandidateTicketNumbers.length > 50;
       const outcome = applyResultToContinuationOutcome(
         applied.result,
-        applied.result.failureStage === "rateLimit" && applied.result.retrySafe === true
+        (applied.result.failureStage === "rateLimit" && applied.result.retrySafe === true) ||
+          applied.result.continuationRequired === true
           ? checkpointStage
           : applied.stage,
         observedMutationResult,

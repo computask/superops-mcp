@@ -107,14 +107,27 @@ export async function runOperationContinuation(
         const item = current.itemStates[itemKey];
         if (!item) continue;
         const possibleWrite = item.writeMayHaveSucceeded && item.observedMutationResult !== "Rejected";
+        const terminalReason = "Maximum continuation count reached.";
+        const terminalStage: OperationItemStage = possibleWrite ? "AmbiguousWriteUnresolved" : "FailedBeforeWrite";
         next.itemStates[itemKey] = {
           ...item,
-          stage: possibleWrite ? "AmbiguousWriteUnresolved" : "FailedBeforeWrite",
+          stage: terminalStage,
           outcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : "ContinuationLimitExceeded",
           ambiguousWrite: possibleWrite || item.ambiguousWrite,
           partialWrite: possibleWrite || item.partialWrite,
-          errorClass: "ContinuationFailure",
-          failureReason: "Maximum continuation count reached.",
+          initialFailureReason: item.initialFailureReason ?? item.failureReason ?? terminalReason,
+          initialErrorClass: item.initialErrorClass ?? item.errorClass ?? "ContinuationFailure",
+          terminalFailureReason: terminalReason,
+          terminalErrorClass: "ContinuationFailure",
+          stageHistory: [...new Set([...(item.stageHistory ?? [item.stage]), terminalStage])],
+          failureHistory: [
+            ...(item.failureHistory ?? []),
+            { stage: terminalStage, reason: terminalReason, errorClass: "ContinuationFailure" as const, retryCount: item.retryCount },
+          ].slice(-8),
+          replaySafe: !possibleWrite,
+          humanReconciliationRequired: possibleWrite,
+          errorClass: item.errorClass ?? "ContinuationFailure",
+          failureReason: item.failureReason ?? terminalReason,
           lease: undefined,
         };
       }

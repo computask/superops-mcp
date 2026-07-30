@@ -141,6 +141,19 @@ export interface OperationItemState {
   targetFields?: Record<string, unknown>;
   originalMetadataExpectations?: Record<string, unknown>;
   rateLimit?: OperationRateLimitState;
+  initialFailureReason?: string;
+  initialErrorClass?: OperationErrorClass;
+  terminalFailureReason?: string;
+  terminalErrorClass?: OperationErrorClass;
+  stageHistory?: OperationItemStage[];
+  failureHistory?: Array<{
+    stage: OperationItemStage;
+    reason?: string;
+    errorClass?: OperationErrorClass;
+    retryCount: number;
+  }>;
+  replaySafe?: boolean;
+  humanReconciliationRequired?: boolean;
   lease?: OperationLease;
   claimedAt?: string;
   completedAt?: string;
@@ -155,8 +168,12 @@ export interface OperationLedgerRecord {
   createdAt: string;
   updatedAt: string;
   expiresAt: string;
-  /** Hard deadline for processing; retained evidence may outlive this value. */
+  /** Hard deadline for active processing; durable eligibility waits extend it. */
   maxOperationLifetimeAt?: string;
+  /** Total durable waiting time excluded from the active-processing lifetime. */
+  pausedLifetimeMs?: number;
+  /** Furthest eligibility instant already credited to pausedLifetimeMs. */
+  lifetimePausedUntil?: string;
   originalRequestHash: string;
   operationRequest?: Record<string, unknown>;
   state: OperationState;
@@ -652,6 +669,13 @@ function assertOperationRecord(value: unknown): asserts value is OperationLedger
       (typeof record.maxOperationLifetimeAt !== "string" || !Number.isFinite(Date.parse(record.maxOperationLifetimeAt)))) {
     throw new MalformedStoredOperationError("Operation maxOperationLifetimeAt is invalid.");
   }
+  if (record.pausedLifetimeMs !== undefined && !isFiniteNonnegativeInteger(record.pausedLifetimeMs)) {
+    throw new MalformedStoredOperationError("Operation pausedLifetimeMs is invalid.");
+  }
+  if (record.lifetimePausedUntil !== undefined &&
+      (typeof record.lifetimePausedUntil !== "string" || !Number.isFinite(Date.parse(record.lifetimePausedUntil)))) {
+    throw new MalformedStoredOperationError("Operation lifetimePausedUntil is invalid.");
+  }
 
   const expectedItems = record.expectedItems as string[];
   if (expectedItems.length > MAX_OPERATION_ITEMS) {
@@ -822,13 +846,22 @@ function expireOperationLifetime(record: OperationLedgerRecord, now: string): Op
   for (const itemKey of next.expectedItems) {
     const item = next.itemStates[itemKey];
     if (!item || TERMINAL_STAGES.has(item.stage)) continue;
-    next.itemStates[itemKey] = {
-      ...item,
+    const lifetimeReason = "Operation maximum lifetime exceeded before the item reached a terminal state.";
+    const lifetimePatch: Partial<OperationItemState> & { stage: OperationItemStage } = {
       stage: item.writeMayHaveSucceeded ? "AmbiguousWriteUnresolved" : "FailedBeforeWrite",
       ambiguousWrite: item.writeMayHaveSucceeded || item.ambiguousWrite,
       partialWrite: item.partialWrite || item.writeMayHaveSucceeded,
-      errorClass: "ContinuationFailure",
-      failureReason: "Operation maximum lifetime exceeded before the item reached a terminal state.",
+      errorClass: item.errorClass ?? "ContinuationFailure",
+      failureReason: item.failureReason ?? lifetimeReason,
+      terminalFailureReason: lifetimeReason,
+      terminalErrorClass: "ContinuationFailure",
+    };
+    next.itemStates[itemKey] = {
+      ...item,
+      ...lifetimePatch,
+      ...diagnosticItemFields(item, lifetimePatch),
+      terminalFailureReason: lifetimeReason,
+      terminalErrorClass: "ContinuationFailure",
       lease: undefined,
     };
   }
@@ -860,14 +893,22 @@ function terminalizeContinuationFailureInRecord(
     const item = next.itemStates[itemKey];
     if (!item || TERMINAL_STAGES.has(item.stage)) continue;
     const possibleWrite = item.writeMayHaveSucceeded && item.observedMutationResult !== "Rejected";
-    next.itemStates[itemKey] = {
-      ...item,
+    const terminalPatch: Partial<OperationItemState> & { stage: OperationItemStage } = {
       stage: possibleWrite ? "AmbiguousWriteUnresolved" : "FailedBeforeWrite",
       outcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : params.outcome,
       ambiguousWrite: possibleWrite || item.ambiguousWrite,
       partialWrite: possibleWrite || item.partialWrite,
       errorClass: item.errorClass ?? params.errorClass,
       failureReason: item.failureReason ?? params.reason,
+      terminalFailureReason: params.reason,
+      terminalErrorClass: params.errorClass,
+    };
+    next.itemStates[itemKey] = {
+      ...item,
+      ...terminalPatch,
+      ...diagnosticItemFields(item, terminalPatch),
+      terminalFailureReason: params.reason,
+      terminalErrorClass: params.errorClass,
       lease: undefined,
       completedAt: now,
     };
@@ -1026,6 +1067,12 @@ function mergeCompactResultHistory(previous: unknown, next: unknown): unknown {
     "statusWriteOutcome",
     "suppressCloseNotificationRequested",
     "suppressCloseNotificationIncluded",
+    "initialFailureReason",
+    "initialFailureClass",
+    "terminalFailureReason",
+    "terminalFailureClass",
+    "replaySafe",
+    "humanReconciliationRequired",
   ] as const) {
     if ((merged[field] === undefined || merged[field] === null) && previous[field] !== undefined) {
       merged[field] = previous[field];
@@ -1068,8 +1115,10 @@ function hasTerminalContinuationFailure(record: OperationLedgerRecord): boolean 
     return Boolean(
       item &&
       TERMINAL_STAGES.has(item.stage) &&
-      item.errorClass &&
-      TERMINAL_CONTINUATION_ERROR_CLASSES.has(item.errorClass)
+      (
+        (item.errorClass && TERMINAL_CONTINUATION_ERROR_CLASSES.has(item.errorClass)) ||
+        (item.terminalErrorClass && TERMINAL_CONTINUATION_ERROR_CLASSES.has(item.terminalErrorClass))
+      )
     );
   });
 }
@@ -1099,6 +1148,25 @@ function deriveTerminalFailureReason(record: OperationLedgerRecord): string | un
   return record.terminalFailureReason;
 }
 
+function itemHasUnresolvedAmbiguity(item: OperationItemState): boolean {
+  return item.ambiguousWrite === true ||
+    item.stage === "WriteAmbiguous" ||
+    item.stage === "ResolutionWriteAmbiguous" ||
+    item.stage === "NoteWriteAmbiguous" ||
+    item.stage === "AmbiguousWriteUnresolved" ||
+    (
+      item.observedMutationResult === "Ambiguous" &&
+      item.writeMayHaveSucceeded &&
+      item.verificationState !== "Verified"
+    );
+}
+
+function itemIsWaitingForRateLimit(item: OperationItemState): boolean {
+  if (TERMINAL_STAGES.has(item.stage)) return false;
+  return RATE_LIMIT_STAGES.has(item.stage) ||
+    (item.errorClass === "SuperOpsRateLimit" && Boolean(item.nextEligibleTime || item.rateLimit?.nextEligibleAt));
+}
+
 function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedgerRecord {
   const next = cloneRecord(record);
   const completed: string[] = [];
@@ -1118,10 +1186,8 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
       continue;
     }
     if (item.partialWrite) partialWriteCount += 1;
-    if (item.ambiguousWrite || item.stage === "WriteAmbiguous" || item.stage === "ResolutionWriteAmbiguous" || item.stage === "AmbiguousWriteUnresolved") {
-      ambiguousWriteCount += 1;
-    }
-    if (RATE_LIMIT_STAGES.has(item.stage)) rateLimited.push(itemKey);
+    if (itemHasUnresolvedAmbiguity(item)) ambiguousWriteCount += 1;
+    if (itemIsWaitingForRateLimit(item)) rateLimited.push(itemKey);
     if (item.stage === "Stale" || item.stage === "StaleAfterRateLimitWait") stale.push(itemKey);
     if (item.stage === "Unattempted") {
       unattempted.push(itemKey);
@@ -1136,6 +1202,41 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
       pending.push(itemKey);
     }
   }
+
+  next.compactResults = next.compactResults.map((entry) => {
+    if (!isRecordObject(entry)) return entry;
+    const itemKey = itemResultKey(entry);
+    const item = itemKey ? next.itemStates[itemKey] : undefined;
+    if (!item) return entry;
+    const physicalWrites = Array.isArray(entry.physicalWrites)
+      ? entry.physicalWrites.filter((write) => isRecordObject(write) &&
+          ["Accepted", "AcceptedAndVerified", "VerifiedApplied", "VerifiedAppliedAfterAmbiguous"]
+            .includes(String(write.outcome ?? "")))
+      : [];
+    const completedStages = Array.isArray(entry.completedStages)
+      ? entry.completedStages.filter((stage): stage is string => typeof stage === "string")
+      : [];
+    const stagesCompleted = [...new Set([...completedStages, ...(item.stageHistory ?? [])])];
+    const exposeDiagnostics = Boolean(
+      item.initialFailureReason || item.initialErrorClass || item.failureHistory?.length ||
+      item.terminalFailureReason || item.partialWrite || itemHasUnresolvedAmbiguity(item) ||
+      FAILED_STAGES.has(item.stage) || SKIPPED_STAGES.has(item.stage)
+    );
+    if (!exposeDiagnostics) return entry;
+    return {
+      ...entry,
+      initialFailureReason: item.initialFailureReason ?? entry.initialFailureReason,
+      initialFailureClass: item.initialErrorClass ?? entry.initialFailureClass,
+      continuationHistory: item.failureHistory,
+      retryCount: item.retryCount,
+      terminalFailureReason: item.terminalFailureReason ?? entry.terminalFailureReason,
+      terminalFailureClass: item.terminalErrorClass ?? entry.terminalFailureClass,
+      stagesCompleted,
+      acceptedPhysicalWrites: physicalWrites,
+      replaySafe: item.replaySafe ?? entry.replaySafe,
+      humanReconciliationRequired: item.humanReconciliationRequired ?? entry.humanReconciliationRequired,
+    };
+  });
 
   next.completedItems = completed;
   next.failedItems = failed;
@@ -1169,6 +1270,32 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
   }
 
   return next;
+}
+
+function creditDurableWaitToOperationLifetime(
+  record: OperationLedgerRecord,
+  nextEligibleTime: string | undefined,
+  scheduledAt: string
+): OperationLedgerRecord {
+  if (!nextEligibleTime || !record.maxOperationLifetimeAt) return record;
+  const scheduledAtMs = Date.parse(scheduledAt);
+  const nextEligibleMs = Date.parse(nextEligibleTime);
+  const previousPauseUntilMs = record.lifetimePausedUntil
+    ? Date.parse(record.lifetimePausedUntil)
+    : scheduledAtMs;
+  if (![scheduledAtMs, nextEligibleMs, previousPauseUntilMs].every(Number.isFinite) ||
+      nextEligibleMs <= scheduledAtMs) {
+    return record;
+  }
+  const uncreditedWaitStartsAt = Math.max(scheduledAtMs, previousPauseUntilMs);
+  const additionalPausedMs = Math.max(0, nextEligibleMs - uncreditedWaitStartsAt);
+  if (additionalPausedMs === 0) return record;
+  const currentLifetimeAtMs = Date.parse(record.maxOperationLifetimeAt);
+  if (!Number.isFinite(currentLifetimeAtMs)) return record;
+  record.pausedLifetimeMs = (record.pausedLifetimeMs ?? 0) + additionalPausedMs;
+  record.lifetimePausedUntil = nextEligibleTime;
+  record.maxOperationLifetimeAt = new Date(currentLifetimeAtMs + additionalPausedMs).toISOString();
+  return record;
 }
 
 function claimNextItemInRecord(
@@ -1224,6 +1351,45 @@ function claimNextItemInRecord(
     },
   };
 }
+function diagnosticItemFields(
+  current: OperationItemState,
+  patch: Partial<OperationItemState> & { stage: OperationItemStage }
+): Partial<OperationItemState> {
+  const shouldTrackStages = Boolean(
+    current.stageHistory || current.failureReason || current.errorClass ||
+    patch.failureReason || patch.errorClass || patch.partialWrite ||
+    patch.observedMutationResult === "Ambiguous" || FAILED_STAGES.has(patch.stage) || SKIPPED_STAGES.has(patch.stage)
+  );
+  const stageHistory = shouldTrackStages
+    ? [...new Set([...(current.stageHistory ?? [current.stage]), patch.stage])].slice(-16)
+    : undefined;
+  const failureReason = patch.failureReason ?? current.failureReason;
+  const errorClass = patch.errorClass ?? current.errorClass;
+  const retryCount = patch.retryCount ?? current.retryCount;
+  const previousHistory = current.failureHistory ?? [];
+  const nextFailure = patch.failureReason || patch.errorClass
+    ? [{ stage: patch.stage, reason: patch.failureReason, errorClass: patch.errorClass, retryCount }]
+    : [];
+  const failureHistory = [...previousHistory, ...nextFailure]
+    .filter((entry, index, entries) => index === 0 || JSON.stringify(entry) !== JSON.stringify(entries[index - 1]))
+    .slice(-8);
+  const possibleWrite = (patch.writeMayHaveSucceeded ?? current.writeMayHaveSucceeded) &&
+    (patch.observedMutationResult ?? current.observedMutationResult) !== "Rejected";
+  const terminal = TERMINAL_STAGES.has(patch.stage);
+  return {
+    stageHistory,
+    failureHistory: failureHistory.length > 0 ? failureHistory : undefined,
+    initialFailureReason: current.initialFailureReason ?? current.failureReason ?? patch.failureReason,
+    initialErrorClass: current.initialErrorClass ?? current.errorClass ?? patch.errorClass,
+    terminalFailureReason: terminal ? failureReason : current.terminalFailureReason,
+    terminalErrorClass: terminal ? errorClass : current.terminalErrorClass,
+    replaySafe: terminal ? !possibleWrite : current.replaySafe,
+    humanReconciliationRequired: terminal
+      ? patch.stage === "AmbiguousWriteUnresolved" || (possibleWrite && patch.verificationState !== "Verified")
+      : current.humanReconciliationRequired,
+  };
+}
+
 function applyItemPatch(
   record: OperationLedgerRecord,
   params: OperationCompleteItemParams
@@ -1250,6 +1416,7 @@ function applyItemPatch(
   const item: OperationItemState = {
     ...current,
     ...definedPatch,
+    ...diagnosticItemFields(current, definedPatch),
     itemKey: current.itemKey,
     idempotencyKey: current.idempotencyKey,
     completedAt: TERMINAL_STAGES.has(params.patch.stage) ? nowIso() : current.completedAt,
@@ -1297,8 +1464,12 @@ function applyItemCheckpoint(
     Object.entries(params.patch).filter(([, value]) => value !== undefined)
   ) as typeof params.patch;
   record.itemStates[params.itemKey] = {
-    ...current, ...definedPatch, itemKey: current.itemKey,
-    idempotencyKey: current.idempotencyKey, lease: current.lease,
+    ...current,
+    ...definedPatch,
+    ...diagnosticItemFields(current, definedPatch),
+    itemKey: current.itemKey,
+    idempotencyKey: current.idempotencyKey,
+    lease: current.lease,
   };
   record.currentItem = params.itemKey;
   record.updatedAt = nowIso();
@@ -1412,8 +1583,10 @@ class MemoryOperationStore implements OperationStore {
   }
   async scheduleContinuation(params: OperationScheduleContinuationParams): Promise<OperationLedgerRecord> {
     return this.update(params.operationId, params.ownerHash, (record) => {
+      const scheduledAt = nowIso();
       const alreadyScheduledFor = record.nextEligibleTime === params.nextEligibleTime &&
         record.schedulingSucceeded === true;
+      creditDurableWaitToOperationLifetime(record, params.nextEligibleTime, scheduledAt);
       record.state = params.nextEligibleTime ? "Rescheduled" : "ContinuationRequired";
       record.nextEligibleTime = params.nextEligibleTime;
       record.workflowId = params.workflowId ?? record.workflowId;
@@ -1421,7 +1594,7 @@ class MemoryOperationStore implements OperationStore {
       // Re-delivery of the same scheduling request is expected. It must not
       // manufacture another continuation identity or inflate retry limits.
       if (!alreadyScheduledFor) record.continuationCount += 1;
-      record.updatedAt = nowIso();
+      record.updatedAt = scheduledAt;
       return record;
     });
   }
@@ -1880,6 +2053,7 @@ export function operationTotals(record: OperationLedgerRecord): Record<string, n
   const totals = {
     expected: record.expectedItems.length,
     completed: 0,
+    successfulVerified: 0,
     updated: 0,
     resolved: 0,
     noteOnly: 0,
@@ -1915,9 +2089,7 @@ export function operationTotals(record: OperationLedgerRecord): Record<string, n
     }
     if (item.stage === "AmbiguousWriteUnresolved") totals.ambiguousUnresolved += 1;
     if (item.stage === "RateLimitExceeded") totals.rateLimitExceeded += 1;
-    if (RATE_LIMIT_STAGES.has(item.stage) && item.stage !== "RateLimitExceeded") {
-      totals.waitingForRateLimit += 1;
-    }
+    if (itemIsWaitingForRateLimit(item)) totals.waitingForRateLimit += 1;
     if (item.stage === "Unattempted") {
       totals.unattempted += 1;
       totals.pending += 1;
@@ -1930,6 +2102,9 @@ export function operationTotals(record: OperationLedgerRecord): Record<string, n
       if (item.errorClass === "ValidationFailure") totals.validationFailed += 1;
     } else if (TERMINAL_STAGES.has(item.stage)) {
       totals.completed += 1;
+      if (item.verificationState === "Verified" || item.verificationState === "NotRequired") {
+        totals.successfulVerified += 1;
+      }
     } else {
       totals.pending += 1;
     }
@@ -2018,6 +2193,9 @@ export function operationResultView(record: OperationLedgerRecord): Record<strin
     waitingForRateLimitCount: record.rateLimitedItems.length,
     rateLimitedItems: record.rateLimitedItems,
     nextEligibleTime: record.nextEligibleTime,
+    pausedLifetimeMs: record.pausedLifetimeMs ?? 0,
+    lifetimePausedUntil: record.lifetimePausedUntil,
+    maxOperationLifetimeAt: record.maxOperationLifetimeAt,
     continuationCount: record.continuationCount,
     terminalFailureReason: record.terminalFailureReason,
     workflowId: record.workflowId,
@@ -2045,6 +2223,7 @@ function operationItemTelemetry(record: OperationLedgerRecord): Record<string, u
   const now = new Date().toISOString();
   return record.expectedItems.map((itemKey) => {
     const item = record.itemStates[itemKey];
+    const compact = compactResultForItem(record, itemKey);
     const retryEligible = Boolean(
       item &&
       !TERMINAL_STAGES.has(item.stage) &&
@@ -2068,7 +2247,20 @@ function operationItemTelemetry(record: OperationLedgerRecord): Record<string, u
       writeAttempted: item?.writeAttempted ?? false,
       writeMayHaveSucceeded: item?.writeMayHaveSucceeded ?? false,
       verificationState: item?.verificationState,
-      finalReason: item?.failureReason ?? item?.outcome,
+      initialFailureReason: item?.initialFailureReason,
+      initialFailureClass: item?.initialErrorClass,
+      continuationHistory: item?.failureHistory,
+      terminalFailureReason: item?.terminalFailureReason,
+      terminalFailureClass: item?.terminalErrorClass,
+      stagesCompleted: [...new Set([
+        ...((compact?.completedStages as unknown[] | undefined) ?? [])
+          .filter((stage): stage is string => typeof stage === "string"),
+        ...(item?.stageHistory ?? []),
+      ])],
+      acceptedPhysicalWrites: compact?.acceptedPhysicalWrites,
+      replaySafe: item?.replaySafe,
+      humanReconciliationRequired: item?.humanReconciliationRequired,
+      finalReason: item?.terminalFailureReason ?? item?.failureReason ?? item?.outcome,
     };
   });
 }
@@ -2111,6 +2303,9 @@ function operationRecentView(record: OperationLedgerRecord): Record<string, unkn
     staleCount: record.staleItems?.length ?? 0,
     waitingForRateLimitCount: record.rateLimitedItems.length,
     nextEligibleTime: record.nextEligibleTime,
+    pausedLifetimeMs: record.pausedLifetimeMs ?? 0,
+    lifetimePausedUntil: record.lifetimePausedUntil,
+    maxOperationLifetimeAt: record.maxOperationLifetimeAt,
     continuationCount: record.continuationCount,
     totals: operationTotals(record),
   };
@@ -2531,14 +2726,20 @@ export class SuperOpsOperationLedger {
         assertRecordOwner(record, params.ownerHash);
         const alreadyScheduledFor = record.nextEligibleTime === params.nextEligibleTime &&
           record.schedulingSucceeded === true;
+        const scheduledAt = nowIso();
+        const creditedRecord = creditDurableWaitToOperationLifetime(
+          cloneRecord(record),
+          params.nextEligibleTime,
+          scheduledAt
+        );
         const updated = normalizeOperationRecord({
-          ...cloneRecord(record),
+          ...creditedRecord,
           state: params.nextEligibleTime ? "Rescheduled" : "ContinuationRequired",
           nextEligibleTime: params.nextEligibleTime,
           workflowId: params.workflowId ?? record.workflowId,
           terminalFailureReason: params.reason,
           continuationCount: alreadyScheduledFor ? record.continuationCount : record.continuationCount + 1,
-          updatedAt: nowIso(),
+          updatedAt: scheduledAt,
         });
         const scheduled = startTerminalRetention(
           record,

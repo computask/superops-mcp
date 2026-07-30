@@ -1936,6 +1936,9 @@ describe("operation store", () => {
           ambiguousWrite: true,
           partialWrite: true,
           verificationState: "Pending",
+          failureReason: "Original ambiguous status reconciliation remained unresolved.",
+          errorClass: "AmbiguousWrite",
+          retryCount: 3,
         },
       },
     });
@@ -1955,6 +1958,14 @@ describe("operation store", () => {
           writeMayHaveSucceeded: true,
           ambiguousWrite: true,
           partialWrite: true,
+          failureReason: "Original ambiguous status reconciliation remained unresolved.",
+          errorClass: "AmbiguousWrite",
+          initialFailureReason: "Original ambiguous status reconciliation remained unresolved.",
+          initialErrorClass: "AmbiguousWrite",
+          terminalFailureReason: "Operation maximum lifetime exceeded before the item reached a terminal state.",
+          terminalErrorClass: "ContinuationFailure",
+          replaySafe: false,
+          humanReconciliationRequired: true,
         },
       },
     });
@@ -2026,6 +2037,137 @@ describe("operation store", () => {
     });
   });
 
+  it("excludes durable eligibility waits from the active operation lifetime", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-18T00:00:00.000Z"));
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const ownerHash = stableHash("owner@example.com");
+      const waitingItem: OperationItemState = {
+        ...record().itemStates["57401"],
+        stage: "RateLimitedRescheduled",
+        outcome: "SuperOpsRateLimitRescheduled",
+        nextEligibleTime: "2026-07-18T00:01:00.000Z",
+        errorClass: "SuperOpsRateLimit",
+      };
+      await store.put(record({
+        operationId: "op-paused-lifetime",
+        maxOperationLifetimeAt: "2026-07-18T00:00:10.000Z",
+        expectedItems: ["57401"],
+        itemStates: { "57401": waitingItem },
+        compactResults: [{ ticketNumber: "57401", finalOutcome: "SuperOpsRateLimitRescheduled" }],
+      }));
+
+      const scheduled = await store.scheduleContinuation({
+        operationId: "op-paused-lifetime",
+        ownerHash,
+        reason: "SuperOpsRateLimitRescheduled",
+        nextEligibleTime: "2026-07-18T00:01:00.000Z",
+      });
+      expect(scheduled).toMatchObject({
+        pausedLifetimeMs: 60_000,
+        lifetimePausedUntil: "2026-07-18T00:01:00.000Z",
+        maxOperationLifetimeAt: "2026-07-18T00:01:10.000Z",
+      });
+
+      const duplicate = await store.scheduleContinuation({
+        operationId: "op-paused-lifetime",
+        ownerHash,
+        reason: "SuperOpsRateLimitRescheduled",
+        nextEligibleTime: "2026-07-18T00:01:00.000Z",
+      });
+      expect(duplicate.pausedLifetimeMs).toBe(60_000);
+      expect(duplicate.maxOperationLifetimeAt).toBe("2026-07-18T00:01:10.000Z");
+
+      vi.setSystemTime(new Date("2026-07-18T00:01:00.000Z"));
+      await expect(store.claimNextItem({
+        operationId: "op-paused-lifetime",
+        ownerHash,
+        leaseOwner: "eligible-worker",
+        leaseMs: 1_000,
+        now: "2026-07-18T00:01:00.000Z",
+      })).resolves.toMatchObject({ itemKey: "57401" });
+    });
+    vi.useRealTimers();
+  });
+
+  it("derives mixed-batch counters only from durable per-item outcomes", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const base = record().itemStates["57400"];
+      const item = (itemKey: string, overrides: Partial<OperationItemState>): OperationItemState => ({
+        ...base,
+        itemKey,
+        idempotencyKey: "item-" + itemKey,
+        ...overrides,
+      });
+      const itemStates: Record<string, OperationItemState> = {
+        success: item("success", { stage: "Completed", outcome: "Updated", verificationState: "Verified" }),
+        stale: item("stale", {
+          stage: "Stale", outcome: "SkippedChangedSinceSnapshot", writeAttempted: false,
+          writeMayHaveSucceeded: false, partialWrite: false, verificationState: "NotRequired",
+        }),
+        rate: item("rate", {
+          stage: "ClassificationVerified", outcome: "SuperOpsRateLimitRescheduled",
+          nextEligibleTime: "2026-07-18T00:05:00.000Z", errorClass: "SuperOpsRateLimit",
+          rateLimit: { attempts: 1, retryAfterSupplied: true, continuedInAnotherInvocation: true,
+            writeAttempted: true, nextEligibleAt: "2026-07-18T00:05:00.000Z" },
+        }),
+        ambiguous: item("ambiguous", {
+          stage: "AmbiguousWriteUnresolved", outcome: "AmbiguousWriteUnresolved",
+          observedMutationResult: "Ambiguous", partialWrite: true, ambiguousWrite: true,
+          verificationState: "Pending", errorClass: "AmbiguousWrite",
+        }),
+        notFound: item("notFound", {
+          stage: "FailedBeforeWrite", outcome: "NotFound", writeAttempted: false,
+          writeMayHaveSucceeded: false, partialWrite: false, verificationState: "NotRequired",
+        }),
+      };
+      const expectedItems = Object.keys(itemStates);
+      await store.put(record({
+        operationId: "op-mixed-authoritative-counters",
+        expectedItems,
+        itemStates,
+        summary: { completed: 99, partialWrite: 99, waitingForRateLimit: 99 },
+        compactResults: expectedItems.map((ticketNumber) => ({ ticketNumber })),
+        completedItems: [], failedItems: [], skippedItems: [], unattemptedItems: [], pendingItems: [],
+        partialWriteCount: 99,
+        ambiguousWriteCount: 99,
+        rateLimitedItems: [],
+      }));
+
+      const stored = await store.get("op-mixed-authoritative-counters", stableHash("owner@example.com"));
+      expect(stored).toMatchObject({
+        completedItems: ["success"],
+        failedItems: ["ambiguous", "notFound"],
+        skippedItems: ["stale"],
+        pendingItems: ["rate"],
+        partialWriteCount: 1,
+        ambiguousWriteCount: 1,
+        rateLimitedItems: ["rate"],
+      });
+      expect(operationTotals(stored as OperationLedgerRecord)).toEqual({
+        expected: 5,
+        completed: 1,
+        successfulVerified: 1,
+        updated: 1,
+        resolved: 0,
+        noteOnly: 0,
+        completedAfterRetry: 0,
+        completedAfterAmbiguousVerification: 0,
+        skipped: 0,
+        validationFailed: 0,
+        stale: 1,
+        failed: 2,
+        partialWrite: 1,
+        ambiguousUnresolved: 1,
+        pending: 1,
+        unattempted: 0,
+        waitingForRateLimit: 1,
+        rateLimitExceeded: 0,
+      });
+    });
+  });
   it("counts note-only outcomes from the authoritative mutation type", () => {
     const noteItem = {
       ...record().itemStates["57400"],

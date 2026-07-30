@@ -257,8 +257,13 @@ type FakeSuperOpsOptions = {
   canonicalTicketReadRateLimits?: number;
   canonicalTicketReadRateLimitReads?: number[];
   noteReadUnavailable?: boolean;
+  noteReadRateLimitReads?: number[];
   unsupportedNoteEnvelope?: boolean;
   noteVisibilityMisses?: number;
+  classificationApplyOnTicketRead?: number;
+  statusApplyOnTicketRead?: number;
+  displayLookupEmpty?: boolean;
+  ticketMissing?: boolean;
   classificationFault?: MutationFault;
   classificationFaults?: MutationFault[];
   noteFault?: MutationFault;
@@ -339,6 +344,8 @@ class FakeSuperOps {
   private readonly classificationFaults: MutationFault[];
   private updatedSequence = 0;
   private ticketReadCount = 0;
+  private noteReadCount = 0;
+  private readonly noteReadRateLimitReads: Set<number>;
 
   constructor(private readonly history: History, private readonly options: FakeSuperOpsOptions = {}) {
     this.ticket = {
@@ -353,6 +360,7 @@ class FakeSuperOps {
     this.remainingVisibilityMisses = options.noteVisibilityMisses ?? 0;
     this.remainingCanonicalTicketReadRateLimits = options.canonicalTicketReadRateLimits ?? 0;
     this.canonicalTicketReadRateLimitReads = new Set(options.canonicalTicketReadRateLimitReads ?? []);
+    this.noteReadRateLimitReads = new Set(options.noteReadRateLimitReads ?? []);
     this.classificationFaults = [...(options.classificationFaults ?? [])];
     if (options.classified) this.setClassified();
   }
@@ -425,7 +433,7 @@ class FakeSuperOps {
     if (query.includes("getTicketList")) {
       this.history.add("superops.read.ticket-list", { input });
       return graphQlData({ getTicketList: {
-        tickets: [{ ticketId: TICKET_ID, displayId: TICKET_NUMBER }],
+        tickets: this.options.displayLookupEmpty ? [] : [{ ticketId: TICKET_ID, displayId: TICKET_NUMBER }],
         listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
       } });
     }
@@ -441,7 +449,11 @@ class FakeSuperOps {
       } });
     }
     if (query.includes("getTicketNoteList")) {
-      this.history.add("superops.read.notes", { ticketId: input.ticketId });
+      this.noteReadCount += 1;
+      this.history.add("superops.read.notes", { ticketId: input.ticketId, read: this.noteReadCount });
+      if (this.noteReadRateLimitReads.delete(this.noteReadCount)) {
+        return graphQlReadRateLimit("getTicketNoteList");
+      }
       if (this.options.noteReadUnavailable) {
         return new Response("notes unavailable", { status: 503, statusText: "Service Unavailable" });
       }
@@ -497,6 +509,18 @@ class FakeSuperOps {
     }
     if (query.includes("getTicket")) {
       this.ticketReadCount += 1;
+      if (this.options.ticketMissing) {
+        this.history.add("superops.read.ticket", { ticketId: input.ticketId, read: this.ticketReadCount, missing: true });
+        return graphQlData({ getTicket: null });
+      }
+      if (this.options.classificationApplyOnTicketRead === this.ticketReadCount) {
+        this.setClassified();
+        this.ticket.updatedTime = this.nextUpdatedTime();
+      }
+      if (this.options.statusApplyOnTicketRead === this.ticketReadCount) {
+        this.setResolved();
+        this.ticket.updatedTime = this.nextUpdatedTime();
+      }
       if (this.remainingCanonicalTicketReadRateLimits > 0 ||
           this.canonicalTicketReadRateLimitReads.delete(this.ticketReadCount)) {
         if (this.remainingCanonicalTicketReadRateLimits > 0) {
@@ -538,6 +562,26 @@ function resolveAction() {
     action: "resolve",
     note: "JUNK",
     target: { ...RESOLVE_TARGET },
+  };
+}
+
+function leaveAction() {
+  return {
+    ticketNumber: TICKET_NUMBER,
+    expectedTicketId: TICKET_ID,
+    expectedStatus: "New Calls",
+    expectedUpdatedTime: INITIAL_UPDATED_TIME,
+    contentVerified: true,
+    action: "leave",
+    target: {
+      impact: CLASSIFICATION.impact,
+      urgency: CLASSIFICATION.urgency,
+      category: CLASSIFICATION.category,
+      subcategory: CLASSIFICATION.subcategory,
+      cause: CLASSIFICATION.cause,
+      clientName: "TaskGroup",
+      clientId: CLIENT_ID,
+    },
   };
 }
 
@@ -816,7 +860,6 @@ describe("deterministic end-to-end apply-triage harness", () => {
       "StatusVerified",
     ]));
     expect(harness.history.kinds("superops.")).toEqual([
-      "superops.read.ticket-list",
       "superops.read.ticket",
       "superops.read.fields",
       "superops.write.classification",
@@ -922,7 +965,6 @@ describe("deterministic end-to-end apply-triage harness", () => {
       { method: "updateTicket.statusOnly", outcome: "Accepted" },
     ]);
     expect(harness.history.kinds("superops.")).toEqual([
-      "superops.read.ticket-list",
       "superops.read.ticket",
       "superops.read.fields",
       "superops.read.ticket",
@@ -1092,6 +1134,51 @@ describe("deterministic end-to-end apply-triage harness", () => {
     harness.assertGlobalInvariants(record);
   });
 
+  it("uses the approved immutable ticket ID even when display-number lookup would fail", async () => {
+    const harness = new TriageHarness("immutable-id-recovery", {
+      classified: true,
+      resolved: true,
+      initialNotes: [{ ...CANONICAL_PRIVATE_JUNK }],
+      displayLookupEmpty: true,
+    });
+    const { parsed } = await harness.invoke({
+      actions: [{ ...resolveAction(), expectedStatus: "Resolved" }],
+    });
+    const record = await harness.record();
+
+    expect(firstResult(parsed)).toMatchObject({
+      finalOutcome: "Resolved",
+      identityResolution: "expectedTicketId",
+      immutableIdentityRecovered: true,
+    });
+    expect(harness.history.count("superops.read.ticket-list")).toBe(0);
+    expect(harness.history.kinds("superops.write.")).toEqual([]);
+    harness.assertGlobalInvariants(record);
+  });
+
+  it("classifies a genuinely disappeared immutable ticket as NotFound before any write", async () => {
+    const harness = new TriageHarness("immutable-ticket-disappeared", {
+      ticketMissing: true,
+    });
+    const { parsed } = await harness.invoke();
+    const record = await harness.record();
+
+    expect(firstResult(parsed)).toMatchObject({
+      finalOutcome: "NotFound",
+      failureStage: "readMetadata",
+      identityResolution: "confirmedNotFound",
+      writeAttempted: false,
+      partialWrite: false,
+      replaySafe: true,
+    });
+    expect(record.itemStates[TICKET_NUMBER]).toMatchObject({
+      stage: "FailedBeforeWrite",
+      writeAttempted: false,
+      writeMayHaveSucceeded: false,
+    });
+    expect(harness.history.kinds("superops.write.")).toEqual([]);
+    harness.assertGlobalInvariants(record);
+  });
   it("reschedules the exact pre-write getTicket DataFetchingException and completes 59005 in a fresh continuation", async () => {
     const harness = new TriageHarness("preflight-ticket-rate-limit", {
       classified: true,
@@ -1405,6 +1492,127 @@ describe("deterministic end-to-end apply-triage harness", () => {
     harness.assertGlobalInvariants(record);
   });
 
+  it("resumes a rate-limited note check after verified classification without replay", async () => {
+    const harness = new TriageHarness("classification-note-read-rate-limit", {
+      noteReadRateLimitReads: [1, 2, 3],
+    });
+    await harness.invoke({}, {
+      SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "3",
+    });
+
+    const waiting = await harness.record();
+    expect(waiting).toMatchObject({
+      state: "Rescheduled",
+      itemStates: {
+        [TICKET_NUMBER]: {
+          stage: "NoteDedupeChecked",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          observedMutationResult: "VerifiedApplied",
+          errorClass: "SuperOpsRateLimit",
+        },
+      },
+    });
+    expect(itemResult(waiting)).toMatchObject({
+      failureStage: "rateLimit",
+      retrySafe: true,
+      completedStages: expect.arrayContaining(["ClassificationVerified"]),
+    });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(0);
+    expect(harness.history.count("superops.write.status")).toBe(0);
+
+    const terminal = await harness.resumeUntilTerminal();
+    expect(terminal.state).toBe("Completed");
+    expect(itemResult(terminal)).toMatchObject({
+      finalOutcome: "Resolved",
+      finalVerificationState: "Verified",
+    });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(1);
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
+  });
+
+  it("delays an ambiguous status-only close until a later read confirms acceptance", async () => {
+    const harness = new TriageHarness("ambiguous-status-delayed-visible", {
+      classified: true,
+      initialNotes: [{ ...CANONICAL_PRIVATE_JUNK }],
+      statusFault: "timeoutNoApply",
+      statusApplyOnTicketRead: 5,
+    });
+    await harness.invoke();
+
+    const waiting = await harness.record();
+    expect(waiting.itemStates[TICKET_NUMBER]).toMatchObject({
+      stage: "StatusWriteStarted",
+      outcome: "AmbiguousWritePending",
+      retryCount: 1,
+      nextEligibleTime: expect.any(String),
+      updatedTimeExpectation: INITIAL_UPDATED_TIME,
+    });
+    expect(harness.history.count("superops.write.status")).toBe(1);
+
+    const terminal = await harness.resumeUntilTerminal();
+    expect(terminal.state).toBe("Completed");
+    expect(itemResult(terminal)).toMatchObject({
+      finalOutcome: "Resolved",
+      finalVerificationState: "Verified",
+      statusWriteOutcome: "NotRequired",
+    });
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
+  });
+
+  it("delays an ambiguous leave update until a later immutable-ID read confirms acceptance", async () => {
+    const harness = new TriageHarness("ambiguous-update-delayed-visible", {
+      classificationFault: "timeoutNoApply",
+      classificationApplyOnTicketRead: 3,
+    });
+    await harness.invoke({ actions: [leaveAction()] });
+
+    const waiting = await harness.record();
+    expect(waiting.itemStates[TICKET_NUMBER]).toMatchObject({
+      stage: "WriteAmbiguous",
+      outcome: "AmbiguousWritePending",
+      retryCount: 1,
+    });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+
+    const terminal = await harness.resumeUntilTerminal();
+    expect(terminal.state).toBe("Completed");
+    expect(itemResult(terminal)).toMatchObject({
+      finalOutcome: "Left",
+      verified: true,
+      immutableIdentityRecovered: true,
+    });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
+  });
+
+  it("terminalises an unobserved ambiguous leave update only after the bounded read ceiling", async () => {
+    const harness = new TriageHarness("ambiguous-update-unresolved", {
+      classificationFault: "timeoutNoApply",
+    });
+    await harness.invoke({ actions: [leaveAction()] });
+
+    const terminal = await harness.resumeUntilTerminal();
+    expect(terminal.state).toBe("CompletedWithFailures");
+    expect(terminal.itemStates[TICKET_NUMBER]).toMatchObject({
+      stage: "AmbiguousWriteUnresolved",
+      retryCount: 4,
+      replaySafe: false,
+      humanReconciliationRequired: true,
+    });
+    expect(itemResult(terminal)).toMatchObject({
+      terminalReason: "AmbiguousWriteUnresolved",
+      ambiguousVerificationAttempts: 4,
+      replaySafe: false,
+      humanReconciliationRequired: true,
+    });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
+  });
   it("K1: visible resolved state reconciles an ambiguous status write without replay", async () => {
     const harness = new TriageHarness("ambiguous-status-visible", {
       classified: true,
@@ -1426,21 +1634,34 @@ describe("deterministic end-to-end apply-triage harness", () => {
     harness.assertGlobalInvariants(record);
   });
 
-  it("K2: unresolved ambiguous status terminates safely without replay", async () => {
+  it("K2: unresolved ambiguous status exhausts delayed reads without replay", async () => {
     const harness = new TriageHarness("ambiguous-status-unresolved", {
       classified: true,
       initialNotes: [{ ...CANONICAL_PRIVATE_JUNK }],
       statusFault: "timeoutNoApply",
     });
     const { parsed } = await harness.invoke();
-    const result = firstResult(parsed);
-    const record = await harness.record();
 
-    expect(result).toMatchObject({
+    expect(firstResult(parsed)).toMatchObject({
       finalOutcome: "Failed",
-      terminalReason: "AmbiguousStatusCloseUnresolved",
+      terminalReason: "AmbiguousWritePending",
       statusWriteOutcome: "Ambiguous",
       finalVerificationState: "Pending",
+      ambiguousVerificationAttempts: 1,
+      continuationRequired: true,
+    });
+
+    const record = await harness.resumeUntilTerminal();
+    expect(itemResult(record)).toMatchObject({
+      finalOutcome: "Failed",
+      terminalReason: "AmbiguousWriteUnresolved",
+      ambiguousVerificationAttempts: 4,
+      replaySafe: false,
+      humanReconciliationRequired: true,
+    });
+    expect(record.itemStates[TICKET_NUMBER]).toMatchObject({
+      stage: "AmbiguousWriteUnresolved",
+      retryCount: 4,
     });
     expect(harness.history.count("superops.write.status")).toBe(1);
     harness.assertGlobalInvariants(record);

@@ -3656,7 +3656,6 @@ describe("Tickets Domain", () => {
       expectedCandidateTicketNumbers: ["57402"],
       actions: [{
         ticketNumber: "57402",
-        expectedTicketId: "ticket-57402-blocked",
         expectedStatus: "New Calls",
         expectedUpdatedTime: "2026-07-26T08:59:00Z",
         contentVerified: true,
@@ -3727,7 +3726,6 @@ describe("Tickets Domain", () => {
       expectedCandidateTicketNumbers: ["57402"],
       actions: [{
         ticketNumber: "57402",
-        expectedTicketId: "ticket-57402",
         expectedStatus: "Resolved",
         expectedUpdatedTime: "2026-07-26T09:00:00Z",
         contentVerified: true,
