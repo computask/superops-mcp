@@ -45,6 +45,8 @@ export type OperationItemStage =
   | "NoteWriteAmbiguous"
   | "NoteAdded"
   | "NoteVerified"
+  | "RecoveryWriteStarted"
+  | "RecoveryWriteAmbiguous"
   | "Verifying"
   | "Completed"
   | "CompletedAfterRetry"
@@ -111,6 +113,20 @@ export interface OperationRateLimitState {
   finalResult?: string;
 }
 
+export type OperationMutationType =
+  | "update"
+  | "classification"
+  | "resolution"
+  | "status"
+  | "note"
+  | "resolveFallback";
+
+export type ReconciliationDisposition =
+  | "VerifiedSuccess"
+  | "ConfirmedPartialWrite"
+  | "ConfirmedNotApplied"
+  | "AmbiguousUnresolved";
+
 export interface OperationItemState {
   itemKey: string;
   stage: OperationItemStage;
@@ -120,7 +136,8 @@ export interface OperationItemState {
   writeMayHaveSucceeded: boolean;
   partialWrite: boolean;
   ambiguousWrite?: boolean;
-  mutationType?: "update" | "classification" | "resolution" | "status" | "note" | "resolveFallback";
+  ambiguityEncountered?: boolean;
+  mutationType?: OperationMutationType;
   mutationStartStage?: "WriteStarted" | "ClassificationWriteStarted" | "ResolutionWriteStarted" | "StatusWriteStarted" | "NoteWriteStarted";
   reliableResponseReceived?: boolean;
   observedMutationResult?: "Accepted" | "Rejected" | "VerifiedApplied" | "Ambiguous";
@@ -140,6 +157,43 @@ export interface OperationItemState {
   updatedTimeExpectation?: string;
   targetFields?: Record<string, unknown>;
   originalMetadataExpectations?: Record<string, unknown>;
+  expectedTicketId?: string;
+  preMutationUpdatedTime?: string;
+  preMutationState?: Record<string, unknown>;
+  reconciliationMutationType?: OperationMutationType;
+  reconciliationPass?: number;
+  reconciliationPassReadAttempts?: number;
+  reconciliationReadAttempts?: number;
+  reconciliationDisposition?: ReconciliationDisposition;
+  reconciliationUpdatedTimes?: string[];
+  recoveryRetryCount?: number;
+  recoveryRetryCounts?: Partial<Record<OperationMutationType, number>>;
+  recoveryMutationStage?: OperationMutationType;
+  recoveryWriteStarted?: boolean;
+  originalMutationEvidence?: {
+    reliableResponseReceived: boolean;
+    mutationResult: "Rejected" | "Accepted" | "VerifiedApplied" | "Ambiguous";
+    responseHadMutationPayload?: boolean | null;
+    errorClass?: string;
+    failureReason?: string;
+  };
+  acceptedPhysicalWrites?: Array<{
+    mutationType: OperationMutationType;
+    method: string;
+    outcome: "Accepted" | "VerifiedApplied";
+    recovery: boolean;
+  }>;
+  observedRequestedEffects?: string[];
+  missingRequestedEffects?: string[];
+  conflictingEffects?: string[];
+  schemaDependencyFields?: string[];
+  recoveryHistory?: Array<{
+    pass: number;
+    event: string;
+    outcome?: string;
+  }>;
+  recoveryRetryOutcome?: string;
+  replaySafetyReason?: string;
   rateLimit?: OperationRateLimitState;
   initialFailureReason?: string;
   initialErrorClass?: OperationErrorClass;
@@ -561,8 +615,21 @@ const VALID_OPERATION_STATES = new Set<OperationState>([
   "Failed",
   "Cancelled",
 ]);
-const VALID_OPERATION_ITEM_STAGES = new Set<OperationItemStage>([
-  "Pending",
+const VALID_OPERATION_MUTATION_TYPES = new Set<OperationMutationType>([
+  "update",
+  "classification",
+  "resolution",
+  "status",
+  "note",
+  "resolveFallback",
+]);
+const VALID_RECONCILIATION_DISPOSITIONS = new Set<ReconciliationDisposition>([
+  "VerifiedSuccess",
+  "ConfirmedPartialWrite",
+  "ConfirmedNotApplied",
+  "AmbiguousUnresolved",
+]);
+const VALID_OPERATION_ITEM_STAGES = new Set<OperationItemStage>([  "Pending",
   "Validating",
   "Validated",
   "PreflightValidated",
@@ -588,6 +655,8 @@ const VALID_OPERATION_ITEM_STAGES = new Set<OperationItemStage>([
   "NoteWriteAmbiguous",
   "NoteAdded",
   "NoteVerified",
+  "RecoveryWriteStarted",
+  "RecoveryWriteAmbiguous",
   "Verifying",
   "Completed",
   "CompletedAfterRetry",
@@ -629,8 +698,83 @@ function assertStringArray(value: unknown, field: string): asserts value is stri
   }
 }
 
-function assertOperationRecord(value: unknown): asserts value is OperationLedgerRecord {
-  if (!isRecordObject(value)) throw new MalformedStoredOperationError();
+function validOptionalRecoveryMetadata(item: Record<string, unknown>): boolean {
+  for (const field of ["mutationType", "reconciliationMutationType", "recoveryMutationStage"] as const) {
+    const value = item[field];
+    if (value !== undefined && !VALID_OPERATION_MUTATION_TYPES.has(value as OperationMutationType)) return false;
+  }
+  if (item.reconciliationDisposition !== undefined &&
+      !VALID_RECONCILIATION_DISPOSITIONS.has(item.reconciliationDisposition as ReconciliationDisposition)) {
+    return false;
+  }
+  if (item.expectedTicketId !== undefined &&
+      (typeof item.expectedTicketId !== "string" || !item.expectedTicketId)) return false;
+  if (item.recoveryRetryCount !== undefined &&
+      (!isFiniteNonnegativeInteger(item.recoveryRetryCount) || item.recoveryRetryCount > 1)) return false;
+  if (item.reconciliationPass !== undefined &&
+      (!isFiniteNonnegativeInteger(item.reconciliationPass) || item.reconciliationPass < 1 || item.reconciliationPass > 2)) {
+    return false;
+  }
+  if ((item.stage === "RecoveryWriteStarted" || item.stage === "RecoveryWriteAmbiguous" ||
+       item.recoveryWriteStarted === true) &&
+      (item.recoveryRetryCount !== 1 ||
+       !VALID_OPERATION_MUTATION_TYPES.has(item.recoveryMutationStage as OperationMutationType))) {
+    return false;
+  }
+  if (item.recoveryRetryCounts !== undefined) {
+    if (!isRecordObject(item.recoveryRetryCounts)) return false;
+    for (const [mutationType, count] of Object.entries(item.recoveryRetryCounts)) {
+      if (!VALID_OPERATION_MUTATION_TYPES.has(mutationType as OperationMutationType) ||
+          !isFiniteNonnegativeInteger(count) || count > 1) return false;
+    }
+  }
+  for (const field of [
+    "observedRequestedEffects",
+    "missingRequestedEffects",
+    "conflictingEffects",
+    "schemaDependencyFields",
+    "reconciliationUpdatedTimes",
+  ] as const) {
+    const value = item[field];
+    if (value !== undefined &&
+        (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry))) return false;
+  }
+  if (item.acceptedPhysicalWrites !== undefined && (
+    !Array.isArray(item.acceptedPhysicalWrites) ||
+    item.acceptedPhysicalWrites.some((write) =>
+      !isRecordObject(write) ||
+      !VALID_OPERATION_MUTATION_TYPES.has(write.mutationType as OperationMutationType) ||
+      typeof write.method !== "string" || !write.method ||
+      !["Accepted", "VerifiedApplied"].includes(String(write.outcome)) ||
+      typeof write.recovery !== "boolean"
+    )
+  )) return false;
+  if (item.originalMutationEvidence !== undefined && (
+    !isRecordObject(item.originalMutationEvidence) ||
+    typeof item.originalMutationEvidence.reliableResponseReceived !== "boolean" ||
+    !["Rejected", "Accepted", "VerifiedApplied", "Ambiguous"]
+      .includes(String(item.originalMutationEvidence.mutationResult)) ||
+    item.originalMutationEvidence.responseHadMutationPayload !== undefined &&
+      item.originalMutationEvidence.responseHadMutationPayload !== null &&
+      typeof item.originalMutationEvidence.responseHadMutationPayload !== "boolean" ||
+    item.originalMutationEvidence.errorClass !== undefined &&
+      (typeof item.originalMutationEvidence.errorClass !== "string" || !item.originalMutationEvidence.errorClass) ||
+    item.originalMutationEvidence.failureReason !== undefined &&
+      (typeof item.originalMutationEvidence.failureReason !== "string" || !item.originalMutationEvidence.failureReason)
+  )) return false;
+  if (item.recoveryHistory !== undefined && (
+    !Array.isArray(item.recoveryHistory) ||
+    item.recoveryHistory.some((entry) =>
+      !isRecordObject(entry) ||
+      !isFiniteNonnegativeInteger(entry.pass) ||
+      typeof entry.event !== "string" || !entry.event ||
+      entry.outcome !== undefined && typeof entry.outcome !== "string"
+    )
+  )) return false;
+  return true;
+}
+
+function assertOperationRecord(value: unknown): asserts value is OperationLedgerRecord {  if (!isRecordObject(value)) throw new MalformedStoredOperationError();
   const record = value as Partial<OperationLedgerRecord>;
   if (
     record.responseVersion !== 1 ||
@@ -703,7 +847,12 @@ function assertOperationRecord(value: unknown): asserts value is OperationLedger
       typeof item.writeAttempted !== "boolean" ||
       typeof item.writeMayHaveSucceeded !== "boolean" ||
       typeof item.partialWrite !== "boolean" ||
-      !isFiniteNonnegativeInteger(item.retryCount)
+      !isFiniteNonnegativeInteger(item.retryCount) ||
+      (item.recoveryRetryCount !== undefined && !isFiniteNonnegativeInteger(item.recoveryRetryCount)) ||
+      (item.reconciliationPass !== undefined && !isFiniteNonnegativeInteger(item.reconciliationPass)) ||
+      (item.reconciliationPassReadAttempts !== undefined && !isFiniteNonnegativeInteger(item.reconciliationPassReadAttempts)) ||
+      (item.reconciliationReadAttempts !== undefined && !isFiniteNonnegativeInteger(item.reconciliationReadAttempts)) ||
+      !validOptionalRecoveryMetadata(item)
     ) {
       throw new MalformedStoredOperationError(`Operation item state is invalid: ${itemKey}.`);
     }
@@ -850,7 +999,7 @@ function expireOperationLifetime(record: OperationLedgerRecord, now: string): Op
     const lifetimePatch: Partial<OperationItemState> & { stage: OperationItemStage } = {
       stage: item.writeMayHaveSucceeded ? "AmbiguousWriteUnresolved" : "FailedBeforeWrite",
       ambiguousWrite: item.writeMayHaveSucceeded || item.ambiguousWrite,
-      partialWrite: item.partialWrite || item.writeMayHaveSucceeded,
+      partialWrite: item.partialWrite,
       errorClass: item.errorClass ?? "ContinuationFailure",
       failureReason: item.failureReason ?? lifetimeReason,
       terminalFailureReason: lifetimeReason,
@@ -897,7 +1046,7 @@ function terminalizeContinuationFailureInRecord(
       stage: possibleWrite ? "AmbiguousWriteUnresolved" : "FailedBeforeWrite",
       outcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : params.outcome,
       ambiguousWrite: possibleWrite || item.ambiguousWrite,
-      partialWrite: possibleWrite || item.partialWrite,
+      partialWrite: item.partialWrite,
       errorClass: item.errorClass ?? params.errorClass,
       failureReason: item.failureReason ?? params.reason,
       terminalFailureReason: params.reason,
@@ -969,11 +1118,13 @@ const EXPLICIT_STAGE_TRANSITIONS: Partial<Record<OperationItemStage, ReadonlySet
   NoteWriteAmbiguous: new Set(["Verifying"]),
   NoteAdded: new Set(["NoteVerified", "Verifying", "StatusWriteStarted"]),
   NoteVerified: new Set(["StatusWriteStarted", "StatusVerified", "Verifying"]),
+  RecoveryWriteStarted: new Set(["FieldsUpdated", "ClassificationWriteSucceeded", "ClassificationVerified", "ResolutionWriteSucceeded", "ResolutionVerified", "StatusWriteSucceeded", "StatusVerified", "RecoveryWriteAmbiguous", "RateLimitedRescheduled", "Verifying"]),
+  RecoveryWriteAmbiguous: new Set(["ClassificationVerified", "ResolutionVerified", "StatusVerified", "Verifying"]),
   Verifying: new Set(["NoteChecked", "NoteDedupeChecked"]),
   RateLimited: new Set(["RateLimitedRetrying", "RateLimitedRescheduled"]),
   RateLimitedRetrying: new Set(["RateLimitedRescheduled"]),
   RateLimitedRescheduled: new Set(["Validating", "Validated", "PreflightValidated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "ClassificationWriteStarted", "ResolutionValidated", "ResolutionWriteStarted", "StatusWriteStarted", "NoteChecked", "NoteDedupeChecked", "NoteWriteStarted", "Verifying"]),
-  Rescheduled: new Set(["Validating", "Validated", "PreflightValidated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "ClassificationWriteStarted", "NoteChecked", "NoteDedupeChecked", "StatusWriteStarted", "Verifying", "RateLimitedRescheduled"]),
+  Rescheduled: new Set(["Validating", "Validated", "PreflightValidated", "WriteNotStarted", "WriteStarted", "WriteAmbiguous", "ClassificationWriteStarted", "NoteChecked", "NoteDedupeChecked", "StatusWriteStarted", "RecoveryWriteStarted", "RecoveryWriteAmbiguous", "Verifying", "RateLimitedRescheduled"]),
 };
 
 function assertTransition(current: OperationItemStage, next: OperationItemStage): void {
@@ -1003,6 +1154,12 @@ function assertTransition(current: OperationItemStage, next: OperationItemStage)
  */
 function assertCheckpointTransition(current: OperationItemStage, next: OperationItemStage): void {
   if ((current === "Pending" || current === "Unattempted") && ["WriteStarted", "ClassificationWriteStarted", "ResolutionWriteStarted", "StatusWriteStarted", "NoteWriteStarted"].includes(next)) {
+    return;
+  }
+  // RecoveryWriteStarted is deliberately reachable only through the leased
+  // checkpoint API. The durable retry counter and mutation boundary therefore
+  // become visible atomically before the one permitted recovery call.
+  if (next === "RecoveryWriteStarted" && !TERMINAL_STAGES.has(current)) {
     return;
   }
   assertTransition(current, next);
@@ -1049,10 +1206,14 @@ function mergeCompactResultHistory(previous: unknown, next: unknown): unknown {
   const shouldMergeStagedHistory = previous.workflowMode === "staged" ||
     next.workflowMode === "staged" ||
     Array.isArray(previous.completedStages) ||
-    Array.isArray(next.completedStages);
+    Array.isArray(next.completedStages) ||
+    previous.ambiguityEncountered === true ||
+    next.ambiguityEncountered === true ||
+    Array.isArray(previous.recoveryHistory) ||
+    Array.isArray(next.recoveryHistory);
   if (!shouldMergeStagedHistory) return next;
   const merged: Record<string, unknown> = { ...previous, ...next };
-  for (const field of ["physicalWrites", "completedStages"] as const) {
+  for (const field of ["physicalWrites", "completedStages", "recoveryHistory"] as const) {
     const history = mergeArrayHistory(previous[field], next[field]);
     if (history) merged[field] = history;
   }
@@ -1149,10 +1310,21 @@ function deriveTerminalFailureReason(record: OperationLedgerRecord): string | un
 }
 
 function itemHasUnresolvedAmbiguity(item: OperationItemState): boolean {
+  if (item.reconciliationDisposition === "VerifiedSuccess" ||
+      (TERMINAL_STAGES.has(item.stage) && item.stage !== "AmbiguousWriteUnresolved")) {
+    return false;
+  }
+  if (item.reconciliationDisposition === "AmbiguousUnresolved" ||
+      item.reconciliationDisposition === "ConfirmedNotApplied" ||
+      item.reconciliationDisposition === "ConfirmedPartialWrite") {
+    return true;
+  }
   return item.ambiguousWrite === true ||
     item.stage === "WriteAmbiguous" ||
     item.stage === "ResolutionWriteAmbiguous" ||
     item.stage === "NoteWriteAmbiguous" ||
+    item.stage === "RecoveryWriteStarted" ||
+    item.stage === "RecoveryWriteAmbiguous" ||
     item.stage === "AmbiguousWriteUnresolved" ||
     (
       item.observedMutationResult === "Ambiguous" &&
@@ -1181,6 +1353,7 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
 
   for (const itemKey of next.expectedItems) {
     const item = next.itemStates[itemKey];
+
     if (!item) {
       pending.push(itemKey);
       continue;
@@ -1208,11 +1381,11 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
     const itemKey = itemResultKey(entry);
     const item = itemKey ? next.itemStates[itemKey] : undefined;
     if (!item) return entry;
-    const physicalWrites = Array.isArray(entry.physicalWrites)
+    const physicalWrites = item.acceptedPhysicalWrites ?? (Array.isArray(entry.physicalWrites)
       ? entry.physicalWrites.filter((write) => isRecordObject(write) &&
           ["Accepted", "AcceptedAndVerified", "VerifiedApplied", "VerifiedAppliedAfterAmbiguous"]
             .includes(String(write.outcome ?? "")))
-      : [];
+      : []);
     const completedStages = Array.isArray(entry.completedStages)
       ? entry.completedStages.filter((stage): stage is string => typeof stage === "string")
       : [];
@@ -1422,6 +1595,28 @@ function applyItemPatch(
     completedAt: TERMINAL_STAGES.has(params.patch.stage) ? nowIso() : current.completedAt,
   };
   delete item.lease;
+  if (TERMINAL_STAGES.has(item.stage)) {
+    delete item.nextEligibleTime;
+  }
+  if (isTerminalSuccessfulItem(item) && item.ambiguityEncountered !== true) {
+    delete item.expectedTicketId;
+    delete item.preMutationUpdatedTime;
+    delete item.preMutationState;
+    delete item.reconciliationMutationType;
+    delete item.reconciliationPass;
+    delete item.reconciliationPassReadAttempts;
+    delete item.reconciliationReadAttempts;
+    delete item.reconciliationUpdatedTimes;
+    delete item.reconciliationDisposition;
+    delete item.originalMutationEvidence;
+    delete item.recoveryMutationStage;
+    delete item.recoveryWriteStarted;
+    delete item.stageHistory;
+    delete item.mutationStartStage;
+    delete item.updatedTimeExpectation;
+    delete item.replaySafe;
+    if (item.humanReconciliationRequired !== true) delete item.humanReconciliationRequired;
+  }
   record.itemStates[params.itemKey] = item;
   if (record.currentLease?.leaseId === current.lease?.leaseId) {
     record.currentLease = undefined;
@@ -2069,6 +2264,9 @@ export function operationTotals(record: OperationLedgerRecord): Record<string, n
     unattempted: 0,
     waitingForRateLimit: 0,
     rateLimitExceeded: 0,
+    acceptedPhysicalWrites: 0,
+    humanReconciliationRequired: 0,
+    noWriteFailures: 0,
   };
 
   for (const itemKey of record.expectedItems) {
@@ -2078,6 +2276,15 @@ export function operationTotals(record: OperationLedgerRecord): Record<string, n
       continue;
     }
     if (item.partialWrite) totals.partialWrite += 1;
+    totals.acceptedPhysicalWrites += item.acceptedPhysicalWrites?.length ?? 0;
+    if (item.humanReconciliationRequired === true && TERMINAL_STAGES.has(item.stage)) {
+      totals.humanReconciliationRequired += 1;
+    }
+    if (FAILED_STAGES.has(item.stage) && !item.partialWrite &&
+        (item.acceptedPhysicalWrites?.length ?? 0) === 0 &&
+        (item.observedRequestedEffects?.length ?? 0) === 0) {
+      totals.noWriteFailures += 1;
+    }
     if (item.outcome === "Updated") totals.updated += 1;
     if (item.outcome === "Resolved") totals.resolved += 1;
     if (item.outcome === "Updated" && item.mutationType === "note") totals.noteOnly += 1;

@@ -696,6 +696,26 @@ describe("operation store", () => {
     });
   });
 
+  it("loads legacy items without recovery metadata and rejects malformed recovery state", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const legacy = record({ operationId: "op-legacy-recovery-defaults" });
+      await expect(store.put(legacy)).resolves.toBeUndefined();
+      const loadedLegacy = await store.get("op-legacy-recovery-defaults", legacy.ownerHash);
+      expect(loadedLegacy?.itemStates["57401"].recoveryRetryCount).toBeUndefined();
+      expect(loadedLegacy?.itemStates["57401"].reconciliationDisposition).toBeUndefined();
+
+      const malformed = record({ operationId: "op-malformed-recovery" });
+      malformed.itemStates["57401"] = {
+        ...malformed.itemStates["57401"],
+        stage: "RecoveryWriteStarted",
+        recoveryRetryCount: 2,
+        recoveryMutationStage: "update",
+        recoveryWriteStarted: true,
+      };
+      await expect(store.put(malformed)).rejects.toBeInstanceOf(MalformedStoredOperationError);
+    });
+  });
   it("uses only the dedicated key for approved private-note encryption and recovery", async () => {
     const values = new Map<string, unknown>();
     const storage = {
@@ -2016,7 +2036,7 @@ describe("operation store", () => {
     });
   });
 
-  it("stops an overdue non-terminal operation without discarding possible-write evidence", async () => {
+  it("stops an overdue non-terminal operation without misreporting possible-write evidence as partial", async () => {
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();
       const ownerHash = stableHash("owner@example.com");
@@ -2032,7 +2052,7 @@ describe("operation store", () => {
       })).resolves.toBeUndefined();
       await expect(store.get("op-lifetime")).resolves.toMatchObject({
         state: "CompletedWithFailures", terminalFailureReason: "Operation maximum lifetime exceeded.",
-        itemStates: { "57401": { stage: "AmbiguousWriteUnresolved", writeMayHaveSucceeded: true, partialWrite: true } },
+        itemStates: { "57401": { stage: "AmbiguousWriteUnresolved", writeMayHaveSucceeded: true, partialWrite: false } },
       });
     });
   });
@@ -2165,6 +2185,109 @@ describe("operation store", () => {
         unattempted: 0,
         waitingForRateLimit: 1,
         rateLimitExceeded: 0,
+        acceptedPhysicalWrites: 0,
+        humanReconciliationRequired: 0,
+        noWriteFailures: 1,
+      });
+    });
+  });
+  it("keeps recovery, partial-write, ambiguity, concurrency, and waiting totals consistent with item results", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const base = record().itemStates["57400"];
+      const item = (itemKey: string, overrides: Partial<OperationItemState>): OperationItemState => ({
+        ...base,
+        itemKey,
+        idempotencyKey: `mixed-${itemKey}`,
+        ...overrides,
+      });
+      const accepted = (recovery: boolean) => [{
+        mutationType: "update" as const,
+        method: "updateTicket",
+        outcome: "Accepted" as const,
+        recovery,
+      }];
+      const itemStates: Record<string, OperationItemState> = {
+        ordinary: item("ordinary", {
+          stage: "Completed", outcome: "Updated", verificationState: "Verified",
+          acceptedPhysicalWrites: accepted(false),
+        }),
+        reconciled: item("reconciled", {
+          stage: "CompletedAfterAmbiguousWriteVerification", outcome: "Updated",
+          verificationState: "Verified", ambiguityEncountered: true,
+          reconciliationDisposition: "VerifiedSuccess", partialWrite: false,
+        }),
+        recovered: item("recovered", {
+          stage: "CompletedAfterRetry", outcome: "Updated", verificationState: "Verified",
+          ambiguityEncountered: true, reconciliationDisposition: "VerifiedSuccess",
+          recoveryRetryCount: 1, recoveryRetryCounts: { update: 1 }, attemptCount: 2,
+          acceptedPhysicalWrites: accepted(true), partialWrite: false,
+        }),
+        partial: item("partial", {
+          stage: "FailedAfterPartialWrite", outcome: "Failed", verificationState: "Pending",
+          ambiguityEncountered: true, reconciliationDisposition: "ConfirmedPartialWrite",
+          observedRequestedEffects: ["impact"], missingRequestedEffects: ["status"], partialWrite: true,
+        }),
+        unresolved: item("unresolved", {
+          stage: "AmbiguousWriteUnresolved", outcome: "AmbiguousWriteUnresolved",
+          verificationState: "Pending", ambiguityEncountered: true,
+          reconciliationDisposition: "AmbiguousUnresolved", observedRequestedEffects: [],
+          acceptedPhysicalWrites: [], partialWrite: false, humanReconciliationRequired: true,
+        }),
+        waiting: item("waiting", {
+          stage: "ClassificationVerified", outcome: "SuperOpsRateLimitRescheduled",
+          verificationState: "Verified", nextEligibleTime: "2026-07-18T00:05:00.000Z",
+          errorClass: "SuperOpsRateLimit",
+          rateLimit: {
+            attempts: 1, retryAfterSupplied: true, continuedInAnotherInvocation: true,
+            writeAttempted: true, nextEligibleAt: "2026-07-18T00:05:00.000Z",
+          },
+        }),
+        concurrent: item("concurrent", {
+          stage: "AmbiguousWriteUnresolved", outcome: "AmbiguousWriteUnresolved",
+          verificationState: "Pending", ambiguityEncountered: true,
+          reconciliationDisposition: "AmbiguousUnresolved", conflictingEffects: ["updatedTime"],
+          observedRequestedEffects: [], acceptedPhysicalWrites: [], partialWrite: false,
+          humanReconciliationRequired: true,
+        }),
+      };
+      const expectedItems = Object.keys(itemStates);
+      await store.put(record({
+        operationId: "op-recovery-counter-consistency",
+        expectedItems,
+        itemStates,
+        compactResults: expectedItems.map((ticketNumber) => ({ ticketNumber })),
+      }));
+
+      const stored = await store.get(
+        "op-recovery-counter-consistency",
+        stableHash("owner@example.com")
+      ) as OperationLedgerRecord;
+      expect(stored.partialWriteCount).toBe(1);
+      expect(stored.ambiguousWriteCount).toBe(2);
+      expect(stored.compactResults).toHaveLength(7);
+      expect(operationTotals(stored)).toEqual({
+        expected: 7,
+        completed: 3,
+        successfulVerified: 3,
+        updated: 3,
+        resolved: 0,
+        noteOnly: 0,
+        completedAfterRetry: 1,
+        completedAfterAmbiguousVerification: 1,
+        skipped: 0,
+        validationFailed: 0,
+        stale: 0,
+        failed: 3,
+        partialWrite: 1,
+        ambiguousUnresolved: 2,
+        pending: 1,
+        unattempted: 0,
+        waitingForRateLimit: 1,
+        rateLimitExceeded: 0,
+        acceptedPhysicalWrites: 2,
+        humanReconciliationRequired: 2,
+        noWriteFailures: 2,
       });
     });
   });

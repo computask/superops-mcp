@@ -14,6 +14,7 @@ import {
   type OperationCompleteItemParams,
   type OperationItemClaim,
   type OperationItemStage,
+  type OperationItemState,
   type OperationLedgerRecord,
 } from "./operation-store.js";
 
@@ -46,6 +47,7 @@ export interface ContinuationItemOutcome {
   suppliedDelayMs?: number;
   retryOperationName?: string;
   retryEndpoint?: string;
+  durablePatch?: Partial<Omit<OperationItemState, "itemKey" | "idempotencyKey" | "lease" | "stage">>;
 }
 
 export interface OperationContinuationAdapter {
@@ -114,7 +116,7 @@ export async function runOperationContinuation(
           stage: terminalStage,
           outcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : "ContinuationLimitExceeded",
           ambiguousWrite: possibleWrite || item.ambiguousWrite,
-          partialWrite: possibleWrite || item.partialWrite,
+          partialWrite: item.partialWrite,
           initialFailureReason: item.initialFailureReason ?? item.failureReason ?? terminalReason,
           initialErrorClass: item.initialErrorClass ?? item.errorClass ?? "ContinuationFailure",
           terminalFailureReason: terminalReason,
@@ -196,17 +198,21 @@ export async function runOperationContinuation(
         claim.item.stage === "ResolutionWriteAmbiguous";
       const stagedWrite = claim.item.stage === "ClassificationWriteStarted" ||
         claim.item.stage === "StatusWriteStarted";
+      const recoveryWrite = claim.item.stage === "RecoveryWriteStarted" ||
+        claim.item.stage === "RecoveryWriteAmbiguous";
       const mutationBoundary = claim.item.stage === "WriteStarted" ||
-        claim.item.stage === "WriteAmbiguous" || resolutionWrite || noteWrite || stagedWrite;
+        claim.item.stage === "WriteAmbiguous" || resolutionWrite || noteWrite || stagedWrite || recoveryWrite;
       // Only an in-flight mutation boundary becomes explicitly ambiguous.
       // A later durable stage (for example FieldsUpdated) already records a
       // reliable response and must retain that exact progress instead.
       const stage = mutationBoundary
-        ? noteWrite
-          ? "NoteWriteAmbiguous"
-          : resolutionWrite
-            ? "ResolutionWriteAmbiguous"
-            : "WriteAmbiguous"
+        ? recoveryWrite
+          ? "RecoveryWriteAmbiguous"
+          : noteWrite
+            ? "NoteWriteAmbiguous"
+            : resolutionWrite
+              ? "ResolutionWriteAmbiguous"
+              : "WriteAmbiguous"
         : hasPriorWrite ? claim.item.stage : "Rescheduled";
       record = await store.completeItem({
         operationId: params.operationId,
@@ -232,7 +238,7 @@ export async function runOperationContinuation(
               itemKey: claim.itemKey,
               finalOutcome: "AmbiguousWriteRequiresVerification",
               writeAttempted: true,
-              partialWrite: true,
+              partialWrite: claim.item.partialWrite === true,
             }
           : {
               itemKey: claim.itemKey,
@@ -328,6 +334,7 @@ export async function runOperationContinuation(
           itemKey: claim.itemKey,
           leaseId: claim.lease.leaseId,
           patch: {
+            ...effectiveOutcome.durablePatch,
             stage: effectiveOutcome.stage,
             outcome: effectiveOutcome.outcome,
             writeAttempted: effectiveOutcome.writeAttempted,
@@ -445,16 +452,17 @@ export async function runOperationContinuation(
         const currentItem = (await store.get(params.operationId, params.ownerHash))?.itemStates[claim.itemKey];
         const hasPriorWrite = currentItem?.writeAttempted === true ||
           currentItem?.writeMayHaveSucceeded === true;
-        const possibleWrite = currentItem?.writeMayHaveSucceeded === true &&
-          currentItem.observedMutationResult !== "Rejected";
+
         const noteWrite = currentItem?.stage === "NoteWriteStarted" ||
           currentItem?.stage === "NoteWriteAmbiguous";
         const resolutionWrite = currentItem?.stage === "ResolutionWriteStarted" ||
           currentItem?.stage === "ResolutionWriteAmbiguous";
         const stagedWrite = currentItem?.stage === "ClassificationWriteStarted" ||
           currentItem?.stage === "StatusWriteStarted";
+        const recoveryWrite = currentItem?.stage === "RecoveryWriteStarted" ||
+          currentItem?.stage === "RecoveryWriteAmbiguous";
         const mutationBoundary = currentItem?.stage === "WriteStarted" ||
-          currentItem?.stage === "WriteAmbiguous" || resolutionWrite || noteWrite || stagedWrite;
+          currentItem?.stage === "WriteAmbiguous" || resolutionWrite || noteWrite || stagedWrite || recoveryWrite;
         const preservedStage = currentItem?.stage ?? "Rescheduled";
         record = await store.completeItem({
           operationId: params.operationId,
@@ -463,11 +471,13 @@ export async function runOperationContinuation(
           leaseId: claim.lease.leaseId,
           patch: {
             stage: mutationBoundary
-              ? noteWrite
-                ? "NoteWriteAmbiguous"
-                : resolutionWrite
-                  ? "ResolutionWriteAmbiguous"
-                  : "WriteAmbiguous"
+              ? recoveryWrite
+                ? "RecoveryWriteAmbiguous"
+                : noteWrite
+                  ? "NoteWriteAmbiguous"
+                  : resolutionWrite
+                    ? "ResolutionWriteAmbiguous"
+                    : "WriteAmbiguous"
               : hasPriorWrite ? preservedStage : "Rescheduled",
             outcome: mutationBoundary
               ? "AmbiguousWriteRequiresVerification"
@@ -478,7 +488,7 @@ export async function runOperationContinuation(
                   : platformLimit ?? "CloudflareExecutionTimeout",
             writeAttempted: currentItem?.writeAttempted === true,
             writeMayHaveSucceeded: currentItem?.writeMayHaveSucceeded === true,
-            partialWrite: possibleWrite || currentItem?.partialWrite === true,
+            partialWrite: currentItem?.partialWrite === true,
             verificationState: "Pending",
             errorClass: caughtError instanceof ExecutionBudgetExceededError
               ? "CloudflareConfiguredBudgetReached"
@@ -494,7 +504,7 @@ export async function runOperationContinuation(
                 itemKey: claim.itemKey,
                 finalOutcome: "AmbiguousWriteRequiresVerification",
                 writeAttempted: true,
-                partialWrite: true,
+                partialWrite: currentItem?.partialWrite === true,
               }
             : undefined,
         });
@@ -530,7 +540,7 @@ export async function runOperationContinuation(
           outcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : "OperationStoreFailure",
           writeAttempted: currentItem.writeAttempted === true,
           writeMayHaveSucceeded: currentItem.writeMayHaveSucceeded === true,
-          partialWrite: possibleWrite || currentItem.partialWrite === true,
+          partialWrite: currentItem.partialWrite === true,
           failureReason,
           errorClass: "OperationStoreFailure",
           result: {
@@ -538,7 +548,7 @@ export async function runOperationContinuation(
             finalOutcome: possibleWrite ? "AmbiguousWriteRequiresReconciliation" : "OperationStoreFailure",
             writeAttempted: currentItem.writeAttempted === true,
             writeMayHaveSucceeded: currentItem.writeMayHaveSucceeded === true,
-            partialWrite: possibleWrite || currentItem.partialWrite === true,
+            partialWrite: currentItem.partialWrite === true,
             failureReason,
           },
         };

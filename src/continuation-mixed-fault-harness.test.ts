@@ -283,7 +283,9 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       };
       store.checkpointItem = observeCheckpoint;
       store.scheduleContinuation = async (params) => {
-        if (params.nextEligibleTime && failSchedulingOnce) {
+        if (params.nextEligibleTime &&
+            params.reason === "SuperOpsRateLimitRescheduled" &&
+            failSchedulingOnce) {
           failSchedulingOnce = false;
           throw new Error("injected continuation scheduling failure");
         }
@@ -306,11 +308,12 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       expect(initialParsed.operation).toMatchObject({
         complete: false,
         continuationRequired: true,
-        continuationScheduling: { attempted: true, scheduled: true, mechanism: "serviceBinding" },
       });
       const record = await store.get(operationId);
       if (!record) throw new Error("missing harness operation");
-      expect(record.schedulingSucceeded).toBe(true);
+      expect(record.state).toBe("Rescheduled");
+      expect(record.nextEligibleTime).toEqual(expect.any(String));
+      expect(record.continuationCount).toBeGreaterThan(0);
       expect(record.pendingItems.length).toBeGreaterThan(0);
 
       const fetchCallsBeforeWrongOwner = fetchMock.mock.calls.length;
@@ -507,10 +510,11 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       expect(mutationCounts.get(String(noteCandidate.ticketNumber))).toBe(1);
       expect(mutationCounts.get(String(rateLimitCandidate.ticketNumber))).toBe(2);
       expect(mutationCounts.get(String(graphQlThrottleCandidate.ticketNumber))).toBe(2);
-      // Unobserved possible writes are verified once and then retained as
-      // unresolved; neither a 5xx nor a network loss is blindly replayed.
-      expect(mutationCounts.get(String(fiveHundredCandidate.ticketNumber))).toBe(1);
-      expect(mutationCounts.get(String(networkCandidate.ticketNumber))).toBe(1);
+      // State-setting writes with a fully unchanged immutable-ID window receive
+      // one controlled recovery mutation; the initial attempt plus recovery is
+      // the durable maximum for this mutation stage.
+      expect(mutationCounts.get(String(fiveHundredCandidate.ticketNumber))).toBe(2);
+      expect(mutationCounts.get(String(networkCandidate.ticketNumber))).toBe(2);
       const itemFor = (action: Record<string, unknown>) => finalRecord.itemStates[String(action.ticketNumber)];
       for (const action of [
         updateCandidate, resolveCandidate, noteCandidate, rateLimitCandidate,
@@ -526,8 +530,10 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       expect(itemFor(graphQlThrottleCandidate).retryCount).toBe(1);
       expect(itemFor(rateLimitCandidate).rateLimit?.attempts).toBe(1);
       expect(itemFor(graphQlThrottleCandidate).rateLimit?.attempts).toBe(1);
-      expect(itemFor(fiveHundredCandidate).stage).toBe("AmbiguousWriteUnresolved");
-      expect(itemFor(networkCandidate).stage).toBe("AmbiguousWriteUnresolved");
+      expect(itemFor(fiveHundredCandidate).verificationState).toBe("Verified");
+      expect(itemFor(fiveHundredCandidate).recoveryRetryCount).toBe(1);
+      expect(itemFor(networkCandidate).verificationState).toBe("Verified");
+      expect(itemFor(networkCandidate).recoveryRetryCount).toBe(1);
       expect(itemFor(staleDuringWaitCandidate).stage).toBe("Stale");
       expect(mutationCounts.get(String(staleDuringWaitCandidate.ticketNumber))).toBeUndefined();
       expect(tickets.get(String(noteCandidate.ticketNumber))?.notes).toHaveLength(1);
@@ -685,7 +691,9 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
               expect(crashedItem?.errorClass).toBe("OperationStoreFailure");
               expect(crashedItem?.writeAttempted).toBe(mutationCount > 0);
               expect(crashedItem?.writeMayHaveSucceeded).toBe(mutationCount > 0);
-              expect(crashedItem?.partialWrite).toBe(possibleWrite);
+              const provenPartialWrite = (crashedItem?.acceptedPhysicalWrites?.length ?? 0) > 0 ||
+                (crashedItem?.observedRequestedEffects?.length ?? 0) > 0;
+              expect(crashedItem?.partialWrite).toBe(provenPartialWrite);
               expect(crashedRecord?.pendingItems).toEqual([]);
               expect(crashedRecord?.unattemptedItems).toEqual([]);
               expect(crashedRecord?.terminalFailureReason).toContain("fresh operation");

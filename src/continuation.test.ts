@@ -513,7 +513,7 @@ describe("durable continuation runner", () => {
         leaseId: initialClaim.lease.leaseId,
         patch: {
           stage: "WriteAmbiguous", writeAttempted: true, writeMayHaveSucceeded: true,
-          partialWrite: true, verificationState: "Pending",
+          partialWrite: false, verificationState: "Pending",
         },
       });
 
@@ -534,7 +534,7 @@ describe("durable continuation runner", () => {
         itemStates: {
           "ticket-checkpoint": {
             stage: "WriteAmbiguous", writeAttempted: true,
-            writeMayHaveSucceeded: true, partialWrite: true,
+            writeMayHaveSucceeded: true, partialWrite: false,
           },
         },
       });
@@ -596,7 +596,7 @@ describe("durable continuation runner", () => {
         itemStates: {
           "ticket-checkpoint": {
             stage: "WriteAmbiguous", writeAttempted: true,
-            writeMayHaveSucceeded: true, partialWrite: true,
+            writeMayHaveSucceeded: true, partialWrite: false,
           },
         },
       });

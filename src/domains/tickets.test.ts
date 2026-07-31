@@ -5159,7 +5159,7 @@ describe("Tickets Domain", () => {
   });
 
   it.each(LIVE_RESOLVE_NO_CHANGE_DATAFETCHING_REGRESSION.operationIds)(
-    "classifies live no-change DataFetchingException operation %s without retry, fallback or note",
+    "defers live no-change DataFetchingException operation %s for bounded recovery evidence",
     async (operationId) => {
       const graphQLError = new SuperOpsError(
         "SuperOps internal server error with token secret-token and customer@example.com",
@@ -5198,7 +5198,7 @@ describe("Tickets Domain", () => {
       expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("status");
       expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("priority");
       expect(parsed.results[0]).toMatchObject({
-        finalOutcome: "AmbiguousNoChangeObserved",
+        finalOutcome: "Failed",
         writeMethod: "staged",
         primaryWriteMethod: "updateTicket.classification",
         primaryGraphqlClassification: "DataFetchingException",
@@ -5206,11 +5206,15 @@ describe("Tickets Domain", () => {
         primaryGraphqlPath: ["updateTicket"],
         primaryResponseHadData: false,
         primarySynchronousFailure: true,
+        initialFailure: expect.objectContaining({ errorClass: "DataFetchingException" }),
         updatedTimeChanged: false,
         noChangeObserved: true,
         noteAdded: false,
         fallbackAttempted: false,
-        terminalReason: "AmbiguousNoChangeObserved",
+        terminalReason: "AmbiguousWritePending",
+        reconciliationDisposition: "AmbiguousUnresolved",
+        partialWrite: false,
+        continuationRequired: true,
       });
       expect(JSON.stringify(parsed.results[0])).not.toContain("secret-token");
       expect(JSON.stringify(parsed.results[0])).not.toContain("customer@example.com");
@@ -5242,12 +5246,14 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).toHaveBeenCalledTimes(1);
     expect(parsed.results[0]).toMatchObject({
       finalOutcome: "Failed",
-      failureStage: "classificationAmbiguousVerification",
-      terminalReason: "ClassificationAmbiguousUnresolved",
+      failureStage: "ambiguousWrite",
+      terminalReason: "AmbiguousWritePending",
+      reconciliationDisposition: "AmbiguousUnresolved",
       writeAttempted: true,
       writeMayHaveSucceeded: true,
-      partialWrite: true,
+      partialWrite: false,
       noteAdded: false,
+      continuationRequired: true,
     });
   });
 
@@ -5267,10 +5273,12 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).toHaveBeenCalledTimes(1);
     expect(parsed.results[0]).toMatchObject({
       finalOutcome: "Failed",
-      terminalReason: "PartialClassificationObserved",
+      terminalReason: "AmbiguousWritePending",
+      reconciliationDisposition: "ConfirmedPartialWrite",
       partialWrite: true,
       noteAdded: false,
-
+      continuationRequired: true,
+      observedRequestedEffects: expect.arrayContaining(["impact"]),
     });
   });
 
@@ -6591,17 +6599,21 @@ describe("Tickets Domain", () => {
     const finalRecord = await getOperationStore().get("status-only-fallback-no-replay");
     expect(mockClient.mutate).not.toHaveBeenCalled();
     expect(finalRecord?.itemStates["57401"]).toMatchObject({
-      stage: "FailedAfterPartialWrite",
-      outcome: "PartialResolveStatusMissing",
+      stage: "AmbiguousWriteUnresolved",
+      outcome: "AmbiguousWriteUnresolved",
       fallbackAttempted: true,
       attemptCount: 2,
       partialWrite: true,
+      reconciliationDisposition: "AmbiguousUnresolved",
+      replaySafe: false,
+      humanReconciliationRequired: true,
     });
     expect(operationResultView(finalRecord!).results).toContainEqual(expect.objectContaining({
       ticketNumber: "57401",
-      finalOutcome: "PartialResolveStatusMissing",
       fallbackAttempted: true,
-      terminalReason: "PartialResolveStatusMissing",
+      terminalReason: "AmbiguousWriteUnresolved",
+      reconciliationDisposition: "AmbiguousUnresolved",
+      replaySafe: false,
     }));
   });
   it("does not repeat an ambiguous private note when its canonical content is observed", async () => {
@@ -7179,7 +7191,7 @@ describe("Tickets Domain", () => {
     });
   });
 
-  it("does not reschedule or replay an ambiguous private-note failure", async () => {
+  it("never replays an ambiguous private-note failure and terminalises only after bounded reconciliation", async () => {
     const domain = getTicketsTools();
     await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
       { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
@@ -7210,19 +7222,48 @@ describe("Tickets Domain", () => {
         })
       )
     );
-    const finalRecord = await getOperationStore().get("private-note-ambiguous");
+    let finalRecord = await getOperationStore().get("private-note-ambiguous");
     if (!finalRecord) throw new Error("missing ambiguous private-note operation");
+    expect(finalRecord.itemStates["57401"]).toMatchObject({
+      stage: "NoteWriteAmbiguous",
+      writeAttempted: true,
+      writeMayHaveSucceeded: true,
+      partialWrite: false,
+      verificationState: "Pending",
+      errorClass: "AmbiguousWrite",
+      reconciliationDisposition: "AmbiguousUnresolved",
+      recoveryRetryCount: 0,
+    });
+    for (let attempt = 0; attempt < 4 && finalRecord.state !== "CompletedWithFailures"; attempt += 1) {
+      await runWithExecutionConfig({}, () => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => resumeApplyTriageOperation({
+          operationId: "private-note-ambiguous",
+          ownerHash: stored.ownerHash,
+          leaseOwner: `note-reconcile-${attempt}`,
+          now: finalRecord!.itemStates["57401"].nextEligibleTime,
+        })
+      ));
+      finalRecord = await getOperationStore().get("private-note-ambiguous");
+      if (!finalRecord) throw new Error("missing ambiguous private-note operation");
+    }
     expect(finalRecord.itemStates["57401"]).toMatchObject({
       stage: "AmbiguousWriteUnresolved",
       writeAttempted: true,
       writeMayHaveSucceeded: true,
-      partialWrite: true,
+      partialWrite: false,
       verificationState: "Pending",
       errorClass: "AmbiguousWrite",
+      reconciliationDisposition: "AmbiguousUnresolved",
+      recoveryRetryCount: 0,
+      replaySafe: false,
+      humanReconciliationRequired: true,
     });
     expect(finalRecord.itemStates["57401"].nextEligibleTime).toBeUndefined();
     expect(operationResultView(finalRecord).totals).toMatchObject({
       ambiguousUnresolved: 1,
+      partialWrite: 0,
+      humanReconciliationRequired: 1,
       validationFailed: 0,
     });
     expect(mockClient.mutate).toHaveBeenCalledTimes(1);
