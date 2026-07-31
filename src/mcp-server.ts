@@ -172,6 +172,7 @@ export async function blockedToolNamesByCategory(
 }
 
 const CHATGPT_DIRECT_TRIAGE_PLAN_TOOL_NAME = "superops_tickets_apply_triage_plan";
+const CHATGPT_DIRECT_OPERATION_CANCEL_TOOL_NAME = "superops_operations_cancel";
 const CHATGPT_DIRECT_SCRIPT_EXECUTION_TOOL_NAME = "superops_scripts_execute_on_asset";
 
 export type ChatGptDirectToolPolicy = {
@@ -202,8 +203,10 @@ export async function chatGptDirectBlockedToolNames(
   const blocked = await blockedToolNamesByCategory(categories);
   if (policy.reviewedTriagePlanAllowed === true) {
     blocked.delete(CHATGPT_DIRECT_TRIAGE_PLAN_TOOL_NAME);
+    blocked.delete(CHATGPT_DIRECT_OPERATION_CANCEL_TOOL_NAME);
   } else {
     blocked.add(CHATGPT_DIRECT_TRIAGE_PLAN_TOOL_NAME);
+    blocked.add(CHATGPT_DIRECT_OPERATION_CANCEL_TOOL_NAME);
   }
   if (policy.scriptExecutionAllowed === true) {
     blocked.delete(CHATGPT_DIRECT_SCRIPT_EXECUTION_TOOL_NAME);
@@ -273,6 +276,30 @@ const operationTools: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {},
+    },
+  },
+  {
+    name: "superops_operations_cancel",
+    description:
+      "High-risk durable-control tool. Atomically cancels one nonterminal operation after a matching status read. It never calls SuperOps, refuses active leases, and preserves ambiguous or partial-write evidence as terminal reconciliation failures.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        operationId: {
+          type: "string",
+          description: "Exact durable operation ID to cancel.",
+        },
+        expectedUpdatedAt: {
+          type: "string",
+          description: "Exact updatedAt from the latest superops_operations_get response.",
+        },
+        reason: {
+          type: "string",
+          description: "Optional bounded operational reason; do not include ticket or customer content.",
+          maxLength: 240,
+        },
+      },
+      required: ["operationId", "expectedUpdatedAt"],
     },
   },
 ];
@@ -446,6 +473,29 @@ async function executeToolCall(
           text: JSON.stringify(records, null, 2),
         },
       ],
+    };
+  }
+  if (name === "superops_operations_cancel") {
+    const operationId = typeof args.operationId === "string" ? args.operationId.trim() : "";
+    const expectedUpdatedAt = typeof args.expectedUpdatedAt === "string"
+      ? args.expectedUpdatedAt.trim()
+      : "";
+    const reason = typeof args.reason === "string" ? args.reason.trim() : undefined;
+    if (!operationId || !expectedUpdatedAt || !Number.isFinite(Date.parse(expectedUpdatedAt))) {
+      return errorResult("operationId and a valid expectedUpdatedAt are required.");
+    }
+    if (reason && reason.length > 240) {
+      return errorResult("reason must not exceed 240 characters.");
+    }
+    const ownerHash = currentOwnerHash();
+    const cancelled = await getOperationStore().cancel({
+      operationId,
+      ownerHash,
+      expectedUpdatedAt,
+      reason,
+    });
+    return {
+      content: [{ type: "text", text: JSON.stringify(operationResultView(cancelled), null, 2) }],
     };
   }
   // Check for credential issues before domain calls

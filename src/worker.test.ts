@@ -440,6 +440,7 @@ describe("ChatGPT direct mutation policy", () => {
       "superops_alerts_resolve",
       "superops_custom_mutation",
       "superops_custom_query",
+      "superops_operations_cancel",
       "superops_scripts_execute_on_asset",
       "superops_tickets_add_note",
       "superops_tickets_apply_triage_plan",
@@ -477,7 +478,7 @@ describe("ChatGPT direct mutation policy", () => {
     expect(blocked.has("superops_operations_results")).toBe(false);
   });
 
-  it("keeps the reviewed ChatGPT direct mutating surface to apply_triage_plan only", async () => {
+  it("keeps the reviewed ChatGPT direct mutating surface to durable triage controls only", async () => {
     const blocked = await chatGptDirectBlockedToolNames({
       reviewedTriagePlanAllowed: true,
     });
@@ -485,7 +486,10 @@ describe("ChatGPT direct mutation policy", () => {
       .filter((toolName) => !blocked.has(toolName))
       .sort();
 
-    expect(allowedMutating).toEqual(["superops_tickets_apply_triage_plan"]);
+    expect(allowedMutating).toEqual([
+      "superops_operations_cancel",
+      "superops_tickets_apply_triage_plan",
+    ]);
   });
 });
 
@@ -1029,7 +1033,7 @@ describe("Cloudflare Worker entrypoint", () => {
         continuationCount: 3,
         schedulingAttempted: true,
         schedulingSucceeded: true,
-        terminalFailureReason: "ContinuationRequiredBeforeItem",
+        currentPauseReason: "ContinuationRequiredBeforeItem",
         pendingItems: ["59021"],
         itemStates: {
           "59021": {

@@ -5,6 +5,7 @@ import {
   getOperationStore,
   MalformedStoredOperationError,
   normalizedNoteFingerprint,
+  operationManualResumeEligibility,
   operationResultView,
   operationTotals,
   runWithOperationStore,
@@ -279,6 +280,144 @@ describe("operation store", () => {
     });
     expect(stored.state).toBe("Rescheduled");
     expect(stored.nextEligibleTime).toBe("2026-07-18T00:05:00.000Z");
+  });
+
+  it("allows only bounded same-operation manual wake recovery after the stall grace", () => {
+    const stalled = record({
+      state: "Rescheduled",
+      nextEligibleTime: "2026-07-18T00:05:00.000Z",
+      manualResumeCount: 2,
+    });
+    expect(operationManualResumeEligibility(stalled, "2026-07-18T00:07:01.000Z"))
+      .toEqual({ allowed: true, reason: "The durable eligibility time passed without progress." });
+    expect(operationManualResumeEligibility(
+      { ...stalled, manualResumeCount: 3 },
+      "2026-07-18T00:07:01.000Z"
+    )).toMatchObject({ allowed: false, reason: expect.stringContaining("limit") });
+  });
+
+  it("cancels clean pending work atomically but refuses an active lease", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const clean = record({ operationId: "cancel-clean" });
+      await store.put(clean);
+      const cancelled = await store.cancel({
+        operationId: clean.operationId,
+        ownerHash: clean.ownerHash,
+        expectedUpdatedAt: clean.updatedAt,
+        reason: "Approved action was found to be incorrect.",
+        now: "2026-07-18T00:00:02.000Z",
+      });
+      expect(cancelled).toMatchObject({
+        state: "Cancelled",
+        pendingItems: [],
+        cancellationReason: "Approved action was found to be incorrect.",
+        itemStates: {
+          "57401": {
+            stage: "Skipped",
+            outcome: "CancelledBeforeWrite",
+            writeAttempted: false,
+          },
+        },
+      });
+
+      const active = record({ operationId: "cancel-active" });
+      await store.put(active);
+      await store.claimNextItem({
+        operationId: active.operationId,
+        ownerHash: active.ownerHash,
+        leaseOwner: "active-worker",
+        leaseMs: 60_000,
+        now: "2026-07-18T00:00:01.000Z",
+      });
+      const current = await store.get(active.operationId, active.ownerHash);
+      await expect(store.cancel({
+        operationId: active.operationId,
+        ownerHash: active.ownerHash,
+        expectedUpdatedAt: current!.updatedAt,
+        now: "2026-07-18T00:00:02.000Z",
+      })).rejects.toThrow("active item lease");
+    });
+  });
+
+  it("keeps recovered rate limits as history without a terminal failure", async () => {
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const historical = record({
+        operationId: "recovered-rate-history",
+        expectedItems: ["57401"],
+        completedItems: [],
+        pendingItems: ["57401"],
+        unattemptedItems: [],
+        itemStates: {
+          "57401": {
+            ...record().itemStates["57401"],
+            stage: "RateLimitedRescheduled",
+            writeAttempted: true,
+            writeMayHaveSucceeded: false,
+            reliableResponseReceived: true,
+            observedMutationResult: "Rejected",
+            failureReason: "rate_limit_exceeded",
+            errorClass: "SuperOpsRateLimit",
+            initialFailureReason: "rate_limit_exceeded",
+            initialErrorClass: "SuperOpsRateLimit",
+          },
+        },
+        compactResults: [{
+          ticketNumber: "57401",
+          finalOutcome: "RateLimitedPending",
+          failureReason: "rate_limit_exceeded",
+          terminalFailureReason: null,
+        }],
+      });
+      await store.put(historical);
+      const claim = await store.claimNextItem({
+        operationId: historical.operationId,
+        ownerHash: historical.ownerHash,
+        leaseOwner: "recovery",
+        leaseMs: 60_000,
+        now: "2026-07-18T00:10:00.000Z",
+      });
+      const completed = await store.completeItem({
+        operationId: historical.operationId,
+        ownerHash: historical.ownerHash,
+        itemKey: "57401",
+        leaseId: claim!.lease.leaseId,
+        patch: {
+          stage: "CompletedAfterRetry",
+          outcome: "Updated",
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          partialWrite: false,
+          verificationState: "Verified",
+        },
+        result: {
+          ticketNumber: "57401",
+          finalOutcome: "Updated",
+          verified: true,
+          partialWrite: false,
+          initialFailureReason: "rate_limit_exceeded",
+          initialFailureClass: "SuperOpsRateLimit",
+          terminalFailureReason: null,
+          terminalFailureClass: null,
+        },
+      });
+      const view = operationResultView(completed);
+      expect(view).toMatchObject({
+        state: "Completed",
+        terminalFailureReason: undefined,
+        items: [{
+          finalErrorClass: undefined,
+          initialFailureClass: "SuperOpsRateLimit",
+          terminalFailureReason: undefined,
+        }],
+        results: [{
+          finalOutcome: "Updated",
+          initialFailureClass: "SuperOpsRateLimit",
+          terminalFailureReason: null,
+        }],
+      });
+    });
   });
   it("retries a transient Durable Object checkpoint rate limit without counting mutation attempts", async () => {
     let checkpointPutAttempts = 0;
@@ -1743,6 +1882,149 @@ describe("operation store", () => {
       nextEligibleTime: "2026-07-18T00:05:00.000Z",
     }));
     expect(JSON.stringify(batches)).not.toContain("note");
+  });
+
+  it("applies the scheduling retry ceiling per durable wait while retaining a lifetime total", async () => {
+    const values = new Map<string, unknown>();
+    let workflowCalls = 0;
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+      },
+    }, {
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+      SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS: "1",
+      SUPEROPS_CONTINUATION_WORKFLOW: {
+        createBatch: async (batch) => {
+          workflowCalls += 1;
+          return batch.map(({ id }) => ({ id }));
+        },
+      },
+    });
+    await durableObject.fetch(new Request("https://operation.local/operations/op-workflow-many-waits", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record({ operationId: "op-workflow-many-waits" })),
+    }));
+    const schedule = (nextEligibleTime: string) => durableObject.fetch(new Request(
+      "https://operation.local/operations/op-workflow-many-waits/schedule-continuation",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          operationId: "op-workflow-many-waits",
+          ownerHash: stableHash("owner@example.com"),
+          reason: "RateLimitedRescheduled",
+          nextEligibleTime,
+        }),
+      }
+    ));
+
+    const first = await schedule("2026-07-18T00:05:00.000Z");
+    await expect(first.json()).resolves.toMatchObject({
+      state: "Rescheduled",
+      currentSchedulingAttemptCount: 1,
+      totalSchedulingAttemptCount: 1,
+      schedulingAttemptCount: 1,
+    });
+    const second = await schedule("2026-07-18T00:10:00.000Z");
+    await expect(second.json()).resolves.toMatchObject({
+      state: "Rescheduled",
+      currentSchedulingAttemptCount: 1,
+      totalSchedulingAttemptCount: 2,
+      schedulingAttemptCount: 2,
+      schedulingSucceeded: true,
+    });
+    expect(workflowCalls).toBe(2);
+  });
+
+  it("watchdogs an acknowledged Workflow that never wakes and terminalizes at the bounded ceiling", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-18T00:08:00.000Z"));
+    const values = new Map<string, unknown>();
+    const batches: Array<Array<{ id: string; params: Record<string, unknown> }>> = [];
+    const alarms: number[] = [];
+    const durableObject = new SuperOpsOperationLedger({
+      storage: {
+        get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => { values.set(key, value); },
+        delete: async (key: string) => values.delete(key),
+        list: async <T = unknown>() => values as Map<string, T>,
+        setAlarm: async (time: number | Date) => { alarms.push(Number(time)); },
+      },
+    }, {
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+      SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS: "1",
+      SUPEROPS_CONTINUATION_WORKFLOW: {
+        createBatch: async (batch) => {
+          batches.push(batch);
+          return batch.map(({ id }) => ({ id }));
+        },
+      },
+    });
+    values.set("op:watchdog", record({
+      operationId: "watchdog",
+      state: "Rescheduled",
+      nextEligibleTime: "2026-07-18T00:05:00.000Z",
+      continuationMechanism: "workflow",
+      continuationInstanceId: "wf-original",
+      schedulingAttempted: true,
+      schedulingSucceeded: true,
+      continuationCount: 2,
+      maxOperationLifetimeAt: "2026-07-18T01:00:00.000Z",
+    }));
+
+    await durableObject.alarm();
+
+    expect(values.get("op:watchdog")).toMatchObject({
+      state: "Rescheduled",
+      nextEligibleTime: "2026-07-18T00:08:00.000Z",
+      currentPauseReason: "ContinuationWatchdogRescheduled",
+      watchdogWakeCount: 1,
+      lastWatchdogWakeAt: "2026-07-18T00:08:00.000Z",
+      currentSchedulingAttemptCount: 1,
+      totalSchedulingAttemptCount: 1,
+      schedulingSucceeded: true,
+    });
+    expect(batches).toHaveLength(1);
+    expect(batches[0][0].params).toMatchObject({
+      operationId: "watchdog",
+      nextEligibleTime: "2026-07-18T00:08:00.000Z",
+    });
+    expect(alarms.at(-1)).toBe(Date.parse("2026-07-18T00:10:00.000Z"));
+
+    values.set("op:watchdog", record({
+      operationId: "watchdog",
+      state: "Rescheduled",
+      nextEligibleTime: "2026-07-18T00:05:00.000Z",
+      continuationMechanism: "workflow",
+      continuationInstanceId: "wf-third",
+      schedulingAttempted: true,
+      schedulingSucceeded: true,
+      continuationCount: 4,
+      watchdogWakeCount: 3,
+      maxOperationLifetimeAt: "2026-07-18T01:00:00.000Z",
+    }));
+
+    await durableObject.alarm();
+
+    expect(values.get("op:watchdog")).toMatchObject({
+      state: "CompletedWithFailures",
+      terminalFailureReason: "Durable continuation watchdog wake limit exhausted without operation progress.",
+      itemStates: {
+        "57401": {
+          stage: "FailedBeforeWrite",
+          outcome: "ContinuationWatchdogExhausted",
+          writeAttempted: false,
+        },
+      },
+    });
+    expect(batches).toHaveLength(1);
   });
 
   it("retries Workflow creation with bounded backoff and one deterministic identity", async () => {

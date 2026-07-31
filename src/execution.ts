@@ -31,6 +31,7 @@ export interface ExecutionConfigInput {
   SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_ATTEMPTS?: string;
   SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_DURATION_MS?: string;
   SUPEROPS_EXECUTION_MAX_DURABLE_SINGLE_WAIT_MS?: string;
+  SUPEROPS_EXECUTION_DURABLE_BACKOFF_BASE_DELAY_MS?: string;
   SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS?: string;
   SUPEROPS_EXECUTION_VERIFICATION_MODE?: string;
   SUPEROPS_OPERATION_RETENTION_SECONDS?: string;
@@ -58,6 +59,7 @@ export interface ExecutionConfig {
   maxDurableRetryAttempts: number;
   maxDurableRetryDurationMs: number;
   maxDurableSingleWaitMs: number;
+  durableBackoffBaseDelayMs: number;
   maxSchedulingAttempts: number;
   verificationMode: "mutationResponse" | "verifyReads";
   operationRetentionSeconds: number;
@@ -148,6 +150,7 @@ const DEFAULT_CONFIG: ExecutionConfig = {
   maxDurableRetryAttempts: 10,
   maxDurableRetryDurationMs: 3_600_000,
   maxDurableSingleWaitMs: 900_000,
+  durableBackoffBaseDelayMs: 30_000,
   maxSchedulingAttempts: 8,
   verificationMode: "verifyReads",
   operationRetentionSeconds: 86_400,
@@ -348,6 +351,12 @@ export function executionConfigFromEnv(
     ),
     maxDurableSingleWaitMs: integer(
       merged("SUPEROPS_EXECUTION_MAX_DURABLE_SINGLE_WAIT_MS"), DEFAULT_CONFIG.maxDurableSingleWaitMs, 1, 86_400_000
+    ),
+    durableBackoffBaseDelayMs: integer(
+      merged("SUPEROPS_EXECUTION_DURABLE_BACKOFF_BASE_DELAY_MS"),
+      DEFAULT_CONFIG.durableBackoffBaseDelayMs,
+      1_000,
+      3_600_000
     ),
     maxSchedulingAttempts: integer(
       merged("SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS"), DEFAULT_CONFIG.maxSchedulingAttempts, 1, 100
@@ -655,6 +664,10 @@ export function executionDiagnostics(): Record<string, unknown> | undefined {
   if (!state) return undefined;
   return {
     invocationId: state.invocationId,
+    executionTraceId: state.operationId,
+    executionOperationId: state.operationId,
+    // Backward-compatible alias. Durable tool responses expose their ledger ID
+    // separately as durableOperationId.
     operationId: state.operationId,
     toolName: state.toolName,
     startedAt: state.startedAt,

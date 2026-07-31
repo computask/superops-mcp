@@ -64,6 +64,7 @@ const HIGH_RISK_WRITE_TOOLS = new Set([
   "superops_tickets_update",
   "superops_tickets_resolve_full",
   "superops_tickets_apply_triage_plan",
+  "superops_operations_cancel",
   "superops_tickets_add_note",
   "superops_tickets_log_time",
   "superops_alerts_create",
@@ -74,6 +75,7 @@ const HIGH_RISK_WRITE_TOOLS = new Set([
 
 const REVIEWED_DURABLE_WRITE_TOOLS = new Set([
   "superops_tickets_apply_triage_plan",
+  "superops_operations_cancel",
 ]);
 
 const RUNTIME_CONTEXT = new AsyncLocalStorage<AuditContext>();

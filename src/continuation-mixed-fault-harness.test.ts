@@ -351,10 +351,11 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       let staleChangedDuringWait = false;
       for (let invocation = 0; continuationRequired && invocation < MAX_HARNESS_CONTINUATION_INVOCATIONS; invocation += 1) {
         continuationInvocations += 1;
+        const invocationNowMs = Date.parse("2026-07-18T11:00:00.000Z") + invocation * 1000;
         await runWithExecutionConfig({ SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "14", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "2", SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0", SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT: "1000" }, async () => {
           await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
             try {
-              const now = new Date(Date.parse("2026-07-18T11:00:00.000Z") + invocation * 1000).toISOString();
+              const now = new Date(invocationNowMs).toISOString();
               const result = await runWithHarnessCredentials(() => resumeApplyTriageOperation({ operationId, ownerHash: record.ownerHash, leaseOwner: `seed-${invocation}`, now, leaseMs: 1 }));
               continuationRequired = result.continuationRequired;
             } catch (error) {
@@ -390,7 +391,10 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
         if (current?.nextEligibleTime) {
           rateLimitRescheduled += 1;
           durableWaits += 1;
-          maxDurableWaitMs = Math.max(maxDurableWaitMs, Date.parse(current.nextEligibleTime) - Date.now());
+          maxDurableWaitMs = Math.max(
+            maxDurableWaitMs,
+            Date.parse(current.nextEligibleTime) - invocationNowMs
+          );
           if (!staleChangedDuringWait) {
             tickets.get(String(staleDuringWaitCandidate.ticketNumber))!.updatedTime = "2026-07-18T10:00:02.000Z";
             staleChangedDuringWait = true;

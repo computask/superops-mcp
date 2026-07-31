@@ -312,6 +312,66 @@ describe("durable continuation runner", () => {
     expect(attempts.get("ticket-rate")).toBe(2);
   });
 
+  it("rebases an expired adapter rate-limit timestamp onto the durable backoff floor", async () => {
+    const ownerHash = stableHash("durable-backoff-owner");
+    const adapter: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      estimateItemSubrequests: () => 1,
+      async processItem() {
+        return {
+          stage: "RateLimitedRescheduled",
+          outcome: "RateLimitedPending",
+          writeAttempted: true,
+          writeMayHaveSucceeded: false,
+          reliableResponseReceived: true,
+          observedMutationResult: "Rejected",
+          partialWrite: false,
+          rateLimited: true,
+          retryAfterSupplied: false,
+          retryDelaySource: "backoff",
+          nextEligibleTime: new Date(Date.now() - 1_000).toISOString(),
+          errorClass: "SuperOpsRateLimit",
+        };
+      },
+    };
+
+    await runWithOperationStore({}, async () => {
+      await getOperationStore().put(ledgerRecord({
+        operationId: "op-durable-backoff-floor",
+        ownerHash,
+        itemKeys: ["ticket-rate"],
+      }));
+      const observedAt = Date.now();
+      await runWithExecutionConfig({
+        SUPEROPS_EXECUTION_DURABLE_BACKOFF_BASE_DELAY_MS: "5000",
+      }, () => runWithExecutionContext("test_batch_tool", () =>
+        runOperationContinuation({
+          operationId: "op-durable-backoff-floor",
+          ownerHash,
+          adapter,
+          leaseOwner: "backoff-test",
+        })
+      ));
+      const stored = await getOperationStore().get("op-durable-backoff-floor");
+      const eligibleAt = Date.parse(stored?.nextEligibleTime ?? "");
+      expect(eligibleAt - observedAt).toBeGreaterThanOrEqual(4_900);
+      expect(stored).toMatchObject({
+        state: "Rescheduled",
+        itemStates: {
+          "ticket-rate": {
+            stage: "RateLimitedRescheduled",
+            rateLimit: {
+              source: "backoff",
+              retryAfterSupplied: false,
+              parsedDelayMs: 5000,
+              cappedDelayMs: 5000,
+            },
+          },
+        },
+      });
+    });
+  });
+
   it("preserves same-invocation write checkpoints across repeated reliable throttles", async () => {
     const ownerHash = stableHash("owner@example.com");
     let attempts = 0;
@@ -386,6 +446,7 @@ describe("durable continuation runner", () => {
         itemKeys: ["ticket-rate-history"],
       }));
 
+      let continuationNow = Date.now();
       for (let invocation = 1; invocation <= 3; invocation += 1) {
         await runWithExecutionConfig({}, () => runWithExecutionContext(
           "test_batch_tool",
@@ -394,7 +455,7 @@ describe("durable continuation runner", () => {
             ownerHash,
             adapter,
             leaseOwner: `rate-history-${invocation}`,
-            now: new Date(Date.now() + invocation * 1_000).toISOString(),
+            now: new Date(continuationNow).toISOString(),
           })
         ));
         const current = await getOperationStore().get("op-rate-write-history");
@@ -410,6 +471,7 @@ describe("durable continuation runner", () => {
               },
             },
           });
+          continuationNow = Date.parse(current?.nextEligibleTime ?? "") + 1;
         }
       }
 
@@ -650,7 +712,8 @@ describe("durable continuation runner", () => {
         }, async () => runWithExecutionContext("test_batch_tool", () =>
           runOperationContinuation({
             operationId: "op-rate-exhausted", ownerHash, adapter,
-            leaseOwner: `rate-${invocation}`, now: "2999-01-01T00:00:00.000Z",
+            leaseOwner: `rate-${invocation}`,
+            now: new Date(Date.parse("2999-01-01T00:00:00.000Z") + invocation * 1_000).toISOString(),
           })
         ));
       }

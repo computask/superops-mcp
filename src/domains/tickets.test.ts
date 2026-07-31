@@ -362,6 +362,8 @@ describe("Tickets Domain", () => {
       "superops_tickets_get",
       "superops_tickets_get_by_number",
       "superops_tickets_get_safe_by_number",
+      "superops_tickets_get_safe",
+      "superops_tickets_triage_evidence_recover",
       "superops_tickets_triage_snapshot",
       "superops_tickets_apply_triage_plan",
       "superops_tickets_conversation_list",
@@ -2217,6 +2219,98 @@ describe("Tickets Domain", () => {
     );
     expect(new Set(snapshotTicket.safeContentItems.map((item: { id: string }) => item.id)).size)
       .toBe(snapshotTicket.safeContentItems.length);
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("recovers bounded sanitised evidence by immutable ticket ID and preserves batch failures", async () => {
+    mockClient.query.mockImplementation(async (
+      query: string,
+      variables?: { input?: { ticketId?: string } }
+    ) => {
+      const ticketId = String(variables?.input?.ticketId ?? "");
+      if (query.includes("getTicket(input")) {
+        if (ticketId === "ticket-unavailable") throw new Error("read temporarily unavailable");
+        return {
+          getTicket: {
+            ticketId,
+            displayId: ticketId === "ticket-59420" ? "59420" : "59419",
+            subject: ticketId === "ticket-59420" ? "Greenport-Fresh new starter" : "Disk space request",
+            client: { accountId: "client-1", name: "TaskGroup" },
+            status: "New Calls",
+            impact: "Medium",
+            urgency: "Medium",
+            category: "1. Support request",
+            subcategory: "User Administration",
+            createdTime: "2026-07-31T08:00:00.000Z",
+            updatedTime: "2026-07-31T09:00:00.000Z",
+          },
+        };
+      }
+      if (query.includes("getTicketConversationList")) {
+        return {
+          getTicketConversationList: [{
+            conversationId: `description-${ticketId}`,
+            type: "DESCRIPTION",
+            time: "2026-07-31T08:00:00.000Z",
+            content: `<p>Verified request for ${ticketId}.</p><script>hidden()</script>`,
+          }],
+        };
+      }
+      throw new Error(`Unexpected query: ${query}`);
+    });
+
+    const domain = getTicketsTools();
+    const singleResult = await domain.handleCall("superops_tickets_get_safe", {
+      ticketId: "ticket-59420",
+      includeNotes: false,
+      includeConversations: true,
+      attachments: "metadataOnly",
+    });
+    const single = JSON.parse(singleResult.content[0].text);
+    expect(singleResult.isError).toBeUndefined();
+    expect(single).toMatchObject({
+      ok: true,
+      ticketId: "ticket-59420",
+      contentEvidenceState: "meaningful",
+      evidence: {
+        ticketId: "ticket-59420",
+        ticketNumber: "59420",
+        subject: "Greenport-Fresh new starter",
+        safeContent: {
+          items: [{ plainText: expect.stringContaining("Verified request for ticket-59420") }],
+        },
+      },
+    });
+    expect(JSON.stringify(single)).not.toContain("<script>");
+
+    const batchResult = await domain.handleCall("superops_tickets_triage_evidence_recover", {
+      ticketIds: ["ticket-59419", "ticket-unavailable"],
+      includeNotes: false,
+      includeConversations: true,
+      attachments: "metadataOnly",
+    });
+    const batch = JSON.parse(batchResult.content[0].text);
+    expect(batchResult.isError).toBeUndefined();
+    expect(batch).toMatchObject({
+      complete: false,
+      requestedCount: 2,
+      recoveredCount: 1,
+      ticketIds: ["ticket-59419", "ticket-unavailable"],
+      results: [
+        { ticketId: "ticket-59419", ok: true, contentEvidenceState: "meaningful" },
+        {
+          ticketId: "ticket-unavailable",
+          ok: false,
+          contentEvidenceState: "unavailable",
+          errorClass: "SafeReadFailure",
+        },
+      ],
+    });
+    const safeMetadataQueries = mockClient.query.mock.calls
+      .map(([query]) => String(query))
+      .filter((query) => query.includes("getTicket(input"));
+    expect(safeMetadataQueries).not.toHaveLength(0);
+    expect(safeMetadataQueries.every((query) => !query.includes("customFields"))).toBe(true);
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
@@ -4093,6 +4187,8 @@ describe("Tickets Domain", () => {
         contentVerified: true,
         action: "leave",
         policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
         note: SCHEDULED_TRIAGE_TEST_NOTE,
         isPublicNote: false,
         target: { ...TRIAGE_TEST_CLASSIFICATION },
@@ -4116,6 +4212,8 @@ describe("Tickets Domain", () => {
       contentVerified: true,
       action: "leave",
       policyDisposition: "customer_request",
+      contentEvidenceState: "meaningful",
+      policyReason: "customer_or_requester_work",
       isPublicNote: false,
       target: { ...TRIAGE_TEST_CLASSIFICATION },
     };
@@ -4152,6 +4250,8 @@ describe("Tickets Domain", () => {
         contentVerified: true,
         action: "update",
         policyDisposition: "engineer_review",
+        contentEvidenceState: "meaningful",
+        policyReason: "actionable_engineer_work",
         note: SCHEDULED_TRIAGE_TEST_NOTE,
         isPublicNote: false,
         target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
@@ -4160,6 +4260,39 @@ describe("Tickets Domain", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("must use server_down with leave");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a 59405-equivalent empty ticket resolution before creating an operation", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v1",
+      expectedCandidateTicketNumbers: ["59405"],
+      actions: [{
+        ticketNumber: "59405",
+        expectedTicketId: "ticket-59405",
+        expectedSubject: "Test from Sam to support",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-31T09:00:00Z",
+        contentVerified: true,
+        contentEvidenceState: "empty",
+        policyReason: "no_action_administration",
+        policyDisposition: "resolve_no_action",
+        action: "resolve",
+        note: SCHEDULED_TRIAGE_TEST_NOTE,
+        isPublicNote: false,
+        target: {
+          ...TRIAGE_TEST_CLASSIFICATION,
+          cause: "Unknown",
+          resolutionCode: "Permanent Fix",
+          status: "Resolved",
+          suppressCloseNotification: true,
+        },
+      }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("empty content evidence");
     expect(mockClient.query).not.toHaveBeenCalled();
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
@@ -4791,6 +4924,8 @@ describe("Tickets Domain", () => {
   });
 
   it("resumes a stored approved operation from a compact batch envelope without replay", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-26T09:00:00.000Z"));
     const operationId = "legacy-generated-operation-recovery";
     const expectedCandidateTicketNumbers = ["59009", "59012"];
     const approvedActions = [
@@ -4890,6 +5025,7 @@ describe("Tickets Domain", () => {
         "already exists with different ownership or approved input"
       );
 
+      vi.setSystemTime(new Date("2026-07-26T09:03:00.000Z"));
       const recovered = await runWithExecutionContext(
         "superops_tickets_apply_triage_plan",
         () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {

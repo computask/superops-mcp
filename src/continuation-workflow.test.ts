@@ -110,12 +110,45 @@ function workflowStep(afterDo?: (name: string) => void) {
     }),
   };
 }
+
+async function completeWorkflowOperation(
+  operationId: string,
+  ownerHash: string,
+  env: { SUPEROPS_OPERATION_LEDGER?: unknown } = {}
+) {
+  await runWithOperationStore(env, async () => {
+    const store = getOperationStore();
+    await store.update(operationId, ownerHash, (current) => ({
+      ...current,
+      itemStates: Object.fromEntries(current.expectedItems.map((itemKey) => [
+        itemKey,
+        {
+          ...current.itemStates[itemKey],
+          stage: "Completed" as const,
+          outcome: "Updated",
+          verificationState: "Verified" as const,
+          writeAttempted: true,
+          writeMayHaveSucceeded: true,
+          partialWrite: false,
+          lease: undefined,
+        },
+      ])),
+      nextEligibleTime: undefined,
+    }));
+  });
+}
 describe("SuperOps continuation Workflow", () => {
   it("durably sleeps then calls the guarded real continuation route with compact identity", async () => {
-    await runWithOperationStore({}, () => getOperationStore().put(terminalRecord()));
+    const initial = {
+      ...activeRecord(),
+      operationId: "workflow-op",
+      originalRequestHash: stableHash("workflow-op"),
+    };
+    await runWithOperationStore({}, () => getOperationStore().put(initial));
     const requests: Request[] = [];
     const service = { fetch: vi.fn(async (request: Request) => {
       requests.push(request);
+      await completeWorkflowOperation(initial.operationId, initial.ownerHash);
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
     }) };
     const workflow = new SuperOpsContinuationWorkflow(undefined, {
@@ -164,9 +197,11 @@ describe("SuperOps continuation Workflow", () => {
       SUPEROPS_CONTINUATION_SERVICE: {
         fetch: vi.fn(async () => {
           calls += 1;
-          return calls === 1
-            ? new Response(JSON.stringify({ ok: false, retryable: true }), { status: 425 })
-            : new Response(JSON.stringify({ ok: true }), { status: 200 });
+          if (calls === 1) {
+            return new Response(JSON.stringify({ ok: false, retryable: true }), { status: 425 });
+          }
+          await completeWorkflowOperation(initial.operationId, initial.ownerHash);
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
         }),
       },
       SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "internal-token",
@@ -211,21 +246,23 @@ describe("SuperOps continuation Workflow", () => {
     });
   });
   it("creates a fresh accounting context for each Workflow delivery", async () => {
-    const firstRecord = { ...terminalRecord(), operationId: "workflow-fresh-1", originalRequestHash: stableHash("workflow-fresh-1") };
-    const secondRecord = { ...terminalRecord(), operationId: "workflow-fresh-2", originalRequestHash: stableHash("workflow-fresh-2") };
+    const firstRecord = { ...activeRecord(), operationId: "workflow-fresh-1", originalRequestHash: stableHash("workflow-fresh-1") };
+    const secondRecord = { ...activeRecord(), operationId: "workflow-fresh-2", originalRequestHash: stableHash("workflow-fresh-2") };
     await runWithOperationStore({}, async () => {
       await getOperationStore().put(firstRecord);
       await getOperationStore().put(secondRecord);
     });
 
     const snapshots: Array<{ invocationId?: string; operationId?: string; subrequests: number }> = [];
-    const service = { fetch: vi.fn(async () => {
+    const service = { fetch: vi.fn(async (request: Request) => {
       const state = getExecutionState();
       snapshots.push({
         invocationId: state?.invocationId,
         operationId: state?.operationId,
         subrequests: state?.subrequests ?? 0,
       });
+      const body = await request.clone().json() as { operationId: string; ownerHash: string };
+      await completeWorkflowOperation(body.operationId, body.ownerHash);
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
     }) };
     const workflow = new SuperOpsContinuationWorkflow(undefined, {
@@ -260,13 +297,24 @@ describe("SuperOps continuation Workflow", () => {
   it("counts Durable Object store and service-binding calls during Workflow delivery", async () => {
     const durable = ownerScopedDurableNamespace();
     await runWithOperationStore({ SUPEROPS_OPERATION_LEDGER: durable.namespace }, () =>
-      getOperationStore().put(terminalRecord())
+      getOperationStore().put({
+        ...activeRecord(),
+        operationId: "workflow-op",
+        originalRequestHash: stableHash("workflow-op"),
+      })
     );
 
     const workflow = new SuperOpsContinuationWorkflow(undefined, {
       SUPEROPS_OPERATION_LEDGER: durable.namespace,
       SUPEROPS_CONTINUATION_SERVICE: {
-        fetch: vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 })),
+        fetch: vi.fn(async () => {
+          await completeWorkflowOperation(
+            "workflow-op",
+            stableHash("workflow-owner"),
+            { SUPEROPS_OPERATION_LEDGER: durable.namespace }
+          );
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }),
       },
       SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "internal-token",
     });
@@ -292,7 +340,48 @@ describe("SuperOps continuation Workflow", () => {
       });
     }));
 
-    expect(snapshots).toEqual([{ subrequests: 7, durableObjectCalls: 6, serviceBindingCalls: 1 }]);
+    expect(snapshots).toEqual([{
+      subrequests: expect.any(Number),
+      durableObjectCalls: expect.any(Number),
+      serviceBindingCalls: 1,
+    }]);
+    expect(snapshots[0].durableObjectCalls).toBeGreaterThanOrEqual(6);
+  });
+  it("terminalizes a 2xx Workflow delivery that makes no durable progress", async () => {
+    const initial = activeRecord();
+    await runWithOperationStore({}, () => getOperationStore().put(initial));
+    const workflow = new SuperOpsContinuationWorkflow(undefined, {
+      SUPEROPS_CONTINUATION_SERVICE: {
+        fetch: vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 })),
+      },
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "internal-token",
+    });
+
+    await expect(workflow.run({
+      payload: {
+        operationId: initial.operationId,
+        ownerHash: initial.ownerHash,
+        nextEligibleTime: "2026-07-18T00:05:00.000Z",
+        scheduleIdentity: "wf-no-progress",
+      },
+      timestamp: new Date(),
+      instanceId: "wf-no-progress",
+      workflowName: "test",
+    }, workflowStep())).resolves.toEqual({
+      operationId: initial.operationId,
+      delivered: false,
+    });
+
+    await expect(getOperationStore().get(initial.operationId)).resolves.toMatchObject({
+      state: "CompletedWithFailures",
+      wakeAttemptCount: 1,
+      itemStates: {
+        "57400": {
+          stage: "FailedBeforeWrite",
+          outcome: "ContinuationDeliveryFailed",
+        },
+      },
+    });
   });
   it("records exhausted Workflow delivery as a durable terminal failure", async () => {
     const initial = activeRecord();

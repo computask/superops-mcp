@@ -638,6 +638,8 @@ function scheduledResolveAction() {
     ...resolveAction(),
     expectedSubject: "Anonymised junk call",
     policyDisposition: "resolve_no_action",
+    contentEvidenceState: "meaningful",
+    policyReason: "junk",
     note: SCHEDULED_TRIAGE_NOTE,
     isPublicNote: false,
   };
@@ -875,10 +877,13 @@ describe("deterministic end-to-end apply-triage harness", () => {
     vi.useRealTimers();
   });
 
-  it("keeps the public ChatGPT mutation surface limited to apply_triage_plan", async () => {
+  it("keeps the public ChatGPT mutation surface limited to durable triage controls", async () => {
     const blocked = await chatGptDirectBlockedToolNames({ reviewedTriagePlanAllowed: true });
     const exposedMutations = [...MUTATING_TOOL_NAMES].filter((name) => !blocked.has(name));
-    expect(exposedMutations).toEqual(["superops_tickets_apply_triage_plan"]);
+    expect(exposedMutations.sort()).toEqual([
+      "superops_operations_cancel",
+      "superops_tickets_apply_triage_plan",
+    ]);
   });
 
   it("A: resolves a clean junk ticket through every staged write exactly once", async () => {
@@ -1412,7 +1417,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
       },
     });
     expect(itemResult(throttled)).toMatchObject({
-      finalOutcome: "Failed",
+      finalOutcome: "RateLimitedPending",
       failureStage: "rateLimit",
       completedStages: expect.arrayContaining([
         "ClassificationVerified",

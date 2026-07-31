@@ -246,6 +246,8 @@ export interface OperationLedgerRecord {
   rateLimitedItems: string[];
   continuationCount: number;
   nextEligibleTime?: string;
+  /** Current nonterminal pause/reschedule reason. */
+  currentPauseReason?: string;
   terminalFailureReason?: string;
   currentLease?: OperationLease;
   workflowId?: string;
@@ -255,13 +257,24 @@ export interface OperationLedgerRecord {
   schedulingAttempted?: boolean;
   schedulingSucceeded?: boolean;
   schedulingError?: string;
+  /** Backward-compatible lifetime scheduling-attempt total. */
   schedulingAttemptCount?: number;
+  /** Attempts used for the most recent distinct scheduling boundary. */
+  currentSchedulingAttemptCount?: number;
+  /** Lifetime scheduling attempts across all continuation boundaries. */
+  totalSchedulingAttemptCount?: number;
   wakeAttemptCount?: number;
   wakeDeliveryCount?: number;
   lastWakeAttemptAt?: string;
   lastWakeSucceededAt?: string;
   wakeDeliveryError?: string;
   wakeDeliveryExhaustedAt?: string;
+  watchdogWakeCount?: number;
+  lastWatchdogWakeAt?: string;
+  manualResumeCount?: number;
+  lastManualResumeAt?: string;
+  cancelledAt?: string;
+  cancellationReason?: string;
   lastInvocationId?: string;
   staleItems?: string[];
 }
@@ -283,7 +296,8 @@ export interface OperationTerminalFailureParams {
   operationId: string;
   ownerHash: string;
   errorClass: "ContinuationSchedulingFailure" | "ContinuationExecutionFailure" | "OperationStoreFailure";
-  outcome: "ContinuationSchedulingFailed" | "ContinuationDeliveryFailed" | "OperationStoreFailed";
+  outcome: "ContinuationSchedulingFailed" | "ContinuationDeliveryFailed" |
+    "ContinuationWatchdogExhausted" | "OperationStoreFailed";
   reason: string;
   schedulingFailure?: boolean;
   deliveryFailure?: boolean;
@@ -331,6 +345,14 @@ export interface OperationScheduleContinuationParams {
   workflowId?: string;
 }
 
+export interface OperationCancelParams {
+  operationId: string;
+  ownerHash: string;
+  expectedUpdatedAt: string;
+  reason?: string;
+  now?: string;
+}
+
 export interface OperationStore {
   put(record: OperationLedgerRecord, options?: OperationPutOptions): Promise<void>;
   get(operationId: string, ownerHash?: string): Promise<OperationLedgerRecord | undefined>;
@@ -350,6 +372,7 @@ export interface OperationStore {
   completeItem(params: OperationCompleteItemParams): Promise<OperationLedgerRecord>;
   checkpointItem(params: OperationCheckpointItemParams): Promise<OperationLedgerRecord>;
   scheduleContinuation(params: OperationScheduleContinuationParams): Promise<OperationLedgerRecord>;
+  cancel(params: OperationCancelParams): Promise<OperationLedgerRecord>;
   terminalizeContinuationFailure(params: OperationTerminalFailureParams): Promise<OperationLedgerRecord>;
 }
 
@@ -400,6 +423,8 @@ const OPERATION_STORE_RATE_LIMIT_BACKOFF_MS = [25, 75];
 const OPERATION_STORE_CONFLICT_MAX_ATTEMPTS = 5;
 const UNATTEMPTED_RUNNING_STALL_MS = 5 * 60 * 1000;
 const RESCHEDULED_STALL_GRACE_MS = 2 * 60 * 1000;
+export const MAX_WATCHDOG_WAKE_COUNT = 3;
+export const MAX_MANUAL_RESUME_COUNT = 3;
 
 interface RecentOperationIndexEntry {
   version: 1;
@@ -820,6 +845,41 @@ function assertOperationRecord(value: unknown): asserts value is OperationLedger
       (typeof record.lifetimePausedUntil !== "string" || !Number.isFinite(Date.parse(record.lifetimePausedUntil)))) {
     throw new MalformedStoredOperationError("Operation lifetimePausedUntil is invalid.");
   }
+  for (const [field, candidate] of [
+    ["schedulingAttemptCount", record.schedulingAttemptCount],
+    ["currentSchedulingAttemptCount", record.currentSchedulingAttemptCount],
+    ["totalSchedulingAttemptCount", record.totalSchedulingAttemptCount],
+    ["wakeAttemptCount", record.wakeAttemptCount],
+    ["wakeDeliveryCount", record.wakeDeliveryCount],
+    ["watchdogWakeCount", record.watchdogWakeCount],
+    ["manualResumeCount", record.manualResumeCount],
+  ] as const) {
+    if (candidate !== undefined && !isFiniteNonnegativeInteger(candidate)) {
+      throw new MalformedStoredOperationError(`Operation ${field} is invalid.`);
+    }
+  }
+  if ((record.manualResumeCount ?? 0) > MAX_MANUAL_RESUME_COUNT) {
+    throw new MalformedStoredOperationError("Operation manualResumeCount exceeds its durable limit.");
+  }
+  if ((record.watchdogWakeCount ?? 0) > MAX_WATCHDOG_WAKE_COUNT) {
+    throw new MalformedStoredOperationError("Operation watchdogWakeCount exceeds its durable limit.");
+  }
+  if (record.lastWatchdogWakeAt !== undefined &&
+      (typeof record.lastWatchdogWakeAt !== "string" || !Number.isFinite(Date.parse(record.lastWatchdogWakeAt)))) {
+    throw new MalformedStoredOperationError("Operation lastWatchdogWakeAt is invalid.");
+  }
+  if (record.lastManualResumeAt !== undefined &&
+      (typeof record.lastManualResumeAt !== "string" || !Number.isFinite(Date.parse(record.lastManualResumeAt)))) {
+    throw new MalformedStoredOperationError("Operation lastManualResumeAt is invalid.");
+  }
+  if (record.cancelledAt !== undefined &&
+      (typeof record.cancelledAt !== "string" || !Number.isFinite(Date.parse(record.cancelledAt)))) {
+    throw new MalformedStoredOperationError("Operation cancelledAt is invalid.");
+  }
+  if (record.cancellationReason !== undefined &&
+      (typeof record.cancellationReason !== "string" || record.cancellationReason.length > 240)) {
+    throw new MalformedStoredOperationError("Operation cancellationReason is invalid.");
+  }
 
   const expectedItems = record.expectedItems as string[];
   if (expectedItems.length > MAX_OPERATION_ITEMS) {
@@ -1016,6 +1076,7 @@ function expireOperationLifetime(record: OperationLedgerRecord, now: string): Op
   }
   next.currentLease = undefined;
   next.nextEligibleTime = undefined;
+  next.currentPauseReason = undefined;
   next.terminalFailureReason = "Operation maximum lifetime exceeded.";
   next.updatedAt = now;
   return normalizeOperationRecord(next);
@@ -1064,6 +1125,7 @@ function terminalizeContinuationFailureInRecord(
   }
   next.currentLease = undefined;
   next.nextEligibleTime = undefined;
+  next.currentPauseReason = undefined;
   next.terminalFailureReason = params.reason;
   if (params.schedulingFailure) {
     next.schedulingAttempted = true;
@@ -1074,6 +1136,67 @@ function terminalizeContinuationFailureInRecord(
     next.wakeDeliveryError = params.reason;
     next.wakeDeliveryExhaustedAt = now;
   }
+  next.updatedAt = now;
+  return normalizeOperationRecord(next);
+}
+
+function cancelOperationInRecord(
+  record: OperationLedgerRecord,
+  params: OperationCancelParams
+): OperationLedgerRecord {
+  assertRecordOwner(record, params.ownerHash);
+  const now = params.now ?? nowIso();
+  if (record.updatedAt !== params.expectedUpdatedAt) {
+    throw new Error("Operation changed after it was inspected; read current status before cancelling.");
+  }
+  if (isTerminalOperation(record)) {
+    throw new Error("A terminal operation cannot be cancelled.");
+  }
+  if (Object.values(record.itemStates).some((item) => isLeaseActive(item.lease, now))) {
+    throw new Error("Operation has an active item lease and cannot be cancelled until that lease is released or expires.");
+  }
+
+  const reason = sanitizeText(params.reason?.trim() || "Cancelled by the authenticated operation owner.").slice(0, 240);
+  const next = cloneRecord(record);
+  for (const itemKey of next.expectedItems) {
+    const item = next.itemStates[itemKey];
+    if (!item || TERMINAL_STAGES.has(item.stage)) continue;
+    const possibleWrite = item.writeMayHaveSucceeded && item.observedMutationResult !== "Rejected";
+    const acceptedOrObserved = (item.acceptedPhysicalWrites?.length ?? 0) > 0 ||
+      (item.observedRequestedEffects?.length ?? 0) > 0 || item.partialWrite;
+    const stage: OperationItemStage = possibleWrite
+      ? "AmbiguousWriteUnresolved"
+      : acceptedOrObserved
+        ? "FailedAfterPartialWrite"
+        : "Skipped";
+    const outcome = possibleWrite
+      ? "CancelledWithAmbiguousWrite"
+      : acceptedOrObserved
+        ? "CancelledAfterPartialWrite"
+        : "CancelledBeforeWrite";
+    next.itemStates[itemKey] = {
+      ...item,
+      stage,
+      outcome,
+      ambiguousWrite: possibleWrite || item.ambiguousWrite,
+      partialWrite: acceptedOrObserved,
+      terminalFailureReason: possibleWrite || acceptedOrObserved ? reason : undefined,
+      terminalErrorClass: possibleWrite ? "AmbiguousWrite" : acceptedOrObserved ? "ContinuationFailure" : undefined,
+      replaySafe: !possibleWrite,
+      humanReconciliationRequired: possibleWrite || acceptedOrObserved,
+      stageHistory: [...new Set([...(item.stageHistory ?? [item.stage]), stage])],
+      completedAt: now,
+      lease: undefined,
+      nextEligibleTime: undefined,
+    };
+  }
+  next.state = "Cancelled";
+  next.currentLease = undefined;
+  next.nextEligibleTime = undefined;
+  next.currentPauseReason = undefined;
+  next.terminalFailureReason = undefined;
+  next.cancelledAt = now;
+  next.cancellationReason = reason;
   next.updatedAt = now;
   return normalizeOperationRecord(next);
 }
@@ -1235,7 +1358,9 @@ function mergeCompactResultHistory(previous: unknown, next: unknown): unknown {
     "replaySafe",
     "humanReconciliationRequired",
   ] as const) {
-    if ((merged[field] === undefined || merged[field] === null) && previous[field] !== undefined) {
+    // Explicit null/false values clear current diagnostic state after a
+    // successful recovery. Only an omitted field inherits durable history.
+    if (merged[field] === undefined && previous[field] !== undefined) {
       merged[field] = previous[field];
     }
   }
@@ -1431,6 +1556,7 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
         partialWriteCount > 0 || ambiguousWriteCount > 0;
       next.state = hasFailureClassOutcome ? "CompletedWithFailures" : "Completed";
       delete next.nextEligibleTime;
+      delete next.currentPauseReason;
       delete next.currentLease;
       if (next.state === "Completed") {
         delete next.terminalFailureReason;
@@ -1511,6 +1637,7 @@ function claimNextItemInRecord(
   record.currentLease = lease;
   record.lastInvocationId = getExecutionState()?.invocationId ?? params.leaseOwner;
   record.state = "Running";
+  record.currentPauseReason = undefined;
   record.updatedAt = now;
   const normalized = normalizeOperationRecord(record);
 
@@ -1549,16 +1676,21 @@ function diagnosticItemFields(
   const possibleWrite = (patch.writeMayHaveSucceeded ?? current.writeMayHaveSucceeded) &&
     (patch.observedMutationResult ?? current.observedMutationResult) !== "Rejected";
   const terminal = TERMINAL_STAGES.has(patch.stage);
+  const terminalSuccess = terminal &&
+    !FAILED_STAGES.has(patch.stage) && !SKIPPED_STAGES.has(patch.stage);
   return {
+    failureReason: terminalSuccess ? undefined : failureReason,
+    errorClass: terminalSuccess ? undefined : errorClass,
     stageHistory,
     failureHistory: failureHistory.length > 0 ? failureHistory : undefined,
     initialFailureReason: current.initialFailureReason ?? current.failureReason ?? patch.failureReason,
     initialErrorClass: current.initialErrorClass ?? current.errorClass ?? patch.errorClass,
-    terminalFailureReason: terminal ? failureReason : current.terminalFailureReason,
-    terminalErrorClass: terminal ? errorClass : current.terminalErrorClass,
+    terminalFailureReason: terminal ? terminalSuccess ? undefined : failureReason : current.terminalFailureReason,
+    terminalErrorClass: terminal ? terminalSuccess ? undefined : errorClass : current.terminalErrorClass,
     replaySafe: terminal ? !possibleWrite : current.replaySafe,
     humanReconciliationRequired: terminal
-      ? patch.stage === "AmbiguousWriteUnresolved" || (possibleWrite && patch.verificationState !== "Verified")
+      ? terminalSuccess ? false : patch.stage === "AmbiguousWriteUnresolved" ||
+        (possibleWrite && patch.verificationState !== "Verified")
       : current.humanReconciliationRequired,
   };
 }
@@ -1623,14 +1755,26 @@ function applyItemPatch(
   }
 
   if (params.result !== undefined) {
-    const compactKey = itemResultKey(params.result) ?? params.itemKey;
+    const resultForStorage = isTerminalSuccessfulItem(item) && isRecordObject(params.result)
+      ? {
+          ...params.result,
+          failureStage: null,
+          failureReason: null,
+          finalReason: null,
+          terminalFailure: null,
+          terminalFailureReason: null,
+          terminalFailureClass: null,
+          humanReconciliationRequired: false,
+        }
+      : params.result;
+    const compactKey = itemResultKey(resultForStorage) ?? params.itemKey;
     const previousResult = record.compactResults.find(
       (result) => (itemResultKey(result) ?? "") === compactKey
     );
     record.compactResults = record.compactResults.filter(
       (result) => (itemResultKey(result) ?? "") !== compactKey
     );
-    record.compactResults.push(mergeCompactResultHistory(previousResult, params.result));
+    record.compactResults.push(mergeCompactResultHistory(previousResult, resultForStorage));
   }
 
   record.currentItem = params.itemKey;
@@ -1785,13 +1929,22 @@ class MemoryOperationStore implements OperationStore {
       record.state = params.nextEligibleTime ? "Rescheduled" : "ContinuationRequired";
       record.nextEligibleTime = params.nextEligibleTime;
       record.workflowId = params.workflowId ?? record.workflowId;
-      record.terminalFailureReason = params.reason;
+      record.currentPauseReason = params.reason;
+      delete record.terminalFailureReason;
       // Re-delivery of the same scheduling request is expected. It must not
       // manufacture another continuation identity or inflate retry limits.
       if (!alreadyScheduledFor) record.continuationCount += 1;
       record.updatedAt = scheduledAt;
       return record;
     });
+  }
+
+  async cancel(params: OperationCancelParams): Promise<OperationLedgerRecord> {
+    const cancelled = await this.update(params.operationId, params.ownerHash, (record) =>
+      cancelOperationInRecord(record, params)
+    );
+    deleteMemoryApprovedPrivateNotes(params.operationId);
+    return cancelled;
   }
 
   async terminalizeContinuationFailure(
@@ -2018,6 +2171,20 @@ class DurableObjectOperationStore implements OperationStore {
       })
     );
     if (!response.ok) throw await operationStoreFailure(response, "Operation store schedule failed");
+    return (await response.json()) as OperationLedgerRecord;
+  }
+
+  async cancel(params: OperationCancelParams): Promise<OperationLedgerRecord> {
+    const response = await operationStoreFetch(
+      "operationStore.cancel",
+      this.operationStub(params.operationId, params.ownerHash),
+      new Request(`https://operation.local/operations/${params.operationId}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params),
+      })
+    );
+    if (!response.ok) throw await operationStoreFailure(response, "Operation store cancel failed");
     return (await response.json()) as OperationLedgerRecord;
   }
 
@@ -2377,10 +2544,43 @@ function derivedOperationStall(record: OperationLedgerRecord): Record<string, un
   return derivedUnattemptedStall(record) ?? derivedRescheduledStall(record);
 }
 
+export function operationManualResumeEligibility(
+  record: OperationLedgerRecord,
+  now = new Date().toISOString()
+): { allowed: boolean; reason: string } {
+  if (isTerminalOperation(record) || record.pendingItems.length === 0) {
+    return { allowed: false, reason: "The operation is terminal or has no pending items." };
+  }
+  if ((record.manualResumeCount ?? 0) >= MAX_MANUAL_RESUME_COUNT) {
+    return { allowed: false, reason: "The bounded same-operation manual-resume limit has been reached." };
+  }
+  if (Object.values(record.itemStates).some((item) => isLeaseActive(item.lease, now))) {
+    return { allowed: false, reason: "An item lease is active." };
+  }
+  const nowMs = Date.parse(now);
+  if (record.state === "Rescheduled" && record.nextEligibleTime) {
+    const eligibleMs = Date.parse(record.nextEligibleTime);
+    return Number.isFinite(nowMs) && Number.isFinite(eligibleMs) &&
+      nowMs - eligibleMs >= RESCHEDULED_STALL_GRACE_MS
+      ? { allowed: true, reason: "The durable eligibility time passed without progress." }
+      : { allowed: false, reason: "The operation is not yet beyond its durable eligibility grace period." };
+  }
+  if (record.state === "ContinuationRequired" || record.state === "Running") {
+    const updatedMs = Date.parse(record.updatedAt);
+    return Number.isFinite(nowMs) && Number.isFinite(updatedMs) &&
+      nowMs - updatedMs >= RESCHEDULED_STALL_GRACE_MS
+      ? { allowed: true, reason: "The operation has required continuation without progress beyond the grace period." }
+      : { allowed: false, reason: "The operation has not been idle beyond the manual-resume grace period." };
+  }
+  return { allowed: false, reason: `Operation state ${record.state} is not resumable.` };
+}
+
 export function operationResultView(record: OperationLedgerRecord): Record<string, unknown> {
   const stalled = derivedOperationStall(record);
+  const manualResume = operationManualResumeEligibility(record);
   return redactPublicOperationValue({
     operationId: record.operationId,
+    durableOperationId: record.operationId,
     toolName: record.toolName,
     state: record.state,
     derivedState: stalled?.derivedState,
@@ -2404,7 +2604,9 @@ export function operationResultView(record: OperationLedgerRecord): Record<strin
     lifetimePausedUntil: record.lifetimePausedUntil,
     maxOperationLifetimeAt: record.maxOperationLifetimeAt,
     continuationCount: record.continuationCount,
-    terminalFailureReason: record.terminalFailureReason,
+    currentPauseReason: record.currentPauseReason ??
+      (!isTerminalOperation(record) ? record.terminalFailureReason : undefined),
+    terminalFailureReason: isTerminalOperation(record) ? record.terminalFailureReason : undefined,
     workflowId: record.workflowId,
     continuationMechanism: record.continuationMechanism,
     continuationInstanceId: record.continuationInstanceId,
@@ -2412,12 +2614,24 @@ export function operationResultView(record: OperationLedgerRecord): Record<strin
     schedulingSucceeded: record.schedulingSucceeded,
     schedulingError: record.schedulingError,
     schedulingAttemptCount: record.schedulingAttemptCount,
+    currentSchedulingAttemptCount: record.currentSchedulingAttemptCount,
+    totalSchedulingAttemptCount: record.totalSchedulingAttemptCount ?? record.schedulingAttemptCount,
     wakeAttemptCount: record.wakeAttemptCount,
     wakeDeliveryCount: record.wakeDeliveryCount,
     lastWakeAttemptAt: record.lastWakeAttemptAt,
     lastWakeSucceededAt: record.lastWakeSucceededAt,
     wakeDeliveryError: record.wakeDeliveryError,
     wakeDeliveryExhaustedAt: record.wakeDeliveryExhaustedAt,
+    watchdogWakeCount: record.watchdogWakeCount ?? 0,
+    watchdogWakeLimit: MAX_WATCHDOG_WAKE_COUNT,
+    lastWatchdogWakeAt: record.lastWatchdogWakeAt,
+    manualResumeCount: record.manualResumeCount ?? 0,
+    manualResumeLimit: MAX_MANUAL_RESUME_COUNT,
+    manualResumeAllowed: manualResume.allowed,
+    manualResumeReason: manualResume.reason,
+    lastManualResumeAt: record.lastManualResumeAt,
+    cancelledAt: record.cancelledAt,
+    cancellationReason: record.cancellationReason,
     lastInvocationId: record.lastInvocationId,
     totals: operationTotals(record),
     summary: record.summary,
@@ -2540,15 +2754,44 @@ export class SuperOpsOperationLedger {
   }
 
   private async setRecordAlarm(record: OperationLedgerRecord): Promise<void> {
-    // Alarms remain cleanup-only: active records wake only to enforce their
-    // maximum processing lifetime, never to execute a SuperOps continuation.
     if (typeof this.state.storage.setAlarm !== "function") return;
-    const alarmAt = Date.parse(
-      isTerminalOperation(record)
-        ? record.expiresAt
-        : record.maxOperationLifetimeAt ?? ""
+    const candidates = isTerminalOperation(record)
+      ? [Date.parse(record.expiresAt)]
+      : [
+          Date.parse(record.maxOperationLifetimeAt ?? ""),
+          this.watchdogAlarmAt(record),
+        ];
+    const alarmAt = candidates
+      .filter((candidate): candidate is number => Number.isFinite(candidate))
+      .reduce<number | undefined>(
+        (earliest, candidate) => earliest === undefined ? candidate : Math.min(earliest, candidate),
+        undefined
+      );
+    if (alarmAt === undefined) return;
+    const existingAlarm = await this.state.storage.getAlarm?.();
+    if (existingAlarm === null || existingAlarm === undefined || alarmAt < existingAlarm) {
+      await this.state.storage.setAlarm(alarmAt);
+    }
+  }
+
+  private watchdogAlarmAt(record: OperationLedgerRecord): number {
+    if (record.state !== "Rescheduled" || !record.nextEligibleTime ||
+        record.continuationMechanism !== "workflow" || record.schedulingSucceeded !== true) {
+      return Number.NaN;
+    }
+    const eligibleAt = Date.parse(record.nextEligibleTime);
+    if (!Number.isFinite(eligibleAt)) return Number.NaN;
+    const activeLeaseExpiry = Object.values(record.itemStates)
+      .map((item) => Date.parse(item.lease?.expiresAt ?? ""))
+      .filter((expiry) => Number.isFinite(expiry) && expiry > Date.now())
+      .reduce<number | undefined>(
+        (latest, expiry) => latest === undefined ? expiry : Math.max(latest, expiry),
+        undefined
+      );
+    return Math.max(
+      eligibleAt + RESCHEDULED_STALL_GRACE_MS,
+      activeLeaseExpiry === undefined ? 0 : activeLeaseExpiry + 1_000
     );
-    if (Number.isFinite(alarmAt)) await this.state.storage.setAlarm(alarmAt);
   }
 
   private async deleteApprovedPrivateNotes(
@@ -2659,7 +2902,11 @@ export class SuperOpsOperationLedger {
       record.schedulingSucceeded === true
     ) return record;
 
-    let attempt = record.schedulingAttemptCount ?? 0;
+    // The retry ceiling applies to this distinct workflow-creation boundary,
+    // not to the lifetime number of successful reschedules for the operation.
+    let attempt = 0;
+    const priorTotalAttempts = record.totalSchedulingAttemptCount ??
+      record.schedulingAttemptCount ?? 0;
     let lastError = "Workflow scheduling failed.";
     while (attempt < this.maxSchedulingAttempts()) {
       attempt += 1;
@@ -2690,7 +2937,9 @@ export class SuperOpsOperationLedger {
           schedulingAttempted: true,
           schedulingSucceeded: true,
           schedulingError: undefined,
-          schedulingAttemptCount: attempt,
+          currentSchedulingAttemptCount: attempt,
+          totalSchedulingAttemptCount: priorTotalAttempts + attempt,
+          schedulingAttemptCount: priorTotalAttempts + attempt,
         };
       } catch (error) {
         if (started) recordSubrequestFinish(started, "workflowCreateBatchError", false);
@@ -2701,7 +2950,11 @@ export class SuperOpsOperationLedger {
               ...record,
               schedulingAttempted: started !== undefined || record.schedulingAttempted,
               schedulingSucceeded: false,
-              schedulingAttemptCount: started ? attempt : Math.max(0, attempt - 1),
+              currentSchedulingAttemptCount: started ? attempt : Math.max(0, attempt - 1),
+              totalSchedulingAttemptCount: priorTotalAttempts +
+                (started ? attempt : Math.max(0, attempt - 1)),
+              schedulingAttemptCount: priorTotalAttempts +
+                (started ? attempt : Math.max(0, attempt - 1)),
             },
             `Workflow scheduling budget exhausted: ${lastError}`,
             now
@@ -2714,7 +2967,12 @@ export class SuperOpsOperationLedger {
       }
     }
     return this.terminalizeSchedulingFailure(
-      { ...record, schedulingAttemptCount: attempt },
+      {
+        ...record,
+        currentSchedulingAttemptCount: attempt,
+        totalSchedulingAttemptCount: priorTotalAttempts + attempt,
+        schedulingAttemptCount: priorTotalAttempts + attempt,
+      },
       `Workflow scheduling exhausted: ${lastError}`,
       now
     );
@@ -2731,22 +2989,54 @@ export class SuperOpsOperationLedger {
         await this.state.storage.delete(recentOperationKey(record.operationId));
         await this.deleteApprovedPrivateNotes(this.state.storage, record.operationId);
       } else if (!isTerminalOperation(record)) {
-        const normalized = startTerminalRetention(
+        let normalized = startTerminalRetention(
           record,
           expireOperationLifetime(record, now),
           now
         );
+        const watchdogAt = this.watchdogAlarmAt(normalized);
+        const activeLease = Object.values(normalized.itemStates).some((item) => isLeaseActive(item.lease, now));
+        if (!isTerminalOperation(normalized) && Number.isFinite(watchdogAt) &&
+            watchdogAt <= Date.parse(now) && !activeLease) {
+          if ((normalized.watchdogWakeCount ?? 0) >= MAX_WATCHDOG_WAKE_COUNT) {
+            normalized = startTerminalRetention(record, terminalizeContinuationFailureInRecord(
+              normalized,
+              {
+                operationId: normalized.operationId,
+                ownerHash: normalized.ownerHash,
+                errorClass: "ContinuationExecutionFailure",
+                outcome: "ContinuationWatchdogExhausted",
+                reason: "Durable continuation watchdog wake limit exhausted without operation progress.",
+                now,
+              }
+            ), now);
+          } else {
+            normalized = startTerminalRetention(record, await this.scheduleDurableWake(normalizeOperationRecord({
+              ...normalized,
+              state: "Rescheduled",
+              nextEligibleTime: now,
+              continuationCount: normalized.continuationCount + 1,
+              schedulingSucceeded: false,
+              currentPauseReason: "ContinuationWatchdogRescheduled",
+              watchdogWakeCount: (normalized.watchdogWakeCount ?? 0) + 1,
+              lastWatchdogWakeAt: now,
+              updatedAt: now,
+            })), now);
+          }
+        }
         if (isTerminalOperation(normalized)) {
           await this.persistRecord(normalized);
           await this.deleteApprovedPrivateNotes(this.state.storage, record.operationId);
+        } else if (normalized !== record) {
+          await this.persistRecord(normalized);
         }
-        const alarmAt = Date.parse(
-          isTerminalOperation(normalized)
-            ? normalized.expiresAt
-            : normalized.maxOperationLifetimeAt ?? ""
-        );
-        if (Number.isFinite(alarmAt)) {
-          nextAlarmAt = nextAlarmAt === undefined ? alarmAt : Math.min(nextAlarmAt, alarmAt);
+        const alarmCandidates = isTerminalOperation(normalized)
+          ? [Date.parse(normalized.expiresAt)]
+          : [Date.parse(normalized.maxOperationLifetimeAt ?? ""), this.watchdogAlarmAt(normalized)];
+        for (const alarmAt of alarmCandidates) {
+          if (Number.isFinite(alarmAt)) {
+            nextAlarmAt = nextAlarmAt === undefined ? alarmAt : Math.min(nextAlarmAt, alarmAt);
+          }
         }
       } else {
         const alarmAt = Date.parse(record.expiresAt);
@@ -2771,7 +3061,7 @@ export class SuperOpsOperationLedger {
       ? ["", pathParts[1], pathParts[2]]
       : undefined;
     const operationMatch = url.pathname.match(/^\/operations\/([^/]+)$/);
-    const operationActionMatch = url.pathname.match(/^\/operations\/([^/]+)\/(claim-next|complete-item|checkpoint-item|schedule-continuation)$/);
+    const operationActionMatch = url.pathname.match(/^\/operations\/([^/]+)\/(claim-next|complete-item|checkpoint-item|schedule-continuation|cancel)$/);
 
     if (request.method === "PUT" && operationMatch) {
       try {
@@ -2944,7 +3234,8 @@ export class SuperOpsOperationLedger {
           state: params.nextEligibleTime ? "Rescheduled" : "ContinuationRequired",
           nextEligibleTime: params.nextEligibleTime,
           workflowId: params.workflowId ?? record.workflowId,
-          terminalFailureReason: params.reason,
+          currentPauseReason: params.reason,
+          terminalFailureReason: undefined,
           continuationCount: alreadyScheduledFor ? record.continuationCount : record.continuationCount + 1,
           updatedAt: scheduledAt,
         });
@@ -2958,6 +3249,19 @@ export class SuperOpsOperationLedger {
         }
         await this.setRecordAlarm(scheduled);
         return json(scheduled);
+      }
+
+      if (action === "cancel") {
+        const params = await request.json() as OperationCancelParams;
+        const cancelled = startTerminalRetention(
+          record,
+          cancelOperationInRecord(cloneRecord(record), params),
+          params.now ?? nowIso()
+        );
+        await this.persistRecord(cancelled);
+        await this.deleteApprovedPrivateNotes(this.state.storage, operationId);
+        await this.setRecordAlarm(cancelled);
+        return json(cancelled);
       }
 
       if (action === "terminalize-continuation") {

@@ -45,6 +45,7 @@ import {
   currentOwnerHash,
   getOperationStore,
   normalizedNoteFingerprint,
+  operationManualResumeEligibility,
   operationResultView,
   stableHash,
   type OperationItemState,
@@ -292,6 +293,32 @@ const GET_TICKET_QUERY = `
       resolutionViolated
       customFields
       worklogTimespent
+    }
+  }
+`;
+
+// Safe evidence recovery intentionally avoids the large customFields and SLA
+// payloads returned by the general ticket-detail query. It contains only the
+// canonical metadata needed by the bounded sanitised evidence result.
+const GET_SAFE_TICKET_QUERY = `
+  query getTicket($input: TicketIdentifierInput!) {
+    getTicket(input: $input) {
+      ticketId
+      displayId
+      subject
+      client
+      site
+      requester
+      status
+      priority
+      impact
+      urgency
+      category
+      subcategory
+      cause
+      resolutionCode
+      createdTime
+      updatedTime
     }
   }
 `;
@@ -552,6 +579,14 @@ interface SafeTicketParams {
   attachments?: "metadataOnly" | "none";
 }
 
+interface SafeTicketByIdParams extends Omit<SafeTicketParams, "ticketNumber"> {
+  ticketId?: string;
+}
+
+interface TriageEvidenceRecoveryParams extends Omit<SafeTicketParams, "ticketNumber"> {
+  ticketIds?: string[];
+}
+
 interface TriageSnapshotParams {
   status?: string[];
   max?: number;
@@ -659,6 +694,17 @@ type TriagePolicyDisposition =
   | "manual_intake"
   | "engineer_review"
   | "resolve_no_action";
+type TriageContentEvidenceState = "meaningful" | "empty" | "unavailable";
+type TriagePolicyReason =
+  | "customer_or_requester_work"
+  | "server_down_notification"
+  | "ambiguous_or_empty_intake"
+  | "actionable_engineer_work"
+  | "no_action_administration"
+  | "junk"
+  | "newsletter_or_marketing"
+  | "automated_digest"
+  | "outlook_reaction_digest";
 type TriageFinalOutcome =
   | "Resolved"
   | "Updated"
@@ -666,6 +712,8 @@ type TriageFinalOutcome =
   | "Skipped"
   | "Blocked"
   | "Failed"
+  | "Pending"
+  | "RateLimitedPending"
   | "NoteVisibilityPending"
   | "RejectedOrNoChange"
   | "AmbiguousNoChangeObserved"
@@ -688,6 +736,8 @@ interface TriagePlanAction {
   contentVerified?: boolean;
   action: TriagePlanActionType;
   policyDisposition?: TriagePolicyDisposition;
+  contentEvidenceState?: TriageContentEvidenceState;
+  policyReason?: TriagePolicyReason;
   reason?: string;
   note?: string;
   noteFingerprint?: string;
@@ -705,6 +755,7 @@ interface TriagePlanAction {
 
 interface ApplyTriagePlanParams {
   batchId?: string;
+  expectedOperationUpdatedAt?: string;
   policyMode?: TriagePolicyMode;
   expectedCandidateTicketNumbers?: string[];
   actions?: TriagePlanAction[];
@@ -725,6 +776,18 @@ const TRIAGE_POLICY_DISPOSITIONS = [
   "manual_intake",
   "engineer_review",
   "resolve_no_action",
+] as const;
+const TRIAGE_CONTENT_EVIDENCE_STATES = ["meaningful", "empty", "unavailable"] as const;
+const TRIAGE_POLICY_REASONS = [
+  "customer_or_requester_work",
+  "server_down_notification",
+  "ambiguous_or_empty_intake",
+  "actionable_engineer_work",
+  "no_action_administration",
+  "junk",
+  "newsletter_or_marketing",
+  "automated_digest",
+  "outlook_reaction_digest",
 ] as const;
 const SCHEDULED_NEW_CALLS_POLICY: TriagePolicyMode = "scheduled-new-calls-v1";
 const SCHEDULED_TRIAGE_TASKGROUP_NAME = "TaskGroup";
@@ -781,6 +844,8 @@ const TRIAGE_PLAN_ACTION_FIELD_NAMES = [
   "contentVerified",
   "action",
   "policyDisposition",
+  "contentEvidenceState",
+  "policyReason",
   "reason",
   "note",
   "noteFingerprint",
@@ -835,6 +900,16 @@ const TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES = {
     type: "string",
     enum: [...TRIAGE_POLICY_DISPOSITIONS],
     description: "Standing scheduled-triage disposition that determines whether the ticket stays in New Calls, moves to Awaiting Engineer, or resolves.",
+  },
+  contentEvidenceState: {
+    type: "string",
+    enum: [...TRIAGE_CONTENT_EVIDENCE_STATES],
+    description: "Frozen safe-content evidence state. Empty or unavailable evidence can never support automatic resolution.",
+  },
+  policyReason: {
+    type: "string",
+    enum: [...TRIAGE_POLICY_REASONS],
+    description: "Deterministic reason class binding the verified evidence to policyDisposition.",
   },
   allowWriteIfUpdatedTimeChanged: {
     type: "boolean",
@@ -1179,6 +1254,17 @@ async function getTicketByInternalId(
   ticketId: string
 ): Promise<Ticket> {
   const response = await client.query<GetTicketResponse>(GET_TICKET_QUERY, {
+    input: { ticketId },
+  });
+
+  return response.getTicket;
+}
+
+async function getSafeTicketByInternalId(
+  client: SuperOpsClientInstance,
+  ticketId: string
+): Promise<Ticket> {
+  const response = await client.query<GetTicketResponse>(GET_SAFE_TICKET_QUERY, {
     input: { ticketId },
   });
 
@@ -1583,6 +1669,12 @@ function looksLikeServerDownSubject(subject: string): boolean {
     new RegExp(`\\b${failure}\\b.*\\b${actor}\\b`).test(normalized);
 }
 
+function looksLikeOutlookReactionDigestSubject(subject: string): boolean {
+  return /\bmicrosoft\s+outlook\s+reaction\s+daily\s+digest\b/i.test(
+    subject.replace(/\s+/g, " ").trim()
+  );
+}
+
 function validateScheduledNewCallsPolicy(
   request: ApplyTriagePlanParams,
   expected: string[],
@@ -1614,6 +1706,19 @@ function validateScheduledNewCallsPolicy(
     engineer_review: "update",
     resolve_no_action: "resolve",
   };
+  const expectedReasonsByDisposition: Record<TriagePolicyDisposition, readonly TriagePolicyReason[]> = {
+    customer_request: ["customer_or_requester_work"],
+    server_down: ["server_down_notification"],
+    manual_intake: ["ambiguous_or_empty_intake"],
+    engineer_review: ["actionable_engineer_work"],
+    resolve_no_action: [
+      "no_action_administration",
+      "junk",
+      "newsletter_or_marketing",
+      "automated_digest",
+      "outlook_reaction_digest",
+    ],
+  };
   for (const [index, action] of actions.entries()) {
     const label = `actions[${index}]`;
     if (!action.policyDisposition ||
@@ -1622,6 +1727,33 @@ function validateScheduledNewCallsPolicy(
     }
     if (action.action !== expectedActionByDisposition[action.policyDisposition]) {
       return `${label}.action does not match policyDisposition ${action.policyDisposition}.`;
+    }
+    if (!action.contentEvidenceState ||
+        !(TRIAGE_CONTENT_EVIDENCE_STATES as readonly string[]).includes(action.contentEvidenceState)) {
+      return `${label}.contentEvidenceState is required for scheduled-new-calls-v1.`;
+    }
+    if (action.contentEvidenceState === "unavailable") {
+      return `${label} cannot be submitted because its content evidence is unavailable.`;
+    }
+    if (!action.policyReason ||
+        !expectedReasonsByDisposition[action.policyDisposition].includes(action.policyReason)) {
+      return `${label}.policyReason does not support policyDisposition ${action.policyDisposition}.`;
+    }
+    const outlookReactionDigest = looksLikeOutlookReactionDigestSubject(action.expectedSubject ?? "");
+    if (action.contentEvidenceState === "empty" &&
+        action.policyDisposition !== "manual_intake" &&
+        action.policyDisposition !== "server_down" &&
+        !outlookReactionDigest) {
+      return `${label} has empty content evidence and must use manual_intake unless its subject proves the server-down or Outlook Reaction digest exception.`;
+    }
+    if (action.policyDisposition === "resolve_no_action" &&
+        action.contentEvidenceState !== "meaningful" && !outlookReactionDigest) {
+      return `${label} cannot resolve without meaningful affirmative no-action evidence.`;
+    }
+    if (outlookReactionDigest &&
+        (action.policyDisposition !== "resolve_no_action" ||
+         action.action !== "resolve" || action.policyReason !== "outlook_reaction_digest")) {
+      return `${label} is a Microsoft Outlook Reaction Daily Digest and must use resolve_no_action with outlook_reaction_digest.`;
     }
     if (typeof action.expectedTicketId !== "string" || action.expectedTicketId.trim().length === 0 ||
         typeof action.expectedSubject !== "string" || action.expectedSubject.trim().length === 0 ||
@@ -2467,6 +2599,11 @@ function buildTriageSnapshotTicket(params: {
     .slice(0, 800);
   const conversationAvailability = safeResult.contentAvailability.conversations;
   const noteAvailability = safeResult.contentAvailability.notes;
+  const contentEvidenceState: TriageContentEvidenceState = contentErrors.length > 0 || !metadataAvailable
+    ? "unavailable"
+    : safeContentItems.some((item) => item.plainText.trim().length > 0)
+      ? "meaningful"
+      : "empty";
 
   return {
     ticketNumber: ticket.displayId ?? candidate.displayId,
@@ -2496,6 +2633,7 @@ function buildTriageSnapshotTicket(params: {
       noteCount: noteAvailability.count,
       contentErrors,
     }),
+    contentEvidenceState,
     safeSummary,
     safeContentItems,
     attachments: safeResult.attachments,
@@ -3618,7 +3756,7 @@ function markRateLimitedReadResult(
   operationName: string
 ): ApplyTriagePlanResult {
   const rateLimit = rateLimitRetryMetadata(error);
-  result.finalOutcome = "Failed";
+  result.finalOutcome = "RateLimitedPending";
   result.failureStage = "rateLimit";
   result.failureReason = safeErrorMessage(error);
   result.retrySafe = true;
@@ -5620,6 +5758,14 @@ function compactApplyResult(
     writeMethod: result.writeMethod,
     noteAdded: result.noteAdded,
     noteDeduped: result.noteDeduped,
+    physicalNoteWriteOccurred: result.noteAdded ? true : undefined,
+    physicalNoteWriteCount: result.noteAdded ? 1 : undefined,
+    recoveryNoteAction: result.noteAdded && result.noteDeduped
+      ? "DeduplicatedExistingAcceptedNote"
+      : result.noteDeduped ? "Deduplicated" : undefined,
+    finalNotePresentAndVerified: result.noteWriteOutcome === "AcceptedAndVerified" ||
+      result.noteWriteOutcome === "VerifiedExistingPrivateNote" ||
+      (result.noteAdded || result.noteDeduped) && result.verified ? true : undefined,
     notePlanned: result.notePlanned,
     noteDedupePlanned: result.noteDedupePlanned,
     noteDedupeChecked: result.noteDedupeChecked,
@@ -5734,6 +5880,8 @@ function serializableApplyTriageRequest(
           contentVerified: action.contentVerified,
           action: action.action,
           policyDisposition: action.policyDisposition,
+          contentEvidenceState: action.contentEvidenceState,
+          policyReason: action.policyReason,
           noteFingerprint: action.note
             ? normalizedNoteFingerprint(action.note)
             : action.noteFingerprint,
@@ -6105,8 +6253,18 @@ function summarizeApplyResults(results: ApplyTriagePlanResult[]) {
     skipped: results.filter((result) => result.finalOutcome === "Skipped" || result.finalOutcome === "NoApprovedAction" || result.finalOutcome === "SkippedChangedSinceSnapshot").length,
     blocked: results.filter((result) => result.finalOutcome === "Blocked").length,
     failed: results.filter((result) => ["Failed", "RejectedOrNoChange", "AmbiguousNoChangeObserved", "PartialResolveStatusMissing"].includes(result.finalOutcome)).length,
+    pending: results.filter((result) => result.finalOutcome === "Pending" || result.finalOutcome === "RateLimitedPending").length,
+    rateLimitedPending: results.filter((result) => result.finalOutcome === "RateLimitedPending").length,
     notFound: results.filter((result) => result.finalOutcome === "NotFound").length,
     notAttempted: results.filter((result) => result.finalOutcome === "NotAttemptedExecutionStopped" || result.finalOutcome === "FailedBeforeProcessing").length,
+    attemptedWithoutAcceptedWrite: results.filter((result) =>
+      result.writeAttempted === true &&
+      (result.acceptedPhysicalWrites?.length ?? 0) === 0 &&
+      !(result.physicalWrites ?? []).some((write) =>
+        ["Accepted", "AcceptedAndVerified", "VerifiedApplied", "VerifiedAppliedAfterAmbiguous"]
+          .includes(write.outcome)
+      )
+    ).length,
     partialWrites: results.filter((result) => result.partialWrite).length,
     verified: results.filter((result) => result.verified).length,
   };
@@ -6131,13 +6289,26 @@ function completeApplyResultsFromLedger(
     if (compact) return compact;
     const item = record.itemStates[ticketNumber];
     const pending = record.pendingItems.includes(ticketNumber);
+    const rateLimitedPending = pending && Boolean(item && (
+      item.stage === "RateLimited" || item.stage === "RateLimitedRetrying" ||
+      item.stage === "RateLimitedRescheduled" || item.errorClass === "SuperOpsRateLimit"
+    ));
+    const neverEnteredProcessing = pending && (!item || item.stage === "Unattempted");
     return {
       ticketNumber,
       requestedAction: actionsByTicket.get(ticketNumber)?.action,
-      finalOutcome: pending ? "NotAttemptedExecutionStopped" : "Failed",
-      failureStage: pending ? "executionBudget" : "continuation",
-      failureReason: item?.failureReason ?? (pending
-        ? "The durable operation has not attempted this item yet."
+      finalOutcome: rateLimitedPending
+        ? "RateLimitedPending"
+        : neverEnteredProcessing
+          ? "NotAttemptedExecutionStopped"
+          : pending ? "Pending" : "Failed",
+      failureStage: rateLimitedPending
+        ? "rateLimit"
+        : neverEnteredProcessing ? "executionBudget" : "continuation",
+      failureReason: item?.failureReason ?? (neverEnteredProcessing
+        ? "The durable operation has not entered processing for this item yet."
+        : pending
+          ? "The durable operation has not reached a terminal result for this item."
         : "The item reached a terminal ledger state without a compact result."),
       writeAttempted: item?.writeAttempted ?? false,
       noteAdded: Boolean(item?.createdNoteId),
@@ -6707,6 +6878,7 @@ async function applyApprovedTriageAction(params: {
       return markRateLimitedReadResult(result, error, "getTicketNoteList.noteOnlyDedupe");
     }
     if (rateLimited) {
+      result.finalOutcome = "RateLimitedPending";
       const rateLimit = rateLimitRetryMetadata(error);
       result.rateLimitRetryAfterMs = rateLimit.delayMs;
       result.rateLimitRequestedDelayMs = rateLimit.requestedDelayMs;
@@ -8843,6 +9015,59 @@ export function getTicketsTools(): DomainTools {
         },
       },
       {
+        name: "superops_tickets_get_safe",
+        description:
+          "Safely retrieve one ticket by immutable internal ticket ID with compact canonical metadata, sanitised bounded plain-text conversations and notes, and attachment metadata only.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ticketId: { type: "string", description: "Immutable internal SuperOps ticket ID." },
+            includeDescription: { type: "boolean", default: true },
+            includeNotes: { type: "boolean", default: true },
+            includeConversations: { type: "boolean", default: true },
+            latestFirst: { type: "boolean", default: true },
+            maxItems: { type: "number", default: 20 },
+            maxCharsPerItem: { type: "number", default: 4000 },
+            maxTotalChars: { type: "number", default: 20000 },
+            redactCredentials: { type: "boolean", default: true },
+            stripHtml: { type: "boolean", default: true },
+            stripHeaders: { type: "boolean", default: true },
+            attachments: { type: "string", enum: ["metadataOnly", "none"], default: "metadataOnly" },
+          },
+          required: ["ticketId"],
+        },
+      },
+      {
+        name: "superops_tickets_triage_evidence_recover",
+        description:
+          "Read-only bounded batch recovery for up to 10 immutable ticket IDs. Returns sanitised canonical evidence per ticket and explicit unavailable/error results; it never returns attachment bodies.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ticketIds: {
+              type: "array",
+              minItems: 1,
+              maxItems: 10,
+              uniqueItems: true,
+              items: { type: "string" },
+              description: "Immutable internal SuperOps ticket IDs in fixed order.",
+            },
+            includeDescription: { type: "boolean", default: true },
+            includeNotes: { type: "boolean", default: true },
+            includeConversations: { type: "boolean", default: true },
+            latestFirst: { type: "boolean", default: true },
+            maxItems: { type: "number", default: 20 },
+            maxCharsPerItem: { type: "number", default: 4000 },
+            maxTotalChars: { type: "number", default: 20000 },
+            redactCredentials: { type: "boolean", default: true },
+            stripHtml: { type: "boolean", default: true },
+            stripHeaders: { type: "boolean", default: true },
+            attachments: { type: "string", enum: ["metadataOnly", "none"], default: "metadataOnly" },
+          },
+          required: ["ticketIds"],
+        },
+      },
+      {
         name: "superops_tickets_triage_snapshot",
         description:
           "Read-only ticket triage snapshot for an explicitly selected configured status queue. Returns one execution-safe page of fixed candidates with safe compact metadata and sanitized conversation/note evidence. Follow pagination.nextPage until hasMore is false before proposing a complete queue plan.",
@@ -8922,6 +9147,10 @@ export function getTicketsTools(): DomainTools {
             batchId: {
               type: "string",
               description: "Optional batch identifier. To resume an existing nonterminal operation, send its exact expectedCandidateTicketNumbers and omit actions and override flags.",
+            },
+            expectedOperationUpdatedAt: {
+              type: "string",
+              description: "For compact same-operation recovery, the exact updatedAt from the latest operation status read.",
             },
             policyMode: {
               type: "string",
@@ -9645,6 +9874,120 @@ export function getTicketsTools(): DomainTools {
             };
           }
 
+          case "superops_tickets_get_safe": {
+            const requested = args as SafeTicketByIdParams;
+            const ticketId = typeof requested.ticketId === "string" ? requested.ticketId.trim() : "";
+            if (!ticketId) return errorResult("ticketId is required and cannot be empty.");
+            const safeParams = safeTicketParams({ ...requested, ticketNumber: "" });
+            const ticket = await getSafeTicketByInternalId(client, ticketId);
+            if (ticket.ticketId !== ticketId) {
+              return errorResult("Immutable ticket identity did not match the requested ticketId.");
+            }
+            const collection = await collectSafeTicketContent({
+              client,
+              ticket,
+              safeParams,
+              initialContentTicketIds: [ticketId],
+              displayId: ticket.displayId,
+            });
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  ok: collection.contentErrors.length === 0,
+                  ticketId,
+                  contentEvidenceState: collection.contentErrors.length > 0
+                    ? "unavailable"
+                    : collection.safeResult.safeContent.items.some((item) => item.plainText.trim())
+                      ? "meaningful"
+                      : "empty",
+                  evidence: collection.safeResult,
+                  errors: collection.contentErrors,
+                }, null, 2),
+              }],
+            };
+          }
+
+          case "superops_tickets_triage_evidence_recover": {
+            const requested = args as TriageEvidenceRecoveryParams;
+            const ticketIds = Array.isArray(requested.ticketIds)
+              ? requested.ticketIds.map((value) => typeof value === "string" ? value.trim() : "")
+              : [];
+            if (ticketIds.length === 0 || ticketIds.length > 10 ||
+                ticketIds.some((ticketId) => !ticketId) || new Set(ticketIds).size !== ticketIds.length) {
+              return errorResult("ticketIds must contain 1 to 10 unique non-empty immutable ticket IDs.");
+            }
+            const safeParams = safeTicketParams({ ...requested, ticketNumber: "" });
+            const recovered: Array<Record<string, unknown>> = [];
+            let executionStopped = false;
+            for (const ticketId of ticketIds) {
+              if (executionStopped) {
+                recovered.push({
+                  ticketId,
+                  ok: false,
+                  contentEvidenceState: "unavailable",
+                  errorClass: "ExecutionBudgetStopped",
+                  error: "Evidence recovery stopped before this ticket; no empty-content inference is permitted.",
+                });
+                continue;
+              }
+              try {
+                const ticket = await getSafeTicketByInternalId(client, ticketId);
+                if (ticket.ticketId !== ticketId) {
+                  recovered.push({
+                    ticketId,
+                    ok: false,
+                    contentEvidenceState: "unavailable",
+                    errorClass: "ImmutableIdentityMismatch",
+                    error: "Immutable ticket identity did not match the requested ticketId.",
+                  });
+                  continue;
+                }
+                const collection = await collectSafeTicketContent({
+                  client,
+                  ticket,
+                  safeParams,
+                  initialContentTicketIds: [ticketId],
+                  displayId: ticket.displayId,
+                });
+                recovered.push({
+                  ticketId,
+                  ok: collection.contentErrors.length === 0,
+                  contentEvidenceState: collection.contentErrors.length > 0
+                    ? "unavailable"
+                    : collection.safeResult.safeContent.items.some((item) => item.plainText.trim())
+                      ? "meaningful"
+                      : "empty",
+                  evidence: collection.safeResult,
+                  errors: collection.contentErrors,
+                });
+              } catch (error) {
+                executionStopped = isExecutionStopError(error);
+                recovered.push({
+                  ticketId,
+                  ok: false,
+                  contentEvidenceState: "unavailable",
+                  errorClass: isRateLimitError(error)
+                    ? "SuperOpsRateLimit"
+                    : executionStopped ? "ExecutionBudgetStopped" : "SafeReadFailure",
+                  error: safeErrorMessage(error),
+                });
+              }
+            }
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  complete: recovered.every((item) => item.ok === true),
+                  requestedCount: ticketIds.length,
+                  recoveredCount: recovered.filter((item) => item.ok === true).length,
+                  ticketIds,
+                  results: recovered,
+                }, null, 2),
+              }],
+            };
+          }
+
           case "superops_tickets_triage_snapshot": {
             const snapshotParams = triageSnapshotParams(args as TriageSnapshotParams);
             const invalidStatuses = invalidValues(
@@ -9775,6 +10118,7 @@ export function getTicketsTools(): DomainTools {
               actionsByTicket: actionByTicket, continuationRequired: false,
               summary: initialSummary,
             });
+            let compactStoredRecovery = false;
 
             try {
               const existing = await store.get(operationId, ownerHash);
@@ -9786,7 +10130,7 @@ export function getTicketsTools(): DomainTools {
                   : undefined;
                 const exactGeneratedIdRecovery = recoveryRequest !== undefined &&
                   stableHash(existing.operationRequest) === stableHash(recoveryRequest);
-                const compactStoredRecovery = isCompactStoredApplyTriageRecovery(
+                compactStoredRecovery = !exactGeneratedIdRecovery && isCompactStoredApplyTriageRecovery(
                   params,
                   expected,
                   actions,
@@ -9800,7 +10144,37 @@ export function getTicketsTools(): DomainTools {
                     )) {
                   return errorResult("The requested operation ID already exists with different ownership or approved input.");
                 }
+                if (compactStoredRecovery) {
+                  if (params.expectedOperationUpdatedAt !== undefined &&
+                      params.expectedOperationUpdatedAt !== existing.updatedAt) {
+                    return errorResult("The durable operation changed after the compact recovery status read.");
+                  }
+                  const eligibility = operationManualResumeEligibility(existing);
+                  if (!eligibility.allowed) {
+                    return errorResult(`Compact same-operation recovery is not permitted: ${eligibility.reason}`);
+                  }
+                  await store.update(operationId, ownerHash, (current) => {
+                    if (params.expectedOperationUpdatedAt !== undefined &&
+                        current.updatedAt !== params.expectedOperationUpdatedAt) {
+                      throw new Error("The durable operation changed before compact recovery obtained its boundary.");
+                    }
+                    const currentEligibility = operationManualResumeEligibility(current);
+                    if (!currentEligibility.allowed) {
+                      throw new Error(`Compact same-operation recovery is not permitted: ${currentEligibility.reason}`);
+                    }
+                    return {
+                      ...current,
+                      manualResumeCount: (current.manualResumeCount ?? 0) + 1,
+                      lastManualResumeAt: new Date().toISOString(),
+                    };
+                  });
+                } else if (params.expectedOperationUpdatedAt !== undefined) {
+                  return errorResult("expectedOperationUpdatedAt is allowed only for compact same-operation recovery.");
+                }
               } else {
+                if (params.expectedOperationUpdatedAt !== undefined) {
+                  return errorResult("expectedOperationUpdatedAt cannot be used to create a new durable operation.");
+                }
                 // No initial mutation is permitted until this write is acknowledged.
                 const approvedPrivateNotes = [...actionByTicket.values()].flatMap((action) => {
                   const ticketNumber = normaliseTicketNumber(action.ticketNumber);
@@ -9823,7 +10197,7 @@ export function getTicketsTools(): DomainTools {
             } catch (error) {
               return {
                 content: [{ type: "text", text: JSON.stringify({
-                  operation: { operationId, complete: false, continuationRequired: false,
+                  operation: { operationId, durableOperationId: operationId, complete: false, continuationRequired: false,
                     persisted: false, errorClass: "OperationStoreFailure",
                     writeAttempted: false, writeMayHaveSucceeded: false,
                     storeError: safeErrorMessage(error) },
@@ -10026,7 +10400,8 @@ export function getTicketsTools(): DomainTools {
             return {
               content: [{ type: "text", text: JSON.stringify({
                 batchId: params.batchId,
-                operation: { operationId, idempotencyKey: params.batchId ?? operationId,
+                operation: { operationId, durableOperationId: operationId,
+                  idempotencyKey: params.batchId ?? operationId,
                   complete, continuationRequired: !complete, persisted: true,
                   storeError: continuationError, continuationScheduling, state: finalRecord.state,
                   errorClass: durableFinalErrorClass ?? (continuationError ? "OperationStoreFailure" : undefined),

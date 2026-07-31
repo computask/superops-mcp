@@ -7,7 +7,12 @@ import {
   runWithExecutionConfig,
   runWithExecutionContext,
 } from "./execution.js";
-import { getOperationStore, runWithOperationStore, type OperationStoreEnv } from "./operation-store.js";
+import {
+  getOperationStore,
+  runWithOperationStore,
+  type OperationLedgerRecord,
+  type OperationStoreEnv,
+} from "./operation-store.js";
 
 export interface ContinuationWorkflowParams {
   operationId: string;
@@ -19,6 +24,28 @@ export interface ContinuationWorkflowParams {
 interface ContinuationWorkflowEnv extends OperationStoreEnv, ExecutionConfigInput {
   SUPEROPS_CONTINUATION_SERVICE?: { fetch(request: Request): Promise<Response> };
   SUPEROPS_INTERNAL_CONTINUATION_TOKEN?: string;
+}
+
+const TERMINAL_OPERATION_STATES = new Set(["Completed", "CompletedWithFailures", "Failed", "Cancelled"]);
+
+function durableProgressSignature(record: OperationLedgerRecord): string {
+  return JSON.stringify({
+    state: record.state,
+    currentItem: record.currentItem,
+    completedItems: record.completedItems,
+    failedItems: record.failedItems,
+    skippedItems: record.skippedItems,
+    pendingItems: record.pendingItems,
+    nextEligibleTime: record.nextEligibleTime,
+    continuationCount: record.continuationCount,
+    lastInvocationId: record.lastInvocationId,
+    itemStages: record.expectedItems.map((itemKey) => [
+      itemKey,
+      record.itemStates[itemKey]?.stage,
+      record.itemStates[itemKey]?.attemptCount,
+      record.itemStates[itemKey]?.retryCount,
+    ]),
+  });
 }
 
 export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
@@ -66,16 +93,24 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
           const token = this.env.SUPEROPS_INTERNAL_CONTINUATION_TOKEN?.trim();
           if (!service || !token) throw new Error("Continuation service binding or token is unavailable.");
 
+          let progressBefore: string | undefined;
+          let alreadyTerminal = false;
           await runWithOperationStore(this.env, async () => {
             const store = getOperationStore();
             const record = await store.get(params.operationId, params.ownerHash);
-            if (!record || record.ownerHash !== params.ownerHash) return;
+            if (!record || record.ownerHash !== params.ownerHash) {
+              throw new Error("Continuation operation is unavailable to the workflow owner.");
+            }
+            alreadyTerminal = TERMINAL_OPERATION_STATES.has(record.state);
+            progressBefore = durableProgressSignature(record);
+            if (alreadyTerminal) return;
             await store.update(params.operationId, params.ownerHash, (current) => ({
               ...current,
               wakeAttemptCount: (current.wakeAttemptCount ?? 0) + 1,
               lastWakeAttemptAt: new Date().toISOString(),
             }));
           });
+          if (alreadyTerminal) return;
 
           const response = await fetchContinuationService(service, new Request(
             "https://superops-continuation.local/internal/operations/continue",
@@ -99,7 +134,13 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
           await runWithOperationStore(this.env, async () => {
             const store = getOperationStore();
             const record = await store.get(params.operationId, params.ownerHash);
-            if (!record || record.ownerHash !== params.ownerHash) return;
+            if (!record || record.ownerHash !== params.ownerHash) {
+              throw new Error("Continuation operation disappeared after workflow delivery.");
+            }
+            if (!TERMINAL_OPERATION_STATES.has(record.state) &&
+                durableProgressSignature(record) === progressBefore) {
+              throw new Error("Continuation service returned success without durable operation progress.");
+            }
             await store.update(params.operationId, params.ownerHash, (current) => ({
               ...current,
               wakeDeliveryCount: (current.wakeDeliveryCount ?? 0) + 1,

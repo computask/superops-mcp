@@ -278,15 +278,28 @@ export async function runOperationContinuation(
       const config = getExecutionConfig();
       const priorRate = claim.item.rateLimit;
       const rateAttempts = outcome.rateLimited ? (priorRate?.attempts ?? 0) + 1 : 0;
-      const firstThrottledAt = priorRate?.firstThrottledAt ?? (outcome.rateLimited ? new Date().toISOString() : undefined);
-      const rateObservedAtMs = Date.now();
+      const rateObservedAtMs = Date.parse(params.now ?? new Date().toISOString());
       const rateObservedAt = new Date(rateObservedAtMs).toISOString();
+      const firstThrottledAt = priorRate?.firstThrottledAt ?? (outcome.rateLimited ? rateObservedAt : undefined);
       const previousActualDelayMs = priorRate?.scheduledAt
         ? Math.max(0, rateObservedAtMs - Date.parse(priorRate.scheduledAt))
         : priorRate?.actualDelayMs;
-      const requestedDelayMs = outcome.nextEligibleTime
+      const adapterRequestedDelayMs = outcome.nextEligibleTime
         ? Math.max(0, Date.parse(outcome.nextEligibleTime) - rateObservedAtMs)
         : 0;
+      const durableBackoffDelayMs = outcome.rateLimited && outcome.retryAfterSupplied !== true
+        ? Math.min(
+            config.maxDurableRetryDurationMs,
+            config.durableBackoffBaseDelayMs * 2 ** Math.max(0, rateAttempts - 1)
+          )
+        : 0;
+      // Adapter timestamps can be consumed by checkpoint persistence before
+      // the continuation reaches this durable scheduling boundary. Rebase the
+      // wait on the observation time and enforce a durable backoff floor when
+      // SuperOps supplied no usable Retry-After value.
+      const requestedDelayMs = outcome.rateLimited
+        ? Math.max(adapterRequestedDelayMs, durableBackoffDelayMs)
+        : adapterRequestedDelayMs;
       const cappedDelayMs = Math.min(requestedDelayMs, config.maxDurableSingleWaitMs);
       const totalRetryDurationMs = (priorRate?.totalRetryDurationMs ?? 0) + cappedDelayMs;
       const durableRetryExhausted = outcome.rateLimited && (
@@ -324,8 +337,8 @@ export async function runOperationContinuation(
           ? { ...adapterOutcome.result as Record<string, unknown>, writeAttempted, writeMayHaveSucceeded }
           : adapterOutcome.result,
       };
-      if (outcome.rateLimited && outcome.nextEligibleTime && cappedDelayMs !== requestedDelayMs) {
-        effectiveOutcome.nextEligibleTime = new Date(Date.now() + cappedDelayMs).toISOString();
+      if (outcome.rateLimited) {
+        effectiveOutcome.nextEligibleTime = new Date(rateObservedAtMs + cappedDelayMs).toISOString();
       }
       try {
         record = await store.completeItem({
@@ -375,7 +388,7 @@ export async function runOperationContinuation(
                   totalRetryDurationMs,
                   totalElapsedMs: firstThrottledAt ? rateObservedAtMs - Date.parse(firstThrottledAt) : undefined,
                   nextEligibleAt: effectiveOutcome.nextEligibleTime,
-                  retryAfterSupplied: effectiveOutcome.retryAfterSupplied ?? Boolean(effectiveOutcome.nextEligibleTime),
+                  retryAfterSupplied: effectiveOutcome.retryAfterSupplied === true,
                   continuedInAnotherInvocation: effectiveOutcome.stage === "RateLimitedRescheduled",
                   writeAttempted: effectiveOutcome.writeAttempted,
                   finalResult: effectiveOutcome.outcome,

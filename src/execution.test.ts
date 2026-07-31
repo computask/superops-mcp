@@ -19,6 +19,7 @@ describe("execution safety limits", () => {
       SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_ATTEMPTS: "4",
       SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_DURATION_MS: "60000",
       SUPEROPS_EXECUTION_MAX_DURABLE_SINGLE_WAIT_MS: "30000",
+      SUPEROPS_EXECUTION_DURABLE_BACKOFF_BASE_DELAY_MS: "12000",
       SUPEROPS_EXECUTION_MAX_SCHEDULING_ATTEMPTS: "3",
     })).toMatchObject({
       requestTimeoutMs: 1234,
@@ -27,6 +28,7 @@ describe("execution safety limits", () => {
       maxDurableRetryAttempts: 4,
       maxDurableRetryDurationMs: 60000,
       maxDurableSingleWaitMs: 30000,
+      durableBackoffBaseDelayMs: 12000,
       maxSchedulingAttempts: 3,
     });
   });

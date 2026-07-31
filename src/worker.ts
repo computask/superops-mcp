@@ -721,7 +721,11 @@ async function scheduleImmediateInternalContinuation(
         schedulingAttempted: true,
         schedulingSucceeded: true,
         schedulingError: undefined,
-        schedulingAttemptCount: (current.schedulingAttemptCount ?? 0) + 1,
+        currentSchedulingAttemptCount: 1,
+        totalSchedulingAttemptCount: (current.totalSchedulingAttemptCount ??
+          current.schedulingAttemptCount ?? 0) + 1,
+        schedulingAttemptCount: (current.totalSchedulingAttemptCount ??
+          current.schedulingAttemptCount ?? 0) + 1,
       }));
     } catch (error) {
       persistenceError = error instanceof Error ? error.message : String(error);
