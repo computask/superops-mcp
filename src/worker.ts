@@ -85,6 +85,7 @@ export interface Env {
   CHATGPT_MCP_RESOURCE?: string;
   CHATGPT_OAUTH_SCOPES?: string;
   CHATGPT_AUTH_ALLOWED_EMAIL?: string;
+  CHATGPT_AUTH_ALLOWED_EMAILS?: string;
   CHATGPT_AUTH_ACCESS_ISSUER?: string;
   CHATGPT_AUTH_ACCESS_AUD?: string;
   CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS?: string;
@@ -426,20 +427,42 @@ function normalizeOrigin(value: string | undefined): string | undefined {
   }
 }
 
+function normalizeEmail(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return normalized || undefined;
+}
+
+function allowedAccessEmails(env: Env): Set<string> {
+  const configuredEmails = [
+    env.CHATGPT_AUTH_ALLOWED_EMAIL,
+    ...(env.CHATGPT_AUTH_ALLOWED_EMAILS?.split(",") ?? []),
+  ];
+
+  return new Set(
+    configuredEmails
+      .map((email) => normalizeEmail(email))
+      .filter((email): email is string => email !== undefined)
+  );
+}
+
 async function requireAllowedAccessUser(
   request: Request,
   env: Env
 ): Promise<{ email: string } | Response> {
-  const allowedEmail = env.CHATGPT_AUTH_ALLOWED_EMAIL?.trim();
+  const allowedEmails = allowedAccessEmails(env);
   const issuer = normalizeOrigin(env.CHATGPT_AUTH_ACCESS_ISSUER);
   const audience = env.CHATGPT_AUTH_ACCESS_AUD?.trim();
 
-  if (!allowedEmail || !issuer || !audience) {
+  if (allowedEmails.size === 0 || !issuer || !audience) {
     return json(
       {
         error: "OAuth authorize not configured",
         message:
-          "Set CHATGPT_AUTH_ALLOWED_EMAIL, CHATGPT_AUTH_ACCESS_ISSUER, and CHATGPT_AUTH_ACCESS_AUD.",
+          "Set CHATGPT_AUTH_ALLOWED_EMAIL or CHATGPT_AUTH_ALLOWED_EMAILS, CHATGPT_AUTH_ACCESS_ISSUER, and CHATGPT_AUTH_ACCESS_AUD.",
       },
       503
     );
@@ -462,9 +485,9 @@ async function requireAllowedAccessUser(
         audience,
       }
     );
-    const email = (payload as { email?: unknown }).email;
+    const email = normalizeEmail((payload as { email?: unknown }).email);
 
-    if (email !== allowedEmail) {
+    if (!email || !allowedEmails.has(email)) {
       return json({ error: "Forbidden", message: "Unauthorized user." }, 403);
     }
 

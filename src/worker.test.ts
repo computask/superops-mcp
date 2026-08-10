@@ -25,6 +25,7 @@ const AUTH_SERVER = `https://${DIRECT_HOST}`;
 const ACCESS_ISSUER = "https://computask.cloudflareaccess.test";
 const ACCESS_AUD = "test-access-aud";
 const ALLOWED_EMAIL = "sam@computask.co.uk";
+const ADDITIONAL_ALLOWED_EMAIL = "user-b@example.com";
 const CHATGPT_REDIRECT_URI = "https://chatgpt.com/connector/oauth/callback";
 
 type MemoryKvEntry = {
@@ -365,14 +366,20 @@ async function registerChatGptClient(env: Env): Promise<string> {
   return body.client_id!;
 }
 
-async function getOAuthAccessToken(env: Env): Promise<string> {
-  const clientId = await registerChatGptClient(env);
+async function getOAuthAccessToken(
+  env: Env,
+  {
+    clientId,
+    email = ALLOWED_EMAIL,
+  }: { clientId?: string; email?: string } = {}
+): Promise<string> {
+  const resolvedClientId = clientId ?? (await registerChatGptClient(env));
   const verifier = "test-verifier-abcdefghijklmnopqrstuvwxyz0123456789";
   const challenge = await pkceChallenge(verifier);
 
   const authorizeUrl = new URL(`${AUTH_SERVER}/authorize`);
   authorizeUrl.searchParams.set("response_type", "code");
-  authorizeUrl.searchParams.set("client_id", clientId);
+  authorizeUrl.searchParams.set("client_id", resolvedClientId);
   authorizeUrl.searchParams.set("redirect_uri", CHATGPT_REDIRECT_URI);
   authorizeUrl.searchParams.set("scope", "superops.read");
   authorizeUrl.searchParams.set("state", "test-state");
@@ -383,7 +390,7 @@ async function getOAuthAccessToken(env: Env): Promise<string> {
   const authorizeRes = await worker.fetch(
     new Request(authorizeUrl, {
       headers: {
-        "CF-Access-Jwt-Assertion": await cloudflareAccessJwt(),
+        "CF-Access-Jwt-Assertion": await cloudflareAccessJwt(email),
       },
       redirect: "manual",
     }),
@@ -401,7 +408,7 @@ async function getOAuthAccessToken(env: Env): Promise<string> {
 
   const tokenBody = new URLSearchParams({
     grant_type: "authorization_code",
-    client_id: clientId,
+    client_id: resolvedClientId,
     code: code!,
     redirect_uri: CHATGPT_REDIRECT_URI,
     code_verifier: verifier,
@@ -431,6 +438,17 @@ async function getOAuthAccessToken(env: Env): Promise<string> {
   return tokenJson.access_token!;
 }
 
+async function requestToolsWithOAuthAccessToken(
+  env: Env,
+  accessToken: string
+): Promise<Response> {
+  return mcp(
+    { jsonrpc: "2.0", id: 901, method: "tools/list", params: {} },
+    env,
+    { Authorization: `Bearer ${accessToken}` },
+    `${AUTH_SERVER}/mcp`
+  );
+}
 
 describe("ChatGPT direct mutation policy", () => {
   it("derives direct-route blocks from the registry while preserving reads", async () => {
@@ -1749,6 +1767,113 @@ describe("Cloudflare Worker entrypoint", () => {
       env
     );
     expect(res.status).toBe(403);
+  });
+
+  it("keeps CHATGPT_AUTH_ALLOWED_EMAIL working with normalized comparison and userId", async () => {
+    const env = chatGptEnv({
+      CHATGPT_AUTH_ALLOWED_EMAIL: `  ${ALLOWED_EMAIL.toUpperCase()}  `,
+      CHATGPT_AUTH_ALLOWED_EMAILS: undefined,
+    });
+
+    const token = await getOAuthAccessToken(env, {
+      email: "Sam@Computask.Co.Uk",
+    });
+
+    expect(token.split(":")[0]).toBe(ALLOWED_EMAIL);
+    expect((await requestToolsWithOAuthAccessToken(env, token)).status).toBe(200);
+  });
+
+  it("allows additional users from CHATGPT_AUTH_ALLOWED_EMAILS", async () => {
+    const env = chatGptEnv({
+      CHATGPT_AUTH_ALLOWED_EMAIL: undefined,
+      CHATGPT_AUTH_ALLOWED_EMAILS:
+        ` , ${ADDITIONAL_ALLOWED_EMAIL.toUpperCase()} , , `,
+    });
+
+    const token = await getOAuthAccessToken(env, {
+      email: "User-B@Example.Com",
+    });
+
+    expect(token.split(":")[0]).toBe(ADDITIONAL_ALLOWED_EMAIL);
+    expect((await requestToolsWithOAuthAccessToken(env, token)).status).toBe(200);
+  });
+
+  it("combines CHATGPT_AUTH_ALLOWED_EMAIL and CHATGPT_AUTH_ALLOWED_EMAILS", async () => {
+    const env = chatGptEnv({
+      CHATGPT_AUTH_ALLOWED_EMAILS: ADDITIONAL_ALLOWED_EMAIL,
+    });
+
+    const legacyToken = await getOAuthAccessToken(env);
+    const additionalToken = await getOAuthAccessToken(env, {
+      email: ADDITIONAL_ALLOWED_EMAIL,
+    });
+
+    expect((await requestToolsWithOAuthAccessToken(env, legacyToken)).status).toBe(
+      200
+    );
+    expect(
+      (await requestToolsWithOAuthAccessToken(env, additionalToken)).status
+    ).toBe(200);
+  });
+
+  it("uses different normalized OAuth userIds for different allowed emails", async () => {
+    const env = chatGptEnv({
+      CHATGPT_AUTH_ALLOWED_EMAILS: ADDITIONAL_ALLOWED_EMAIL,
+    });
+    const clientId = await registerChatGptClient(env);
+
+    const legacyToken = await getOAuthAccessToken(env, { clientId });
+    const additionalToken = await getOAuthAccessToken(env, {
+      clientId,
+      email: ADDITIONAL_ALLOWED_EMAIL.toUpperCase(),
+    });
+
+    expect(legacyToken.split(":")[0]).toBe(ALLOWED_EMAIL);
+    expect(additionalToken.split(":")[0]).toBe(ADDITIONAL_ALLOWED_EMAIL);
+    expect(additionalToken.split(":")[0]).not.toBe(legacyToken.split(":")[0]);
+  });
+
+  it("keeps user A's existing token valid when user B is added and authorized", async () => {
+    const env = chatGptEnv({ CHATGPT_AUTH_ALLOWED_EMAILS: undefined });
+    const clientId = await registerChatGptClient(env);
+    const userAToken = await getOAuthAccessToken(env, { clientId });
+
+    env.CHATGPT_AUTH_ALLOWED_EMAILS = ADDITIONAL_ALLOWED_EMAIL;
+    const userBToken = await getOAuthAccessToken(env, {
+      clientId,
+      email: ADDITIONAL_ALLOWED_EMAIL,
+    });
+
+    expect(
+      (await requestToolsWithOAuthAccessToken(env, userAToken)).status
+    ).toBe(200);
+    expect(
+      (await requestToolsWithOAuthAccessToken(env, userBToken)).status
+    ).toBe(200);
+  });
+
+  it("keeps user B's token valid when user A reauthorizes", async () => {
+    const env = chatGptEnv({
+      CHATGPT_AUTH_ALLOWED_EMAILS: ADDITIONAL_ALLOWED_EMAIL,
+    });
+    const clientId = await registerChatGptClient(env);
+    const originalUserAToken = await getOAuthAccessToken(env, { clientId });
+    const userBToken = await getOAuthAccessToken(env, {
+      clientId,
+      email: ADDITIONAL_ALLOWED_EMAIL,
+    });
+    const reauthorizedUserAToken = await getOAuthAccessToken(env, { clientId });
+
+    expect(
+      (await requestToolsWithOAuthAccessToken(env, userBToken)).status
+    ).toBe(200);
+    expect(
+      (await requestToolsWithOAuthAccessToken(env, reauthorizedUserAToken))
+        .status
+    ).toBe(200);
+    expect(
+      (await requestToolsWithOAuthAccessToken(env, originalUserAToken)).status
+    ).toBe(401);
   });
 
   it("rejects dynamic client registration for non-ChatGPT redirect URIs", async () => {
