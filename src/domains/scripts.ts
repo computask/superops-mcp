@@ -113,7 +113,7 @@ const RUN_SCRIPT_ON_ASSET_MUTATION = `
   }
 `;
 
-interface Script {
+export interface Script {
   scriptId: string;
   name?: string;
   description?: string;
@@ -126,6 +126,11 @@ interface Script {
   timeOut?: number;
   tags?: SuperOpsJson;
 }
+
+export type ScriptMetadataPage = {
+  scripts: Script[];
+  listInfo: ListInfo;
+};
 
 interface ScriptListResponse {
   getScriptList: {
@@ -279,6 +284,18 @@ async function queryScriptList(
     input: pageInput(input.max, DEFAULT_PAGE_SIZE, input.page),
   });
   return response.getScriptList;
+}
+
+/**
+ * Read one bounded saved-script metadata page for the central catalogue sync.
+ * This deliberately exposes no script source and performs no mutation.
+ */
+export async function listSavedScriptMetadataPage(params: {
+  page?: number;
+  max?: number;
+  type?: ScriptPlatformType;
+} = {}): Promise<ScriptMetadataPage> {
+  return queryScriptList(getClient(), params);
 }
 
 async function findScriptById(

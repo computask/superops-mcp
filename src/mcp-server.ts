@@ -82,6 +82,11 @@ export async function loadDomain(domain: Domain): Promise<DomainTools> {
       tools = getScriptsTools();
       break;
     }
+    case "script_catalogue": {
+      const { getScriptCatalogueTools } = await import("./domains/script-catalogue.js");
+      tools = getScriptCatalogueTools();
+      break;
+    }
     case "alerts": {
       const { getAlertsTools } = await import("./domains/alerts.js");
       tools = getAlertsTools();
@@ -117,6 +122,8 @@ const domainDescriptions: Record<Domain, string> = {
     "Asset management - list and get hardware/software assets, endpoint inventory",
   scripts:
     "Script management - list saved RMM scripts, inspect safe metadata, review execution activity, and gated single-asset execution",
+  script_catalogue:
+    "Central authoritative SuperOps script catalogue - recommend exact read-only RMM scripts from the last complete nightly snapshot",
   alerts:
     "Alert management - list, retrieve, create, resolve, and summarise SuperOps alerts",
   technicians:
@@ -137,6 +144,7 @@ async function getAllDomainTools(): Promise<ToolDefinition[]> {
     "tickets",
     "assets",
     "scripts",
+    "script_catalogue",
     "alerts",
     "technicians",
     "custom",
@@ -233,10 +241,11 @@ const navigationTool: ToolDefinition = {
 - tickets: ${domainDescriptions.tickets}
 - assets: ${domainDescriptions.assets}
 - scripts: ${domainDescriptions.scripts}
+- script_catalogue: ${domainDescriptions.script_catalogue}
 - alerts: ${domainDescriptions.alerts}
 - technicians: ${domainDescriptions.technicians}
 - custom: ${domainDescriptions.custom}`,
-        enum: ["clients", "tickets", "assets", "scripts", "alerts", "technicians", "custom"],
+        enum: ["clients", "tickets", "assets", "scripts", "script_catalogue", "alerts", "technicians", "custom"],
       },
     },
     required: ["domain"],
@@ -399,8 +408,9 @@ async function executeToolCall(
       "clients",
       "tickets",
       "assets",
-    "scripts",
-    "alerts",
+      "scripts",
+      "script_catalogue",
+      "alerts",
       "technicians",
       "custom",
     ];
@@ -519,6 +529,10 @@ async function executeToolCall(
   }
   if (name.startsWith("superops_scripts_")) {
     const domainTools = await loadDomain("scripts");
+    return domainTools.handleCall(name, args);
+  }
+  if (name.startsWith("superops_script_catalog_")) {
+    const domainTools = await loadDomain("script_catalogue");
     return domainTools.handleCall(name, args);
   }
   if (name.startsWith("superops_alerts_")) {

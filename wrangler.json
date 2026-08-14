@@ -8,6 +8,9 @@
   ],
   "workers_dev": false,
   "preview_urls": false,
+  "triggers": {
+    "crons": ["0 2 * * *"]
+  },
   "keep_vars": true,
   "kv_namespaces": [
     {
@@ -27,6 +30,7 @@
     "CHATGPT_MCP_RESOURCE": "https://superops-mcp-chatgpt-direct.taskgroup.co.uk/mcp",
     "CHATGPT_OAUTH_SCOPES": "superops.read",
     "CHATGPT_AUTH_ALLOWED_EMAIL": "sam@computask.co.uk",
+    "CHATGPT_AUTH_ALLOWED_EMAILS": "clark@computask.co.uk,steven@computask.co.uk,jordan@computask.co.uk,stephene@computask.co.uk,desmond@computask.co.uk",
     "CHATGPT_AUTH_ACCESS_ISSUER": "https://super-bar-5ae4.cloudflareaccess.com",
     "CHATGPT_AUTH_ACCESS_AUD": "9e9e3c95cfb18bbfacfd7e8cc0ceb1a971fc61a382d4c839780f32f18cde1bf2",
     "CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS": "false",
@@ -62,6 +66,10 @@
       {
         "name": "SUPEROPS_OPERATION_LEDGER",
         "class_name": "SuperOpsOperationLedger"
+      },
+      {
+        "name": "SUPEROPS_SCRIPT_CATALOGUE",
+        "class_name": "SuperOpsScriptCatalogue"
       }
     ]
   },
@@ -69,12 +77,33 @@
     "SuperOpsOperationLedger": {
       "type": "durable-object",
       "storage": "sqlite"
+    },
+    "SuperOpsScriptCatalogue": {
+      "type": "durable-object",
+      "storage": "sqlite"
     }
   },
   "services": [
     {
       "binding": "SUPEROPS_CONTINUATION_SERVICE",
-      "service": "superops-mcp"
+      "service": "superops-mcp",
+      "environment": "production"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "superops-mcp-tg110626.taskgroup.co.uk",
+      "zone_name": "taskgroup.co.uk",
+      "custom_domain": true,
+      "enabled": true,
+      "previews_enabled": false
+    },
+    {
+      "pattern": "superops-mcp-chatgpt-direct.taskgroup.co.uk",
+      "zone_name": "taskgroup.co.uk",
+      "custom_domain": true,
+      "enabled": true,
+      "previews_enabled": false
     }
   ],
   "$schema": "node_modules/wrangler/config-schema.json",

@@ -59,7 +59,9 @@ import {
   SuperOpsOperationLedger,
 } from "./operation-store.js";
 import { SuperOpsContinuationWorkflow } from "./continuation-workflow.js";
-export { SuperOpsOperationLedger, SuperOpsContinuationWorkflow };
+import { getScriptCatalogueStore, runWithScriptCatalogueStore, SuperOpsScriptCatalogue } from "./script-catalogue-store.js";
+import { syncScriptCatalogue } from "./script-catalogue-sync.js";
+export { SuperOpsOperationLedger, SuperOpsContinuationWorkflow, SuperOpsScriptCatalogue };
 
 export interface Env {
   SUPEROPS_API_TOKEN?: string;
@@ -73,6 +75,8 @@ export interface Env {
   OAUTH_KV?: unknown;
   OAUTH_PROVIDER?: unknown;
   SUPEROPS_OPERATION_LEDGER?: unknown;
+  SUPEROPS_SCRIPT_CATALOGUE?: unknown;
+  SUPEROPS_SCRIPT_CATALOGUE_ADMIN_TOKEN?: string;
   SUPEROPS_CONTINUATION_WORKFLOW?: {
     createBatch(options: Array<{ id: string; params: Record<string, unknown> }>): Promise<Array<{ id: string }>>;
   };
@@ -226,6 +230,17 @@ async function workerOwnerHash(request: Request, env: Env): Promise<string | und
   if (!env.SUPEROPS_API_TOKEN || !env.SUPEROPS_SUBDOMAIN) return undefined;
   return envTenantOwnerHash({
     subdomain: env.SUPEROPS_SUBDOMAIN,
+    region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
+  });
+}
+
+async function scriptCatalogueTenantKey(request: Request, env: Env): Promise<string> {
+  const isGatewayMode = (env.AUTH_MODE ?? "env") === "gateway";
+  const subdomain = isGatewayMode
+    ? resolveGatewayCredentials((name) => request.headers.get(name) ?? undefined).creds?.subdomain
+    : env.SUPEROPS_SUBDOMAIN;
+  return envTenantOwnerHash({
+    subdomain: subdomain?.trim() || "default",
     region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
   });
 }
@@ -709,6 +724,45 @@ async function handleInternalContinuation(
   return json({ ok: true, result });
 }
 
+async function handleInternalScriptCataloguePublish(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  const expectedToken = env.SUPEROPS_SCRIPT_CATALOGUE_ADMIN_TOKEN?.trim();
+  const authorization = request.headers.get("Authorization") ?? "";
+  if (!expectedToken || authorization !== `Bearer ${expectedToken}`) {
+    return json({ error: "Forbidden" }, 403);
+  }
+  const contentLength = Number(request.headers.get("Content-Length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > 100_000) {
+    return json({ error: "Catalogue publish payload is too large" }, 413);
+  }
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+  const record = typeof body === "object" && body !== null && !Array.isArray(body) && "record" in body
+    ? (body as { record?: unknown }).record
+    : body;
+  if (typeof record !== "object" || record === null || Array.isArray(record)) {
+    return json({ error: "A reviewed catalogue record is required" }, 400);
+  }
+  try {
+    const tenantKey = await scriptCatalogueTenantKey(request, env);
+    await runWithScriptCatalogueStore({
+      namespace: env.SUPEROPS_SCRIPT_CATALOGUE,
+      tenantKey,
+      fn: () => getScriptCatalogueStore().publishReviewed(record as never),
+    });
+    return json({ ok: true, published: true });
+  } catch (error) {
+    return json({ error: safeCatalogueSyncError(error) }, 400);
+  }
+}
+
 async function scheduleImmediateInternalContinuation(
   operationId: string,
   ownerHash: string
@@ -807,6 +861,10 @@ async function handleBaseWorkerFetch(
 ): Promise<Response> {
   const url = new URL(request.url);
 
+  if (url.pathname === "/internal/script-catalogue/publish") {
+    return handleInternalScriptCataloguePublish(request, env);
+  }
+
   if (url.pathname === "/internal/operations/continue") {
     return handleInternalContinuation(request, env, executionContext);
   }
@@ -865,12 +923,18 @@ async function handleBaseWorkerFetch(
     return handleMcp(request, mcpBlockedToolNames);
     };
 
-    const runConfiguredMcpRequest = () =>
-      runWithContinuationScheduler(env, () =>
+    const runConfiguredMcpRequest = async () => {
+      const tenantKey = await scriptCatalogueTenantKey(request, env);
+      return runWithContinuationScheduler(env, () =>
         runWithOperationStore(env, () =>
-          runWithExecutionConfig(env, runMcpRequest)
+          runWithScriptCatalogueStore({
+            namespace: env.SUPEROPS_SCRIPT_CATALOGUE,
+            tenantKey,
+            fn: () => runWithExecutionConfig(env, runMcpRequest),
+          })
         )
       );
+    };
 
     if (auditContextApplied) {
       return runConfiguredMcpRequest();
@@ -945,6 +1009,18 @@ function getChatGptOAuthProvider(env: Env): OAuthProvider<Env> {
   return new OAuthProvider<Env>(getChatGptOAuthOptions(env));
 }
 
+function safeCatalogueSyncError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  return raw
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\b(password|token|secret|api[_-]?key)\b\s*[:=]\s*\S+/gi, "$1=[redacted]")
+    .slice(0, 500);
+}
+
+type ScheduledExecutionContext = {
+  waitUntil(promise: Promise<unknown>): void;
+};
+
 export default {
   async fetch(
     request: Request,
@@ -961,5 +1037,45 @@ export default {
     }
 
     return handleBaseWorkerFetch(request, env, ctx?.props, false, undefined, ctx);
+  },
+  scheduled(
+    _controller: unknown,
+    env: Env,
+    ctx: ScheduledExecutionContext
+  ): void {
+    if (!env.SUPEROPS_API_TOKEN || !env.SUPEROPS_SUBDOMAIN) return;
+    const credentials: SuperOpsCredentials = {
+      apiToken: env.SUPEROPS_API_TOKEN,
+      subdomain: env.SUPEROPS_SUBDOMAIN,
+      region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
+    };
+    const work = (async () => {
+      const tenantKey = await envTenantOwnerHash({
+        subdomain: credentials.subdomain,
+        region: credentials.region,
+      });
+      return runWithAuditContext(
+        {
+          requestId: `script-catalogue-nightly-${new Date().toISOString()}`,
+          ownerHash: tenantKey,
+          ownerIdentityRequired: false,
+          ...runtimeFlagsFromEnv(env),
+        },
+        () => runWithCredentials(credentials, () =>
+          runWithExecutionConfig(env, () =>
+            runWithExecutionContext("superops_script_catalogue_sync", () =>
+              runWithScriptCatalogueStore({
+                namespace: env.SUPEROPS_SCRIPT_CATALOGUE,
+                tenantKey,
+                fn: () => syncScriptCatalogue(),
+              })
+            )
+          )
+        )
+      );
+    })().catch((error) => {
+      console.error("SuperOps script catalogue nightly sync failed:", safeCatalogueSyncError(error));
+    });
+    ctx.waitUntil(work);
   },
 };
