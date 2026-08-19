@@ -1677,6 +1677,7 @@ describe("Tickets Domain", () => {
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.ticketId).toBe("ticket-55841");
+    expect(parsed.contentEvidenceState).toBe("meaningful");
     expect(parsed.safeContent.contentWarnings[0]).toContain(
       "Conversations could not be fetched safely"
     );
@@ -1691,7 +1692,7 @@ describe("Tickets Domain", () => {
     expect(parsed.contentAvailability).toMatchObject({
       conversations: { requested: true, available: false, count: 0 },
       notes: { requested: true, available: true, count: 1 },
-      degraded: false,
+      degraded: true,
     });
   });
 
@@ -1714,7 +1715,7 @@ describe("Tickets Domain", () => {
               status: "New Calls",
             },
           ],
-          listInfo: { page: 1, pageSize: 50, hasMore: false, totalCount: 2 },
+          listInfo: { page: 1, pageSize: 50, hasMore: null, totalCount: 2 },
         },
       })
       .mockResolvedValueOnce({
@@ -1848,7 +1849,7 @@ describe("Tickets Domain", () => {
       morePagesAvailable: false,
       truncated: false,
       pageSizeCapped: true,
-      upstreamHasMore: false,
+      upstreamHasMore: null,
       continuation: null,
     });
     expect(parsed.initialCandidateCount).toBe(2);
@@ -1936,7 +1937,7 @@ describe("Tickets Domain", () => {
     });
   });
 
-  it("does not claim completeness when a nonempty upstream page has ambiguous pagination", async () => {
+  it("completes a nonempty final page from valid totalCount when upstream hasMore is null", async () => {
     mockClient.query
       .mockResolvedValueOnce({
         getTicketList: {
@@ -1956,11 +1957,211 @@ describe("Tickets Domain", () => {
     });
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.pagination).toMatchObject({
-      hasMore: null,
+      hasMore: false,
       nextPage: null,
-      completeness: "upstream_pagination_ambiguous",
+      completeness: "complete",
+      complete: true,
+      upstreamHasMore: null,
+    });
+  });
+
+  it.each([
+    {
+      name: "totalCount smaller than the safe page size",
+      totalCount: 3,
+      rowCount: 3,
+      hasMore: null,
+      expectedHasMore: false,
+      expectedNextPage: null,
+      expectedCompleteness: "complete",
+      expectedComplete: true,
+    },
+    {
+      name: "totalCount exactly equal to the safe page size",
+      totalCount: 8,
+      rowCount: 8,
+      hasMore: null,
+      expectedHasMore: false,
+      expectedNextPage: null,
+      expectedCompleteness: "complete",
+      expectedComplete: true,
+    },
+    {
+      name: "totalCount larger than the safe page size",
+      totalCount: 9,
+      rowCount: 8,
+      hasMore: null,
+      expectedHasMore: null,
+      expectedNextPage: null,
+      expectedCompleteness: "upstream_pagination_ambiguous",
+      expectedComplete: false,
+    },
+    {
+      name: "missing totalCount",
+      rowCount: 8,
+      hasMore: null,
+      expectedHasMore: null,
+      expectedNextPage: null,
+      expectedCompleteness: "upstream_pagination_ambiguous",
+      expectedComplete: false,
+    },
+    {
+      name: "invalid totalCount",
+      totalCount: -1,
+      rowCount: 8,
+      hasMore: null,
+      expectedHasMore: null,
+      expectedNextPage: null,
+      expectedCompleteness: "upstream_pagination_ambiguous",
+      expectedComplete: false,
+    },
+    {
+      name: "explicit hasMore true contradicts a reached totalCount",
+      totalCount: 8,
+      rowCount: 8,
+      hasMore: true,
+      expectedHasMore: true,
+      expectedNextPage: 2,
+      expectedCompleteness: "more_pages_available",
+      expectedComplete: false,
+    },
+    {
+      name: "nonempty page contradicts a zero totalCount",
+      totalCount: 0,
+      rowCount: 1,
+      hasMore: null,
+      expectedHasMore: null,
+      expectedNextPage: null,
+      expectedCompleteness: "upstream_pagination_ambiguous",
+      expectedComplete: false,
+    },
+  ])("keeps total-count completion conservative for $name", async (scenario) => {
+    mockClient.query.mockImplementation(async (
+      query: string,
+      variables?: { input?: { ticketId?: string } }
+    ) => {
+      if (query.includes("getTicketList")) {
+        const listInfo = {
+          page: 1,
+          pageSize: 8,
+          hasMore: scenario.hasMore,
+          ...(scenario.totalCount === undefined ? {} : { totalCount: scenario.totalCount }),
+        };
+        return {
+          getTicketList: {
+            tickets: Array.from({ length: scenario.rowCount }, (_, index) => ({
+              ticketId: `total-count-${index}`,
+              displayId: String(59200 + index),
+              subject: `Total count ${index}`,
+              status: "New Calls",
+            })),
+            listInfo,
+          },
+        };
+      }
+      if (query.includes("getTicket(input")) {
+        const ticketId = variables?.input?.ticketId ?? "total-count-0";
+        return {
+          getTicket: {
+            ticketId,
+            displayId: String(59200 + Number(ticketId.split("-").pop() ?? 0)),
+            subject: "Total count",
+            status: "New Calls",
+          },
+        };
+      }
+      throw new Error(`Unexpected query: ${query}`);
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      max: 8,
+      page: 1,
+      includeConversations: false,
+      includeNotes: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBeUndefined();
+    expect(parsed.pagination).toMatchObject({
+      pageSize: 8,
+      hasMore: scenario.expectedHasMore,
+      nextPage: scenario.expectedNextPage,
+      completeness: scenario.expectedCompleteness,
+      complete: scenario.expectedComplete,
+      upstreamHasMore: scenario.hasMore,
+    });
+  });
+
+  it("uses raw upstream rows on a final null page while preserving cross-page deduplication", async () => {
+    const firstPageCandidates = Array.from({ length: 8 }, (_, index) => ({
+      ticketId: `cross-page-${index}`,
+      displayId: String(59300 + index),
+      subject: `Cross page ${index}`,
+      status: "New Calls",
+    }));
+    const secondPageCandidates = [
+      firstPageCandidates[7],
+      { ticketId: "cross-page-8", displayId: "59308", subject: "Cross page 8", status: "New Calls" },
+      { ticketId: "cross-page-9", displayId: "59309", subject: "Cross page 9", status: "New Calls" },
+    ];
+
+    mockClient.query.mockImplementation(async (
+      query: string,
+      variables?: { input?: { page?: number; ticketId?: string } }
+    ) => {
+      if (query.includes("getTicketList")) {
+        const page = variables?.input?.page ?? 1;
+        return {
+          getTicketList: {
+            tickets: page === 1 ? firstPageCandidates : secondPageCandidates,
+            listInfo: { page, pageSize: 8, hasMore: page === 1 ? true : null, totalCount: 10 },
+          },
+        };
+      }
+      if (query.includes("getTicket(input")) {
+        const ticketId = variables?.input?.ticketId ?? "cross-page-0";
+        const candidate = [...firstPageCandidates, ...secondPageCandidates]
+          .find((ticket) => ticket.ticketId === ticketId);
+        return { getTicket: candidate };
+      }
+      throw new Error(`Unexpected query: ${query}`);
+    });
+
+    const domain = getTicketsTools();
+    const firstPage = JSON.parse((await domain.handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      max: 8,
+      page: 1,
+      includeConversations: false,
+      includeNotes: false,
+    })).content[0].text);
+    const secondPage = JSON.parse((await domain.handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      max: 8,
+      page: 2,
+      excludeCandidateTicketNumbers: firstPage.candidateTicketNumbers,
+      includeConversations: false,
+      includeNotes: false,
+    })).content[0].text);
+
+    expect(firstPage.pagination).toMatchObject({
+      hasMore: true,
+      nextPage: 2,
+      completeness: "more_pages_available",
       complete: false,
     });
+    expect(secondPage.pagination).toMatchObject({
+      hasMore: false,
+      upstreamHasMore: null,
+      nextPage: null,
+      completeness: "complete",
+      complete: true,
+    });
+    expect(secondPage.upstreamCandidateCount).toBe(3);
+    expect(secondPage.initialCandidateCount).toBe(2);
+    expect(secondPage.excludedCandidateCount).toBe(1);
+    expect(secondPage.candidateTicketNumbers).toEqual(["59308", "59309"]);
   });
 
   it("returns an explicit budget_capped state when the list read cannot start", async () => {
@@ -2440,6 +2641,116 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it("keeps meaningful evidence when the optional notes channel is rate-limited across safe paths", async () => {
+    const ticket = {
+      ticketId: "partial-evidence-60624",
+      displayId: "60624",
+      subject: "Partial evidence",
+      status: "New Calls",
+      updatedTime: "2026-08-19T09:00:00.000Z",
+    };
+    mockClient.query.mockImplementation(async (
+      query: string,
+      variables?: { input?: { condition?: { attribute?: string }; ticketId?: string } }
+    ) => {
+      if (query.includes("getTicketList")) {
+        return {
+          getTicketList: {
+            tickets: [ticket],
+            listInfo: { page: 1, pageSize: 8, hasMore: false, totalCount: 1 },
+          },
+        };
+      }
+      if (query.includes("getTicket(input")) {
+        return { getTicket: { ...ticket, ticketId: variables?.input?.ticketId ?? ticket.ticketId } };
+      }
+      if (query.includes("getTicketConversationList")) {
+        return {
+          getTicketConversationList: [{
+            conversationId: "partial-description-60624",
+            type: "DESCRIPTION",
+            time: "2026-08-19T08:00:00.000Z",
+            content: "A meaningful description remains available.",
+          }],
+        };
+      }
+      if (query.includes("getTicketNoteList")) {
+        throw new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded", 2);
+      }
+      throw new Error(`Unexpected query: ${query}`);
+    });
+
+    const domain = getTicketsTools();
+    const byNumberResult = await domain.handleCall("superops_tickets_get_safe_by_number", {
+      ticketNumber: "60624",
+      includeConversations: true,
+      includeNotes: true,
+    });
+    const byNumber = JSON.parse(byNumberResult.content[0].text);
+
+    const byIdResult = await domain.handleCall("superops_tickets_get_safe", {
+      ticketId: ticket.ticketId,
+      includeConversations: true,
+      includeNotes: true,
+    });
+    const byId = JSON.parse(byIdResult.content[0].text);
+
+    const snapshotResult = await domain.handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      includeConversations: true,
+      includeNotes: true,
+    });
+    const snapshot = JSON.parse(snapshotResult.content[0].text);
+
+    const recoveryResult = await domain.handleCall("superops_tickets_triage_evidence_recover", {
+      ticketIds: [ticket.ticketId],
+      includeConversations: true,
+      includeNotes: true,
+    });
+    const recovery = JSON.parse(recoveryResult.content[0].text);
+
+    expect(byNumberResult.isError).toBeUndefined();
+    expect(byNumber).toMatchObject({
+      contentEvidenceState: "meaningful",
+      contentAvailability: {
+        conversations: { requested: true, available: true, count: 1 },
+        notes: { requested: true, available: false, count: 0 },
+        degraded: true,
+      },
+      safeContent: {
+        items: [{ plainText: "A meaningful description remains available." }],
+        contentWarnings: expect.arrayContaining([
+          expect.stringContaining("Notes could not be fetched safely"),
+        ]),
+      },
+    });
+    expect(byIdResult.isError).toBeUndefined();
+    expect(byId).toMatchObject({
+      ok: false,
+      contentEvidenceState: "meaningful",
+      evidence: { contentEvidenceState: "meaningful" },
+      errors: [expect.stringContaining("Notes could not be fetched safely")],
+    });
+    expect(snapshotResult.isError).toBeUndefined();
+    expect(snapshot.tickets[0]).toMatchObject({
+      contentEvidenceState: "meaningful",
+      contentAvailability: {
+        conversations: "available",
+        notes: "unavailable",
+        degraded: true,
+      },
+      warnings: [expect.stringContaining("Notes could not be fetched safely")],
+    });
+    expect(recoveryResult.isError).toBeUndefined();
+    expect(recovery.results[0]).toMatchObject({
+      ok: false,
+      contentEvidenceState: "meaningful",
+      evidence: { contentEvidenceState: "meaningful" },
+      errors: [expect.stringContaining("Notes could not be fetched safely")],
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
   it("recovers bounded sanitised evidence by immutable ticket ID and preserves batch failures", async () => {
     mockClient.query.mockImplementation(async (
       query: string,
@@ -2708,6 +3019,7 @@ describe("Tickets Domain", () => {
         ticketNumber: "57402",
         ticketId: "ticket-57402",
         processingState: "Failed",
+        contentEvidenceState: "unavailable",
         warnings: expect.arrayContaining([
           expect.stringContaining("Metadata could not be fetched safely"),
           expect.stringContaining("Conversations could not be fetched safely"),

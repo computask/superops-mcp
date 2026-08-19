@@ -216,6 +216,11 @@ and MIME-like payloads, removes base64/data/cid embedded content, redacts
 credentials, tokens, private keys, long hashes, passwords, passcodes and secrets,
 and truncates long content. Attachment bodies are never returned by the safe
 tool; `attachments` currently supports only `metadataOnly` and `none`.
+`contentEvidenceState` is `meaningful` when any safe returned item has usable text,
+even if an optional content channel failed; the failure remains visible in the
+warnings/errors and `contentAvailability`, including `degraded: true`. It is
+`unavailable` when no usable item exists and retrieval failed, and it never by
+itself makes content verified for a write.
 
 `superops_tickets_triage_snapshot` is the preferred read-only starting point for
 New Calls triage. It lists the requested status/page once using the normal ticket
@@ -229,6 +234,16 @@ from SuperOps conversation items with type `DESCRIPTION`; the tool does not quer
 `Ticket.description`, because that field is not available in the live schema.
 Prefer this tool over manually listing New Calls and then issuing many individual
 safe reads.
+
+When SuperOps returns `hasMore: null`, the snapshot can still mark a page complete
+only when a valid non-negative `totalCount` is reached by the current page position
+plus the raw upstream row count, with no list failure or row truncation and no
+explicit `hasMore: true`. A reduced execution-safe page can therefore be complete
+while `budgetCapped` remains true; `truncated` and `budget_capped`/`truncated`
+completeness states are not complete. If the list page remains rate-limited after
+bounded client retries, the snapshot preserves the intentional top-level tool
+error rather than returning a partial page that could be mistaken for a complete
+candidate set.
 
 
 ### Historical ticket reporting
@@ -684,6 +699,10 @@ The MCP distinguishes SuperOps upstream throttling from Cloudflare invocation-bu
 exhaustion. Read calls retry only with bounded attempts and capped Retry-After or
 exponential backoff delays. Write calls are not blindly retried by the central client;
 a write path must prove idempotency or verify current state before adding safe retries.
+The New Calls snapshot does not convert a failed list-page read or exhausted list-page
+rate limit into an empty result: after those bounded retries, the existing top-level
+tool error is preserved so the caller can retry without acting on an incomplete
+candidate set.
 
 ## License
 

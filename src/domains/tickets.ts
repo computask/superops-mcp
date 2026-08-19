@@ -1906,15 +1906,64 @@ function boundedTriageCandidateNumbers(value: unknown): string[] {
   return result;
 }
 
+function triageSnapshotTotalCountProvesComplete(params: {
+  totalCount: unknown;
+  page: number;
+  pageSize: number;
+  upstreamRecordCount: number;
+  upstreamHasMore: boolean | null;
+  upstreamRowsTruncated: boolean;
+  listPageReadSucceeded: boolean;
+}): boolean {
+  if (
+    params.upstreamHasMore !== null ||
+    params.upstreamRowsTruncated ||
+    !params.listPageReadSucceeded
+  ) {
+    return false;
+  }
+
+  const totalCount = params.totalCount;
+  if (
+    typeof totalCount !== "number" ||
+    !Number.isSafeInteger(totalCount) ||
+    totalCount < 0 ||
+    !Number.isSafeInteger(params.page) ||
+    params.page < 1 ||
+    !Number.isSafeInteger(params.pageSize) ||
+    params.pageSize < 1 ||
+    !Number.isSafeInteger(params.upstreamRecordCount) ||
+    params.upstreamRecordCount < 0
+  ) {
+    return false;
+  }
+
+  const pageStart = (params.page - 1) * params.pageSize;
+  if (!Number.isSafeInteger(pageStart) || pageStart > totalCount) {
+    return false;
+  }
+
+  // A non-empty page contradicts an explicit zero total; do not turn that
+  // inconsistent upstream response into a complete fixed candidate set.
+  if (totalCount === 0 && params.upstreamRecordCount > 0) {
+    return false;
+  }
+
+  const enumeratedThrough = pageStart + params.upstreamRecordCount;
+  return Number.isSafeInteger(enumeratedThrough) && enumeratedThrough >= totalCount;
+}
+
 function triageSnapshotCompleteness(params: {
   hasMore: boolean | null;
   budgetCappedRead: boolean;
   truncated: boolean;
+  totalCountComplete: boolean;
 }): TriageSnapshotCompleteness {
   if (params.truncated) return "truncated";
   if (params.budgetCappedRead) return "budget_capped";
   if (params.hasMore === false) return "complete";
   if (params.hasMore === true) return "more_pages_available";
+  if (params.totalCountComplete) return "complete";
   return "upstream_pagination_ambiguous";
 }
 
@@ -2290,6 +2339,16 @@ function mergeDiagnostics(
   }
 }
 
+function contentEvidenceStateForItems(
+  items: readonly { plainText: string }[],
+  contentErrors: readonly string[] = []
+): TriageContentEvidenceState {
+  if (items.some((item) => item.plainText.trim().length > 0)) {
+    return "meaningful";
+  }
+  return contentErrors.length > 0 ? "unavailable" : "empty";
+}
+
 function safeErrorMessage(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error);
   return normalizePlainText(
@@ -2462,6 +2521,10 @@ function buildSafeTicketResult(params: {
       (item.type === "conversation" && item.direction === "technician") ||
       (item.type === "note" && !item.isInternal)
   );
+  const contentEvidenceState = contentEvidenceStateForItems(
+    limitedItems,
+    params.contentErrors ?? []
+  );
 
   return {
     ticketNumber: ticket.displayId,
@@ -2502,11 +2565,13 @@ function buildSafeTicketResult(params: {
         available: noteCount > 0,
         count: noteCount,
       },
-      degraded: limitedItems.length === 0 && (conversationCount > 0 || noteCount > 0),
+      degraded: (params.contentErrors?.length ?? 0) > 0 ||
+        (limitedItems.length === 0 && (conversationCount > 0 || noteCount > 0)),
     },
     latestCustomerMessage,
     latestInternalNote,
     latestTechnicianReply,
+    contentEvidenceState,
     attachments,
     sanitization,
   };
@@ -2658,11 +2723,9 @@ function buildTriageSnapshotTicket(params: {
     .slice(0, 800);
   const conversationAvailability = safeResult.contentAvailability.conversations;
   const noteAvailability = safeResult.contentAvailability.notes;
-  const contentEvidenceState: TriageContentEvidenceState = contentErrors.length > 0 || !metadataAvailable
-    ? "unavailable"
-    : safeContentItems.some((item) => item.plainText.trim().length > 0)
-      ? "meaningful"
-      : "empty";
+  const contentEvidenceState = metadataAvailable
+    ? contentEvidenceStateForItems(safeContentItems, contentErrors)
+    : "unavailable";
 
   return {
     ticketNumber: ticket.displayId ?? candidate.displayId,
@@ -2709,6 +2772,7 @@ function buildTriageSnapshotTicket(params: {
         : noteAvailability.requested
           ? "unavailable"
           : "notRequested",
+      degraded: safeResult.contentAvailability.degraded,
       attachments: safeResult.sanitization.attachmentsMetadataOnly
         ? "metadataOnly"
         : "none",
@@ -9962,11 +10026,7 @@ export function getTicketsTools(): DomainTools {
                 text: JSON.stringify({
                   ok: collection.contentErrors.length === 0,
                   ticketId,
-                  contentEvidenceState: collection.contentErrors.length > 0
-                    ? "unavailable"
-                    : collection.safeResult.safeContent.items.some((item) => item.plainText.trim())
-                      ? "meaningful"
-                      : "empty",
+                  contentEvidenceState: collection.safeResult.contentEvidenceState,
                   evidence: collection.safeResult,
                   errors: collection.contentErrors,
                 }, null, 2),
@@ -10019,11 +10079,7 @@ export function getTicketsTools(): DomainTools {
                 recovered.push({
                   ticketId,
                   ok: collection.contentErrors.length === 0,
-                  contentEvidenceState: collection.contentErrors.length > 0
-                    ? "unavailable"
-                    : collection.safeResult.safeContent.items.some((item) => item.plainText.trim())
-                      ? "meaningful"
-                      : "empty",
+                  contentEvidenceState: collection.safeResult.contentEvidenceState,
                   evidence: collection.safeResult,
                   errors: collection.contentErrors,
                 });
@@ -10135,6 +10191,9 @@ export function getTicketsTools(): DomainTools {
                 }),
               });
             } catch (error) {
+              // Preserve list-page failures as top-level tool errors. A partial
+              // candidate page could be mistaken for a complete frozen set;
+              // the shared client already applies bounded read retries.
               if (!isExecutionStopError(error)) throw error;
               return {
                 content: [{
@@ -10199,7 +10258,17 @@ export function getTicketsTools(): DomainTools {
               upstreamCandidates.length === 0 &&
               listInfo.totalCount === 0 &&
               upstreamHasMore !== true;
-            const resolvedHasMore = emptyQueueTerminal ? false : upstreamHasMore;
+            const totalCountPageComplete = triageSnapshotTotalCountProvesComplete({
+              totalCount: listInfo.totalCount,
+              page: snapshotParams.page,
+              pageSize: effectiveMax,
+              upstreamRecordCount: upstreamCandidates.length,
+              upstreamHasMore,
+              // A successful getTicketList response is materialized in full;
+              // this path applies no local cap that can remove upstream rows.
+              upstreamRowsTruncated: false,
+              listPageReadSucceeded: true,
+            });
             const candidateTicketNumbers = candidates.map(
               (ticket) => ticket.displayId ?? ticket.ticketId
             );
@@ -10232,10 +10301,15 @@ export function getTicketsTools(): DomainTools {
                 message: "Execution budget reached before safe evidence was collected for every candidate on this page.",
               });
             }
+            const totalCountComplete = totalCountPageComplete && !truncated && !budgetCappedRead;
+            const resolvedHasMore = emptyQueueTerminal || totalCountComplete
+              ? false
+              : upstreamHasMore;
             const completeness = triageSnapshotCompleteness({
               hasMore: resolvedHasMore,
               budgetCappedRead,
               truncated,
+              totalCountComplete,
             });
             const nextPage = completeness === "more_pages_available"
               ? snapshotParams.page + 1

@@ -18,17 +18,21 @@ READ PHASE
 - includeAttachments: metadataOnly
 - latestFirst: true
 
-2. Retrieve every page by following pagination.nextPage until it is null. The snapshot is complete only when:
+2. Retrieve every page by following pagination.nextPage until it is null. Retain every candidate from every page in one fixed ordered list and use the snapshot's explicit completeness state. When upstream hasMore is null, the snapshot may be terminal only when all of these are true:
 
-- pagination.nextPage is null;
-- the aggregate unique candidate count exactly matches pagination.totalCount; and
-- every candidate from every page is retained in one fixed ordered list.
+- pagination.complete is true and pagination.completeness is complete;
+- pagination.totalCount is a valid finite non-negative count;
+- the current page position plus the raw upstream row count reaches or exceeds totalCount;
+- the list page succeeded and was not truncated; and
+- the upstream response did not explicitly say hasMore:true.
 
-Never treat hasMore:null as proof of completion. A smaller execution-safe page or budgetCapped:true does not make the aggregate incomplete by itself; continue following nextPage.
+Do not use the deduplicated candidate count as a substitute for raw upstream rows, and do not infer completion from page length alone. A smaller execution-safe page may still be complete when all rows covered by totalCount were returned; `truncated:true` or `completeness` of `budget_capped`/`truncated` remains incomplete and must be continued. If a null hasMore response does not satisfy the total-count rule, treat it as ambiguous and do not claim a complete aggregate.
 
 3. Safely recover missing or truncated metadata, conversations and private notes with read-only safe ticket tools. Prefer superops_tickets_triage_evidence_recover for up to ten immutable internal ticket IDs in their frozen order. Use superops_tickets_get_safe for a single immutable internal ticket ID when individual follow-up is required. Use display-number reads only as a fallback or diagnostic aid.
 
 Retry read-only failures and rate limits with bounded waits. Respect any retry delay returned by the tool. Never treat a retrieval failure, unsupported note shape, unavailable client value, truncation or rate limit as empty content.
+
+If the list page itself remains rate-limited after the shared client's bounded read retries, the snapshot intentionally returns the existing top-level tool error rather than a partial candidate page. Retry the tool later; never interpret that error as an empty or complete queue. Per-ticket content-channel failures remain structured in the safe evidence response.
 
 Do not retrieve attachment bodies.
 
@@ -69,9 +73,9 @@ Use exactly one policyReason consistent with policyDisposition:
 
 Set contentEvidenceState from the frozen safe evidence:
 
-- meaningful: usable verified ticket content supports the decision;
-- empty: every required content source was retrieved successfully but contains no usable content; or
-- unavailable: any required content source failed, was truncated beyond safe recovery, rate-limited, unsupported or otherwise unproven.
+- meaningful: at least one safe description, conversation or note item contains usable text. An optional channel may still have failed or been rate-limited; preserve that failure in warnings/errors/content availability and `degraded`, and do not treat meaningful as contentVerified;
+- empty: all requested content channels were retrieved successfully but contain no usable content; or
+- unavailable: no usable safe item exists and one or more required content sources failed, was truncated beyond safe recovery, rate-limited, unsupported or otherwise unproven. If every requested content channel fails, the state is unavailable.
 
 contentEvidenceState unavailable blocks the entire batch. Empty content is not affirmative no-action evidence. An empty or unexplained ticket, including the ticket-59405 shape, must use manual_intake with action leave. It must not use resolve_no_action. The only subject-proven exception is a Microsoft Outlook Reaction Daily Digest, which must use resolve_no_action with policyReason outlook_reaction_digest.
 
