@@ -127,7 +127,7 @@ const RUN_SCRIPT_ON_ASSET_MUTATION = `
   }
 `;
 
-interface Script {
+export interface Script {
   scriptId: string;
   name?: string;
   description?: string;
@@ -173,6 +173,11 @@ interface ScriptCatalogueRecommendationParams {
   safetyRequirementsVerified: boolean;
   maxCandidates: number;
 }
+
+export type ScriptMetadataPage = {
+  scripts: Script[];
+  listInfo: ListInfo;
+};
 
 interface ScriptListResponse {
   getScriptList: {
@@ -626,6 +631,18 @@ async function queryScriptList(
   return response.getScriptList;
 }
 
+/**
+ * Read one bounded saved-script metadata page for the central catalogue sync.
+ * This deliberately exposes no script source and performs no mutation.
+ */
+export async function listSavedScriptMetadataPage(params: {
+  page?: number;
+  max?: number;
+  type?: ScriptPlatformType;
+} = {}): Promise<ScriptMetadataPage> {
+  return queryScriptList(getClient(), params);
+}
+
 async function findScriptById(
   client: ReturnType<typeof getClient>,
   scriptId: string,
@@ -895,73 +912,6 @@ export function getScriptsTools(): DomainTools {
             scriptId: { type: "string", description: "Exact saved SuperOps script ID." },
           },
           required: ["scriptId"],
-        },
-      },
-      {
-        name: "superops_script_catalog_status",
-        description:
-          "Read-only status for the existing published saved-script catalogue. An INCOMPLETE or DEGRADED sync means coverage cannot be claimed complete, but it does not invalidate a specific published REVIEWED record that is present. Does not return script source or authorise execution.",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
-      {
-        name: "superops_script_catalog_get",
-        description:
-          "Read-only safe metadata for one exact published script-catalogue record. A record is advisory evidence only; REVIEWED status, platform applicability, prerequisites, and safety metadata are exposed without returning source or authorising execution.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            scriptId: { type: "string", description: "Exact saved SuperOps script ID." },
-          },
-          required: ["scriptId"],
-        },
-      },
-      {
-        name: "superops_script_catalog_recommend",
-        description:
-          "Read-only advisory recommendation from the existing published script catalogue. Definitive recommendations require a present REVIEWED record with no DO_NOT_USE or LEGACY marker, compatible verified platform, met prerequisites, and satisfied safety requirements. NEEDS_DETAILS is only a candidate state. A catalogue recommendation never authorises script execution.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            request: {
-              type: "string",
-              maxLength: 500,
-              description: "Bounded task description used for lexical matching; do not include customer message bodies or secrets.",
-            },
-            targetPlatform: {
-              type: "string",
-              enum: [...SCRIPT_PLATFORM_TYPES],
-              description: "Target platform when known. A platform-restricted script cannot be definitively recommended until this is verified.",
-            },
-            platformVerified: {
-              type: "boolean",
-              default: false,
-              description: "Set true only when the target platform is verified from live asset evidence.",
-            },
-            verifiedPrerequisites: {
-              type: "array",
-              maxItems: 20,
-              items: { type: "string", maxLength: 120 },
-              description: "Bounded prerequisite identifiers confirmed by evidence.",
-            },
-            prerequisitesMet: {
-              type: "boolean",
-              description: "Explicitly false when known prerequisites are not met.",
-            },
-            safetyRequirementsVerified: {
-              type: "boolean",
-              default: false,
-              description: "Set true only after the catalogue safety requirements are verified for this advisory context.",
-            },
-            maxCandidates: {
-              type: "number",
-              default: 20,
-              description: "Maximum bounded catalogue records to inspect (max 100).",
-            },
-          },
-          required: ["request"],
         },
       },
       {

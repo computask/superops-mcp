@@ -72,9 +72,6 @@ describe("Scripts Domain", () => {
     expect(domain.tools.map((tool) => tool.name)).toEqual([
       "superops_scripts_list",
       "superops_scripts_get",
-      "superops_script_catalog_status",
-      "superops_script_catalog_get",
-      "superops_script_catalog_recommend",
       "superops_scripts_supported_targets",
       "superops_scripts_executions_list",
       "superops_scripts_execution_get",

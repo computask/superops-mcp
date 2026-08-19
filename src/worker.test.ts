@@ -622,6 +622,7 @@ describe("Cloudflare Worker entrypoint", () => {
       CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION: "true",
     });
     const byName = toolsByName(tools);
+    expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length);
 
     expect(byName.get("superops_tickets_triage_snapshot")?.annotations).toEqual(
       EXPECTED_READ_ONLY_ANNOTATIONS
