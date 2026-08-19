@@ -18,7 +18,10 @@ export const MUTATING_TOOL_ANNOTATIONS: ToolAnnotations = {
 
 const EMERGING_ISSUE_TOOL_ANNOTATIONS: ToolAnnotations = {
   readOnlyHint: false,
-  destructiveHint: false,
+  // The signal is internal and bounded, but an upsert changes durable state.
+  // Advertise that state change so authenticated MCP clients do not discard
+  // this non-read-only tool as an unclassified middle state.
+  destructiveHint: true,
   idempotentHint: true,
   openWorldHint: false,
 };

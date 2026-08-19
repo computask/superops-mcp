@@ -22,7 +22,7 @@ export const TRIAGE_EMERGING_ISSUE_TOOL_NAME = "superops_triage_emerging_issue_u
 export const triageEmergingIssueTool: ToolDefinition = {
   name: TRIAGE_EMERGING_ISSUE_TOOL_NAME,
   description:
-    "Internal durable emerging-issue signal only. Use only for credible cross-client evidence correlated by the Ticket History MCP and triage agent; requester recurrence or recurrence confined to one client is not a wider issue. The signal is stable-fingerprint deduplicated, bounded, and does not contact customers, choose notification destinations, create or change tickets, merge tickets, execute scripts, or remediate systems.",
+    "Internal durable emerging-issue signal only. Use only for credible cross-client evidence correlated by the Ticket History MCP and triage agent; do not use it for single-requester recurrence, single-client recurrence, weak textual similarity, or generic shared terminology. The signal is stable-fingerprint deduplicated, bounded, internally owner-scoped, and does not contact customers, choose arbitrary notification destinations, create or change tickets, modify related tickets, merge tickets, execute or schedule scripts, or remediate systems.",
   inputSchema: {
     type: "object",
     properties: {

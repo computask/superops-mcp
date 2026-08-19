@@ -272,6 +272,10 @@ type ToolSafetyAnnotations = {
 type PublishedTool = {
   name: string;
   description?: string;
+  inputSchema: {
+    required?: string[];
+    properties?: Record<string, unknown>;
+  };
   annotations?: ToolSafetyAnnotations;
 };
 
@@ -651,7 +655,7 @@ describe("Cloudflare Worker entrypoint", () => {
       const tool = byName.get(name);
       expect(tool, `${name} should be published in the full catalogue`).toBeDefined();
       expect(tool?.annotations?.readOnlyHint).toBe(false);
-      expect(tool?.annotations?.destructiveHint).toBe(name === "superops_triage_emerging_issue_upsert" ? false : true);
+      expect(tool?.annotations?.destructiveHint).toBe(true);
     }
 
     for (const tool of tools) {
@@ -2117,6 +2121,44 @@ describe("Cloudflare Worker entrypoint", () => {
     });
     expect(parsed.operation.continuationScheduling).toBeUndefined();
     expect(serviceRequests).toHaveLength(0);
+  });
+
+  it("publishes the bounded emerging issue signal on the authenticated direct tools list", async () => {
+    const env = chatGptEnv({
+      SUPEROPS_API_TOKEN: "test-token",
+      SUPEROPS_SUBDOMAIN: "acme",
+      CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+    });
+    const token = await getOAuthAccessToken(env);
+    const list = await mcp(
+      { jsonrpc: "2.0", id: 72, method: "tools/list", params: {} },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+    const body = (await list.json()) as { result?: { tools?: PublishedTool[] } };
+    const tool = toolsByName(body.result?.tools ?? []).get("superops_triage_emerging_issue_upsert");
+
+    expect(tool).toBeDefined();
+    expect(tool?.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+    expect(tool?.description).toContain("credible cross-client evidence");
+    expect(tool?.description).toContain("does not contact customers");
+    expect(tool?.description).toContain("modify related tickets");
+    expect(tool?.inputSchema.required).toEqual(expect.arrayContaining([
+      "issueFingerprint",
+      "summary",
+      "firstSeen",
+      "lastSeen",
+      "affectedClientCount",
+      "evidenceStrength",
+    ]));
   });
 
   it("keeps all other direct mutation and custom tools blocked when triage is allowed", async () => {
