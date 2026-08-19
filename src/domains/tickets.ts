@@ -100,6 +100,14 @@ const DEFAULT_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET = 3000;
 const MAX_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET = 10000;
 const DEFAULT_TRIAGE_MAX_ITEMS_PER_TICKET = 8;
 const MAX_TRIAGE_MAX_ITEMS_PER_TICKET = 20;
+const TRIAGE_SNAPSHOT_COMPLETENESS_STATES = [
+  "complete",
+  "more_pages_available",
+  "upstream_pagination_ambiguous",
+  "budget_capped",
+  "truncated",
+] as const;
+type TriageSnapshotCompleteness = (typeof TRIAGE_SNAPSHOT_COMPLETENESS_STATES)[number];
 const DISPLAY_ID_EQUALS_OPERATOR = "is";
 const STATUS_EQUALS_OPERATOR = "is";
 const STATUS_IN_OPERATOR = "in";
@@ -591,6 +599,7 @@ interface TriageSnapshotParams {
   status?: string[];
   max?: number;
   page?: number;
+  excludeCandidateTicketNumbers?: string[];
   safeRead?: boolean;
   includeNotes?: boolean;
   includeConversations?: boolean;
@@ -644,6 +653,7 @@ interface NormalizedTriageSnapshotParams {
   status: string[];
   max: number;
   page: number;
+  excludeCandidateTicketNumbers: string[];
   safeRead: true;
   includeNotes: boolean;
   includeConversations: boolean;
@@ -1860,6 +1870,54 @@ function triageSnapshotEffectivePageSize(
   return Math.max(1, Math.min(params.max, Math.floor(usableSubrequests / candidateReadCost)));
 }
 
+function upstreamHasMoreValue(value: unknown): boolean | null {
+  if (value === true) return true;
+  if (value === false) return false;
+  return null;
+}
+
+function uniqueTriageSnapshotCandidates(
+  candidates: Ticket[],
+  excludedTicketNumbers: ReadonlySet<string> = new Set()
+): Ticket[] {
+  const seen = new Set<string>();
+  return candidates.filter((ticket) => {
+    const identity = ticket.ticketId || ticket.displayId;
+    const ticketNumber = ticket.displayId ?? ticket.ticketId;
+    if (!identity || seen.has(identity) || excludedTicketNumbers.has(identity) ||
+        (ticketNumber !== undefined && excludedTicketNumbers.has(ticketNumber))) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+function boundedTriageCandidateNumbers(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    const ticketNumber = entry.trim();
+    if (!ticketNumber || ticketNumber.length > 40 || seen.has(ticketNumber)) continue;
+    seen.add(ticketNumber);
+    result.push(ticketNumber);
+    if (result.length >= MAX_TRIAGE_SNAPSHOT_MAX) break;
+  }
+  return result;
+}
+
+function triageSnapshotCompleteness(params: {
+  hasMore: boolean | null;
+  budgetCappedRead: boolean;
+  truncated: boolean;
+}): TriageSnapshotCompleteness {
+  if (params.truncated) return "truncated";
+  if (params.budgetCappedRead) return "budget_capped";
+  if (params.hasMore === false) return "complete";
+  if (params.hasMore === true) return "more_pages_available";
+  return "upstream_pagination_ambiguous";
+}
+
 function triageSnapshotParams(
   args: TriageSnapshotParams
 ): NormalizedTriageSnapshotParams {
@@ -1886,6 +1944,7 @@ function triageSnapshotParams(
     status: args.status && args.status.length > 0 ? args.status : ["New Calls"],
     max: Math.min(Math.max(max, 1), MAX_TRIAGE_SNAPSHOT_MAX),
     page: Math.max(page, 1),
+    excludeCandidateTicketNumbers: boundedTriageCandidateNumbers(args.excludeCandidateTicketNumbers),
     safeRead: true,
     includeNotes: args.includeNotes ?? true,
     includeConversations: args.includeConversations ?? true,
@@ -9070,7 +9129,7 @@ export function getTicketsTools(): DomainTools {
       {
         name: "superops_tickets_triage_snapshot",
         description:
-          "Read-only ticket triage snapshot for an explicitly selected configured status queue. Returns one execution-safe page of fixed candidates with safe compact metadata and sanitized conversation/note evidence. Follow pagination.nextPage until hasMore is false before proposing a complete queue plan.",
+          "Read-only ticket triage snapshot for an explicitly selected configured status queue. Returns one execution-safe page of fixed candidates with safe compact metadata and sanitized conversation/note evidence. A complete snapshot has pagination.completeness=complete and hasMore=false; more_pages_available means another page is required, upstream_pagination_ambiguous means SuperOps did not provide a reliable terminal flag, and budget_capped or truncated means the read is partial. Pass prior candidateTicketNumbers as excludeCandidateTicketNumbers when aggregating pages so repeated upstream candidates are not reprocessed. Do not propose a complete queue plan unless the queue is conclusively complete. No ticket write is performed.",
         inputSchema: {
           type: "object",
           properties: {
@@ -9087,12 +9146,19 @@ export function getTicketsTools(): DomainTools {
             max: {
               type: "number",
               default: DEFAULT_TRIAGE_SNAPSHOT_MAX,
-              description: "Requested candidates per page (default: 50, max: 500). The tool automatically uses a smaller stable page size when required to preserve safe metadata and content reads; follow pagination.nextPage until hasMore is false.",
+              description: "Requested candidates per page (default: 50, max: 500). The tool automatically uses a smaller stable page size when required to preserve safe metadata and content reads. The returned pagination.completeness, not the requested max, determines whether the page is complete.",
             },
             page: {
               type: "number",
               default: 1,
               description: "Ticket list page to snapshot (default: 1)",
+            },
+            excludeCandidateTicketNumbers: {
+              type: "array",
+              maxItems: MAX_TRIAGE_SNAPSHOT_MAX,
+              uniqueItems: true,
+              items: { type: "string", maxLength: 40 },
+              description: "Optional candidate ticket numbers already returned by earlier pages. Pass prior page values to prevent a repeated upstream candidate from appearing in the aggregated triage set.",
             },
             safeRead: {
               type: "boolean",
@@ -10007,24 +10073,175 @@ export function getTicketsTools(): DomainTools {
             }
 
             const effectiveMax = triageSnapshotEffectivePageSize(snapshotParams);
-            const response = await client.query<ListTicketsResponse>(LIST_TICKETS_QUERY, {
-              input: buildTicketListInput({
-                status: snapshotParams.status,
-                max: effectiveMax,
-                page: snapshotParams.page,
-              }),
-            });
-            const candidates = response.getTicketList.tickets;
+            let response: ListTicketsResponse;
+            try {
+              if (!hasExecutionBudgetFor(1)) {
+                return {
+                  content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                      batchId: undefined,
+                      source: {
+                        status: snapshotParams.status,
+                        page: snapshotParams.page,
+                        max: snapshotParams.max,
+                        effectiveMax,
+                      },
+                      pagination: {
+                        page: snapshotParams.page,
+                        pageSize: effectiveMax,
+                        hasMore: null,
+                        totalCount: null,
+                        nextPage: snapshotParams.page,
+                        completeness: "budget_capped",
+                        complete: false,
+                        morePagesAvailable: false,
+                        truncated: true,
+                        budgetCapped: true,
+                        pageSizeCapped: effectiveMax < snapshotParams.max,
+                        upstreamHasMore: null,
+                        continuation: {
+                          nextPage: snapshotParams.page,
+                          pageSize: effectiveMax,
+                          reason: "budget_capped",
+                          replayCurrentPage: true,
+                        },
+                      },
+                      initialCandidateCount: 0,
+                      upstreamCandidateCount: 0,
+                      excludedCandidateCount: 0,
+                      candidateTicketNumbers: [],
+                      tickets: [],
+                      errors: [{
+                        stage: "list",
+                        errorClass: "ExecutionBudget",
+                        message: "Execution budget reached before the triage snapshot page could be read.",
+                      }],
+                      unprocessedCandidateTicketNumbers: [],
+                      safety: {
+                        safeReadUsed: true,
+                        rawHtmlReturned: false,
+                        attachmentBodiesReturned: false,
+                      },
+                    }, null, 2),
+                  }],
+                };
+              }
+              response = await client.query<ListTicketsResponse>(LIST_TICKETS_QUERY, {
+                input: buildTicketListInput({
+                  status: snapshotParams.status,
+                  max: effectiveMax,
+                  page: snapshotParams.page,
+                }),
+              });
+            } catch (error) {
+              if (!isExecutionStopError(error)) throw error;
+              return {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({
+                    batchId: undefined,
+                    source: {
+                      status: snapshotParams.status,
+                      page: snapshotParams.page,
+                      max: snapshotParams.max,
+                      effectiveMax,
+                    },
+                    pagination: {
+                      page: snapshotParams.page,
+                      pageSize: effectiveMax,
+                      hasMore: null,
+                      totalCount: null,
+                      nextPage: snapshotParams.page,
+                      completeness: "budget_capped",
+                      complete: false,
+                      morePagesAvailable: false,
+                      truncated: true,
+                      budgetCapped: true,
+                      pageSizeCapped: effectiveMax < snapshotParams.max,
+                      upstreamHasMore: null,
+                      continuation: {
+                        nextPage: snapshotParams.page,
+                        pageSize: effectiveMax,
+                        reason: "budget_capped",
+                        replayCurrentPage: true,
+                      },
+                    },
+                    initialCandidateCount: 0,
+                    upstreamCandidateCount: 0,
+                    excludedCandidateCount: 0,
+                    candidateTicketNumbers: [],
+                    tickets: [],
+                    errors: [{
+                      stage: "list",
+                      errorClass: "ExecutionBudget",
+                      message: "Execution budget reached before the triage snapshot page could be read.",
+                    }],
+                    unprocessedCandidateTicketNumbers: [],
+                    safety: {
+                      safeReadUsed: true,
+                      rawHtmlReturned: false,
+                      attachmentBodiesReturned: false,
+                    },
+                  }, null, 2),
+                }],
+              };
+            }
+            const upstreamCandidates = response.getTicketList.tickets;
             const listInfo = response.getTicketList.listInfo;
+            const deduplicatedUpstreamCandidates = uniqueTriageSnapshotCandidates(upstreamCandidates);
+            const candidates = uniqueTriageSnapshotCandidates(
+              upstreamCandidates,
+              new Set(snapshotParams.excludeCandidateTicketNumbers)
+            );
+            const upstreamHasMore = upstreamHasMoreValue(listInfo.hasMore);
+            const emptyQueueTerminal = deduplicatedUpstreamCandidates.length === 0 &&
+              upstreamCandidates.length === 0 &&
+              listInfo.totalCount === 0 &&
+              upstreamHasMore !== true;
+            const resolvedHasMore = emptyQueueTerminal ? false : upstreamHasMore;
             const candidateTicketNumbers = candidates.map(
               (ticket) => ticket.displayId ?? ticket.ticketId
             );
             const tickets = [];
+            const errors: Array<Record<string, unknown>> = [];
+            const unprocessedCandidateTicketNumbers: string[] = [];
+            let budgetCappedRead = false;
             for (const ticket of candidates) {
-              tickets.push(
-                await buildTriageSnapshotForCandidate(client, ticket, snapshotParams)
-              );
+              if (!hasExecutionBudgetFor(1)) {
+                budgetCappedRead = true;
+                unprocessedCandidateTicketNumbers.push(ticket.displayId ?? ticket.ticketId);
+                continue;
+              }
+              try {
+                tickets.push(
+                  await buildTriageSnapshotForCandidate(client, ticket, snapshotParams)
+                );
+              } catch (error) {
+                if (!isExecutionStopError(error)) throw error;
+                budgetCappedRead = true;
+                unprocessedCandidateTicketNumbers.push(ticket.displayId ?? ticket.ticketId);
+              }
             }
+
+            const truncated = budgetCappedRead && unprocessedCandidateTicketNumbers.length > 0;
+            if (truncated) {
+              errors.push({
+                stage: "content",
+                errorClass: "ExecutionBudget",
+                message: "Execution budget reached before safe evidence was collected for every candidate on this page.",
+              });
+            }
+            const completeness = triageSnapshotCompleteness({
+              hasMore: resolvedHasMore,
+              budgetCappedRead,
+              truncated,
+            });
+            const nextPage = completeness === "more_pages_available"
+              ? snapshotParams.page + 1
+              : completeness === "budget_capped" || completeness === "truncated"
+                ? snapshotParams.page
+                : null;
 
             return {
               content: [
@@ -10042,15 +10259,32 @@ export function getTicketsTools(): DomainTools {
                       pagination: {
                         page: snapshotParams.page,
                         pageSize: effectiveMax,
-                        hasMore: listInfo.hasMore,
+                        hasMore: resolvedHasMore,
                         totalCount: listInfo.totalCount,
-                        nextPage: listInfo.hasMore ? snapshotParams.page + 1 : null,
-                        budgetCapped: effectiveMax < snapshotParams.max,
+                        nextPage,
+                        completeness,
+                        complete: completeness === "complete",
+                        morePagesAvailable: completeness === "more_pages_available",
+                        truncated,
+                        budgetCapped: effectiveMax < snapshotParams.max || budgetCappedRead,
+                        pageSizeCapped: effectiveMax < snapshotParams.max,
+                        upstreamHasMore,
+                        continuation: nextPage === null
+                          ? null
+                          : {
+                              nextPage,
+                              pageSize: effectiveMax,
+                              reason: completeness,
+                              replayCurrentPage: completeness === "budget_capped" || completeness === "truncated",
+                            },
                       },
                       initialCandidateCount: candidates.length,
+                      upstreamCandidateCount: upstreamCandidates.length,
+                      excludedCandidateCount: deduplicatedUpstreamCandidates.length - candidates.length,
                       candidateTicketNumbers,
                       tickets,
-                      errors: [],
+                      errors,
+                      unprocessedCandidateTicketNumbers,
                       safety: {
                         safeReadUsed: true,
                         rawHtmlReturned: false,

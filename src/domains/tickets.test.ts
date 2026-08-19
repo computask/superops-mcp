@@ -1843,6 +1843,13 @@ describe("Tickets Domain", () => {
       totalCount: 2,
       nextPage: null,
       budgetCapped: true,
+      completeness: "complete",
+      complete: true,
+      morePagesAvailable: false,
+      truncated: false,
+      pageSizeCapped: true,
+      upstreamHasMore: false,
+      continuation: null,
     });
     expect(parsed.initialCandidateCount).toBe(2);
     expect(parsed.candidateTicketNumbers).toEqual(["57400", "57401"]);
@@ -1900,6 +1907,217 @@ describe("Tickets Domain", () => {
     expect(parsed.tickets[0].safeContentItems[1].plainText.length).toBeLessThanOrEqual(
       220
     );
+  });
+
+  it("marks a conclusively empty queue terminal even when the upstream hasMore field is null", async () => {
+    mockClient.query.mockResolvedValueOnce({
+      getTicketList: {
+        tickets: [],
+        listInfo: { page: 1, pageSize: 8, hasMore: null, totalCount: 0 },
+      },
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      includeConversations: false,
+      includeNotes: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed).toMatchObject({
+      initialCandidateCount: 0,
+      candidateTicketNumbers: [],
+      tickets: [],
+      pagination: {
+        hasMore: false,
+        nextPage: null,
+        completeness: "complete",
+        complete: true,
+      },
+    });
+  });
+
+  it("does not claim completeness when a nonempty upstream page has ambiguous pagination", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "ambiguous-1", displayId: "59101", subject: "Ambiguous", status: "New Calls" }],
+          listInfo: { page: 1, pageSize: 8, hasMore: null, totalCount: 1 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "ambiguous-1", displayId: "59101", subject: "Ambiguous", status: "New Calls",
+        },
+      });
+    const result = await getTicketsTools().handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      includeConversations: false,
+      includeNotes: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.pagination).toMatchObject({
+      hasMore: null,
+      nextPage: null,
+      completeness: "upstream_pagination_ambiguous",
+      complete: false,
+    });
+  });
+
+  it("returns an explicit budget_capped state when the list read cannot start", async () => {
+    const result = await runWithExecutionConfig(
+      {
+        SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "1",
+        SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "1",
+      },
+      () => runWithExecutionContext(
+        "superops_tickets_triage_snapshot",
+        () => getTicketsTools().handleCall("superops_tickets_triage_snapshot", {
+          status: ["New Calls"],
+          includeConversations: false,
+          includeNotes: false,
+        })
+      )
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.pagination).toMatchObject({
+      hasMore: null,
+      nextPage: 1,
+      completeness: "budget_capped",
+      complete: false,
+      truncated: true,
+      budgetCapped: true,
+    });
+    expect(mockClient.query).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes a truncated page from a terminal complete page when content reads exhaust the budget", async () => {
+    mockClient.query.mockImplementation(async (query: string, variables?: { input?: { ticketId?: string } }) => {
+      const started = recordTypedSubrequestStart({ type: query.includes("getTicketList") ? "paginationRead" : "verificationRead" });
+      recordSubrequestFinish(started, 200, true);
+      if (query.includes("getTicketList")) {
+        return {
+          getTicketList: {
+            tickets: [
+              { ticketId: "truncated-1", displayId: "59104", subject: "First", status: "New Calls" },
+              { ticketId: "truncated-2", displayId: "59105", subject: "Second", status: "New Calls" },
+            ],
+            listInfo: { page: 1, pageSize: 8, hasMore: false, totalCount: 2 },
+          },
+        };
+      }
+      return {
+        getTicket: {
+          ticketId: variables?.input?.ticketId,
+          displayId: variables?.input?.ticketId === "truncated-1" ? "59104" : "59105",
+          subject: "Verified",
+          status: "New Calls",
+        },
+      };
+    });
+
+    const result = await runWithExecutionConfig(
+      {
+        SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "2",
+        SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "0",
+      },
+      () => runWithExecutionContext(
+        "superops_tickets_triage_snapshot",
+        () => getTicketsTools().handleCall("superops_tickets_triage_snapshot", {
+          status: ["New Calls"],
+          includeConversations: false,
+          includeNotes: false,
+        })
+      )
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.pagination).toMatchObject({
+      hasMore: false,
+      nextPage: 1,
+      completeness: "truncated",
+      complete: false,
+      truncated: true,
+      budgetCapped: true,
+      continuation: { reason: "truncated", replayCurrentPage: true },
+    });
+    expect(parsed.candidateTicketNumbers).toEqual(["59104", "59105"]);
+    expect(parsed.unprocessedCandidateTicketNumbers).toEqual(["59105"]);
+    expect(parsed.tickets).toHaveLength(1);
+  });
+
+  it("deduplicates repeated immutable candidates within an upstream page", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [
+            { ticketId: "duplicate-1", displayId: "59102", subject: "Duplicate", status: "New Calls" },
+            { ticketId: "duplicate-1", displayId: "59102", subject: "Duplicate again", status: "New Calls" },
+          ],
+          listInfo: { page: 1, pageSize: 8, hasMore: false, totalCount: 2 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: {
+          ticketId: "duplicate-1", displayId: "59102", subject: "Duplicate", status: "New Calls",
+        },
+      });
+    const result = await getTicketsTools().handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      includeConversations: false,
+      includeNotes: false,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.upstreamCandidateCount).toBe(2);
+    expect(parsed.initialCandidateCount).toBe(1);
+    expect(parsed.candidateTicketNumbers).toEqual(["59102"]);
+    expect(parsed.tickets).toHaveLength(1);
+  });
+
+  it("excludes a repeated candidate when aggregating a later page", async () => {
+    mockClient.query
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [{ ticketId: "page-1", displayId: "59102", subject: "First page", status: "New Calls" }],
+          listInfo: { page: 1, pageSize: 8, hasMore: true, totalCount: 2 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "page-1", displayId: "59102", subject: "First page", status: "New Calls" },
+      })
+      .mockResolvedValueOnce({
+        getTicketList: {
+          tickets: [
+            { ticketId: "page-1", displayId: "59102", subject: "Repeated page", status: "New Calls" },
+            { ticketId: "page-2", displayId: "59103", subject: "Second page", status: "New Calls" },
+          ],
+          listInfo: { page: 2, pageSize: 8, hasMore: false, totalCount: 2 },
+        },
+      })
+      .mockResolvedValueOnce({
+        getTicket: { ticketId: "page-2", displayId: "59103", subject: "Second page", status: "New Calls" },
+      });
+
+    const domain = getTicketsTools();
+    const firstPage = JSON.parse((await domain.handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      page: 1,
+      includeConversations: false,
+      includeNotes: false,
+    })).content[0].text);
+    const secondPage = JSON.parse((await domain.handleCall("superops_tickets_triage_snapshot", {
+      status: ["New Calls"],
+      page: 2,
+      excludeCandidateTicketNumbers: firstPage.candidateTicketNumbers,
+      includeConversations: false,
+      includeNotes: false,
+    })).content[0].text);
+
+    expect(firstPage.candidateTicketNumbers).toEqual(["59102"]);
+    expect(secondPage.candidateTicketNumbers).toEqual(["59103"]);
+    expect(secondPage.excludedCandidateCount).toBe(1);
+    expect([...firstPage.candidateTicketNumbers, ...secondPage.candidateTicketNumbers]).toEqual([
+      "59102",
+      "59103",
+    ]);
   });
 
   it("snapshots an explicitly selected Ticket on Hold queue", async () => {

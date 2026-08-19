@@ -507,6 +507,7 @@ describe("ChatGPT direct mutation policy", () => {
     expect(allowedMutating).toEqual([
       "superops_operations_cancel",
       "superops_tickets_apply_triage_plan",
+      "superops_triage_emerging_issue_upsert",
     ]);
   });
 });
@@ -649,7 +650,7 @@ describe("Cloudflare Worker entrypoint", () => {
       const tool = byName.get(name);
       expect(tool, `${name} should be published in the full catalogue`).toBeDefined();
       expect(tool?.annotations?.readOnlyHint).toBe(false);
-      expect(tool?.annotations?.destructiveHint).toBe(true);
+      expect(tool?.annotations?.destructiveHint).toBe(name === "superops_triage_emerging_issue_upsert" ? false : true);
     }
 
     for (const tool of tools) {

@@ -883,6 +883,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
     expect(exposedMutations.sort()).toEqual([
       "superops_operations_cancel",
       "superops_tickets_apply_triage_plan",
+      "superops_triage_emerging_issue_upsert",
     ]);
   });
 

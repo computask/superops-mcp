@@ -68,7 +68,7 @@ describe("Alerts Domain", () => {
   it("lists active alerts with status Open using lower-case is and default sort", async () => {
     mockClient.query.mockResolvedValue({
       getAlertList: {
-        alerts: [activeAlert()],
+        alerts: [activeAlert({ updatedTime: "2026-06-25T10:05:00" })],
         listInfo: { page: 1, pageSize: 25, totalCount: 1 },
       },
     });
@@ -93,6 +93,7 @@ describe("Alerts Domain", () => {
     }
     expect(parsed.alerts[0]).toMatchObject({
       id: "alert-1",
+      updatedTime: "2026-06-25T10:05:00",
       clientName: "TaskGroup",
       siteName: "HQ",
       assetName: "Server 1",
@@ -103,6 +104,13 @@ describe("Alerts Domain", () => {
       ownerEmail: "owner@example.test",
     });
     expect(parsed.listInfo).toEqual({ page: 1, pageSize: 25, totalCount: 1 });
+    expect(parsed.evidence).toMatchObject({
+      evidenceType: "current_rmm_alert",
+      live: true,
+      causalInference: "not_proven",
+      exactAssetCorrelationStrongerThanClientCorrelation: true,
+      freeTextAssetInferenceAllowed: false,
+    });
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
@@ -235,7 +243,13 @@ describe("Alerts Domain", () => {
     });
     const parsed = JSON.parse(result.content[0].text);
 
-    expect(parsed).toEqual({ found: false, alertId: "missing-alert", alert: null });
+    expect(parsed).toMatchObject({ found: false, alertId: "missing-alert", alert: null });
+    expect(parsed.evidence).toMatchObject({
+      evidenceType: "current_rmm_alert",
+      live: true,
+      causalInference: "not_proven",
+      correlation: "exact_alert_id",
+    });
   });
 
   it("lists alerts for an asset with safe status filter", async () => {
@@ -268,6 +282,12 @@ describe("Alerts Domain", () => {
       }
     );
     expect(parsed.alerts[0].id).toBe("asset-alert");
+    expect(parsed.evidence).toMatchObject({
+      correlation: "exact_asset_id",
+      assetId: "asset-1",
+      live: true,
+      causalInference: "not_proven",
+    });
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
@@ -545,6 +565,12 @@ describe("Alerts Domain", () => {
     expect(parsed.countsByPolicyType).toEqual({ Performance: 1, Storage: 1 });
     expect(parsed.oldestAlerts[0].id).toBe("alert-1");
     expect(parsed.newestAlerts[0].id).toBe("alert-2");
+    expect(parsed.evidence).toMatchObject({
+      evidenceType: "current_rmm_alert",
+      live: true,
+      causalInference: "not_proven",
+      readCompleteness: "ambiguous",
+    });
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 

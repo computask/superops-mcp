@@ -39,6 +39,10 @@ import {
 import { boundedToolResult } from "./utils/tool-result.js";
 import { publishToolDefinition } from "./tool-catalogue.js";
 import {
+  handleTriageEmergingIssueUpsert,
+  triageEmergingIssueTool,
+} from "./triage-emerging-issue.js";
+import {
   currentOwnerHash,
   getOperationStore,
   operationResultView,
@@ -302,6 +306,7 @@ const operationTools: ToolDefinition[] = [
       required: ["operationId", "expectedUpdatedAt"],
     },
   },
+  triageEmergingIssueTool,
 ];
 // Connection test tool
 const testConnectionTool: ToolDefinition = {
@@ -498,6 +503,9 @@ async function executeToolCall(
       content: [{ type: "text", text: JSON.stringify(operationResultView(cancelled), null, 2) }],
     };
   }
+  if (name === "superops_triage_emerging_issue_upsert") {
+    return handleTriageEmergingIssueUpsert(args);
+  }
   // Check for credential issues before domain calls
   const creds = getCredentials();
   if (!creds) {
@@ -517,7 +525,7 @@ async function executeToolCall(
     const domainTools = await loadDomain("assets");
     return domainTools.handleCall(name, args);
   }
-  if (name.startsWith("superops_scripts_")) {
+  if (name.startsWith("superops_scripts_") || name.startsWith("superops_script_catalog_")) {
     const domainTools = await loadDomain("scripts");
     return domainTools.handleCall(name, args);
   }

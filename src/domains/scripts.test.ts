@@ -72,6 +72,9 @@ describe("Scripts Domain", () => {
     expect(domain.tools.map((tool) => tool.name)).toEqual([
       "superops_scripts_list",
       "superops_scripts_get",
+      "superops_script_catalog_status",
+      "superops_script_catalog_get",
+      "superops_script_catalog_recommend",
       "superops_scripts_supported_targets",
       "superops_scripts_executions_list",
       "superops_scripts_execution_get",
@@ -104,6 +107,152 @@ describe("Scripts Domain", () => {
     expect(parsed.scripts[0]).toMatchObject({ scriptId: "script-1", contentsReturned: false });
     expect(parsed.scripts[0]).not.toHaveProperty("readMe");
     expect(parsed.scripts[0]).not.toHaveProperty("scriptText");
+  });
+
+  it("reports complete and incomplete catalogue coverage without invalidating a present reviewed record", async () => {
+    const reviewed = { ...savedScript, tags: ["REVIEWED", "WINDOWS"], description: "Collect workstation audit" };
+    mockClient.query.mockResolvedValueOnce(listResponse([reviewed], true));
+    const status = await getScriptsTools().handleCall("superops_script_catalog_status", {});
+    const statusBody = JSON.parse(status.content[0].text);
+    expect(statusBody).toMatchObject({
+      syncState: "INCOMPLETE",
+      coverageComplete: false,
+      coverageMayBeIncomplete: true,
+      publishedReviewedRecordCount: 1,
+    });
+
+    mockClient.query.mockResolvedValueOnce(listResponse([reviewed], true));
+    const recommendation = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
+      request: "collect workstation audit",
+      targetPlatform: "WINDOWS",
+      platformVerified: true,
+      safetyRequirementsVerified: true,
+    });
+    const body = JSON.parse(recommendation.content[0].text);
+    expect(body.recommendationState).toBe("DEFINITIVE_RECOMMENDATION");
+    expect(body.bestMatch).toMatchObject({ scriptId: "script-1", catalogueStatus: "REVIEWED" });
+    expect(body.catalogue).toMatchObject({ syncState: "INCOMPLETE", coverageComplete: false });
+    expect(body.executionAuthorised).toBe(false);
+  });
+
+  it("never selects DO_NOT_USE or LEGACY records over a safe reviewed candidate", async () => {
+    const unsafe = { ...savedScript, scriptId: "unsafe", name: "Collect workstation audit immediately", tags: ["REVIEWED", "WINDOWS", "DO_NOT_USE"] };
+    const legacy = { ...savedScript, scriptId: "legacy", name: "Collect workstation audit legacy", tags: ["REVIEWED", "WINDOWS", "LEGACY"] };
+    const safe = { ...savedScript, scriptId: "safe", name: "Collect workstation audit reviewed", tags: ["REVIEWED", "WINDOWS"] };
+    mockClient.query.mockResolvedValueOnce(listResponse([unsafe, legacy, safe]));
+    const result = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
+      request: "collect workstation audit immediately",
+      targetPlatform: "WINDOWS",
+      platformVerified: true,
+      safetyRequirementsVerified: true,
+    });
+    const body = JSON.parse(result.content[0].text);
+    expect(body.recommendationState).toBe("DEFINITIVE_RECOMMENDATION");
+    expect(body.bestMatch.scriptId).toBe("safe");
+    expect(body.rejectedMatches).toEqual(expect.arrayContaining([
+      expect.objectContaining({ scriptId: "unsafe", catalogueStatus: "REJECTED" }),
+      expect.objectContaining({ scriptId: "legacy", catalogueStatus: "REJECTED" }),
+    ]));
+    expect(body.bestMatch.selectionReason).toContain("suitability outrank lexical matchScore");
+  });
+
+  it("returns NEEDS_DETAILS for missing or unverified platform and prerequisites", async () => {
+    const platformScript = { ...savedScript, tags: ["REVIEWED", "WINDOWS"] };
+    mockClient.query.mockResolvedValueOnce(listResponse([platformScript]));
+    const missingPlatform = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
+      request: "collect audit",
+    });
+    expect(JSON.parse(missingPlatform.content[0].text)).toMatchObject({
+      recommendationState: "NEEDS_DETAILS",
+      bestMatch: null,
+      candidate: { scriptId: "script-1" },
+    });
+
+    mockClient.query.mockResolvedValueOnce(listResponse([platformScript]));
+    const incompatiblePlatform = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
+      request: "collect audit",
+      targetPlatform: "MAC",
+      platformVerified: true,
+    });
+    expect(JSON.parse(incompatiblePlatform.content[0].text)).toMatchObject({
+      recommendationState: "NO_SUITABLE_SCRIPT",
+      bestMatch: null,
+    });
+
+    const prerequisiteScript = { ...savedScript, tags: ["REVIEWED", "WINDOWS", "REQUIRES_ADMIN"] };
+    mockClient.query.mockResolvedValueOnce(listResponse([prerequisiteScript]));
+    const missingPrerequisite = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
+      request: "collect audit",
+      targetPlatform: "WINDOWS",
+      platformVerified: true,
+    });
+    expect(JSON.parse(missingPrerequisite.content[0].text)).toMatchObject({
+      recommendationState: "NEEDS_DETAILS",
+      candidate: { scriptId: "script-1" },
+    });
+
+    mockClient.query.mockResolvedValueOnce(listResponse([prerequisiteScript]));
+    const unmet = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
+      request: "collect audit",
+      targetPlatform: "WINDOWS",
+      platformVerified: true,
+      prerequisitesMet: false,
+    });
+    expect(JSON.parse(unmet.content[0].text)).toMatchObject({ recommendationState: "NO_SUITABLE_SCRIPT", bestMatch: null });
+  });
+
+  it("ranks two safe candidates by lexical match only after suitability is established", async () => {
+    const close = { ...savedScript, scriptId: "close", name: "Audit workstation", description: "General audit", tags: ["REVIEWED", "WINDOWS"] };
+    const exact = { ...savedScript, scriptId: "exact", name: "Collect workstation audit", description: "Collect workstation audit evidence", tags: ["REVIEWED", "WINDOWS"] };
+    mockClient.query.mockResolvedValueOnce(listResponse([close, exact]));
+    const result = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
+      request: "collect workstation audit evidence",
+      targetPlatform: "WINDOWS",
+      platformVerified: true,
+      safetyRequirementsVerified: true,
+    });
+    const body = JSON.parse(result.content[0].text);
+    expect(body.recommendationState).toBe("DEFINITIVE_RECOMMENDATION");
+    expect(body.bestMatch).toMatchObject({ scriptId: "exact", suitabilityRank: 100 });
+    expect(body.bestMatch.matchScore).toBeGreaterThan(body.alternatives.find((entry: { scriptId: string }) => entry.scriptId === "close").matchScore);
+  });
+
+  it("distinguishes catalogue unavailable and degraded results from no suitable script", async () => {
+    mockClient.query.mockRejectedValueOnce(new Error("catalogue connection failed"));
+    const unavailable = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
+      request: "collect audit",
+    });
+    expect(unavailable.isError).toBe(true);
+    expect(JSON.parse(unavailable.content[0].text)).toMatchObject({ recommendationState: "CATALOGUE_UNAVAILABLE" });
+
+    mockClient.query.mockResolvedValueOnce(listResponse([{ ...savedScript, tags: ["DO_NOT_USE"] }], true));
+    const degraded = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
+      request: "collect audit",
+      targetPlatform: "WINDOWS",
+      platformVerified: true,
+    });
+    expect(JSON.parse(degraded.content[0].text)).toMatchObject({
+      recommendationState: "CATALOGUE_DEGRADED",
+      catalogue: { syncState: "INCOMPLETE", coverageComplete: false },
+    });
+
+    mockClient.query.mockResolvedValueOnce({
+      getScriptList: {
+        scripts: [{ ...savedScript, tags: ["REVIEWED", "WINDOWS"] }],
+        listInfo: { page: 1, pageSize: 500, hasMore: undefined, totalCount: 1 },
+      },
+    });
+    const ambiguousCatalogue = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
+      request: "collect audit",
+      targetPlatform: "WINDOWS",
+      platformVerified: true,
+    });
+    expect(JSON.parse(ambiguousCatalogue.content[0].text)).toMatchObject({
+      recommendationState: "CATALOGUE_DEGRADED",
+      bestMatch: null,
+      candidate: { scriptId: "script-1" },
+      catalogue: { syncState: "DEGRADED", coverageComplete: false },
+    });
   });
 
   it("rejects arbitrary script text before any SuperOps read or write", async () => {

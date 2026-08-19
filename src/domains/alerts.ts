@@ -236,6 +236,7 @@ function normalizeAlert(alert: Alert): NormalizedAlert {
     id: alert.id,
     message: alert.message,
     createdTime: alert.createdTime,
+    updatedTime: alert.updatedTime,
     status: alert.status,
     severity: alert.severity,
     description: alert.description,
@@ -416,6 +417,11 @@ function readMetadata(params: {
 }) {
   const complete = params.listInfo.hasMore === false;
   const truncated = params.listInfo.hasMore === true;
+  const completionState = complete
+    ? "complete"
+    : truncated
+      ? "more_pages_available"
+      : "upstream_pagination_ambiguous";
   const nextPage =
     truncated && typeof params.listInfo.page === "number"
       ? params.listInfo.page + 1
@@ -433,6 +439,7 @@ function readMetadata(params: {
     upstreamTotalCount: params.listInfo.totalCount,
     upstreamHasMore: params.listInfo.hasMore,
     completeness: complete ? "known" : truncated ? "partial" : "unknown",
+    completionState,
     filtering: {
       applied: params.filterFields.length > 0,
       fields: params.filterFields,
@@ -643,12 +650,37 @@ function compactAlert(alert: NormalizedAlert) {
     id: alert.id,
     message: alert.message,
     createdTime: alert.createdTime,
+    updatedTime: alert.updatedTime,
     status: alert.status,
     severity: alert.severity,
     clientName: alert.clientName,
     assetName: alert.assetName,
     policyName: alert.policyName,
   };
+}
+
+function liveAlertEvidence(params: {
+  correlation: "exact_alert_id" | "exact_asset_id" | "list_read";
+  assetId?: string;
+  readCompleteness: "complete" | "partial" | "ambiguous";
+}) {
+  return {
+    evidenceType: "current_rmm_alert",
+    live: true,
+    causalInference: "not_proven",
+    clientMatchAloneIsNotCausation: true,
+    exactAssetCorrelationStrongerThanClientCorrelation: true,
+    freeTextAssetInferenceAllowed: false,
+    correlation: params.correlation,
+    assetId: params.assetId,
+    readCompleteness: params.readCompleteness,
+  };
+}
+
+function alertReadCompleteness(value: unknown): "complete" | "partial" | "ambiguous" {
+  if (value === "complete") return "complete";
+  if (value === "more_pages_available") return "partial";
+  return "ambiguous";
 }
 
 function synchronousWriteCount(attempted: number, maximum: number) {
@@ -714,7 +746,7 @@ export function getAlertsTools(): DomainTools {
       {
         name: "superops_alerts_list",
         description:
-          "List SuperOps alerts with safe status filtering, sorting, pagination, and optional client-side severity or asset filtering.",
+          "Read-only live RMM evidence: list SuperOps alerts with safe status filtering, sorting, pagination, and optional client-side severity or exact asset filtering. A current alert is evidence of an RMM alert, not proof that it caused a ticket; matching a client alone is not causation, and free text must not be used to infer an asset relationship.",
         inputSchema: {
           type: "object",
           properties: {
@@ -740,7 +772,7 @@ export function getAlertsTools(): DomainTools {
       {
         name: "superops_alerts_get",
         description:
-          "Retrieve one SuperOps alert by exact alert ID using alert-list lookup and safe fallback paging.",
+          "Read-only live RMM evidence: retrieve one SuperOps alert by exact alert ID using alert-list lookup and safe fallback paging. The exact alert record, asset, client, policy, message, severity, status, created time, and update time when exposed are evidence only; an alert match does not prove ticket causation.",
         inputSchema: {
           type: "object",
           properties: {
@@ -751,7 +783,7 @@ export function getAlertsTools(): DomainTools {
       },
       {
         name: "superops_alerts_for_asset",
-        description: "List SuperOps alerts for a specific asset ID.",
+        description: "Read-only live RMM evidence: list alerts for one exact verified SuperOps asset ID. Exact asset correlation is stronger than client-level correlation, but still does not prove the alert caused a ticket; do not infer the asset from free text.",
         inputSchema: {
           type: "object",
           properties: {
@@ -804,7 +836,7 @@ export function getAlertsTools(): DomainTools {
       {
         name: "superops_alerts_summary",
         description:
-          "Summarise SuperOps alerts by severity, client, policy, and policy type. Read-only.",
+          "Read-only live RMM evidence: summarise the bounded alert read by severity, client, policy, and policy type. Check readMetadata.completionState before treating the summary as complete; client recurrence alone is not asset or ticket causation.",
         inputSchema: {
           type: "object",
           properties: {
@@ -824,7 +856,15 @@ export function getAlertsTools(): DomainTools {
         switch (name) {
           case "superops_alerts_list": {
             const result = await queryAlertList(client, args as AlertListParams);
-            return textResult({ alerts: result.alerts, listInfo: result.listInfo, readMetadata: result.readMetadata });
+            return textResult({
+              alerts: result.alerts,
+              listInfo: result.listInfo,
+              readMetadata: result.readMetadata,
+              evidence: liveAlertEvidence({
+                correlation: "list_read",
+                readCompleteness: alertReadCompleteness(result.readMetadata.completionState),
+              }),
+            });
           }
 
           case "superops_alerts_get": {
@@ -834,9 +874,25 @@ export function getAlertsTools(): DomainTools {
             }
             const alert = await findAlertById(client, alertId);
             if (!alert) {
-              return textResult({ found: false, alertId, alert: null });
+              return textResult({
+                found: false,
+                alertId,
+                alert: null,
+                evidence: liveAlertEvidence({
+                  correlation: "exact_alert_id",
+                  readCompleteness: "ambiguous",
+                }),
+              });
             }
-            return textResult({ found: true, alert });
+            return textResult({
+              found: true,
+              alert,
+              evidence: liveAlertEvidence({
+                correlation: "exact_alert_id",
+                assetId: alert.assetId,
+                readCompleteness: "complete",
+              }),
+            });
           }
 
           case "superops_alerts_for_asset": {
@@ -849,7 +905,16 @@ export function getAlertsTools(): DomainTools {
               ...params,
               assetId,
             });
-            return textResult({ alerts: result.alerts, listInfo: result.listInfo, readMetadata: result.readMetadata });
+            return textResult({
+              alerts: result.alerts,
+              listInfo: result.listInfo,
+              readMetadata: result.readMetadata,
+              evidence: liveAlertEvidence({
+                correlation: "exact_asset_id",
+                assetId,
+                readCompleteness: alertReadCompleteness(result.readMetadata.completionState),
+              }),
+            });
           }
 
           case "superops_alerts_resolve": {
@@ -981,6 +1046,10 @@ export function getAlertsTools(): DomainTools {
             return textResult({
               totalAlertsInspected: result.alerts.length,
               readMetadata: result.readMetadata,
+              evidence: liveAlertEvidence({
+                correlation: "list_read",
+                readCompleteness: alertReadCompleteness(result.readMetadata.completionState),
+              }),
               countsBySeverity: countBy(result.alerts, "severity"),
               countsByClientName: countBy(result.alerts, "clientName"),
               countsByPolicyName: countBy(result.alerts, "policyName"),

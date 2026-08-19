@@ -16,6 +16,13 @@ export const MUTATING_TOOL_ANNOTATIONS: ToolAnnotations = {
   openWorldHint: true,
 };
 
+const EMERGING_ISSUE_TOOL_ANNOTATIONS: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+
 export const READ_ONLY_TOOL_NAMES = new Set<string>([
   "superops_navigate",
   "superops_status",
@@ -45,6 +52,9 @@ export const READ_ONLY_TOOL_NAMES = new Set<string>([
   "superops_assets_patches",
   "superops_scripts_list",
   "superops_scripts_get",
+  "superops_script_catalog_status",
+  "superops_script_catalog_recommend",
+  "superops_script_catalog_get",
   "superops_scripts_supported_targets",
   "superops_scripts_executions_list",
   "superops_scripts_execution_get",
@@ -59,6 +69,7 @@ export const READ_ONLY_TOOL_NAMES = new Set<string>([
 ]);
 
 export const MUTATING_TOOL_NAMES = new Set<string>([
+  "superops_triage_emerging_issue_upsert",
   "superops_operations_cancel",
   "superops_tickets_apply_triage_plan",
   "superops_tickets_create",
@@ -75,6 +86,9 @@ export const MUTATING_TOOL_NAMES = new Set<string>([
 const READ_ONLY_DESCRIPTION_PREFIX = "Read-only. Does not modify SuperOps data.";
 
 function annotationsForTool(name: string): ToolAnnotations {
+  if (name === "superops_triage_emerging_issue_upsert") {
+    return EMERGING_ISSUE_TOOL_ANNOTATIONS;
+  }
   if (READ_ONLY_TOOL_NAMES.has(name)) {
     return READ_ONLY_TOOL_ANNOTATIONS;
   }

@@ -353,6 +353,61 @@ export interface OperationCancelParams {
   now?: string;
 }
 
+export type EmergingIssueEvidenceStrength = "weak" | "moderate" | "strong";
+export type EmergingIssueSignalState = "active" | "expired" | "resolved";
+export type EmergingIssueSignalOutcome = "created" | "updated" | "unchanged" | "expired" | "resolved";
+
+export interface EmergingIssueObservation {
+  issueFingerprint: string;
+  summary: string;
+  firstSeen: string;
+  lastSeen: string;
+  affectedClientCount: number;
+  affectedRequesterCount?: number;
+  affectedTicketNumbers: string[];
+  representativeTicketNumbers: string[];
+  evidenceStrength: EmergingIssueEvidenceStrength;
+  signalState: "active" | "resolved";
+  currentRelatedTicketNumbers: string[];
+}
+
+export interface EmergingIssueSignal {
+  issueFingerprint: string;
+  summary: string;
+  firstSeen: string;
+  lastSeen: string;
+  affectedClientCount: number;
+  affectedRequesterCount?: number;
+  affectedTicketNumbers: string[];
+  representativeTicketNumbers: string[];
+  evidenceStrength: EmergingIssueEvidenceStrength;
+  signalState: EmergingIssueSignalState;
+  currentRelatedTicketNumbers: string[];
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  expiredAt?: string;
+}
+
+export interface EmergingIssueUpsertParams {
+  ownerHash: string;
+  operationId: string;
+  observation: EmergingIssueObservation;
+  quietPeriodMs: number;
+  now?: string;
+}
+
+export interface EmergingIssueUpsertResult {
+  outcome: EmergingIssueSignalOutcome;
+  signal: EmergingIssueSignal;
+  operationId: string;
+  acceptedStage: "SignalPersisted";
+  updatedAt: string;
+  continuationRequired: false;
+  ambiguityReconciled: true;
+  finalVerification: { performed: true; verified: true };
+}
+
 export interface OperationStore {
   put(record: OperationLedgerRecord, options?: OperationPutOptions): Promise<void>;
   get(operationId: string, ownerHash?: string): Promise<OperationLedgerRecord | undefined>;
@@ -374,6 +429,8 @@ export interface OperationStore {
   scheduleContinuation(params: OperationScheduleContinuationParams): Promise<OperationLedgerRecord>;
   cancel(params: OperationCancelParams): Promise<OperationLedgerRecord>;
   terminalizeContinuationFailure(params: OperationTerminalFailureParams): Promise<OperationLedgerRecord>;
+  getEmergingIssue(issueFingerprint: string, ownerHash: string): Promise<EmergingIssueSignal | undefined>;
+  upsertEmergingIssue(params: EmergingIssueUpsertParams): Promise<EmergingIssueUpsertResult>;
 }
 
 interface DurableObjectNamespace {
@@ -412,6 +469,7 @@ export interface OperationStoreEnv {
 const STORE_CONTEXT = new AsyncLocalStorage<OperationStore>();
 const memoryRecords = new Map<string, OperationLedgerRecord>();
 const memoryApprovedPrivateNotes = new Map<string, ApprovedPrivateNoteContent>();
+const memoryEmergingIssueSignals = new Map<string, StoredEmergingIssueSignal>();
 const MAX_OPERATION_ITEMS = 500;
 const MAX_SERIALIZED_OPERATION_BYTES = 512 * 1024;
 const MAX_APPROVED_PRIVATE_NOTE_BYTES = 128 * 1024;
@@ -423,8 +481,17 @@ const OPERATION_STORE_RATE_LIMIT_BACKOFF_MS = [25, 75];
 const OPERATION_STORE_CONFLICT_MAX_ATTEMPTS = 5;
 const UNATTEMPTED_RUNNING_STALL_MS = 5 * 60 * 1000;
 const RESCHEDULED_STALL_GRACE_MS = 2 * 60 * 1000;
+export const EMERGING_ISSUE_QUIET_PERIOD_MS = 7 * 24 * 60 * 60 * 1000;
+export const MAX_EMERGING_ISSUE_TICKETS = 50;
+export const MAX_EMERGING_ISSUE_REPRESENTATIVES = 10;
+export const MAX_EMERGING_ISSUE_CURRENT_TICKETS = 50;
+export const MAX_EMERGING_ISSUE_SUMMARY_LENGTH = 240;
 export const MAX_WATCHDOG_WAKE_COUNT = 3;
 export const MAX_MANUAL_RESUME_COUNT = 3;
+
+interface StoredEmergingIssueSignal extends EmergingIssueSignal {
+  ownerHash: string;
+}
 
 interface RecentOperationIndexEntry {
   version: 1;
@@ -715,6 +782,250 @@ function isRecordObject(value: unknown): value is Record<string, unknown> {
 
 function isFiniteNonnegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function boundedUniqueSignalStrings(value: unknown, max: number, field: string): string[] {
+  if (!Array.isArray(value) || value.length > max) {
+    throw new MalformedStoredOperationError(`${field} exceeds its bounded collection limit.`);
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== "string" || !entry.trim() || entry.length > 40 || /[\r\n<>]/.test(entry)) {
+      throw new MalformedStoredOperationError(`${field} contains an invalid bounded identifier.`);
+    }
+    const normalized = entry.trim();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+export function assertEmergingIssueObservation(
+  value: unknown
+): asserts value is EmergingIssueObservation {
+  if (!isRecordObject(value)) {
+    throw new MalformedStoredOperationError("Emerging issue observation must be an object.");
+  }
+  const observation = value as Partial<EmergingIssueObservation>;
+  if (typeof observation.issueFingerprint !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(observation.issueFingerprint)) {
+    throw new MalformedStoredOperationError("issueFingerprint must be a stable bounded identifier.");
+  }
+  if (typeof observation.summary !== "string" ||
+      !observation.summary.trim() || observation.summary.length > MAX_EMERGING_ISSUE_SUMMARY_LENGTH ||
+      /[\r\n<>]/.test(observation.summary) ||
+      sanitizeText(observation.summary) !== observation.summary ||
+      containsForbiddenPersistedContent({ summary: observation.summary })) {
+    throw new MalformedStoredOperationError("summary must be bounded plain text without customer-content fields or markup.");
+  }
+  if (typeof observation.firstSeen !== "string" || !Number.isFinite(Date.parse(observation.firstSeen)) ||
+      typeof observation.lastSeen !== "string" || !Number.isFinite(Date.parse(observation.lastSeen)) ||
+      Date.parse(observation.firstSeen) > Date.parse(observation.lastSeen)) {
+    throw new MalformedStoredOperationError("firstSeen and lastSeen must be ordered ISO timestamps.");
+  }
+  if (!isFiniteNonnegativeInteger(observation.affectedClientCount) || observation.affectedClientCount < 2 ||
+      observation.affectedClientCount > 10000) {
+    throw new MalformedStoredOperationError("affectedClientCount must be an integer from 2 through 10000.");
+  }
+  if (observation.affectedRequesterCount !== undefined &&
+      (!isFiniteNonnegativeInteger(observation.affectedRequesterCount) || observation.affectedRequesterCount > 10000)) {
+    throw new MalformedStoredOperationError("affectedRequesterCount is outside its bounded range.");
+  }
+  boundedUniqueSignalStrings(observation.affectedTicketNumbers, MAX_EMERGING_ISSUE_TICKETS, "affectedTicketNumbers");
+  boundedUniqueSignalStrings(observation.representativeTicketNumbers, MAX_EMERGING_ISSUE_REPRESENTATIVES, "representativeTicketNumbers");
+  boundedUniqueSignalStrings(observation.currentRelatedTicketNumbers, MAX_EMERGING_ISSUE_CURRENT_TICKETS, "currentRelatedTicketNumbers");
+  if (observation.evidenceStrength !== "weak" && observation.evidenceStrength !== "moderate" &&
+      observation.evidenceStrength !== "strong") {
+    throw new MalformedStoredOperationError("evidenceStrength is invalid.");
+  }
+  if (observation.signalState !== "active" && observation.signalState !== "resolved") {
+    throw new MalformedStoredOperationError("signalState must be active or resolved.");
+  }
+}
+
+function emergingIssueSignalKey(ownerHash: string, issueFingerprint: string): string {
+  return `signal:${stableHash({ version: 1, ownerHash, issueFingerprint })}`;
+}
+
+function cloneEmergingIssueSignal(signal: StoredEmergingIssueSignal): StoredEmergingIssueSignal {
+  return JSON.parse(JSON.stringify(signal)) as StoredEmergingIssueSignal;
+}
+
+function publicEmergingIssueSignal(signal: StoredEmergingIssueSignal): EmergingIssueSignal {
+  const { ownerHash: _ownerHash, ...publicSignal } = cloneEmergingIssueSignal(signal);
+  return publicSignal;
+}
+
+function evidenceStrengthRank(value: EmergingIssueEvidenceStrength): number {
+  return value === "strong" ? 3 : value === "moderate" ? 2 : 1;
+}
+
+function mergeSignalStrings(
+  existing: string[],
+  incoming: string[],
+  max: number
+): string[] {
+  return [...new Set([...existing, ...incoming])].slice(0, max);
+}
+
+function expireEmergingIssueSignal(
+  signal: StoredEmergingIssueSignal,
+  now: string
+): StoredEmergingIssueSignal {
+  if (signal.signalState !== "active" || Date.parse(signal.expiresAt) > Date.parse(now)) return signal;
+  return {
+    ...signal,
+    signalState: "expired",
+    expiredAt: signal.expiredAt ?? now,
+    updatedAt: now,
+  };
+}
+
+function upsertEmergingIssueSignalRecord(
+  existing: StoredEmergingIssueSignal | undefined,
+  params: EmergingIssueUpsertParams
+): { record: StoredEmergingIssueSignal; outcome: EmergingIssueSignalOutcome } {
+  assertEmergingIssueObservation(params.observation);
+  if (!params.ownerHash || !params.operationId ||
+      !Number.isSafeInteger(params.quietPeriodMs) || params.quietPeriodMs <= 0 ||
+      params.quietPeriodMs > 31 * 24 * 60 * 60 * 1000) {
+    throw new MalformedStoredOperationError("Emerging issue durability parameters are invalid.");
+  }
+  const now = params.now ?? nowIso();
+  if (!Number.isFinite(Date.parse(now))) {
+    throw new MalformedStoredOperationError("Emerging issue update time is invalid.");
+  }
+  const observation = params.observation;
+  const current = existing ? expireEmergingIssueSignal(existing, now) : undefined;
+  const observationLastSeen = Date.parse(observation.lastSeen);
+  const currentLastSeen = current ? Date.parse(current.lastSeen) : Number.NaN;
+  const freshObservation = !current || observationLastSeen > currentLastSeen;
+  const firstSeen = current && Date.parse(current.firstSeen) <= Date.parse(observation.firstSeen)
+    ? current.firstSeen
+    : observation.firstSeen;
+  const lastSeen = current && currentLastSeen >= observationLastSeen
+    ? current.lastSeen
+    : observation.lastSeen;
+  const activeObservation = observation.signalState === "active" &&
+    observationLastSeen + params.quietPeriodMs > Date.parse(now);
+  const preserveExplicitResolution = current?.signalState === "resolved" && !freshObservation;
+  const signalState: EmergingIssueSignalState = observation.signalState === "resolved"
+    ? "resolved"
+    : preserveExplicitResolution
+      ? "resolved"
+      : activeObservation
+        ? "active"
+        : "expired";
+  const record: StoredEmergingIssueSignal = {
+    ownerHash: params.ownerHash,
+    issueFingerprint: observation.issueFingerprint,
+    summary: freshObservation || !current ? observation.summary.trim() : current!.summary,
+    firstSeen,
+    lastSeen,
+    affectedClientCount: Math.max(current?.affectedClientCount ?? 0, observation.affectedClientCount),
+    affectedRequesterCount: observation.affectedRequesterCount === undefined
+      ? current?.affectedRequesterCount
+      : Math.max(current?.affectedRequesterCount ?? 0, observation.affectedRequesterCount),
+    affectedTicketNumbers: mergeSignalStrings(
+      current?.affectedTicketNumbers ?? [],
+      observation.affectedTicketNumbers,
+      MAX_EMERGING_ISSUE_TICKETS
+    ),
+    representativeTicketNumbers: mergeSignalStrings(
+      current?.representativeTicketNumbers ?? [],
+      observation.representativeTicketNumbers,
+      MAX_EMERGING_ISSUE_REPRESENTATIVES
+    ),
+    evidenceStrength: current && evidenceStrengthRank(current.evidenceStrength) >= evidenceStrengthRank(observation.evidenceStrength)
+      ? current.evidenceStrength
+      : observation.evidenceStrength,
+    signalState,
+    currentRelatedTicketNumbers: mergeSignalStrings(
+      current?.currentRelatedTicketNumbers ?? [],
+      observation.currentRelatedTicketNumbers,
+      MAX_EMERGING_ISSUE_CURRENT_TICKETS
+    ),
+    createdAt: current?.createdAt ?? now,
+    updatedAt: current?.updatedAt ?? now,
+    expiresAt: new Date(Math.max(Date.parse(lastSeen) + params.quietPeriodMs, Date.parse(now))).toISOString(),
+    expiredAt: signalState === "expired" ? current?.expiredAt ?? now : undefined,
+  };
+  const comparable = (value: StoredEmergingIssueSignal) => stableHash({
+    issueFingerprint: value.issueFingerprint,
+    summary: value.summary,
+    firstSeen: value.firstSeen,
+    lastSeen: value.lastSeen,
+    affectedClientCount: value.affectedClientCount,
+    affectedRequesterCount: value.affectedRequesterCount,
+    affectedTicketNumbers: value.affectedTicketNumbers,
+    representativeTicketNumbers: value.representativeTicketNumbers,
+    evidenceStrength: value.evidenceStrength,
+    signalState: value.signalState,
+    currentRelatedTicketNumbers: value.currentRelatedTicketNumbers,
+    expiresAt: value.expiresAt,
+  });
+  const changed = !current || comparable(current) !== comparable(record);
+  if (changed) record.updatedAt = now;
+  else record.updatedAt = current!.updatedAt;
+  const outcome: EmergingIssueSignalOutcome = !current
+    ? "created"
+    : record.signalState === "resolved" && current.signalState !== "resolved"
+      ? "resolved"
+      : record.signalState === "expired" && !freshObservation
+        ? "expired"
+        : changed
+          ? "updated"
+          : "unchanged";
+  return { record, outcome };
+}
+
+function emergingIssueUpsertResult(
+  record: StoredEmergingIssueSignal,
+  params: EmergingIssueUpsertParams,
+  outcome: EmergingIssueSignalOutcome
+): EmergingIssueUpsertResult {
+  const signal = publicEmergingIssueSignal(record);
+  return {
+    outcome,
+    signal,
+    operationId: params.operationId,
+    acceptedStage: "SignalPersisted",
+    updatedAt: signal.updatedAt,
+    continuationRequired: false,
+    ambiguityReconciled: true,
+    finalVerification: { performed: true, verified: true },
+  };
+}
+
+function assertStoredEmergingIssueSignal(value: unknown): asserts value is StoredEmergingIssueSignal {
+  if (!isRecordObject(value) || typeof value.ownerHash !== "string") {
+    throw new MalformedStoredOperationError("Stored emerging issue signal is malformed.");
+  }
+  const signal = value as Partial<StoredEmergingIssueSignal>;
+  if (typeof signal.issueFingerprint !== "string" ||
+      typeof signal.summary !== "string" || signal.summary.length > MAX_EMERGING_ISSUE_SUMMARY_LENGTH ||
+      /[\r\n<>]/.test(signal.summary) ||
+      typeof signal.firstSeen !== "string" || !Number.isFinite(Date.parse(signal.firstSeen)) ||
+      typeof signal.lastSeen !== "string" || !Number.isFinite(Date.parse(signal.lastSeen)) ||
+      Date.parse(signal.firstSeen) > Date.parse(signal.lastSeen) ||
+      typeof signal.affectedClientCount !== "number" ||
+      !Number.isSafeInteger(signal.affectedClientCount) || signal.affectedClientCount < 2 ||
+      (signal.affectedRequesterCount !== undefined &&
+        (!Number.isSafeInteger(signal.affectedRequesterCount) || signal.affectedRequesterCount < 0)) ||
+      !["weak", "moderate", "strong"].includes(String(signal.evidenceStrength)) ||
+      !["active", "expired", "resolved"].includes(String(signal.signalState)) ||
+      typeof signal.createdAt !== "string" || !Number.isFinite(Date.parse(signal.createdAt)) ||
+      typeof signal.updatedAt !== "string" || !Number.isFinite(Date.parse(signal.updatedAt)) ||
+      typeof signal.expiresAt !== "string" || !Number.isFinite(Date.parse(signal.expiresAt)) ||
+      signal.expiredAt !== undefined &&
+        (typeof signal.expiredAt !== "string" || !Number.isFinite(Date.parse(signal.expiredAt)))) {
+    throw new MalformedStoredOperationError("Stored emerging issue signal has invalid fields.");
+  }
+  boundedUniqueSignalStrings(signal.affectedTicketNumbers, MAX_EMERGING_ISSUE_TICKETS, "affectedTicketNumbers");
+  boundedUniqueSignalStrings(signal.representativeTicketNumbers, MAX_EMERGING_ISSUE_REPRESENTATIVES, "representativeTicketNumbers");
+  boundedUniqueSignalStrings(signal.currentRelatedTicketNumbers, MAX_EMERGING_ISSUE_CURRENT_TICKETS, "currentRelatedTicketNumbers");
 }
 
 function assertStringArray(value: unknown, field: string): asserts value is string[] {
@@ -1954,6 +2265,30 @@ class MemoryOperationStore implements OperationStore {
       terminalizeContinuationFailureInRecord(record, params)
     );
   }
+
+  async getEmergingIssue(
+    issueFingerprint: string,
+    ownerHash: string
+  ): Promise<EmergingIssueSignal | undefined> {
+    const key = emergingIssueSignalKey(ownerHash, issueFingerprint);
+    const stored = memoryEmergingIssueSignals.get(key);
+    if (!stored || stored.ownerHash !== ownerHash) return undefined;
+    const expired = expireEmergingIssueSignal(stored, nowIso());
+    if (expired !== stored) memoryEmergingIssueSignals.set(key, expired);
+    assertStoredEmergingIssueSignal(expired);
+    return publicEmergingIssueSignal(expired);
+  }
+
+  async upsertEmergingIssue(
+    params: EmergingIssueUpsertParams
+  ): Promise<EmergingIssueUpsertResult> {
+    const key = emergingIssueSignalKey(params.ownerHash, params.observation.issueFingerprint);
+    const existing = memoryEmergingIssueSignals.get(key);
+    const merged = upsertEmergingIssueSignalRecord(existing, params);
+    assertStoredEmergingIssueSignal(merged.record);
+    memoryEmergingIssueSignals.set(key, cloneEmergingIssueSignal(merged.record));
+    return emergingIssueUpsertResult(merged.record, params, merged.outcome);
+  }
 }
 
 class DurableObjectOperationStore implements OperationStore {
@@ -2207,6 +2542,50 @@ class DurableObjectOperationStore implements OperationStore {
       throw await operationStoreFailure(response, "Operation store terminalisation failed");
     }
     return (await response.json()) as OperationLedgerRecord;
+  }
+
+  async getEmergingIssue(
+    issueFingerprint: string,
+    ownerHash: string
+  ): Promise<EmergingIssueSignal | undefined> {
+    const response = await operationStoreFetch(
+      "operationStore.getEmergingIssue",
+      this.stub(ownerHash),
+      new Request(
+        `https://operation.local/signals/emerging-issue/${encodeURIComponent(issueFingerprint)}?ownerHash=${encodeURIComponent(ownerHash)}`
+      )
+    );
+    if (response.status === 404) return undefined;
+    if (!response.ok) throw await operationStoreFailure(response, "Emerging issue signal lookup failed");
+    const signal = await response.json();
+    if (!isRecordObject(signal) || "ownerHash" in signal) {
+      throw new MalformedStoredOperationError("Emerging issue signal lookup was not redacted.");
+    }
+    assertStoredEmergingIssueSignal({ ...signal, ownerHash });
+    return signal as unknown as EmergingIssueSignal;
+  }
+
+  async upsertEmergingIssue(
+    params: EmergingIssueUpsertParams
+  ): Promise<EmergingIssueUpsertResult> {
+    assertEmergingIssueObservation(params.observation);
+    const response = await operationStoreFetch(
+      "operationStore.upsertEmergingIssue",
+      this.stub(params.ownerHash),
+      new Request("https://operation.local/signals/emerging-issue/upsert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params),
+      })
+    );
+    if (!response.ok) throw await operationStoreFailure(response, "Emerging issue signal upsert failed");
+    const result = await response.json() as EmergingIssueUpsertResult;
+    if (!isRecordObject(result) || !isRecordObject(result.signal) ||
+        result.continuationRequired !== false || result.ambiguityReconciled !== true ||
+        !isRecordObject(result.finalVerification) || result.finalVerification.verified !== true) {
+      throw new MalformedStoredOperationError("Emerging issue signal upsert result is malformed.");
+    }
+    return result;
   }
 }
 
@@ -2774,6 +3153,16 @@ export class SuperOpsOperationLedger {
     }
   }
 
+  private async setEmergingIssueAlarm(signal: StoredEmergingIssueSignal): Promise<void> {
+    if (signal.signalState !== "active" || typeof this.state.storage.setAlarm !== "function") return;
+    const expiresAt = Date.parse(signal.expiresAt);
+    if (!Number.isFinite(expiresAt)) return;
+    const existingAlarm = await this.state.storage.getAlarm?.();
+    if (existingAlarm === null || existingAlarm === undefined || expiresAt < existingAlarm) {
+      await this.state.storage.setAlarm(expiresAt);
+    }
+  }
+
   private watchdogAlarmAt(record: OperationLedgerRecord): number {
     if (record.state !== "Rescheduled" || !record.nextEligibleTime ||
         record.continuationMechanism !== "workflow" || record.schedulingSucceeded !== true) {
@@ -3045,6 +3434,26 @@ export class SuperOpsOperationLedger {
         }
       }
     }
+    const signals = await this.state.storage.list<StoredEmergingIssueSignal>({ prefix: "signal:" });
+    for (const [key, signal] of signals) {
+      if (!key.startsWith("signal:")) continue;
+      try {
+        assertStoredEmergingIssueSignal(signal);
+      } catch {
+        await this.state.storage.delete(key);
+        continue;
+      }
+      const normalized = expireEmergingIssueSignal(signal, now);
+      if (normalized !== signal) {
+        await this.state.storage.put(key, normalized);
+      }
+      if (normalized.signalState === "active") {
+        const expiresAt = Date.parse(normalized.expiresAt);
+        if (Number.isFinite(expiresAt)) {
+          nextAlarmAt = nextAlarmAt === undefined ? expiresAt : Math.min(nextAlarmAt, expiresAt);
+        }
+      }
+    }
     if (nextAlarmAt !== undefined && typeof this.state.storage.setAlarm === "function") {
       await this.state.storage.setAlarm(nextAlarmAt);
     }
@@ -3062,6 +3471,48 @@ export class SuperOpsOperationLedger {
       : undefined;
     const operationMatch = url.pathname.match(/^\/operations\/([^/]+)$/);
     const operationActionMatch = url.pathname.match(/^\/operations\/([^/]+)\/(claim-next|complete-item|checkpoint-item|schedule-continuation|cancel)$/);
+    const emergingIssueSignalMatch = url.pathname.match(/^\/signals\/emerging-issue\/([^/]+)$/);
+
+    if (request.method === "POST" && url.pathname === "/signals/emerging-issue/upsert") {
+      try {
+        const payload = await request.json();
+        if (!isRecordObject(payload) || typeof payload.ownerHash !== "string" ||
+            typeof payload.operationId !== "string" || !isRecordObject(payload.observation)) {
+          return json({ errorClass: "MalformedStoredOperation", error: "Emerging issue upsert parameters are invalid." }, 422);
+        }
+        const params = payload as unknown as EmergingIssueUpsertParams;
+        assertEmergingIssueObservation(params.observation);
+        const key = emergingIssueSignalKey(params.ownerHash, params.observation.issueFingerprint);
+        const existing = await this.state.storage.get<StoredEmergingIssueSignal>(key);
+        if (existing) assertStoredEmergingIssueSignal(existing);
+        const merged = upsertEmergingIssueSignalRecord(existing, params);
+        assertStoredEmergingIssueSignal(merged.record);
+        await this.state.storage.put(key, merged.record);
+        await this.setEmergingIssueAlarm(merged.record);
+        return json(emergingIssueUpsertResult(merged.record, params, merged.outcome));
+      } catch (error) {
+        if (error instanceof MalformedStoredOperationError) {
+          return json({ errorClass: "MalformedStoredOperation", error: error.message }, 422);
+        }
+        throw error;
+      }
+    }
+
+    if (request.method === "GET" && emergingIssueSignalMatch) {
+      const ownerHash = url.searchParams.get("ownerHash") ?? "";
+      if (!ownerHash) return json({ error: "ownerHash is required" }, 400);
+      const issueFingerprint = decodeURIComponent(emergingIssueSignalMatch[1]);
+      const key = emergingIssueSignalKey(ownerHash, issueFingerprint);
+      const stored = await this.state.storage.get<StoredEmergingIssueSignal>(key);
+      if (!stored) return json({ error: "Not found" }, 404);
+      assertStoredEmergingIssueSignal(stored);
+      const normalized = expireEmergingIssueSignal(stored, nowIso());
+      if (normalized !== stored) {
+        await this.state.storage.put(key, normalized);
+      }
+      await this.setEmergingIssueAlarm(normalized);
+      return json(publicEmergingIssueSignal(normalized));
+    }
 
     if (request.method === "PUT" && operationMatch) {
       try {

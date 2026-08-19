@@ -13,8 +13,22 @@ const DEFAULT_PAGE_SIZE = 100;
 const MAX_PAGE_SIZE = 500;
 const DEFAULT_FIND_MAX_PAGES = 20;
 const SCRIPT_PLATFORM_TYPES = ["WINDOWS", "MAC", "LINUX"] as const;
+const SCRIPT_CATALOGUE_MAX_RECORDS = 500;
+const SCRIPT_CATALOGUE_MAX_RECOMMENDATION_CANDIDATES = 100;
+const SCRIPT_CATALOGUE_MAX_REJECTED_MATCHES = 20;
+const SCRIPT_CATALOGUE_RECOMMENDATION_STATES = [
+  "DEFINITIVE_RECOMMENDATION",
+  "NEEDS_DETAILS",
+  "NO_SUITABLE_SCRIPT",
+  "CATALOGUE_UNAVAILABLE",
+  "CATALOGUE_DEGRADED",
+] as const;
+const SCRIPT_CATALOGUE_SYNC_STATES = ["COMPLETE", "INCOMPLETE", "UNAVAILABLE", "DEGRADED"] as const;
 
 type ScriptPlatformType = (typeof SCRIPT_PLATFORM_TYPES)[number];
+type ScriptCatalogueStatus = "REVIEWED" | "UNREVIEWED" | "REJECTED";
+type ScriptCatalogueSyncState = (typeof SCRIPT_CATALOGUE_SYNC_STATES)[number];
+type ScriptCatalogueRecommendationState = (typeof SCRIPT_CATALOGUE_RECOMMENDATION_STATES)[number];
 
 const SCRIPT_FIELDS = `
   scriptId
@@ -125,6 +139,39 @@ interface Script {
   runTimeVariables?: string[];
   timeOut?: number;
   tags?: SuperOpsJson;
+}
+
+interface ScriptCatalogueMetadata {
+  catalogueStatus: ScriptCatalogueStatus;
+  markers: string[];
+  supportedPlatforms: ScriptPlatformType[];
+  prerequisites: string[];
+  safetyRequirements: string[];
+  sourceReviewTime?: string;
+  unsuitable: boolean;
+}
+
+interface ScriptCatalogueEntry {
+  script: Script;
+  metadata: ScriptCatalogueMetadata;
+}
+
+interface ScriptCatalogueSnapshot {
+  entries: ScriptCatalogueEntry[];
+  syncState: ScriptCatalogueSyncState;
+  latestSyncAttemptAt: string;
+  upstreamHasMore: boolean | null;
+  upstreamTotalCount?: number;
+}
+
+interface ScriptCatalogueRecommendationParams {
+  request: string;
+  targetPlatform?: ScriptPlatformType;
+  platformVerified: boolean;
+  verifiedPrerequisites?: string[];
+  prerequisitesMet?: boolean;
+  safetyRequirementsVerified: boolean;
+  maxCandidates: number;
 }
 
 interface ScriptListResponse {
@@ -262,6 +309,304 @@ function filterScripts(
     }
     return true;
   });
+}
+
+function normalizedCatalogueMarker(value: string): string {
+  return value.trim().toUpperCase().replace(/[\s-]+/g, "_");
+}
+
+function canonicalScriptPlatform(value: unknown): ScriptPlatformType | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toUpperCase();
+  if (normalized === "WINDOWS" || normalized === "WIN") return "WINDOWS";
+  if (normalized === "MAC" || normalized === "MACOS" || normalized === "OSX") return "MAC";
+  if (normalized === "LINUX") return "LINUX";
+  return undefined;
+}
+
+function boundedStringList(value: unknown, max = 20): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    const text = entry.trim().replace(/\s+/g, " ");
+    if (!text || text.length > 120 || seen.has(text.toLowerCase())) continue;
+    seen.add(text.toLowerCase());
+    result.push(text);
+    if (result.length >= max) break;
+  }
+  return result;
+}
+
+function scriptCatalogueMetadata(script: Script): ScriptCatalogueMetadata {
+  const tagRecord = jsonRecord(script.tags);
+  const scriptRecord = jsonRecord(script);
+  const publishedRecord = jsonRecord(scriptRecord?.catalogue) ?? scriptRecord;
+  const rawTags = Array.isArray(script.tags)
+    ? script.tags.filter((tag): tag is string => typeof tag === "string")
+    : [];
+  const objectMarkers = [
+    publishedRecord?.status,
+    publishedRecord?.reviewStatus,
+    publishedRecord?.catalogueStatus,
+    ...(Array.isArray(publishedRecord?.flags) ? publishedRecord.flags : []),
+    tagRecord?.status,
+    tagRecord?.reviewStatus,
+    tagRecord?.catalogueStatus,
+    ...(Array.isArray(tagRecord?.flags) ? tagRecord.flags : []),
+  ].filter((value): value is string => typeof value === "string");
+  const markers = [...new Set(
+    [...rawTags, ...objectMarkers]
+      .flatMap((tag) => tag.split(/[,;|]/g))
+      .map(normalizedCatalogueMarker)
+      .filter(Boolean)
+  )].slice(0, 30);
+  const markerSet = new Set(markers);
+  const supportedPlatforms = SCRIPT_PLATFORM_TYPES.filter((platform) =>
+    markerSet.has(platform) || markerSet.has(`PLATFORM_${platform}`) ||
+    markerSet.has(`SUPPORTED_${platform}`) ||
+    boundedStringList(publishedRecord?.supportedPlatforms).some((value) => canonicalScriptPlatform(value) === platform)
+  );
+  const prerequisites = [
+    ...boundedStringList(publishedRecord?.prerequisites),
+    ...boundedStringList(tagRecord?.prerequisites),
+    ...markers
+      .filter((marker) => marker.startsWith("REQUIRES_"))
+      .map((marker) => marker.slice("REQUIRES_".length).replace(/_/g, " ")),
+  ].slice(0, 20);
+  const safetyRequirements = [
+    ...boundedStringList(publishedRecord?.safetyRequirements),
+    ...boundedStringList(tagRecord?.safetyRequirements),
+    ...markers
+      .filter((marker) => marker.startsWith("SAFETY_"))
+      .map((marker) => marker.slice("SAFETY_".length).replace(/_/g, " ")),
+  ].slice(0, 20);
+  const rawStatus = [
+    publishedRecord?.status,
+    publishedRecord?.reviewStatus,
+    publishedRecord?.catalogueStatus,
+    tagRecord?.status,
+    tagRecord?.reviewStatus,
+    tagRecord?.catalogueStatus,
+  ].find((value): value is string => typeof value === "string");
+  const explicitRejected = markerSet.has("DO_NOT_USE") || markerSet.has("LEGACY") ||
+    markerSet.has("UNSUITABLE") || tagRecord?.suitable === false || tagRecord?.usable === false ||
+    publishedRecord?.suitable === false || publishedRecord?.usable === false;
+  const reviewed = normalizedCatalogueMarker(rawStatus ?? "") === "REVIEWED" ||
+    markerSet.has("REVIEWED");
+  const sourceReviewTime = [
+    publishedRecord?.sourceReviewTime,
+    publishedRecord?.reviewedAt,
+    publishedRecord?.reviewTime,
+    tagRecord?.sourceReviewTime,
+    tagRecord?.reviewedAt,
+    tagRecord?.reviewTime,
+  ].find((value): value is string =>
+    typeof value === "string" && Number.isFinite(Date.parse(value))
+  );
+
+  return {
+    catalogueStatus: explicitRejected ? "REJECTED" : reviewed ? "REVIEWED" : "UNREVIEWED",
+    markers,
+    supportedPlatforms,
+    prerequisites,
+    safetyRequirements,
+    sourceReviewTime,
+    unsuitable: explicitRejected,
+  };
+}
+
+function scriptCatalogueEntry(script: Script): ScriptCatalogueEntry {
+  return { script, metadata: scriptCatalogueMetadata(script) };
+}
+
+function uniqueScriptCatalogueEntries(scripts: Script[]): ScriptCatalogueEntry[] {
+  const seen = new Set<string>();
+  const entries: ScriptCatalogueEntry[] = [];
+  for (const script of scripts) {
+    if (!script.scriptId || seen.has(script.scriptId)) continue;
+    seen.add(script.scriptId);
+    entries.push(scriptCatalogueEntry(script));
+  }
+  return entries;
+}
+
+function scriptCatalogueSummary(snapshot: ScriptCatalogueSnapshot) {
+  const reviewed = snapshot.entries.filter((entry) => entry.metadata.catalogueStatus === "REVIEWED");
+  const rejected = snapshot.entries.filter((entry) => entry.metadata.catalogueStatus === "REJECTED");
+  return {
+    syncState: snapshot.syncState,
+    latestSyncAttemptAt: snapshot.latestSyncAttemptAt,
+    upstreamHasMore: snapshot.upstreamHasMore,
+    upstreamTotalCount: snapshot.upstreamTotalCount,
+    coverageComplete: snapshot.syncState === "COMPLETE",
+    coverageMayBeIncomplete: snapshot.syncState !== "COMPLETE",
+    catalogueAvailable: snapshot.syncState !== "UNAVAILABLE",
+    publishedRecordCount: snapshot.entries.length,
+    publishedReviewedRecordCount: reviewed.length,
+    rejectedRecordCount: rejected.length,
+    sourceReviewTimesAvailable: snapshot.entries.some((entry) => Boolean(entry.metadata.sourceReviewTime)),
+    sourceReviewTime: reviewed
+      .map((entry) => entry.metadata.sourceReviewTime)
+      .filter((value): value is string => Boolean(value))
+      .sort()
+      .at(-1),
+  };
+}
+
+async function loadScriptCatalogue(
+  client: ReturnType<typeof getClient>,
+  max = SCRIPT_CATALOGUE_MAX_RECORDS
+): Promise<ScriptCatalogueSnapshot> {
+  const latestSyncAttemptAt = new Date().toISOString();
+  const response = await queryScriptList(client, {
+    page: 1,
+    max: Math.min(Math.max(Math.trunc(max), 1), SCRIPT_CATALOGUE_MAX_RECORDS),
+  });
+  const upstreamHasMore = response.listInfo.hasMore === true
+    ? true
+    : response.listInfo.hasMore === false
+      ? false
+      : null;
+  const syncState: ScriptCatalogueSyncState = upstreamHasMore === false
+    ? "COMPLETE"
+    : upstreamHasMore === true
+      ? "INCOMPLETE"
+      : "DEGRADED";
+  return {
+    entries: uniqueScriptCatalogueEntries(response.scripts),
+    syncState,
+    latestSyncAttemptAt,
+    upstreamHasMore,
+    upstreamTotalCount: response.listInfo.totalCount,
+  };
+}
+
+function recommendationTokens(value: string): string[] {
+  return [...new Set(value.toLowerCase().match(/[a-z0-9]+/g) ?? [])]
+    .filter((token) => token.length > 1)
+    .slice(0, 40);
+}
+
+function scriptMatchScore(script: Script, request: string): number {
+  const tokens = recommendationTokens(request);
+  if (tokens.length === 0) return 0;
+  const name = (script.name ?? "").toLowerCase();
+  const description = (script.description ?? "").toLowerCase();
+  const matched = tokens.filter((token) => name.includes(token) || description.includes(token));
+  const nameMatched = tokens.filter((token) => name.includes(token)).length;
+  const phraseBonus = request.trim().length > 0 &&
+    `${name} ${description}`.includes(request.trim().toLowerCase()) ? 15 : 0;
+  return Math.min(100, Math.round((matched.length / tokens.length) * 75) +
+    Math.min(20, nameMatched * 5) + phraseBonus);
+}
+
+function canonicalPlatform(value: unknown): ScriptPlatformType | undefined {
+  return canonicalScriptPlatform(value);
+}
+
+function normalizedPrerequisites(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return boundedStringList(value, 20).map((entry) => entry.toLowerCase());
+}
+
+function evaluateScriptSuitability(
+  entry: ScriptCatalogueEntry,
+  params: ScriptCatalogueRecommendationParams
+): {
+  eligible: boolean;
+  needsDetails: boolean;
+  suitabilityRank: number;
+  reasons: string[];
+} {
+  const { metadata } = entry;
+  const reasons: string[] = [];
+  if (metadata.catalogueStatus !== "REVIEWED") {
+    reasons.push(`Catalogue status is ${metadata.catalogueStatus}, not REVIEWED.`);
+  }
+  if (metadata.markers.includes("DO_NOT_USE")) reasons.push("Catalogue marker DO_NOT_USE is present.");
+  if (metadata.markers.includes("LEGACY")) reasons.push("Catalogue marker LEGACY is present.");
+  if (metadata.unsuitable) reasons.push("Reviewed catalogue metadata marks this script unsuitable.");
+  if (params.targetPlatform && !params.platformVerified) {
+    reasons.push("Target platform was supplied but not verified.");
+  }
+  if (!params.targetPlatform && metadata.supportedPlatforms.length > 0) {
+    reasons.push("A compatible target platform is required but was not supplied and verified.");
+  }
+  if (params.targetPlatform && metadata.supportedPlatforms.length > 0 &&
+      !metadata.supportedPlatforms.includes(params.targetPlatform)) {
+    reasons.push(`Verified target platform ${params.targetPlatform} is incompatible.`);
+  }
+  if (metadata.prerequisites.length > 0) {
+    if (params.prerequisitesMet === false) {
+      reasons.push("Required prerequisites are known not to be met.");
+    } else if (!params.verifiedPrerequisites) {
+      reasons.push("Required prerequisites have not been verified.");
+    } else {
+      const verified = new Set(params.verifiedPrerequisites.map((value) => value.toLowerCase()));
+      const missing = metadata.prerequisites.filter((value) => !verified.has(value.toLowerCase()));
+      if (missing.length > 0) reasons.push(`Required prerequisites are missing: ${missing.join(", ")}.`);
+    }
+  }
+  if (metadata.safetyRequirements.length > 0 && !params.safetyRequirementsVerified) {
+    reasons.push("Catalogue safety requirements prevent an advisory recommendation until verified.");
+  }
+
+  const hardRejected = metadata.catalogueStatus !== "REVIEWED" || metadata.unsuitable ||
+    metadata.markers.includes("DO_NOT_USE") || metadata.markers.includes("LEGACY") ||
+    (params.targetPlatform !== undefined && metadata.supportedPlatforms.length > 0 &&
+      !metadata.supportedPlatforms.includes(params.targetPlatform)) ||
+    params.prerequisitesMet === false ||
+    (metadata.prerequisites.length > 0 && params.verifiedPrerequisites !== undefined &&
+      metadata.prerequisites.some((value) => !params.verifiedPrerequisites!.some(
+        (verified) => verified.toLowerCase() === value.toLowerCase()
+      )));
+  const needsDetails = !hardRejected && reasons.length > 0;
+  return {
+    eligible: reasons.length === 0,
+    needsDetails,
+    suitabilityRank: reasons.length === 0 ? 100 : hardRejected ? 0 : 50,
+    reasons,
+  };
+}
+
+function catalogueScriptView(entry: ScriptCatalogueEntry) {
+  return {
+    ...sanitizeScript(entry.script),
+    catalogue: {
+      status: entry.metadata.catalogueStatus,
+      markers: entry.metadata.markers,
+      supportedPlatforms: entry.metadata.supportedPlatforms,
+      prerequisites: entry.metadata.prerequisites,
+      safetyRequirements: entry.metadata.safetyRequirements,
+      sourceReviewTime: entry.metadata.sourceReviewTime,
+      suitable: !entry.metadata.unsuitable,
+    },
+  };
+}
+
+function recommendationMatchView(params: {
+  entry: ScriptCatalogueEntry;
+  matchScore: number;
+  suitabilityRank: number;
+  reasons: string[];
+  selectionReason?: string;
+}) {
+  return {
+    scriptId: params.entry.script.scriptId,
+    name: params.entry.script.name,
+    matchScore: params.matchScore,
+    suitabilityRank: params.suitabilityRank,
+    selectionReason: params.selectionReason,
+    catalogueStatus: params.entry.metadata.catalogueStatus,
+    markers: params.entry.metadata.markers,
+    supportedPlatforms: params.entry.metadata.supportedPlatforms,
+    prerequisites: params.entry.metadata.prerequisites,
+    reasons: params.reasons,
+    advisoryOnly: true,
+    executionAuthorised: false,
+  };
 }
 
 async function queryScriptList(
@@ -553,6 +898,73 @@ export function getScriptsTools(): DomainTools {
         },
       },
       {
+        name: "superops_script_catalog_status",
+        description:
+          "Read-only status for the existing published saved-script catalogue. An INCOMPLETE or DEGRADED sync means coverage cannot be claimed complete, but it does not invalidate a specific published REVIEWED record that is present. Does not return script source or authorise execution.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "superops_script_catalog_get",
+        description:
+          "Read-only safe metadata for one exact published script-catalogue record. A record is advisory evidence only; REVIEWED status, platform applicability, prerequisites, and safety metadata are exposed without returning source or authorising execution.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            scriptId: { type: "string", description: "Exact saved SuperOps script ID." },
+          },
+          required: ["scriptId"],
+        },
+      },
+      {
+        name: "superops_script_catalog_recommend",
+        description:
+          "Read-only advisory recommendation from the existing published script catalogue. Definitive recommendations require a present REVIEWED record with no DO_NOT_USE or LEGACY marker, compatible verified platform, met prerequisites, and satisfied safety requirements. NEEDS_DETAILS is only a candidate state. A catalogue recommendation never authorises script execution.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            request: {
+              type: "string",
+              maxLength: 500,
+              description: "Bounded task description used for lexical matching; do not include customer message bodies or secrets.",
+            },
+            targetPlatform: {
+              type: "string",
+              enum: [...SCRIPT_PLATFORM_TYPES],
+              description: "Target platform when known. A platform-restricted script cannot be definitively recommended until this is verified.",
+            },
+            platformVerified: {
+              type: "boolean",
+              default: false,
+              description: "Set true only when the target platform is verified from live asset evidence.",
+            },
+            verifiedPrerequisites: {
+              type: "array",
+              maxItems: 20,
+              items: { type: "string", maxLength: 120 },
+              description: "Bounded prerequisite identifiers confirmed by evidence.",
+            },
+            prerequisitesMet: {
+              type: "boolean",
+              description: "Explicitly false when known prerequisites are not met.",
+            },
+            safetyRequirementsVerified: {
+              type: "boolean",
+              default: false,
+              description: "Set true only after the catalogue safety requirements are verified for this advisory context.",
+            },
+            maxCandidates: {
+              type: "number",
+              default: 20,
+              description: "Maximum bounded catalogue records to inspect (max 100).",
+            },
+          },
+          required: ["request"],
+        },
+      },
+      {
         name: "superops_scripts_supported_targets",
         description: "Identify which SuperOps script platform types currently include a saved script ID.",
         inputSchema: {
@@ -624,6 +1036,210 @@ export function getScriptsTools(): DomainTools {
             if (!scriptId) throw new Error("scriptId is required.");
             const { script } = await findScriptById(client, scriptId);
             return { content: [{ type: "text", text: JSON.stringify(sanitizeScript(script), null, 2) }] };
+          }
+
+          case "superops_script_catalog_status": {
+            try {
+              const snapshot = await loadScriptCatalogue(client);
+              return {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({
+                    ...scriptCatalogueSummary(snapshot),
+                    advisoryOnly: true,
+                    executionAuthorised: false,
+                  }, null, 2),
+                }],
+              };
+            } catch (error) {
+              return {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({
+                    syncState: "UNAVAILABLE",
+                    catalogueAvailable: false,
+                    coverageComplete: false,
+                    coverageMayBeIncomplete: true,
+                    latestSyncAttemptAt: new Date().toISOString(),
+                    advisoryOnly: true,
+                    executionAuthorised: false,
+                    error: error instanceof Error ? error.message.slice(0, 240) : "Catalogue read failed.",
+                  }, null, 2),
+                }],
+                isError: true,
+              };
+            }
+          }
+
+          case "superops_script_catalog_get": {
+            const scriptId = normalizeId(args.scriptId);
+            if (!scriptId) throw new Error("scriptId is required.");
+            const snapshot = await loadScriptCatalogue(client);
+            const entry = snapshot.entries.find((candidate) => candidate.script.scriptId === scriptId);
+            if (!entry) {
+              return {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({
+                    found: false,
+                    scriptId,
+                    catalogue: scriptCatalogueSummary(snapshot),
+                    advisoryOnly: true,
+                    executionAuthorised: false,
+                  }, null, 2),
+                }],
+              };
+            }
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  found: true,
+                  script: catalogueScriptView(entry),
+                  catalogue: scriptCatalogueSummary(snapshot),
+                  advisoryOnly: true,
+                  executionAuthorised: false,
+                }, null, 2),
+              }],
+            };
+          }
+
+          case "superops_script_catalog_recommend": {
+            const request = stringValue(args.request);
+            if (!request) throw new Error("request is required.");
+            if (request.length > 500) throw new Error("request must not exceed 500 characters.");
+            const targetPlatform = canonicalPlatform(args.targetPlatform);
+            if (args.targetPlatform !== undefined && !targetPlatform) {
+              throw new Error("targetPlatform must be WINDOWS, MAC, or LINUX.");
+            }
+            const verifiedPrerequisites = normalizedPrerequisites(args.verifiedPrerequisites);
+            if (args.verifiedPrerequisites !== undefined && !verifiedPrerequisites) {
+              throw new Error("verifiedPrerequisites must be an array of bounded strings.");
+            }
+            const maxCandidates = typeof args.maxCandidates === "number" && Number.isFinite(args.maxCandidates)
+              ? Math.min(Math.max(Math.trunc(args.maxCandidates), 1), SCRIPT_CATALOGUE_MAX_RECOMMENDATION_CANDIDATES)
+              : 20;
+            const params: ScriptCatalogueRecommendationParams = {
+              request,
+              targetPlatform,
+              platformVerified: args.platformVerified === true,
+              verifiedPrerequisites,
+              prerequisitesMet: typeof args.prerequisitesMet === "boolean" ? args.prerequisitesMet : undefined,
+              safetyRequirementsVerified: args.safetyRequirementsVerified === true,
+              maxCandidates,
+            };
+
+            let snapshot: ScriptCatalogueSnapshot;
+            try {
+              snapshot = await loadScriptCatalogue(client, maxCandidates);
+            } catch (error) {
+              return {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({
+                    recommendationState: "CATALOGUE_UNAVAILABLE",
+                    bestMatch: null,
+                    candidate: null,
+                    rejectedMatches: [],
+                    catalogue: {
+                      syncState: "UNAVAILABLE",
+                      catalogueAvailable: false,
+                      coverageComplete: false,
+                      coverageMayBeIncomplete: true,
+                      latestSyncAttemptAt: new Date().toISOString(),
+                    },
+                    advisoryOnly: true,
+                    executionAuthorised: false,
+                    error: error instanceof Error ? error.message.slice(0, 240) : "Catalogue read failed.",
+                  }, null, 2),
+                }],
+                isError: true,
+              };
+            }
+
+            const ranked = snapshot.entries
+              .map((entry) => {
+                const suitability = evaluateScriptSuitability(entry, params);
+                return {
+                  entry,
+                  matchScore: scriptMatchScore(entry.script, request),
+                  ...suitability,
+                };
+              })
+              .sort((left, right) =>
+                right.suitabilityRank - left.suitabilityRank ||
+                right.matchScore - left.matchScore ||
+                left.entry.script.scriptId.localeCompare(right.entry.script.scriptId)
+              );
+            const eligible = ranked.filter((candidate) => candidate.eligible);
+            const details = ranked.filter((candidate) => candidate.needsDetails);
+            const rejected = ranked
+              .filter((candidate) => !candidate.eligible && !candidate.needsDetails)
+              .slice(0, SCRIPT_CATALOGUE_MAX_REJECTED_MATCHES)
+              .map((candidate) => recommendationMatchView({
+                entry: candidate.entry,
+                matchScore: candidate.matchScore,
+                suitabilityRank: candidate.suitabilityRank,
+                reasons: candidate.reasons,
+              }));
+            const selected = eligible[0];
+            const detailCandidate = details[0];
+            const degradedSelectedCandidate = selected && snapshot.syncState === "DEGRADED"
+              ? {
+                  ...selected,
+                  reasons: [
+                    "Latest catalogue enumeration is degraded; coverage cannot be claimed complete.",
+                  ],
+                }
+              : undefined;
+            const recommendationState: ScriptCatalogueRecommendationState = selected && !degradedSelectedCandidate
+              ? "DEFINITIVE_RECOMMENDATION"
+              : detailCandidate
+                ? "NEEDS_DETAILS"
+                : snapshot.syncState !== "COMPLETE"
+                  ? "CATALOGUE_DEGRADED"
+                  : "NO_SUITABLE_SCRIPT";
+            const selectionReason = selected && !degradedSelectedCandidate
+              ? "Selected because reviewed safety and suitability outrank lexical matchScore; the recommendation is advisory only and does not authorise execution."
+              : undefined;
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  recommendationState,
+                  bestMatch: selected && !degradedSelectedCandidate
+                    ? recommendationMatchView({
+                        entry: selected.entry,
+                        matchScore: selected.matchScore,
+                        suitabilityRank: selected.suitabilityRank,
+                        reasons: selected.reasons,
+                        selectionReason,
+                      })
+                    : null,
+                  candidate: (detailCandidate ?? degradedSelectedCandidate)
+                    ? recommendationMatchView({
+                        entry: (detailCandidate ?? degradedSelectedCandidate)!.entry,
+                        matchScore: (detailCandidate ?? degradedSelectedCandidate)!.matchScore,
+                        suitabilityRank: (detailCandidate ?? degradedSelectedCandidate)!.suitabilityRank,
+                        reasons: (detailCandidate ?? degradedSelectedCandidate)!.reasons,
+                      })
+                    : null,
+                  rejectedMatches: rejected,
+                  alternatives: ranked.slice(0, Math.min(maxCandidates, 10)).map((candidate) =>
+                    recommendationMatchView({
+                      entry: candidate.entry,
+                      matchScore: candidate.matchScore,
+                      suitabilityRank: candidate.suitabilityRank,
+                      reasons: candidate.reasons,
+                    })
+                  ),
+                  catalogue: scriptCatalogueSummary(snapshot),
+                  advisoryOnly: true,
+                  executionAuthorised: false,
+                  executionTool: "superops_scripts_execute_on_asset",
+                }, null, 2),
+              }],
+            };
           }
 
           case "superops_scripts_supported_targets": {

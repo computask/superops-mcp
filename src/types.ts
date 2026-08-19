@@ -209,6 +209,7 @@ export interface Alert {
   id: string;
   message?: string;
   createdTime?: string;
+  updatedTime?: string;
   status?: string;
   severity?: string;
   description?: string;

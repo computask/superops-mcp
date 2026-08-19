@@ -57,9 +57,20 @@ export interface AuditMetadata {
     interval?: unknown;
     groupBy?: unknown;
   };
+  emergingIssueSignal?: {
+    issueFingerprint?: unknown;
+    affectedClientCount?: unknown;
+    affectedRequesterCount?: unknown;
+    affectedTicketCount?: unknown;
+    representativeTicketCount?: unknown;
+    currentRelatedTicketCount?: unknown;
+    evidenceStrength?: unknown;
+    signalState?: unknown;
+  };
 }
 
 const HIGH_RISK_WRITE_TOOLS = new Set([
+  "superops_triage_emerging_issue_upsert",
   "superops_tickets_create",
   "superops_tickets_update",
   "superops_tickets_resolve_full",
@@ -74,6 +85,7 @@ const HIGH_RISK_WRITE_TOOLS = new Set([
 ]);
 
 const REVIEWED_DURABLE_WRITE_TOOLS = new Set([
+  "superops_triage_emerging_issue_upsert",
   "superops_tickets_apply_triage_plan",
   "superops_operations_cancel",
 ]);
@@ -422,6 +434,28 @@ export function toolAuditMetadata(
         max: args.max ?? 50,
         safeRead: true,
       },
+    };
+  }
+
+  if (name === "superops_triage_emerging_issue_upsert") {
+    return {
+      emergingIssueSignal: {
+        issueFingerprint: args.issueFingerprint,
+        affectedClientCount: args.affectedClientCount,
+        affectedRequesterCount: args.affectedRequesterCount,
+        affectedTicketCount: Array.isArray(args.affectedTicketNumbers)
+          ? args.affectedTicketNumbers.length
+          : undefined,
+        representativeTicketCount: Array.isArray(args.representativeTicketNumbers)
+          ? args.representativeTicketNumbers.length
+          : undefined,
+        currentRelatedTicketCount: Array.isArray(args.currentRelatedTicketNumbers)
+          ? args.currentRelatedTicketNumbers.length
+          : undefined,
+        evidenceStrength: args.evidenceStrength,
+        signalState: args.signalState ?? "active",
+      },
+      changedFields,
     };
   }
 
