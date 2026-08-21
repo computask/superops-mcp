@@ -154,6 +154,7 @@ export interface OperationItemState {
   nextEligibleTime?: string;
   failureReason?: string;
   errorClass?: OperationErrorClass;
+  /** Legacy active expectation retained for stored-record compatibility. */
   updatedTimeExpectation?: string;
   targetFields?: Record<string, unknown>;
   originalMetadataExpectations?: Record<string, unknown>;
@@ -211,6 +212,10 @@ export interface OperationItemState {
   lease?: OperationLease;
   claimedAt?: string;
   completedAt?: string;
+  /** Frozen updatedTime from the approved snapshot; retained for audit. */
+  originalSnapshotUpdatedTime?: string;
+  /** Last updatedTime returned by a verified mutation made by this operation. */
+  expectedCurrentUpdatedTime?: string;
 }
 
 export interface OperationLedgerRecord {
@@ -1035,6 +1040,14 @@ function assertStringArray(value: unknown, field: string): asserts value is stri
 }
 
 function validOptionalRecoveryMetadata(item: Record<string, unknown>): boolean {
+  for (const field of [
+    "updatedTimeExpectation",
+    "originalSnapshotUpdatedTime",
+    "expectedCurrentUpdatedTime",
+  ] as const) {
+    const value = item[field];
+    if (value !== undefined && (typeof value !== "string" || !value)) return false;
+  }
   for (const field of ["mutationType", "reconciliationMutationType", "recoveryMutationStage"] as const) {
     const value = item[field];
     if (value !== undefined && !VALID_OPERATION_MUTATION_TYPES.has(value as OperationMutationType)) return false;
@@ -2056,7 +2069,6 @@ function applyItemPatch(
     delete item.recoveryWriteStarted;
     delete item.stageHistory;
     delete item.mutationStartStage;
-    delete item.updatedTimeExpectation;
     delete item.replaySafe;
     if (item.humanReconciliationRequired !== true) delete item.humanReconciliationRequired;
   }

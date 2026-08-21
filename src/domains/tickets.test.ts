@@ -6447,7 +6447,9 @@ describe("Tickets Domain", () => {
         writeAttempted: true,
         attemptCount: 2,
         verificationState: "Verified",
+        updatedTimeExpectation: "2026-07-18T10:01:00Z",
       });
+      expect(JSON.stringify(stored?.operationRequest)).toContain("2026-07-18T10:00:00Z");
       expect(parsed.operation.items).toContainEqual(expect.objectContaining({
         itemId: "57400",
         attemptCount: 2,
@@ -6455,6 +6457,372 @@ describe("Tickets Domain", () => {
         writeMayHaveSucceeded: true,
         verificationState: "Verified",
       }));
+    });
+  });
+
+  it("retains the original snapshot while advancing the checkpoint through partial recovery and a rate-limited note continuation", async () => {
+    const operationId = "operation-owned-updated-time-checkpoint";
+    const originalUpdatedTime = "2026-08-21T10:24:53.353";
+    const recoveryUpdatedTime = "2026-08-21T10:46:20.482";
+    const postNoteUpdatedTime = "2026-08-21T10:46:25.000";
+    const target = { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" };
+    const original = {
+      ticketId: "ticket-60731",
+      displayId: "60731",
+      subject: "New call",
+      status: "New Calls",
+      client: { accountId: "client-1", name: "TaskGroup" },
+      updatedTime: originalUpdatedTime,
+    };
+    const partial = {
+      ...original,
+      impact: target.impact,
+      updatedTime: "2026-08-21T10:40:00.000",
+    };
+    const recovered = {
+      ...original,
+      ...target,
+      updatedTime: recoveryUpdatedTime,
+    };
+    const postNote = { ...recovered, updatedTime: postNoteUpdatedTime };
+    let ticketReads = 0;
+    let noteReads = 0;
+    let firstUpdate = true;
+    let noteThrottleIssued = false;
+    let noteCreated = false;
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        return {
+          getTicketList: {
+            tickets: [{ ticketId: original.ticketId, displayId: original.displayId }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        };
+      }
+      if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
+      if (query.includes("getTicketNoteList")) {
+        noteReads += 1;
+        if (!firstUpdate && !noteThrottleIssued) {
+          noteThrottleIssued = true;
+          throw new SuperOpsError("note dedupe throttled", "THROTTLED", 0);
+        }
+        return {
+          getTicketNoteList: noteReads >= 4
+            ? noteCreated
+              ? [{ noteId: "note-60731", content: "Approved private follow-up", privacyType: "PRIVATE" }]
+              : []
+            : [],
+        };
+      }
+      ticketReads += 1;
+      const ticket = ticketReads === 1
+        ? original
+        : ticketReads <= 6
+          ? partial
+          : noteCreated
+            ? postNote
+            : recovered;
+      return { getTicket: ticket };
+    });
+    mockClient.mutate.mockImplementation(async (_mutation: string, variables: { input: Record<string, unknown> }) => {
+      if (variables.input.ticket) {
+        noteCreated = true;
+        return { createTicketNote: { noteId: "note-60731", privacyType: "PRIVATE" } };
+      }
+      if (firstUpdate) {
+        firstUpdate = false;
+        throw new Error("classification response lost after the upstream update");
+      }
+      return { updateTicket: { ticketId: original.ticketId } };
+    });
+
+    await runWithOperationStore({}, async () => {
+      const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: operationId,
+          expectedCandidateTicketNumbers: [original.displayId],
+          actions: [{
+            ticketNumber: original.displayId,
+            expectedStatus: original.status,
+            expectedUpdatedTime: originalUpdatedTime,
+            contentVerified: true,
+            action: "update",
+            target,
+            note: "Approved private follow-up",
+          }],
+        })
+      ));
+      expect(JSON.parse(initial.content[0].text).operation).toMatchObject({
+        continuationRequired: true,
+      });
+
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const current = await getOperationStore().get(operationId);
+        if (current?.state === "Completed") break;
+        if (!current) throw new Error("missing checkpointed operation");
+        await runWithExecutionConfig({}, () => runWithExecutionContext(
+          "superops_tickets_apply_triage_plan",
+          () => resumeApplyTriageOperation({
+            operationId,
+            ownerHash: current.ownerHash,
+            leaseOwner: `operation-owned-checkpoint-${attempt}`,
+            now: new Date(Date.now() + (attempt + 1) * 120_000).toISOString(),
+          })
+        ));
+      }
+
+      const final = await getOperationStore().get(operationId);
+      if (!final) throw new Error("missing final checkpointed operation");
+      expect(final.state).toBe("Completed");
+      expect(ticketReads).toBeGreaterThanOrEqual(8);
+      expect(noteReads).toBeGreaterThan(4);
+      expect(mockClient.mutate.mock.calls.filter(([, variables]) => !variables.input.ticket)).toHaveLength(2);
+      expect(mockClient.mutate.mock.calls.filter(([, variables]) => Boolean(variables.input.ticket))).toHaveLength(1);
+      expect(final.itemStates[original.displayId]).toMatchObject({
+        stage: "Completed",
+        outcome: "Updated",
+        verificationState: "Verified",
+        updatedTimeExpectation: postNoteUpdatedTime,
+        recoveryRetryOutcome: "Accepted",
+        humanReconciliationRequired: false,
+        replaySafe: false,
+      });
+      expect(JSON.stringify(final.operationRequest)).toContain(originalUpdatedTime);
+      const finalView = operationResultView(final) as { results: Array<Record<string, unknown>> };
+      expect(finalView.results[0]).toMatchObject({
+        finalOutcome: "Updated",
+        noteAdded: true,
+        verified: true,
+      });
+    });
+  });
+
+  it("stops a note continuation when an external update follows the verified classification checkpoint", async () => {
+    const operationId = "operation-owned-updated-time-external-change";
+    const originalUpdatedTime = "2026-08-21T10:24:53.353";
+    const operationUpdatedTime = "2026-08-21T10:46:20.482";
+    const externalUpdatedTime = "2026-08-21T10:47:00.000";
+    const target = { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" };
+    const original = {
+      ticketId: "ticket-60731",
+      displayId: "60731",
+      subject: "New call",
+      status: "New Calls",
+      client: { accountId: "client-1", name: "TaskGroup" },
+      updatedTime: originalUpdatedTime,
+    };
+    const partial = { ...original, impact: target.impact, updatedTime: "2026-08-21T10:40:00.000" };
+    const updated = { ...original, ...target, updatedTime: operationUpdatedTime };
+    let ticketReads = 0;
+    let firstUpdate = true;
+    let updateAccepted = false;
+    let externalChange = false;
+    let noteThrottleIssued = false;
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        return {
+          getTicketList: {
+            tickets: [{ ticketId: original.ticketId, displayId: original.displayId }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        };
+      }
+      if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
+      if (query.includes("getTicketNoteList")) {
+        if (updateAccepted && !noteThrottleIssued) {
+          noteThrottleIssued = true;
+          throw new SuperOpsError("note dedupe throttled", "THROTTLED", 0);
+        }
+        return { getTicketNoteList: [] };
+      }
+      ticketReads += 1;
+      return {
+        getTicket: externalChange
+          ? { ...updated, updatedTime: externalUpdatedTime }
+          : ticketReads === 1
+            ? original
+            : ticketReads <= 6
+              ? partial
+              : updated,
+      };
+    });
+    mockClient.mutate.mockImplementation(async (_mutation: string, variables: { input: Record<string, unknown> }) => {
+      if (variables.input.ticket) throw new Error("note mutation must not be attempted after an external change");
+      if (firstUpdate) {
+        firstUpdate = false;
+        throw new Error("classification response lost after the upstream update");
+      }
+      updateAccepted = true;
+      return { updateTicket: { ticketId: original.ticketId } };
+    });
+
+    await runWithOperationStore({}, async () => {
+      const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: operationId,
+          expectedCandidateTicketNumbers: [original.displayId],
+          actions: [{
+            ticketNumber: original.displayId,
+            expectedStatus: original.status,
+            expectedUpdatedTime: originalUpdatedTime,
+            contentVerified: true,
+            action: "update",
+            target,
+            note: "Approved private follow-up",
+          }],
+        })
+      ));
+      expect(JSON.parse(initial.content[0].text).operation.continuationRequired).toBe(true);
+      let pending = await getOperationStore().get(operationId);
+      if (!pending) throw new Error("missing external-change checkpoint");
+      for (let attempt = 0; attempt < 8 && pending.itemStates[original.displayId].stage !== "NoteChecked"; attempt += 1) {
+        await runWithExecutionConfig({}, () => runWithExecutionContext(
+          "superops_tickets_apply_triage_plan",
+          () => resumeApplyTriageOperation({
+            operationId,
+            ownerHash: pending!.ownerHash,
+            leaseOwner: `external-change-reconciliation-${attempt}`,
+            now: new Date(Date.now() + (attempt + 1) * 120_000).toISOString(),
+          })
+        ));
+        pending = await getOperationStore().get(operationId);
+        if (!pending) throw new Error("missing external-change reconciliation checkpoint");
+      }
+      expect(pending.itemStates[original.displayId]).toMatchObject({
+        stage: "NoteChecked",
+        updatedTimeExpectation: operationUpdatedTime,
+      });
+      expect(JSON.stringify(pending.operationRequest)).toContain(originalUpdatedTime);
+
+      externalChange = true;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await runWithExecutionConfig({}, () => runWithExecutionContext(
+          "superops_tickets_apply_triage_plan",
+          () => resumeApplyTriageOperation({
+            operationId,
+            ownerHash: pending!.ownerHash,
+            leaseOwner: `external-change-worker-${attempt}`,
+            now: new Date(Date.now() + (attempt + 2) * 120_000).toISOString(),
+          })
+        ));
+        pending = await getOperationStore().get(operationId);
+        if (!pending || ["Stale", "StaleAfterRateLimitWait", "Completed", "CompletedWithFailures"].includes(pending.itemStates[original.displayId].stage)) break;
+      }
+
+      const final = await getOperationStore().get(operationId);
+      if (!final) throw new Error("missing external-change final checkpoint");
+      expect(final.itemStates[original.displayId]).toMatchObject({
+        stage: "Stale",
+        outcome: "SkippedChangedSinceSnapshot",
+        updatedTimeExpectation: operationUpdatedTime,
+      });
+      expect(JSON.stringify(final.operationRequest)).toContain(originalUpdatedTime);
+      const finalView = operationResultView(final) as { results: Array<Record<string, unknown>> };
+      expect(finalView.results[0]).toMatchObject({
+        finalOutcome: "SkippedChangedSinceSnapshot",
+        noteAdded: false,
+        verified: false,
+      });
+      expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("does not advance the active checkpoint when an accepted recovery fails read-back verification", async () => {
+    const operationId = "operation-owned-updated-time-recovery-verification-failure";
+    const originalUpdatedTime = "2026-08-21T10:24:53.353";
+    const target = { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" };
+    const original = {
+      ticketId: "ticket-60731",
+      displayId: "60731",
+      subject: "New call",
+      status: "New Calls",
+      client: { accountId: "client-1", name: "TaskGroup" },
+      updatedTime: originalUpdatedTime,
+    };
+    const partial = {
+      ...original,
+      impact: target.impact,
+      updatedTime: "2026-08-21T10:40:00.000",
+    };
+    let ticketReads = 0;
+    let firstUpdate = true;
+    let recoveryAccepted = false;
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        return {
+          getTicketList: {
+            tickets: [{ ticketId: original.ticketId, displayId: original.displayId }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        };
+      }
+      if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
+      if (query.includes("getTicketNoteList")) return { getTicketNoteList: [] };
+      ticketReads += 1;
+      return {
+        getTicket: recoveryAccepted || ticketReads > 1 ? partial : original,
+      };
+    });
+    mockClient.mutate.mockImplementation(async (_mutation: string, variables: { input: Record<string, unknown> }) => {
+      if (variables.input.ticket) throw new Error("note mutation must not be attempted after failed recovery verification");
+      if (firstUpdate) {
+        firstUpdate = false;
+        throw new Error("classification response lost after the upstream update");
+      }
+      recoveryAccepted = true;
+      return { updateTicket: { ticketId: original.ticketId } };
+    });
+
+    await runWithOperationStore({}, async () => {
+      const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: operationId,
+          expectedCandidateTicketNumbers: [original.displayId],
+          actions: [{
+            ticketNumber: original.displayId,
+            expectedStatus: original.status,
+            expectedUpdatedTime: originalUpdatedTime,
+            contentVerified: true,
+            action: "update",
+            target,
+            note: "Approved private follow-up",
+          }],
+        })
+      ));
+      expect(JSON.parse(initial.content[0].text).operation.continuationRequired).toBe(true);
+
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const current = await getOperationStore().get(operationId);
+        if (current?.state === "CompletedWithFailures") break;
+        if (!current) throw new Error("missing failed-recovery checkpoint");
+        await runWithExecutionConfig({}, () => runWithExecutionContext(
+          "superops_tickets_apply_triage_plan",
+          () => resumeApplyTriageOperation({
+            operationId,
+            ownerHash: current.ownerHash,
+            leaseOwner: `failed-recovery-verification-${attempt}`,
+            now: new Date(Date.now() + (attempt + 1) * 120_000).toISOString(),
+          })
+        ));
+      }
+
+      const final = await getOperationStore().get(operationId);
+      if (!final) throw new Error("missing failed-recovery final checkpoint");
+      expect(recoveryAccepted).toBe(true);
+      expect(final.state).toBe("CompletedWithFailures");
+      expect(final.itemStates[original.displayId]).toMatchObject({
+        updatedTimeExpectation: originalUpdatedTime,
+        recoveryRetryOutcome: "Accepted",
+        partialWrite: true,
+        replaySafe: false,
+        humanReconciliationRequired: true,
+      });
+      expect(final.itemStates[original.displayId]?.stage).toMatch(/Failed|Unresolved/);
+      expect(JSON.stringify(final.operationRequest)).toContain(originalUpdatedTime);
+      expect(mockClient.mutate).toHaveBeenCalledTimes(2);
     });
   });
 
