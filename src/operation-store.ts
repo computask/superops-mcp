@@ -1565,7 +1565,7 @@ const EXPLICIT_STAGE_TRANSITIONS: Partial<Record<OperationItemStage, ReadonlySet
   NoteWriteAmbiguous: new Set(["Verifying"]),
   NoteAdded: new Set(["NoteVerified", "Verifying", "StatusWriteStarted"]),
   NoteVerified: new Set(["StatusWriteStarted", "StatusVerified", "Verifying"]),
-  RecoveryWriteStarted: new Set(["FieldsUpdated", "ClassificationWriteSucceeded", "ClassificationVerified", "ResolutionWriteSucceeded", "ResolutionVerified", "StatusWriteSucceeded", "StatusVerified", "RecoveryWriteAmbiguous", "RateLimitedRescheduled", "Verifying"]),
+  RecoveryWriteStarted: new Set(["FieldsUpdated", "ClassificationWriteSucceeded", "ClassificationVerified", "ResolutionWriteSucceeded", "ResolutionVerified", "StatusWriteSucceeded", "StatusVerified", "NoteAdded", "RecoveryWriteAmbiguous", "RateLimitedRescheduled", "Verifying"]),
   RecoveryWriteAmbiguous: new Set(["ClassificationVerified", "ResolutionVerified", "StatusVerified", "Verifying"]),
   Verifying: new Set(["NoteChecked", "NoteDedupeChecked"]),
   RateLimited: new Set(["RateLimitedRetrying", "RateLimitedRescheduled"]),

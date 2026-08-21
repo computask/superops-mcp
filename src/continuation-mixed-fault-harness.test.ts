@@ -284,7 +284,7 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       store.checkpointItem = observeCheckpoint;
       store.scheduleContinuation = async (params) => {
         if (params.nextEligibleTime &&
-            params.reason === "SuperOpsRateLimitRescheduled" &&
+            params.reason !== "AmbiguousWritePending" &&
             failSchedulingOnce) {
           failSchedulingOnce = false;
           throw new Error("injected continuation scheduling failure");

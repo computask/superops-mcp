@@ -4363,10 +4363,11 @@ async function createNoteForPlan(params: {
       params.isPublic ?? false
     );
   } catch (error) {
+    const rejected = isReliableSynchronousMutationRejection(error) && !isRateLimitError(error);
     recordPhysicalWrite(
       params.result,
       "createTicketNote",
-      isReliableSynchronousMutationRejection(error) ? "Rejected" : "Ambiguous"
+      rejected ? "Rejected" : "Ambiguous"
     );
     throw error;
   }
@@ -4771,8 +4772,12 @@ function inferredAmbiguityMutationType(result: ApplyTriagePlanResult): DurableMu
   return "update";
 }
 
-function ambiguousWriteNextEligibleTime(): string {
-  return new Date(Date.now() + AMBIGUOUS_WRITE_RECONCILIATION_DELAY_MS).toISOString();
+function ambiguousWriteNextEligibleTime(result?: ApplyTriagePlanResult): string {
+  const rateLimitDelay = result?.rateLimitRetryAfterMs ?? 0;
+  return new Date(Date.now() + Math.max(
+    AMBIGUOUS_WRITE_RECONCILIATION_DELAY_MS,
+    rateLimitDelay
+  )).toISOString();
 }
 
 function markAmbiguousWritePending(params: {
@@ -4792,7 +4797,7 @@ function markAmbiguousWritePending(params: {
   params.result.terminalFailureReason = null;
   params.result.terminalFailureClass = null;
   params.result.terminalReason = "AmbiguousWritePending";
-  params.result.partialWrite = applyResultHasProvenPartialWrite(params.result);
+  params.result.partialWrite = params.result.partialWrite || applyResultHasProvenPartialWrite(params.result);
   params.result.writeMayHaveSucceeded = true;
   params.result.ambiguityEncountered = true;
   params.result.ambiguityMutationType = inferredAmbiguityMutationType(params.result);
@@ -4817,6 +4822,62 @@ function markAmbiguousWritePending(params: {
   params.result.replaySafe = false;
   params.result.humanReconciliationRequired = false;
   return params.result;
+}
+
+function markAmbiguousNoteWritePending(params: {
+  result: ApplyTriagePlanResult;
+  error: unknown;
+}): ApplyTriagePlanResult {
+  const result = params.result;
+  const reason = "Private note creation was submitted but its acceptance is unknown; bounded read-only fingerprint reconciliation is required before any controlled note-only recovery.";
+  applyPrimaryFailureDiagnostics(result, params.error);
+  result.writeMethod = "createTicketNote";
+  result.writeAttempted = true;
+  result.writeMayHaveSucceeded = true;
+  result.noteWriteOutcome = "Ambiguous";
+  result.ambiguityEncountered = true;
+  result.ambiguityMutationType = "note";
+  result.reconciliationPasses = 1;
+  result.reconciliationPassReadAttempts = 0;
+  result.reconciliationReadAttempts = 0;
+  result.recoveryRetryCount = 0;
+  result.recoveryRetryAttempted = false;
+  result.acceptedPhysicalWrites ??= [];
+  result.observedRequestedEffects ??= [];
+  result.missingRequestedEffects = ["privateNoteFingerprint"];
+  result.conflictingEffects ??= [];
+  result.replaySafe = false;
+  result.replaySafetyReason = "CreateTicketNote has no genuine server-enforced idempotency facility and will not be blindly replayed.";
+  if (isRateLimitError(params.error)) {
+    const rateLimit = rateLimitRetryMetadata(params.error);
+    result.rateLimitRetryAfterMs = rateLimit.delayMs;
+    result.rateLimitRequestedDelayMs = rateLimit.requestedDelayMs;
+    result.rateLimitRetryAfterSupplied = rateLimit.retryAfterSupplied;
+    result.rateLimitDelaySource = rateLimit.delaySource;
+    result.rateLimitConclusiveRejection = false;
+    result.rateLimitOperationName = "CreateTicketNote";
+  }
+  return markAmbiguousWritePending({ result, attempts: 0, reason });
+}
+
+function markAmbiguousNoteReadPending(params: {
+  result: ApplyTriagePlanResult;
+  error: unknown;
+  attempts: number;
+}): ApplyTriagePlanResult {
+  const rateLimit = rateLimitRetryMetadata(params.error);
+  const reason = "Private-note reconciliation was rate limited; the note write remains ambiguous and will be checked again read-only before any recovery.";
+  params.result.rateLimitRetryAfterMs = rateLimit.delayMs;
+  params.result.rateLimitRequestedDelayMs = rateLimit.requestedDelayMs;
+  params.result.rateLimitRetryAfterSupplied = rateLimit.retryAfterSupplied;
+  params.result.rateLimitDelaySource = rateLimit.delaySource;
+  params.result.rateLimitConclusiveRejection = false;
+  params.result.rateLimitOperationName = "GetTicketNoteList";
+  return markAmbiguousWritePending({
+    result: params.result,
+    attempts: params.attempts,
+    reason,
+  });
 }
 
 function markAmbiguousWriteUnresolved(params: {
@@ -5130,7 +5191,7 @@ async function applyStagedResolveAction(params: {
     if (notePlan === "pending") {
       result.writeMethod = "staged";
       try {
-        await params.beforeMutation?.("note");
+        await params.beforeMutation?.("note", trustedTicket.updatedTime, trustedTicket);
         result.writeAttempted = true;
         const created = await createTicketNote(client, params.resolvedTicketId, noteBodyForPlan(action.note) as string, false);
         result.noteAdded = true;
@@ -5140,7 +5201,7 @@ async function applyStagedResolveAction(params: {
         await params.afterMutation?.("note", { ticketId: params.resolvedTicketId, noteId: created.noteId });
       } catch (error) {
         if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
-        const rejected = isReliableSynchronousMutationRejection(error);
+        const rejected = isReliableSynchronousMutationRejection(error) && !isRateLimitError(error);
         recordPhysicalWrite(result, "createTicketNote", rejected ? "Rejected" : "Ambiguous");
         result.writeMayHaveSucceeded = !rejected;
         const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
@@ -5172,6 +5233,7 @@ async function applyStagedResolveAction(params: {
           }
           const reason = "Private note creation is ambiguous and was not observed; status resolution was not attempted.";
           result.writeMethod = "createTicketNote";
+          result.noteWriteOutcome = "Ambiguous";
           result.ambiguityEncountered = true;
           result.ambiguityMutationType = "note";
           result.reconciliationPasses = 1;
@@ -5189,6 +5251,7 @@ async function applyStagedResolveAction(params: {
           return markAmbiguousWritePending({ result, attempts: 1, reason });
         }
         result.noteDeduped = true;
+        result.noteWriteOutcome = "AmbiguousButVerified";
       }
     }
     const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
@@ -5199,7 +5262,7 @@ async function applyStagedResolveAction(params: {
         additionalTicketIds: stagedNoteTicketIds(),
       });
     } catch (error) {
-      if (isExecutionStopError(error)) throw error;
+      if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
       if (isRateLimitError(error)) {
         return markRateLimitedReadResult(result, error, "getTicketNoteList.noteVisibility");
       }
@@ -5895,6 +5958,7 @@ function compactApplyResult(
       ? "DeduplicatedExistingAcceptedNote"
       : result.noteDeduped ? "Deduplicated" : undefined,
     finalNotePresentAndVerified: result.noteWriteOutcome === "AcceptedAndVerified" ||
+      result.noteWriteOutcome === "AmbiguousButVerified" ||
       result.noteWriteOutcome === "VerifiedExistingPrivateNote" ||
       (result.noteAdded || result.noteDeduped) && result.verified ? true : undefined,
     notePlanned: result.notePlanned,
@@ -6729,7 +6793,7 @@ async function applyApprovedTriageAction(params: {
         result,
         beforeCheck: stagedResolveResumeHasCheckedNote(params.resumeStage) ? undefined : params.beforeNoteCheck,
         beforeCreate: async () => {
-          await (params.beforeMutation?.("note") ?? Promise.resolve());
+          await (params.beforeMutation?.("note", ticket.updatedTime, ticket) ?? Promise.resolve());
           result.writeAttempted = true;
         },
         afterCreate: (note) => params.afterMutation?.("note", {
@@ -7000,7 +7064,7 @@ async function applyApprovedTriageAction(params: {
             isPublic: false,
             result,
             beforeCreate: async () => {
-              await (params.beforeMutation?.("note") ?? Promise.resolve());
+              await (params.beforeMutation?.("note", verified.updatedTime, verified) ?? Promise.resolve());
               result.writeAttempted = true;
             },
             afterCreate: (note) => params.afterMutation?.("note", {
@@ -7011,12 +7075,18 @@ async function applyApprovedTriageAction(params: {
         }
       } catch (error) {
         if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
-        result.finalOutcome = "Failed";
-        result.failureStage = "createTicketNote";
-        result.failureReason = safeErrorMessage(error);
-        result.partialWrite = applyResultHasProvenPartialWrite(result);
-        result.writeMayHaveSucceeded = true;
-        return result;
+        if (isReliableSynchronousMutationRejection(error) && !isRateLimitError(error)) {
+          return markStagedFailure({
+            result,
+            stage: "createTicketNote",
+            reason: "Private note creation was rejected: " + safeErrorMessage(error),
+            terminalReason: "NoteCreationRejected",
+            partialWrite: applyResultHasProvenPartialWrite(result),
+            writeMayHaveSucceeded: false,
+            verificationState: "Failed",
+          });
+        }
+        return markAmbiguousNoteWritePending({ result, error });
       }
 
       if (notePlan === "pending") {
@@ -7098,6 +7168,9 @@ async function applyApprovedTriageAction(params: {
       ? "rateLimit"
       : result.writeMethod === "createTicketNote" ? "createTicketNote" : "write";
     result.failureReason = safeErrorMessage(error);
+    if (rateLimited && result.writeMethod === "createTicketNote" && result.writeAttempted) {
+      return markAmbiguousNoteWritePending({ result, error });
+    }
     if (rateLimited && !result.writeAttempted && !result.noteAdded) {
       return markRateLimitedReadResult(result, error, "getTicketNoteList.noteOnlyDedupe");
     }
@@ -7128,21 +7201,7 @@ async function applyApprovedTriageAction(params: {
       result.partialWrite = applyResultHasProvenPartialWrite(result);
       result.writeMayHaveSucceeded = !rejected && (result.writeAttempted || result.noteAdded);
       if (result.writeMethod === "createTicketNote" && result.writeAttempted && !rejected) {
-        result.ambiguityEncountered = true;
-        result.ambiguityMutationType = "note";
-        result.acceptedPhysicalWrites ??= [];
-        result.observedRequestedEffects ??= [];
-        result.missingRequestedEffects = ["privateNoteFingerprint"];
-        result.conflictingEffects ??= [];
-        result.recoveryRetryCount = 0;
-        result.recoveryRetryAttempted = false;
-        result.replaySafe = false;
-        result.replaySafetyReason = "CreateTicketNote has no genuine server-enforced idempotency facility and will not be replayed.";
-        return markAmbiguousWritePending({
-          result,
-          attempts: 0,
-          reason: "Private note creation is ambiguous; bounded read-only fingerprint reconciliation is required and the create will not be replayed.",
-        });
+        return markAmbiguousNoteWritePending({ result, error });
       }
     }
     return result;
@@ -7245,7 +7304,7 @@ function applyResultToContinuationOutcome(
       : noteVisibilityPending
         ? stagedNoteVisibilityNextEligibleTime()
         : ambiguousWritePending
-          ? ambiguousWriteNextEligibleTime()
+          ? ambiguousWriteNextEligibleTime(result)
           : undefined,
     verificationFailed: result.failureStage === "verify" || result.failureStage === "verifyFinalState",
     stale: result.finalOutcome === "SkippedChangedSinceSnapshot",
@@ -7533,6 +7592,61 @@ function mergeRecoveryDiagnostics(
   return target;
 }
 
+function noteReconciliationSafety(params: {
+  action: TriagePlanAction;
+  ticket: Ticket;
+  item: OperationItemState;
+  requireStableUpdatedTime: boolean;
+}): { safe: boolean; observation: ReconciliationObservation; reason?: string } {
+  const stateAction = reconciliationActionForMutation(params.action, "note");
+  const observation = reconciliationObservation(stateAction, params.ticket, params.item);
+  const targetMismatch = params.action.action === "addNote"
+    ? []
+    : verifyFinalTargetState(params.action, params.ticket).mismatches;
+  if (targetMismatch.length > 0) {
+    return {
+      safe: false,
+      observation,
+      reason: "The previously verified classification/routing target no longer matches during private-note reconciliation.",
+    };
+  }
+  if (params.action.action !== "addNote" && !params.item.preMutationState) {
+    return {
+      safe: false,
+      observation,
+      reason: "The operation did not persist a post-classification baseline for safe private-note recovery.",
+    };
+  }
+  const blockingConflicts = observation.conflictingEffects.filter(
+    (field) => field !== "preMutationBaselineUnavailable"
+  );
+  const blockingUnrelatedChanges = observation.unrelatedChanges.filter(
+    (field) => field !== "preMutationBaselineUnavailable"
+  );
+  if ((params.action.action !== "addNote" && blockingConflicts.length > 0) ||
+      blockingUnrelatedChanges.length > 0 ||
+      (params.action.action !== "addNote" && !observation.fullTargetApplied)) {
+    return {
+      safe: false,
+      observation,
+      reason: "Ticket state changed outside the operation-owned classification/routing checkpoint; private-note recovery is unsafe.",
+    };
+  }
+  if (params.requireStableUpdatedTime) {
+    const expectedUpdatedTime = params.item.expectedCurrentUpdatedTime ??
+      params.item.updatedTimeExpectation ?? params.item.preMutationUpdatedTime;
+    if (expectedUpdatedTime && params.ticket.updatedTime &&
+        expectedUpdatedTime !== params.ticket.updatedTime) {
+      return {
+        safe: false,
+        observation,
+        reason: `Ticket updatedTime changed outside the operation-owned checkpoint. Expected ${expectedUpdatedTime}, got ${params.ticket.updatedTime}.`,
+      };
+    }
+  }
+  return { safe: true, observation };
+}
+
 async function ambiguityCheckedTriageResult(params: {
   client: SuperOpsClientInstance;
   ticketNumber: string;
@@ -7609,7 +7723,7 @@ async function ambiguityCheckedTriageResult(params: {
     disposition: ReconciliationDisposition = "AmbiguousUnresolved"
   ) => {
     result.reconciliationDisposition = disposition;
-    result.partialWrite = applyResultHasProvenPartialWrite(result);
+    result.partialWrite = result.partialWrite || applyResultHasProvenPartialWrite(result);
     result.replaySafe = false;
     result.replaySafetyReason = reason;
     result.humanReconciliationRequired = true;
@@ -7785,7 +7899,11 @@ async function ambiguityCheckedTriageResult(params: {
   let approvedLookup: ApprovedTicketLookup;
   try {
     approvedLookup = await lookupApprovedTicket(client, ticketNumber, expectedTicketId, {
-      requireTicket: !noteOnlyReconciliation,
+      // Note reconciliation must inspect the current ticket state as well as
+      // the exact note.  The state read is what preserves the operation-owned
+      // updatedTime checkpoint and detects an external ticket change before a
+      // controlled note-only recovery.
+      requireTicket: true,
     });
   } catch (error) {
     if (isExecutionStopError(error)) throw error;
@@ -7851,6 +7969,79 @@ async function ambiguityCheckedTriageResult(params: {
     const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
     result.notePlanned = Boolean(fingerprint);
     result.noteDedupePlanned = Boolean(fingerprint);
+    const finishVerifiedNote = async (noteResult: {
+      ticket: Ticket;
+      noteAdded: boolean;
+      noteDeduped: boolean;
+      noteWriteOutcome: string;
+      attempts: number;
+    }): Promise<{ result: ApplyTriagePlanResult; stage: OperationItemState["stage"] }> => {
+      const safety = noteReconciliationSafety({
+        action,
+        ticket: noteResult.ticket,
+        item: itemState,
+        requireStableUpdatedTime: false,
+      });
+      if (!safety.safe) {
+        result.finalState = ticketFinalState(noteResult.ticket);
+        result.observedFinalState = result.finalState;
+        result.conflictingEffects = [
+          ...(result.conflictingEffects ?? []),
+          ...safety.observation.conflictingEffects,
+          ...safety.observation.unrelatedChanges.map((field) => `unrelated:${field}`),
+        ];
+        return {
+          result: terminalUnresolved(result, safety.reason ?? "Private-note reconciliation found unsafe ticket state."),
+          stage: "AmbiguousWriteUnresolved",
+        };
+      }
+      result.finalState = ticketFinalState(noteResult.ticket);
+      result.observedFinalState = result.finalState;
+      result.verifiedState = result.finalState;
+      result.updatedTimeChanged = safety.observation.updatedTimeChanged;
+      result.reconciliationUpdatedTimes = [
+        ...(result.reconciliationUpdatedTimes ?? []),
+        ...(noteResult.ticket.updatedTime ? [noteResult.ticket.updatedTime] : []),
+      ];
+      result.observedRequestedEffects = [
+        ...new Set([
+          ...(result.observedRequestedEffects ?? []),
+          ...safety.observation.observedEffects,
+          "privateNoteFingerprint",
+        ]),
+      ];
+      result.missingRequestedEffects = [];
+      result.conflictingEffects = [];
+      result.noteAdded = noteResult.noteAdded;
+      result.noteDeduped = noteResult.noteDeduped;
+      result.noteWriteOutcome = noteResult.noteWriteOutcome;
+      result.noteDedupeChecked = true;
+      result.initialNoteVerificationObserved = false;
+      result.noteVerificationAttempts = noteResult.attempts;
+      result.noteVerifiedAfterDelay = true;
+      result.finalOutcome = action.action === "resolve"
+        ? "Resolved"
+        : action.action === "leave" ? "Left" : "Updated";
+      result.writeAttempted = true;
+      result.writeMayHaveSucceeded = true;
+      result.verified = true;
+      result.finalVerificationState = "Verified";
+      result.partialWrite = false;
+      result.continuationRequired = false;
+      result.reconciliationDisposition = "VerifiedSuccess";
+      result.replaySafe = false;
+      result.replaySafetyReason = noteResult.noteDeduped
+        ? "The exact approved private-note fingerprint was observed after the ambiguous mutation."
+        : "The controlled note-only recovery was verified by the exact approved private-note fingerprint.";
+      result.humanReconciliationRequired = false;
+      result.failureStage = null;
+      result.failureReason = null;
+      result.terminalReason = null;
+      result.terminalFailureReason = null;
+      result.terminalFailureClass = null;
+      await params.afterVerification?.("note", noteResult.ticket);
+      return { result, stage: "CompletedAfterAmbiguousWriteVerification" };
+    };
     try {
       const noteObserved = await existingNoteMatchesFingerprint(client, ticket.ticketId, fingerprint, {
         ticketNumber,
@@ -7862,17 +8053,13 @@ async function ambiguityCheckedTriageResult(params: {
       result.reconciliationPassReadAttempts = nextPassAttempts;
       result.reconciliationReadAttempts = nextTotalAttempts;
       if (noteObserved) {
-        result.noteDeduped = true;
-        result.observedRequestedEffects = ["privateNoteFingerprint"];
-        result.missingRequestedEffects = [];
-        result.finalOutcome = "Updated";
-        result.verified = true;
-        result.partialWrite = false;
-        result.reconciliationDisposition = "VerifiedSuccess";
-        result.replaySafe = false;
-        result.replaySafetyReason = "The exact approved private-note fingerprint was observed.";
-        result.humanReconciliationRequired = false;
-        return { result, stage: "CompletedAfterAmbiguousWriteVerification" };
+        return finishVerifiedNote({
+          ticket,
+          noteAdded: false,
+          noteDeduped: true,
+          noteWriteOutcome: "AmbiguousButVerified",
+          attempts: nextTotalAttempts,
+        });
       }
       result.observedRequestedEffects = [];
       result.missingRequestedEffects = ["privateNoteFingerprint"];
@@ -7881,23 +8068,256 @@ async function ambiguityCheckedTriageResult(params: {
       result.replaySafe = false;
       result.replaySafetyReason = reason;
       result.partialWrite = applyResultHasProvenPartialWrite(result);
-      if (nextPassAttempts >= AMBIGUOUS_WRITE_RECONCILIATION_MAX_ATTEMPTS) {
+      const reconciliationSafety = noteReconciliationSafety({
+        action,
+        ticket,
+        item: itemState,
+        requireStableUpdatedTime: true,
+      });
+      result.partialWrite = result.partialWrite ||
+        (action.action !== "addNote" && reconciliationSafety.observation.fullTargetApplied) ||
+        applyResultHasProvenPartialWrite(result);
+      if (!reconciliationSafety.safe) {
         return {
-          result: terminalUnresolved(result, reason),
+          result: terminalUnresolved(result, reconciliationSafety.reason ?? reason),
           stage: "AmbiguousWriteUnresolved",
           retryCount: nextTotalAttempts,
         };
       }
-      return {
-        result: markAmbiguousWritePending({ result, attempts: nextPassAttempts, reason }),
-        stage: params.ambiguityStage,
-        retryCount: nextTotalAttempts,
-      };
+      if (nextPassAttempts < AMBIGUOUS_WRITE_RECONCILIATION_MAX_ATTEMPTS) {
+        return {
+          result: markAmbiguousWritePending({ result, attempts: nextPassAttempts, reason }),
+          stage: params.ambiguityStage,
+          retryCount: nextTotalAttempts,
+        };
+      }
+      const currentRecoveryCount = itemState.recoveryRetryCounts?.note ??
+        itemState.recoveryRetryCount ?? 0;
+      if (currentRecoveryCount >= 1) {
+        return {
+          result: terminalUnresolved(
+            result,
+            "The controlled private-note recovery was already attempted and the exact note remains unresolved."
+          ),
+          stage: "AmbiguousWriteUnresolved",
+          retryCount: nextTotalAttempts,
+        };
+      }
+
+      let recoveryNotePlan: "none" | "deduped" | "pending";
+      try {
+        // This is a fresh normal dedupe read immediately before the one
+        // controlled recovery write. It is intentionally not checkpointed as
+        // NoteChecked after RecoveryWriteStarted, because a read throttle here
+        // must never make the recovery write boundary look started.
+        recoveryNotePlan = await checkNoteForPlan({
+          client,
+          ticketId: ticket.ticketId,
+          ticketNumber,
+          additionalTicketIds: [approvedLookup.ticketId, ticket.ticketId],
+          note: action.note,
+          dedupe: true,
+          result,
+        });
+      } catch (error) {
+        if (isExecutionStopError(error)) throw error;
+        if (isRateLimitError(error)) {
+          return {
+            result: markAmbiguousNoteReadPending({
+              result,
+              error,
+              attempts: nextPassAttempts,
+            }),
+            stage: params.ambiguityStage,
+            retryCount: nextTotalAttempts,
+          };
+        }
+        return {
+          result: terminalUnresolved(
+            result,
+            "The final private-note dedupe read before controlled recovery was unavailable."
+          ),
+          stage: "AmbiguousWriteUnresolved",
+          retryCount: nextTotalAttempts,
+        };
+      }
+      if (recoveryNotePlan === "deduped") {
+        return finishVerifiedNote({
+          ticket,
+          noteAdded: false,
+          noteDeduped: true,
+          noteWriteOutcome: "AmbiguousButVerified",
+          attempts: nextTotalAttempts + 1,
+        });
+      }
+
+      const recoveryReadAttempts = nextTotalAttempts + 1;
+      try {
+        await params.beforeRecoveryMutation({
+          mutationType: "note",
+          disposition: "ConfirmedNotApplied",
+          pass: 1,
+          passReadAttempts: nextPassAttempts,
+          totalReadAttempts: recoveryReadAttempts,
+          observedEffects: reconciliationSafety.observation.observedEffects,
+          missingEffects: ["privateNoteFingerprint"],
+          conflictingEffects: [],
+          schemaDependencyFields: [],
+          updatedTimes: result.reconciliationUpdatedTimes ?? [],
+          replaySafetyReason: "The immutable ticket, verified classification/routing state, stable operation-owned updatedTime checkpoint, and repeated absent exact fingerprint permit one NOTE-ONLY recovery.",
+        });
+      } catch (error) {
+        if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
+        return {
+          result: terminalUnresolved(result, "The controlled private-note recovery checkpoint could not be persisted."),
+          stage: "AmbiguousWriteUnresolved",
+          retryCount: recoveryReadAttempts,
+        };
+      }
+      result.recoveryRetryCount = 1;
+      result.recoveryRetryAttempted = true;
+      result.recoveryRetryOutcome = "Started";
+      result.reconciliationPasses = 2;
+      result.reconciliationPassReadAttempts = 0;
+      result.reconciliationReadAttempts = recoveryReadAttempts;
+      result.recoveryHistory = [
+        ...(result.recoveryHistory ?? []),
+        { pass: 2, event: "RecoveryWriteStarted", outcome: "note" },
+      ];
+
+      try {
+        await createNoteForPlan({
+          client,
+          ticketId: ticket.ticketId,
+          note: action.note,
+          isPublic: false,
+          result,
+          beforeCreate: async () => {
+            result.writeAttempted = true;
+            result.writeMayHaveSucceeded = true;
+          },
+          afterCreate: (note) => params.afterMutation?.("note", {
+            ticketId: ticket.ticketId,
+            noteId: note.noteId,
+          }) ?? Promise.resolve(),
+        });
+      } catch (error) {
+        if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
+        const rejected = isReliableSynchronousMutationRejection(error) && !isRateLimitError(error);
+        result.recoveryRetryOutcome = rejected ? "Rejected" : "Ambiguous";
+        result.noteWriteOutcome = rejected ? "Rejected" : "Ambiguous";
+        result.recoveryHistory = [
+          ...(result.recoveryHistory ?? []),
+          { pass: 2, event: "RecoveryResponse", outcome: result.recoveryRetryOutcome },
+        ];
+        if (rejected) {
+          return {
+            result: terminalUnresolved(
+              result,
+              "The controlled private-note recovery was rejected; no further note write is permitted."
+            ),
+            stage: "AmbiguousWriteUnresolved",
+            retryCount: recoveryReadAttempts,
+          };
+        }
+        const pending = markAmbiguousWritePending({
+          result,
+          attempts: 0,
+          reason: "The controlled private-note recovery write was ambiguous; bounded read-only reconciliation is required and no further note write is permitted.",
+        });
+        pending.reconciliationPasses = 2;
+        pending.reconciliationPassReadAttempts = 0;
+        pending.reconciliationReadAttempts = recoveryReadAttempts;
+        pending.recoveryRetryCount = 1;
+        pending.recoveryRetryAttempted = true;
+        pending.recoveryRetryOutcome = "Ambiguous";
+        return {
+          result: pending,
+          stage: "RecoveryWriteAmbiguous",
+          retryCount: recoveryReadAttempts,
+        };
+      }
+
+      let recoveryNoteVerified = false;
+      try {
+        recoveryNoteVerified = await existingNoteMatchesFingerprint(client, ticket.ticketId, fingerprint, {
+          ticketNumber,
+          additionalTicketIds: [approvedLookup.ticketId, ticket.ticketId],
+        });
+        result.noteDedupeChecked = true;
+      } catch (error) {
+        if (isExecutionStopError(error)) throw error;
+        if (isRateLimitError(error)) {
+          return {
+            result: markAmbiguousNoteReadPending({ result, error, attempts: 0 }),
+            stage: "NoteAdded",
+            retryCount: recoveryReadAttempts,
+          };
+        }
+        return {
+          result: terminalUnresolved(
+            result,
+            "The controlled private-note recovery could not be verified because the exact-note read was unavailable."
+          ),
+          stage: "AmbiguousWriteUnresolved",
+          retryCount: recoveryReadAttempts,
+        };
+      }
+      result.noteVerificationAttempts = 1;
+      result.initialNoteVerificationObserved = false;
+      if (!recoveryNoteVerified) {
+        result.recoveryRetryOutcome = "Accepted";
+        return {
+          result: markStagedNoteVisibilityPending({
+            result,
+            stage: "NoteAdded",
+            attempts: 1,
+            initialObserved: false,
+          }),
+          stage: "NoteAdded",
+          retryCount: recoveryReadAttempts + 1,
+        };
+      }
+
+      let postRecoveryTicket: Ticket;
+      try {
+        postRecoveryTicket = await getTicketByInternalId(client, ticket.ticketId);
+      } catch (error) {
+        if (isExecutionStopError(error)) throw error;
+        if (isRateLimitError(error)) {
+          return {
+            result: markAmbiguousNoteReadPending({ result, error, attempts: 0 }),
+            stage: "NoteAdded",
+            retryCount: recoveryReadAttempts + 1,
+          };
+        }
+        return {
+          result: terminalUnresolved(result, "The controlled private-note recovery target verification was unavailable."),
+          stage: "AmbiguousWriteUnresolved",
+          retryCount: recoveryReadAttempts + 1,
+        };
+      }
+      result.recoveryRetryOutcome = "Accepted";
+      result.recoveryHistory = [
+        ...(result.recoveryHistory ?? []),
+        { pass: 2, event: "RecoveryResponse", outcome: "Accepted" },
+      ];
+      return finishVerifiedNote({
+        ticket: postRecoveryTicket,
+        noteAdded: true,
+        noteDeduped: false,
+        noteWriteOutcome: "AcceptedAndVerified",
+        attempts: recoveryReadAttempts + 1,
+      });
     } catch (error) {
-      if (isExecutionStopError(error)) throw error;
+      if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
       if (isRateLimitError(error)) {
         return {
-          result: markRateLimitedReadResult(result, error, "getTicketNoteList.ambiguousNoteVerification"),
+          result: markAmbiguousNoteReadPending({
+            result,
+            error,
+            attempts: itemState.reconciliationPassReadAttempts ?? params.previousRetryCount,
+          }),
           stage: params.ambiguityStage,
         };
       }
@@ -8518,13 +8938,21 @@ function createApplyTriageContinuationAdapter(
         replaySafetyReason: string;
       }) => {
         assertExecutionBudget(5);
-        const priorCount = recoveryRetryCounts[params.mutationType] ?? 0;
+        const priorCount = params.mutationType === "note"
+          ? (claim.item.recoveryRetryCount ?? 0)
+          : recoveryRetryCounts[params.mutationType] ?? 0;
         if (priorCount >= 1 || claim.item.recoveryWriteStarted === true &&
             claim.item.recoveryMutationStage === params.mutationType) {
           throw new Error(`Recovery retry already exhausted for ${params.mutationType}.`);
         }
         const nextCount = priorCount + 1;
-        recoveryRetryCounts = { ...recoveryRetryCounts, [params.mutationType]: nextCount };
+        // Operation metadata must never contain a field named `note`: the
+        // ledger rejects that key to prevent accidental persistence of note
+        // bodies. The scalar recoveryRetryCount is the durable note counter;
+        // the per-mutation map remains for classification/status/resolution.
+        recoveryRetryCounts = params.mutationType === "note"
+          ? { ...recoveryRetryCounts }
+          : { ...recoveryRetryCounts, [params.mutationType]: nextCount };
         try {
           await checkpoint({
             stage: "RecoveryWriteStarted",
@@ -8533,6 +8961,8 @@ function createApplyTriageContinuationAdapter(
             writeMayHaveSucceeded: true,
             reliableResponseReceived: false,
             observedMutationResult: "Ambiguous",
+            canonicalTargetHash,
+            noteFingerprint: action?.noteFingerprint ?? normalizedNoteFingerprint(action?.note),
             partialWrite: durablePartialWrite,
             verificationState: "Pending",
             expectedTicketId: action?.expectedTicketId ?? claim.item.expectedTicketId,

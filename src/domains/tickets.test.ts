@@ -350,6 +350,151 @@ describe("Tickets Domain", () => {
     vi.clearAllMocks();
   });
 
+  function installProductionShaped60745Mocks(options: {
+    initialNote?: "accepted" | "ambiguous" | "ambiguous-visible";
+    recoveryNote?: "accepted" | "ambiguous" | "ambiguous-visible";
+    errorKind?: "http" | "graphql";
+  } = {}) {
+    const originalUpdatedTime = "2026-08-21T10:24:53.353Z";
+    const operationUpdatedTime = "2026-08-21T10:46:20.482Z";
+    const postNoteUpdatedTime = "2026-08-21T10:46:25.000Z";
+    const externalUpdatedTime = "2026-08-21T10:47:00.000Z";
+    const noteBody = "Triage private note for the 60745 regression fixture";
+    const target = {
+      status: "Awaiting Engineer",
+      impact: "Low",
+      urgency: "Low",
+      category: "1. Support request",
+      subcategory: "Network",
+      cause: "Network Issue",
+    };
+    const fields = [
+      ticketField("priority", ["Low", "High"]),
+      ticketField("impact", ["Low", "High"]),
+      ticketField("urgency", ["Low", "High"]),
+      ticketField("category", ["1. Support request", "2. Change request"]),
+      ticketField("cause", ["Network Issue", "Unknown"]),
+      subcategoryFieldWithParents([{
+        id: "subcategory-network",
+        value: "Network",
+        parentCategory: "1. Support request",
+      }]),
+    ];
+    const originalTicket = {
+      ticketId: "ticket-60745",
+      displayId: "60745",
+      subject: "New call regression fixture",
+      status: "New Calls",
+      priority: "High",
+      impact: "High",
+      urgency: "High",
+      category: "2. Change request",
+      subcategory: "Access",
+      cause: "Unknown",
+      updatedTime: originalUpdatedTime,
+    };
+    const classifiedTicket = { ...originalTicket, ...target, updatedTime: operationUpdatedTime };
+    const postNoteTicket = { ...classifiedTicket, updatedTime: postNoteUpdatedTime };
+    const events: string[] = [];
+    let currentTicket = originalTicket;
+    let noteVisible = false;
+    let classificationWriteCount = 0;
+    let noteWriteCount = 0;
+
+    const makeAmbiguousError = () => options.errorKind === "graphql"
+      ? new SuperOpsError(
+          "rate_limit_exceeded",
+          "rate_limit_exceeded",
+          0,
+          { clientError: { code: "rate_limit_exceeded" } }
+        )
+      : new SuperOpsHttpError("rate limited after note submission", 429, "Too Many Requests", 0);
+
+    const applyNoteDisposition = (disposition: "accepted" | "ambiguous" | "ambiguous-visible") => {
+      if (disposition === "accepted" || disposition === "ambiguous-visible") {
+        noteVisible = true;
+        currentTicket = postNoteTicket;
+      }
+      if (disposition === "accepted") {
+        return { createTicketNote: { noteId: `note-60745-${noteWriteCount}`, privacyType: "PRIVATE" } };
+      }
+      throw makeAmbiguousError();
+    };
+
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getFields")) return { getFields: fields };
+      if (query.includes("getTicketNoteList")) {
+        return { getTicketNoteList: noteVisible
+          ? [{ noteId: "note-60745-visible", content: noteBody, privacyType: "PRIVATE" }]
+          : [] };
+      }
+      if (query.includes("getTicketList")) {
+        return {
+          getTicketList: {
+            tickets: [{ ticketId: currentTicket.ticketId, displayId: currentTicket.displayId }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        };
+      }
+      return { getTicket: currentTicket };
+    });
+    mockClient.mutate.mockImplementation(async (mutation: string) => {
+      if (mutation.includes("createTicketNote")) {
+        noteWriteCount += 1;
+        events.push(`note-${noteWriteCount}`);
+        const disposition = noteWriteCount === 1
+          ? options.initialNote ?? "accepted"
+          : options.recoveryNote ?? "accepted";
+        return applyNoteDisposition(disposition);
+      }
+      classificationWriteCount += 1;
+      events.push(`classification-${classificationWriteCount}`);
+      currentTicket = classifiedTicket;
+      return { updateTicket: { ticketId: currentTicket.ticketId, status: currentTicket.status } };
+    });
+
+    return {
+      originalUpdatedTime,
+      operationUpdatedTime,
+      postNoteUpdatedTime,
+      externalUpdatedTime,
+      noteBody,
+      target,
+      originalTicket,
+      classifiedTicket,
+      events,
+      get classificationWriteCount() { return classificationWriteCount; },
+      get noteWriteCount() { return noteWriteCount; },
+      get currentTicket() { return currentTicket; },
+      introduceExternalChange() {
+        currentTicket = { ...classifiedTicket, updatedTime: externalUpdatedTime };
+      },
+    };
+  }
+
+  async function resume60745UntilTerminal(operationId: string, maxAttempts = 12) {
+    let current = await getOperationStore().get(operationId);
+    if (!current) throw new Error(`missing ${operationId} operation`);
+    for (let attempt = 0; attempt < maxAttempts &&
+        !["Completed", "CompletedWithFailures", "Failed"].includes(current.state); attempt += 1) {
+      const nextEligibleTime = current.itemStates["60745"]?.nextEligibleTime ?? current.nextEligibleTime;
+      await runWithExecutionConfig({}, () => runWithExecutionContext(
+        "superops_tickets_apply_triage_plan",
+        () => resumeApplyTriageOperation({
+          operationId,
+          ownerHash: current!.ownerHash,
+          leaseOwner: `60745-reconciliation-${attempt}`,
+          now: nextEligibleTime
+            ? new Date(Date.parse(nextEligibleTime) + 1).toISOString()
+            : new Date(Date.now() + 60_000).toISOString(),
+        })
+      ));
+      current = await getOperationStore().get(operationId);
+      if (!current) throw new Error(`missing ${operationId} operation after resume`);
+    }
+    return current;
+  }
+
   it("returns the expected public tools", () => {
     const domain = getTicketsTools();
 
@@ -6928,7 +7073,466 @@ describe("Tickets Domain", () => {
       expect(mockClient.mutate.mock.calls[0][1].input).not.toHaveProperty("resolutionCode");
     });
   });
-  it("persists conclusive rejection before retry scheduling", async () => {
+  it("completes a normal classification plus private-note update as fully verified", async () => {
+    await runWithOperationStore({}, async () => {
+      const fixture = installProductionShaped60745Mocks();
+      const result = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+        runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+            batchId: "60745-normal-update-note",
+            expectedCandidateTicketNumbers: ["60745"],
+            actions: [{
+              ticketNumber: "60745",
+              expectedTicketId: "ticket-60745",
+              expectedStatus: "New Calls",
+              expectedUpdatedTime: fixture.originalUpdatedTime,
+              contentVerified: true,
+              action: "update",
+              target: fixture.target,
+              note: fixture.noteBody,
+            }],
+          })
+        )
+      ));
+      const parsed = JSON.parse(result.content[0].text);
+      const stored = await getOperationStore().get("60745-normal-update-note");
+      const view = operationResultView(stored!) as { totals: Record<string, unknown> };
+
+      expect(stored?.state).toBe("Completed");
+      expect(fixture.classificationWriteCount).toBe(1);
+      expect(fixture.noteWriteCount).toBe(1);
+      expect(parsed.results[0]).toMatchObject({
+        ticketNumber: "60745",
+        finalOutcome: "Updated",
+        verified: true,
+        noteAdded: true,
+        noteWriteOutcome: "AcceptedAndVerified",
+        finalNotePresentAndVerified: true,
+        partialWrite: false,
+        humanReconciliationRequired: false,
+      });
+      expect(view.totals).toMatchObject({
+        completed: 1,
+        successfulVerified: 1,
+        partialWrite: 0,
+        humanReconciliationRequired: 0,
+      });
+    });
+  });
+
+  it("reconciles production-shaped ticket 60745 after an ambiguous note write without replaying classification", async () => {
+    await runWithOperationStore({}, async () => {
+      const fixture = installProductionShaped60745Mocks({
+        initialNote: "ambiguous-visible",
+        errorKind: "graphql",
+      });
+      const operationId = "c5aeb214-0aba-49d5-b2f0-0f08ce60610b";
+      await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+        runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+            batchId: operationId,
+            expectedCandidateTicketNumbers: ["60745"],
+            actions: [{
+              ticketNumber: "60745",
+              expectedTicketId: "ticket-60745",
+              expectedStatus: "New Calls",
+              expectedUpdatedTime: fixture.originalUpdatedTime,
+              contentVerified: true,
+              action: "update",
+              target: fixture.target,
+              note: fixture.noteBody,
+            }],
+          })
+        )
+      ));
+      const pending = await getOperationStore().get(operationId);
+      if (!pending) throw new Error("missing production-shaped ambiguous-note operation");
+      expect(pending.itemStates["60745"]).toMatchObject({
+        stage: "NoteWriteAmbiguous",
+        expectedTicketId: "ticket-60745",
+        preMutationUpdatedTime: fixture.operationUpdatedTime,
+        preMutationState: { status: "Awaiting Engineer" },
+        noteFingerprint: expect.any(String),
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+        partialWrite: true,
+      });
+      expect(pending.itemStates["60745"].noteFingerprint).not.toBe(fixture.noteBody);
+      expect(JSON.stringify(pending.operationRequest)).not.toContain(fixture.noteBody);
+
+      const final = await resume60745UntilTerminal(operationId);
+      const compact = final.compactResults.find((entry) =>
+        typeof entry === "object" && entry !== null &&
+        (entry as { ticketNumber?: string }).ticketNumber === "60745"
+      ) as Record<string, unknown> | undefined;
+      expect(final.state).toBe("Completed");
+      expect(fixture.classificationWriteCount).toBe(1);
+      expect(fixture.noteWriteCount).toBe(1);
+      expect(final.itemStates["60745"]).toMatchObject({
+        stage: "CompletedAfterAmbiguousWriteVerification",
+        outcome: "Updated",
+        verificationState: "Verified",
+        recoveryRetryCount: 0,
+        humanReconciliationRequired: false,
+      });
+      expect(compact).toMatchObject({
+        ticketNumber: "60745",
+        finalOutcome: "Updated",
+        noteDeduped: true,
+        noteWriteOutcome: "AmbiguousButVerified",
+        finalNotePresentAndVerified: true,
+        partialWrite: false,
+        humanReconciliationRequired: false,
+      });
+      expect(fixture.events).toEqual(["classification-1", "note-1"]);
+    });
+  });
+
+  it("performs one controlled note-only recovery after bounded absence and never replays classification", async () => {
+    await runWithOperationStore({}, async () => {
+      const fixture = installProductionShaped60745Mocks({
+        initialNote: "ambiguous",
+        recoveryNote: "accepted",
+        errorKind: "http",
+      });
+      const operationId = "60745-note-only-recovery";
+      await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+        runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+            batchId: operationId,
+            expectedCandidateTicketNumbers: ["60745"],
+            actions: [{
+              ticketNumber: "60745",
+              expectedTicketId: "ticket-60745",
+              expectedStatus: "New Calls",
+              expectedUpdatedTime: fixture.originalUpdatedTime,
+              contentVerified: true,
+              action: "update",
+              target: fixture.target,
+              note: fixture.noteBody,
+            }],
+          })
+        )
+      ));
+      const final = await resume60745UntilTerminal(operationId);
+      const compact = final.compactResults.find((entry) =>
+        typeof entry === "object" && entry !== null &&
+        (entry as { ticketNumber?: string }).ticketNumber === "60745"
+      ) as Record<string, unknown> | undefined;
+
+      expect(final.state).toBe("Completed");
+      expect(fixture.classificationWriteCount).toBe(1);
+      expect(fixture.noteWriteCount).toBe(2);
+      expect(fixture.events).toEqual(["classification-1", "note-1", "note-2"]);
+      expect(final.itemStates["60745"]).toMatchObject({
+        stage: "CompletedAfterAmbiguousWriteVerification",
+        outcome: "Updated",
+        recoveryRetryCount: 1,
+        recoveryRetryOutcome: "Accepted",
+        verificationState: "Verified",
+        humanReconciliationRequired: false,
+      });
+      expect(compact).toMatchObject({
+        noteAdded: true,
+        noteWriteOutcome: "AcceptedAndVerified",
+        finalNotePresentAndVerified: true,
+        partialWrite: false,
+      });
+      expect(fixture.currentTicket).toMatchObject(fixture.target);
+    });
+  });
+
+  it("reconciles an ambiguous recovery note write when the exact note appears later", async () => {
+    await runWithOperationStore({}, async () => {
+      const fixture = installProductionShaped60745Mocks({
+        initialNote: "ambiguous",
+        recoveryNote: "ambiguous-visible",
+      });
+      const operationId = "60745-ambiguous-recovery-note";
+      await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+        runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+            batchId: operationId,
+            expectedCandidateTicketNumbers: ["60745"],
+            actions: [{
+              ticketNumber: "60745",
+              expectedTicketId: "ticket-60745",
+              expectedStatus: "New Calls",
+              expectedUpdatedTime: fixture.originalUpdatedTime,
+              contentVerified: true,
+              action: "update",
+              target: fixture.target,
+              note: fixture.noteBody,
+            }],
+          })
+        )
+      ));
+      const final = await resume60745UntilTerminal(operationId);
+      const compact = final.compactResults.find((entry) =>
+        typeof entry === "object" && entry !== null &&
+        (entry as { ticketNumber?: string }).ticketNumber === "60745"
+      ) as Record<string, unknown> | undefined;
+
+      expect(final.state).toBe("Completed");
+      expect(fixture.classificationWriteCount).toBe(1);
+      expect(fixture.noteWriteCount).toBe(2);
+      expect(fixture.events).toEqual(["classification-1", "note-1", "note-2"]);
+      expect(final.itemStates["60745"]).toMatchObject({
+        stage: "CompletedAfterAmbiguousWriteVerification",
+        outcome: "Updated",
+        recoveryRetryCount: 1,
+        verificationState: "Verified",
+        humanReconciliationRequired: false,
+      });
+      expect(compact).toMatchObject({
+        noteDeduped: true,
+        noteWriteOutcome: "AmbiguousButVerified",
+        finalNotePresentAndVerified: true,
+        partialWrite: false,
+      });
+    });
+  });
+
+  it("requires human reconciliation after bounded note recovery exhaustion and preserves classification-only partial totals", async () => {
+    await runWithOperationStore({}, async () => {
+      const fixture = installProductionShaped60745Mocks({
+        initialNote: "ambiguous",
+        recoveryNote: "ambiguous",
+      });
+      const operationId = "60745-note-human-reconciliation";
+      await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+        runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+            batchId: operationId,
+            expectedCandidateTicketNumbers: ["60745"],
+            actions: [{
+              ticketNumber: "60745",
+              expectedTicketId: "ticket-60745",
+              expectedStatus: "New Calls",
+              expectedUpdatedTime: fixture.originalUpdatedTime,
+              contentVerified: true,
+              action: "update",
+              target: fixture.target,
+              note: fixture.noteBody,
+            }],
+          })
+        )
+      ));
+      const final = await resume60745UntilTerminal(operationId, 16);
+      const finalView = operationResultView(final) as {
+        totals: Record<string, unknown>;
+        results: Array<Record<string, unknown>>;
+      };
+      expect(final.state).toBe("CompletedWithFailures");
+      expect(fixture.classificationWriteCount).toBe(1);
+      expect(fixture.noteWriteCount).toBe(2);
+      expect(final.itemStates["60745"]).toMatchObject({
+        stage: "AmbiguousWriteUnresolved",
+        outcome: "AmbiguousWriteUnresolved",
+        partialWrite: true,
+        recoveryRetryCount: 1,
+        humanReconciliationRequired: true,
+        terminalErrorClass: "AmbiguousWrite",
+        replaySafe: false,
+      });
+      expect(finalView.results[0]).toMatchObject({
+        terminalFailureClass: "AmbiguousWrite",
+        humanReconciliationRequired: true,
+      });
+      expect(finalView.totals).toMatchObject({
+        completed: 0,
+        successfulVerified: 0,
+        partialWrite: 1,
+        ambiguousUnresolved: 1,
+        humanReconciliationRequired: 1,
+      });
+      expect(fixture.currentTicket).toMatchObject(fixture.target);
+      expect(fixture.currentTicket.updatedTime).toBe(fixture.operationUpdatedTime);
+    });
+  });
+
+  it("stops note-only continuation on a genuine external updatedTime change", async () => {
+    await runWithOperationStore({}, async () => {
+      const fixture = installProductionShaped60745Mocks({ initialNote: "ambiguous" });
+      const operationId = "60745-note-external-change";
+      await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
+        runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+            batchId: operationId,
+            expectedCandidateTicketNumbers: ["60745"],
+            actions: [{
+              ticketNumber: "60745",
+              expectedTicketId: "ticket-60745",
+              expectedStatus: "New Calls",
+              expectedUpdatedTime: fixture.originalUpdatedTime,
+              contentVerified: true,
+              action: "update",
+              target: fixture.target,
+              note: fixture.noteBody,
+            }],
+          })
+        )
+      ));
+      const pending = await getOperationStore().get(operationId);
+      if (!pending) throw new Error("missing external-change operation");
+      fixture.introduceExternalChange();
+      const final = await resume60745UntilTerminal(operationId, 4);
+
+      expect(final.state).toBe("CompletedWithFailures");
+      expect(final.itemStates["60745"]).toMatchObject({
+        stage: "AmbiguousWriteUnresolved",
+        humanReconciliationRequired: true,
+        replaySafe: false,
+      });
+      expect(final.itemStates["60745"].terminalFailureReason).toContain("updatedTime changed");
+      expect(fixture.classificationWriteCount).toBe(1);
+      expect(fixture.noteWriteCount).toBe(1);
+      expect(fixture.currentTicket.updatedTime).toBe(fixture.externalUpdatedTime);
+      expect(pending.itemStates["60745"].preMutationUpdatedTime).toBe(fixture.operationUpdatedTime);
+    });
+  });
+
+  it("continues a multi-ticket batch while one private note is under durable reconciliation", async () => {
+    await runWithOperationStore({}, async () => {
+      const target = {
+        status: "Awaiting Engineer",
+        impact: "Low",
+        urgency: "Low",
+        category: "1. Support request",
+        subcategory: "Network",
+        cause: "Network Issue",
+      };
+      const fields = [
+        ticketField("priority", ["Low", "High"]),
+        ticketField("impact", ["Low", "High"]),
+        ticketField("urgency", ["Low", "High"]),
+        ticketField("category", ["1. Support request", "2. Change request"]),
+        ticketField("cause", ["Network Issue", "Unknown"]),
+        subcategoryFieldWithParents([{
+          id: "subcategory-network",
+          value: "Network",
+          parentCategory: "1. Support request",
+        }]),
+      ];
+      const originalOne = {
+        ticketId: "ticket-60745",
+        displayId: "60745",
+        subject: "New call note reconciliation batch fixture",
+        status: "New Calls",
+        priority: "High",
+        impact: "High",
+        urgency: "High",
+        category: "2. Change request",
+        subcategory: "Access",
+        cause: "Unknown",
+        updatedTime: "2026-08-21T10:24:53.353Z",
+      };
+      const originalTwo = {
+        ...originalOne,
+        ticketId: "ticket-60746",
+        displayId: "60746",
+        subject: "Independent batch candidate",
+        updatedTime: "2026-08-21T10:25:00.000Z",
+      };
+      const classifiedOne = { ...originalOne, ...target, updatedTime: "2026-08-21T10:46:20.482Z" };
+      const classifiedTwo = { ...originalTwo, ...target, updatedTime: "2026-08-21T10:46:21.000Z" };
+      const current = new Map<string, typeof originalOne>([
+        [originalOne.ticketId, originalOne],
+        [originalTwo.ticketId, originalTwo],
+      ]);
+      let classificationWrites = 0;
+      let noteWrites = 0;
+
+      mockClient.query.mockImplementation(async (
+        query: string,
+        variables?: { input?: { ticketId?: string } }
+      ) => {
+        if (query.includes("getFields")) return { getFields: fields };
+        if (query.includes("getTicketNoteList")) return { getTicketNoteList: [] };
+        if (query.includes("getTicketList")) {
+          return {
+            getTicketList: {
+              tickets: [originalOne, originalTwo].map(({ ticketId, displayId }) => ({ ticketId, displayId })),
+              listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 2 },
+            },
+          };
+        }
+        const ticketId = variables?.input?.ticketId;
+        const ticket = ticketId ? current.get(ticketId) : undefined;
+        if (!ticket) throw new Error(`Unexpected ticket read in batch test: ${ticketId ?? "missing"}`);
+        return { getTicket: ticket };
+      });
+      mockClient.mutate.mockImplementation(async (
+        mutation: string,
+        variables: { input: Record<string, unknown> }
+      ) => {
+        if (mutation.includes("createTicketNote")) {
+          noteWrites += 1;
+          throw new SuperOpsHttpError("rate limited after ticket 60745 note submission", 429, "Too Many Requests", 0);
+        }
+        const ticketId = String(variables.input.ticketId ?? "");
+        classificationWrites += 1;
+        if (ticketId === originalOne.ticketId) {
+          current.set(ticketId, classifiedOne);
+          return { updateTicket: { ticketId, status: classifiedOne.status } };
+        }
+        if (ticketId === originalTwo.ticketId) {
+          current.set(ticketId, classifiedTwo);
+          return { updateTicket: { ticketId, status: classifiedTwo.status } };
+        }
+        throw new Error(`Unexpected update in batch test: ${ticketId}`);
+      });
+
+      const operationId = "60745-note-reconciliation-batch";
+      await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
+        { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "2" },
+        () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+          batchId: operationId,
+          expectedCandidateTicketNumbers: ["60745", "60746"],
+          actions: [
+            {
+              ticketNumber: "60745",
+              expectedTicketId: originalOne.ticketId,
+              expectedStatus: originalOne.status,
+              expectedUpdatedTime: originalOne.updatedTime,
+              contentVerified: true,
+              action: "update",
+              target,
+              note: "Batch note reconciliation fixture",
+            },
+            {
+              ticketNumber: "60746",
+              expectedTicketId: originalTwo.ticketId,
+              expectedStatus: originalTwo.status,
+              expectedUpdatedTime: originalTwo.updatedTime,
+              contentVerified: true,
+              action: "update",
+              target,
+            },
+          ],
+        })
+      ));
+
+      const stored = await getOperationStore().get(operationId);
+      if (!stored) throw new Error("missing multi-ticket note reconciliation operation");
+      expect(stored.itemStates["60745"]).toMatchObject({
+        stage: "NoteWriteAmbiguous",
+        writeAttempted: true,
+        writeMayHaveSucceeded: true,
+        partialWrite: true,
+      });
+      expect(stored.itemStates["60746"]).toMatchObject({
+        stage: "Completed",
+        outcome: "Updated",
+        verificationState: "Verified",
+      });
+      expect(stored.pendingItems).toEqual(["60745"]);
+      expect(classificationWrites).toBe(2);
+      expect(noteWrites).toBe(1);
+    });
+  });
+
+  it("persists the ambiguous note checkpoint before continuation scheduling", async () => {
     await runWithOperationStore({}, async () => {
       const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
         { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
@@ -6944,21 +7548,22 @@ describe("Tickets Domain", () => {
 
       const events: string[] = [];
       const store = getOperationStore();
-      const checkpoint = store.checkpointItem.bind(store);
+      const completeItem = store.completeItem.bind(store);
       const schedule = store.scheduleContinuation.bind(store);
-      store.checkpointItem = async (params) => {
-        const updated = await checkpoint(params);
-        if (params.patch.observedMutationResult === "Rejected") events.push("rejection-checkpoint");
+      store.completeItem = async (params) => {
+        const updated = await completeItem(params);
+        if (params.patch.stage === "NoteWriteAmbiguous") events.push("ambiguity-checkpoint");
         return updated;
       };
       store.scheduleContinuation = async (params) => {
         events.push("schedule-continuation");
-        expect(events).toContain("rejection-checkpoint");
+        expect(events).toContain("ambiguity-checkpoint");
         const current = await store.get(params.operationId, params.ownerHash);
         expect(current?.itemStates["57401"]).toMatchObject({
-          stage: "RateLimitedRescheduled",
-          observedMutationResult: "Rejected",
-          errorClass: "SuperOpsRateLimit",
+          stage: "NoteWriteAmbiguous",
+          observedMutationResult: "Ambiguous",
+          writeMayHaveSucceeded: true,
+          errorClass: "AmbiguousWrite",
         });
         return schedule(params);
       };
@@ -6976,12 +7581,12 @@ describe("Tickets Domain", () => {
         "superops_tickets_apply_triage_plan",
         () => resumeApplyTriageOperation({ operationId, ownerHash: stored.ownerHash, leaseOwner: "reject-before-schedule" })
       ));
-      expect(events).toEqual(expect.arrayContaining(["rejection-checkpoint", "schedule-continuation"]));
-      expect(events.indexOf("rejection-checkpoint")).toBeLessThan(events.indexOf("schedule-continuation"));
+      expect(events).toEqual(expect.arrayContaining(["ambiguity-checkpoint", "schedule-continuation"]));
+      expect(events.indexOf("ambiguity-checkpoint")).toBeLessThan(events.indexOf("schedule-continuation"));
     });
   });
 
-  it("resumes from a conclusive rejection checkpoint after a crash before retry", async () => {
+  it("resumes from an ambiguous note checkpoint after a crash before reconciliation", async () => {
     await runWithOperationStore({}, async () => {
       const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
         { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
@@ -6996,27 +7601,33 @@ describe("Tickets Domain", () => {
       if (!stored) throw new Error("missing rejection-crash-restart operation");
 
       const store = getOperationStore();
-      const checkpoint = store.checkpointItem.bind(store);
-      let crashAfterRejection = true;
-      store.checkpointItem = async (params) => {
-        const updated = await checkpoint(params);
-        if (params.patch.observedMutationResult === "Rejected" && crashAfterRejection) {
-          crashAfterRejection = false;
-          throw new Error("simulated crash after rejection checkpoint");
+      const completeItem = store.completeItem.bind(store);
+      let crashAfterAmbiguity = true;
+      store.completeItem = async (params) => {
+        const updated = await completeItem(params);
+        if (params.patch.stage === "NoteWriteAmbiguous" && crashAfterAmbiguity) {
+          crashAfterAmbiguity = false;
+          throw new Error("simulated crash after ambiguous note checkpoint");
         }
         return updated;
       };
+      let noteAccepted = false;
       mockClient.query.mockImplementation(async (query: string) => {
         if (query.includes("getTicketList")) return { getTicketList: {
           tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
           listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
         } };
-        if (query.includes("getTicketNoteList")) return { getTicketNoteList: [] };
+        if (query.includes("getTicketNoteList")) return { getTicketNoteList: noteAccepted
+          ? [{ noteId: "note-recovered", content: "Recover rejected note", privacyType: "PRIVATE" }]
+          : [] };
         return { getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" } };
       });
       mockClient.mutate
         .mockRejectedValueOnce(new SuperOpsHttpError("rate limited", 429, "Too Many Requests", 0))
-        .mockResolvedValueOnce({ createTicketNote: { noteId: "note-recovered", privacyType: "PRIVATE" } });
+        .mockImplementationOnce(async () => {
+          noteAccepted = true;
+          return { createTicketNote: { noteId: "note-recovered", privacyType: "PRIVATE" } };
+        });
 
       await expect(runWithExecutionConfig({}, () => runWithExecutionContext(
         "superops_tickets_apply_triage_plan",
@@ -7025,42 +7636,49 @@ describe("Tickets Domain", () => {
           ownerHash: stored.ownerHash,
           leaseOwner: "reject-crash-1",
           leaseMs: 1,
-          now: "2026-07-18T00:00:00.000Z",
+          now: new Date(Date.now() + 60_000).toISOString(),
         })
-      ))).rejects.toThrow(/simulated crash after rejection checkpoint/);
+      ))).rejects.toThrow(/simulated crash after ambiguous note checkpoint/);
 
-      const rejected = await store.get(operationId, stored.ownerHash);
-      expect(rejected?.itemStates["57401"]).toMatchObject({
-        stage: "RateLimitedRescheduled",
-        observedMutationResult: "Rejected",
+      const ambiguous = await store.get(operationId, stored.ownerHash);
+      expect(ambiguous?.itemStates["57401"]).toMatchObject({
+        stage: "NoteWriteAmbiguous",
+        observedMutationResult: "Ambiguous",
         writeAttempted: true,
         attemptCount: 1,
-        errorClass: "SuperOpsRateLimit",
+        writeMayHaveSucceeded: true,
+        errorClass: "AmbiguousWrite",
       });
 
-      const resumed = await runWithExecutionConfig({}, () => runWithExecutionContext(
-        "superops_tickets_apply_triage_plan",
-        () => resumeApplyTriageOperation({
-          operationId,
-          ownerHash: stored.ownerHash,
-          leaseOwner: "reject-crash-2",
-          now: new Date(Date.now() + 1_000).toISOString(),
-        })
-      ));
-      const finalRecord = await store.get(operationId, stored.ownerHash);
+      let finalRecord = ambiguous;
+      for (let attempt = 0; attempt < 8 && finalRecord?.state !== "Completed"; attempt += 1) {
+        if (!finalRecord) throw new Error("missing ambiguous note operation");
+        const nextEligibleTime = finalRecord.itemStates["57401"].nextEligibleTime;
+        await runWithExecutionConfig({}, () => runWithExecutionContext(
+          "superops_tickets_apply_triage_plan",
+          () => resumeApplyTriageOperation({
+            operationId,
+            ownerHash: stored.ownerHash,
+            leaseOwner: `reject-crash-2-${attempt}`,
+            now: nextEligibleTime
+              ? new Date(Date.parse(nextEligibleTime) + 1).toISOString()
+              : new Date(Date.now() + 60_000).toISOString(),
+          })
+        ));
+        finalRecord = await store.get(operationId, stored.ownerHash);
+      }
       if (!finalRecord) throw new Error("missing final rejection-crash-restart operation");
       expect(finalRecord.itemStates["57401"]).toMatchObject({
-        stage: "Completed",
+        stage: "CompletedAfterAmbiguousWriteVerification",
         observedMutationResult: "VerifiedApplied",
         attemptCount: 2,
         verificationState: "Verified",
       });
       expect(operationResultView(finalRecord).totals).toMatchObject({
-        completedAfterRetry: 1,
+        completedAfterAmbiguousVerification: 1,
         updated: 1,
         validationFailed: 0,
       });
-      expect(resumed.view.totals).toMatchObject({ completedAfterRetry: 1 });
       expect(mockClient.mutate).toHaveBeenCalledTimes(2);
     });
   });
@@ -7759,7 +8377,7 @@ describe("Tickets Domain", () => {
   it.each([
     ["http-429", () => new SuperOpsHttpError("rate limited", 429, "Too Many Requests", 0)],
     ["graphql-throttle", () => new SuperOpsError("GraphQL throttled", "THROTTLED", 0)],
-  ])("durably reschedules a conclusively rejected private note for %s and revalidates before retry", async (
+  ])("reconciles an ambiguous private note after %s before one controlled recovery", async (
     throttleKind,
     throttleError
   ) => {
@@ -7778,6 +8396,7 @@ describe("Tickets Domain", () => {
     if (!stored) throw new Error("missing private-note throttle operation");
 
     const events: string[] = [];
+    let noteVisible = false;
     mockClient.query.mockImplementation(async (query: string) => {
       if (query.includes("getTicketList")) {
         events.push("revalidate-list");
@@ -7786,7 +8405,9 @@ describe("Tickets Domain", () => {
       }
       if (query.includes("getTicketNoteList")) {
         events.push("dedupe-notes");
-        return { getTicketNoteList: [] };
+        return { getTicketNoteList: noteVisible
+          ? [{ noteId: "note-accepted", content: noteBody, privacyType: "PRIVATE" }]
+          : [] };
       }
       events.push("revalidate-ticket");
       return { getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" } };
@@ -7801,43 +8422,66 @@ describe("Tickets Domain", () => {
         events.push("note-accepted");
         expect(variables.input.privacyType).toBe("PRIVATE");
         acceptedPrivateNotes += 1;
+        noteVisible = true;
         return { createTicketNote: { noteId: "note-accepted", privacyType: "PRIVATE" } };
       });
 
     await runWithExecutionConfig({}, () =>
       runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
-        resumeApplyTriageOperation({ operationId, ownerHash: stored.ownerHash, leaseOwner: "note-throttle-1" })
+        resumeApplyTriageOperation({
+          operationId,
+          ownerHash: stored.ownerHash,
+          leaseOwner: "note-throttle-1",
+          now: new Date(Date.now() + 60_000).toISOString(),
+        })
       )
     );
-    const rescheduled = await getOperationStore().get(operationId);
-    expect(rescheduled?.itemStates["57401"]).toMatchObject({
-      stage: "RateLimitedRescheduled",
+    const ambiguous = await getOperationStore().get(operationId);
+    expect(ambiguous?.itemStates["57401"]).toMatchObject({
+      stage: "NoteWriteAmbiguous",
       mutationType: "note",
       mutationStartStage: "NoteWriteStarted",
       writeAttempted: true,
-      writeMayHaveSucceeded: false,
-      reliableResponseReceived: true,
-      observedMutationResult: "Rejected",
+      writeMayHaveSucceeded: true,
+      reliableResponseReceived: false,
+      observedMutationResult: "Ambiguous",
       partialWrite: false,
       nextEligibleTime: expect.any(String),
     });
-    expect(rescheduled?.itemStates["57401"].rateLimit).toMatchObject({ attempts: 1 });
-    if (!rescheduled) throw new Error("missing rate-limited operation");
-    expect(operationResultView(rescheduled).totals).toMatchObject({
-      waitingForRateLimit: 1,
+    expect(ambiguous?.itemStates["57401"].rateLimit).toBeUndefined();
+    if (!ambiguous) throw new Error("missing ambiguous operation");
+    expect(operationResultView(ambiguous).totals).toMatchObject({
+      pending: 1,
+      ambiguousUnresolved: 0,
+      humanReconciliationRequired: 0,
       validationFailed: 0,
     });
 
-    await runWithExecutionConfig({}, () =>
-      runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
-        resumeApplyTriageOperation({ operationId, ownerHash: stored.ownerHash, leaseOwner: "note-throttle-2" })
-      )
-    );
-    const secondMutation = events.indexOf("note-accepted");
-    const eventsBeforeRetry = events.slice(events.indexOf("note-throttled") + 1, secondMutation);
-    expect(eventsBeforeRetry).toEqual(expect.arrayContaining([
-      "revalidate-list", "revalidate-ticket", "dedupe-notes",
-    ]));
+    let finalRecord = ambiguous;
+    for (let attempt = 0; attempt < 8 && !["Completed", "CompletedWithFailures"].includes(finalRecord.state); attempt += 1) {
+      const nextEligibleTime = finalRecord.itemStates["57401"].nextEligibleTime;
+      await runWithExecutionConfig({}, () =>
+        runWithExecutionContext("superops_tickets_apply_triage_plan", () =>
+          resumeApplyTriageOperation({
+            operationId,
+            ownerHash: stored.ownerHash,
+            leaseOwner: `note-throttle-${attempt + 2}`,
+            now: nextEligibleTime
+              ? new Date(Date.parse(nextEligibleTime) + 1).toISOString()
+              : new Date(Date.now() + 60_000).toISOString(),
+          })
+        )
+      );
+      finalRecord = await getOperationStore().get(operationId) ?? finalRecord;
+    }
+    expect(finalRecord.state).toBe("Completed");
+    expect(finalRecord.itemStates["57401"]).toMatchObject({
+      stage: "CompletedAfterAmbiguousWriteVerification",
+      outcome: "Updated",
+      verificationState: "Verified",
+      recoveryRetryCount: 1,
+      humanReconciliationRequired: false,
+    });
     expect(acceptedPrivateNotes).toBe(1);
     expect(mockClient.mutate).toHaveBeenCalledTimes(2);
     expect(mockClient.mutate.mock.calls.every(([, variables]) =>
@@ -8225,7 +8869,7 @@ describe("Tickets Domain", () => {
     });
   });
 
-  it("never replays an ambiguous private-note failure and terminalises only after bounded reconciliation", async () => {
+  it("allows one controlled note-only recovery, then requires human reconciliation if still unresolved", async () => {
     const domain = getTicketsTools();
     await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
       { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
@@ -8268,7 +8912,7 @@ describe("Tickets Domain", () => {
       reconciliationDisposition: "AmbiguousUnresolved",
       recoveryRetryCount: 0,
     });
-    for (let attempt = 0; attempt < 4 && finalRecord.state !== "CompletedWithFailures"; attempt += 1) {
+    for (let attempt = 0; attempt < 10 && finalRecord.state !== "CompletedWithFailures"; attempt += 1) {
       await runWithExecutionConfig({}, () => runWithExecutionContext(
         "superops_tickets_apply_triage_plan",
         () => resumeApplyTriageOperation({
@@ -8289,7 +8933,7 @@ describe("Tickets Domain", () => {
       verificationState: "Pending",
       errorClass: "AmbiguousWrite",
       reconciliationDisposition: "AmbiguousUnresolved",
-      recoveryRetryCount: 0,
+      recoveryRetryCount: 1,
       replaySafe: false,
       humanReconciliationRequired: true,
     });
@@ -8300,10 +8944,10 @@ describe("Tickets Domain", () => {
       humanReconciliationRequired: 1,
       validationFailed: 0,
     });
-    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
   });
 
-  it("dedupes a matching private note before a resumed conclusive-throttle retry", async () => {
+  it("verifies an exact private note found during ambiguous reconciliation without a duplicate write", async () => {
     const noteBody = "Appeared during durable wait";
     const domain = getTicketsTools();
     await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
@@ -8337,15 +8981,20 @@ describe("Tickets Domain", () => {
         operationId: "private-note-dedupe-after-throttle",
         ownerHash: stored.ownerHash,
         leaseOwner: "note-dedupe-1",
+        now: new Date(Date.now() + 60_000).toISOString(),
       })
     ));
     noteNowExists = true;
+    const pending = await getOperationStore().get("private-note-dedupe-after-throttle");
     await runWithExecutionConfig({}, () => runWithExecutionContext(
       "superops_tickets_apply_triage_plan",
       () => resumeApplyTriageOperation({
         operationId: "private-note-dedupe-after-throttle",
         ownerHash: stored.ownerHash,
         leaseOwner: "note-dedupe-2",
+        now: pending?.itemStates["57401"].nextEligibleTime
+          ? new Date(Date.parse(pending.itemStates["57401"].nextEligibleTime!) + 1).toISOString()
+          : new Date(Date.now() + 60_000).toISOString(),
       })
     ));
 
@@ -8353,9 +9002,9 @@ describe("Tickets Domain", () => {
     expect(finalRecord?.itemStates["57401"]).toMatchObject({
       outcome: "Updated",
       writeAttempted: true,
-      writeMayHaveSucceeded: false,
-      reliableResponseReceived: true,
-      observedMutationResult: "Rejected",
+      writeMayHaveSucceeded: true,
+      reliableResponseReceived: false,
+      observedMutationResult: "VerifiedApplied",
       verificationState: "Verified",
       partialWrite: false,
     });
@@ -8364,6 +9013,9 @@ describe("Tickets Domain", () => {
       finalOutcome: "Updated",
       writeAttempted: true,
       noteDeduped: true,
+      noteWriteOutcome: "AmbiguousButVerified",
+      finalNotePresentAndVerified: true,
+      humanReconciliationRequired: false,
     }));
     expect(mockClient.mutate).toHaveBeenCalledTimes(1);
     expect(mockClient.mutate.mock.calls[0][1].input.privacyType).toBe("PRIVATE");

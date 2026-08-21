@@ -148,25 +148,64 @@ export async function runOperationContinuation(
   }
 
   let processedThisInvocation = 0;
+  let deferredNextEligibleTime: string | undefined;
+  let deferredScheduleReason: string | undefined;
+  let deferredRateLimitScheduleReason: string | undefined;
   for (;;) {
     if (record.pendingItems.length === 0) {
       return continuationResult(record, false);
     }
     if (processedThisInvocation >= getExecutionConfig().maxItemsPerBatch) {
+      const batchRecord = record;
+      if (!batchRecord) {
+        throw new Error(`Operation disappeared before continuation batch boundary: ${params.operationId}`);
+      }
+      const pendingRateLimitItem = batchRecord.pendingItems
+        .map((itemKey) => batchRecord.itemStates[itemKey])
+        .find((item) => item?.stage === "RateLimitedRescheduled" || item?.rateLimit?.nextEligibleAt);
+      const batchNextEligibleTime = deferredNextEligibleTime ??
+        pendingRateLimitItem?.nextEligibleTime ?? pendingRateLimitItem?.rateLimit?.nextEligibleAt;
+      const batchScheduleReason = deferredRateLimitScheduleReason ??
+        (pendingRateLimitItem ? "SuperOpsRateLimitRescheduled" : deferredScheduleReason);
       record = await store.scheduleContinuation({
         operationId: params.operationId,
         ownerHash: params.ownerHash,
-        reason: "ContinuationRequiredMaxItemsPerBatch",
+        reason: batchNextEligibleTime
+          ? batchScheduleReason ?? "ContinuationRequiredWaitingForItem"
+          : "ContinuationRequiredMaxItemsPerBatch",
+        nextEligibleTime: batchNextEligibleTime,
       });
-      return continuationResult(record, true, "ContinuationRequiredMaxItemsPerBatch");
+      return continuationResult(
+        record,
+        true,
+        batchNextEligibleTime ? "ContinuationRequiredWaitingForItem" : "ContinuationRequiredMaxItemsPerBatch"
+      );
     }
     if (!hasExecutionBudgetFor(2)) {
+      const budgetRecord = record;
+      if (!budgetRecord) {
+        throw new Error(`Operation disappeared before continuation budget boundary: ${params.operationId}`);
+      }
+      const pendingRateLimitItem = budgetRecord.pendingItems
+        .map((itemKey) => budgetRecord.itemStates[itemKey])
+        .find((item) => item?.stage === "RateLimitedRescheduled" || item?.rateLimit?.nextEligibleAt);
+      const budgetNextEligibleTime = deferredNextEligibleTime ??
+        pendingRateLimitItem?.nextEligibleTime ?? pendingRateLimitItem?.rateLimit?.nextEligibleAt;
+      const budgetScheduleReason = deferredRateLimitScheduleReason ??
+        (pendingRateLimitItem ? "SuperOpsRateLimitRescheduled" : deferredScheduleReason);
       record = await store.scheduleContinuation({
         operationId: params.operationId,
         ownerHash: params.ownerHash,
-        reason: "ContinuationRequiredBeforeClaim",
+        reason: budgetNextEligibleTime
+          ? budgetScheduleReason ?? "ContinuationRequiredWaitingForItem"
+          : "ContinuationRequiredBeforeClaim",
+        nextEligibleTime: budgetNextEligibleTime,
       });
-      return continuationResult(record, true, "ContinuationRequiredBeforeClaim");
+      return continuationResult(
+        record,
+        true,
+        budgetNextEligibleTime ? "ContinuationRequiredWaitingForItem" : "ContinuationRequiredBeforeClaim"
+      );
     }
 
     const claim = await store.claimNextItem({
@@ -179,8 +218,26 @@ export async function runOperationContinuation(
       now: params.now ?? new Date().toISOString(),
     });
     if (!claim) {
-      record = (await store.get(params.operationId, params.ownerHash)) ?? record;
-      return continuationResult(record, record.pendingItems.length > 0, "NoEligibleItem");
+      const currentRecord = (await store.get(params.operationId, params.ownerHash)) ?? record;
+      if (!currentRecord) {
+        throw new Error(`Operation disappeared while checking continuation eligibility: ${params.operationId}`);
+      }
+      record = currentRecord;
+      const eligibilityTimes = currentRecord.pendingItems
+        .map((itemKey) => currentRecord.itemStates[itemKey]?.nextEligibleTime)
+        .filter((value): value is string => typeof value === "string")
+        .sort();
+      const nextEligibleTime = eligibilityTimes[0];
+      if (nextEligibleTime) {
+        record = await store.scheduleContinuation({
+          operationId: params.operationId,
+          ownerHash: params.ownerHash,
+          reason: "ContinuationRequiredWaitingForItem",
+          nextEligibleTime,
+        });
+        return continuationResult(record, true, "ContinuationRequiredWaitingForItem");
+      }
+      return continuationResult(record, currentRecord.pendingItems.length > 0, "NoEligibleItem");
     }
 
     record = (await store.get(params.operationId, params.ownerHash)) ?? record;
@@ -419,17 +476,44 @@ export async function runOperationContinuation(
         }
         throw error;
       }
+      const completedRecord = record;
+      if (!completedRecord) {
+        throw new Error(`Operation disappeared after completing item: ${params.operationId}`);
+      }
       processedThisInvocation += 1;
       markExecutionItem({
         completed: effectiveOutcome.stage.startsWith("Completed") || effectiveOutcome.stage === "Completed" ||
           effectiveOutcome.stage === "RateLimitExceeded",
-        remainingItems: record.pendingItems.length + record.unattemptedItems.length,
+        remainingItems: completedRecord.pendingItems.length + completedRecord.unattemptedItems.length,
         partialWrite: effectiveOutcome.partialWrite,
         stale: effectiveOutcome.stale,
         verificationFailure: effectiveOutcome.verificationFailed,
       });
 
       if (effectiveOutcome.stage === "RateLimitedRescheduled" || effectiveOutcome.nextEligibleTime) {
+        const otherPendingItem = completedRecord.pendingItems.some((itemKey) =>
+          itemKey !== claim.itemKey && ![
+            "Completed", "CompletedAfterRetry", "CompletedAfterAmbiguousWriteVerification",
+            "FailedBeforeWrite", "FailedAfterPartialWrite", "AmbiguousWriteUnresolved",
+            "RateLimitExceeded", "Stale", "StaleAfterRateLimitWait", "Skipped",
+          ].includes(completedRecord.itemStates[itemKey]?.stage ?? "")
+        );
+        if (otherPendingItem) {
+          // A delayed item carries its own eligibility checkpoint. Continue
+          // with other candidates in this batch before setting the operation-
+          // level wake time, so one ambiguous note does not block unrelated
+          // read/write-safe candidates.
+          if (effectiveOutcome.nextEligibleTime && (
+            !deferredNextEligibleTime || effectiveOutcome.nextEligibleTime < deferredNextEligibleTime
+          )) {
+            deferredNextEligibleTime = effectiveOutcome.nextEligibleTime;
+            deferredScheduleReason = effectiveOutcome.outcome;
+          }
+          if (effectiveOutcome.stage === "RateLimitedRescheduled") {
+            deferredRateLimitScheduleReason = effectiveOutcome.outcome;
+          }
+          continue;
+        }
         record = await store.scheduleContinuation({
           operationId: params.operationId,
           ownerHash: params.ownerHash,
