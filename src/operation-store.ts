@@ -8,6 +8,7 @@ import {
   recordSubrequestFinish,
   recordTypedSubrequestStart,
 } from "./execution.js";
+import { canonicalizeNoteText } from "./utils/note-canonicalization.js";
 
 export type OperationState =
   | "Running"
@@ -600,7 +601,7 @@ function validateApprovedPrivateNotes(
       seen.has(note.itemKey) ||
       !note.content.trim() ||
       new TextEncoder().encode(note.content).byteLength > MAX_APPROVED_PRIVATE_NOTE_BYTES ||
-      normalizedNoteFingerprint(note.content) !== note.fingerprint ||
+      !noteFingerprintMatchesContent(note.content, note.fingerprint) ||
       record.itemStates[note.itemKey]?.noteFingerprint !== note.fingerprint
     ) {
       throw new MalformedStoredOperationError("Approved private-note payload is invalid.");
@@ -689,7 +690,7 @@ async function decryptApprovedPrivateNote(
       base64ToBytes(stored.ciphertext)
     );
     const content = new TextDecoder().decode(plaintext);
-    return normalizedNoteFingerprint(content) === stored.fingerprint ? content : undefined;
+    return noteFingerprintMatchesContent(content, stored.fingerprint) ? content : undefined;
   } catch {
     return undefined;
   }
@@ -2200,7 +2201,7 @@ class MemoryOperationStore implements OperationStore {
       !note ||
       note.privacyType !== "PRIVATE" ||
       note.fingerprint !== fingerprint ||
-      normalizedNoteFingerprint(note.content) !== fingerprint
+      !noteFingerprintMatchesContent(note.content, fingerprint)
     ) return undefined;
     return note.content;
   }
@@ -2790,11 +2791,31 @@ export function envTenantOwnerHash(credentials: {
   });
 }
 
-export function normalizedNoteFingerprint(value: string | undefined): string | undefined {
+function legacyNormalizedNoteFingerprint(value: string | undefined): string | undefined {
   if (!value || !value.trim()) return undefined;
   return stableHash(
     value.normalize("NFKC").replace(/\r\n?/g, "\n").trim().replace(/\s+/gu, " ").toLowerCase()
   );
+}
+
+export function normalizedNoteFingerprint(value: string | undefined): string | undefined {
+  const canonical = canonicalizeNoteText(value);
+  // Preserve the existing exact-after-normalisation, case-insensitive note
+  // identity contract while making HTML/plain-text representations converge.
+  return canonical === undefined ? undefined : stableHash(canonical.toLowerCase());
+}
+
+/**
+ * Match new canonical fingerprints while retaining read-only compatibility
+ * with durable records created before HTML note canonicalisation was added.
+ */
+export function noteFingerprintMatchesContent(
+  value: string | undefined,
+  fingerprint: string | undefined
+): boolean {
+  if (!fingerprint) return false;
+  return normalizedNoteFingerprint(value) === fingerprint ||
+    legacyNormalizedNoteFingerprint(value) === fingerprint;
 }
 
 /**

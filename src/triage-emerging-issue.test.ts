@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { handleTriageEmergingIssueUpsert } from "./triage-emerging-issue.js";
 import { runWithOperationStore, SuperOpsOperationLedger } from "./operation-store.js";
@@ -59,6 +59,11 @@ function durableNamespace() {
 }
 
 describe("triage emerging issue signalling", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-19T12:00:00.000Z"));
+  });
+
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -136,8 +141,6 @@ describe("triage emerging issue signalling", () => {
   });
 
   it("expires an active signal after the central quiet period without claiming the incident is fixed", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-08-19T12:00:00.000Z"));
     await handleTriageEmergingIssueUpsert(observation({ issueFingerprint: "issue-expiry-006" }));
 
     vi.setSystemTime(new Date("2026-08-27T12:00:00.000Z"));

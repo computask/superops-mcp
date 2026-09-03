@@ -201,6 +201,28 @@ const SCHEDULED_TRIAGE_TEST_NOTE = [
   "When: During this scheduled triage run.",
 ].join("\n");
 
+// Privacy-safe semantic fixture for the production-shaped ticket/note IDs in
+// the HTML-rendering regression. It intentionally contains no customer data.
+const REGRESSION_61125_NOTE_ID = "4464097591550377984";
+const REGRESSION_61125_SUBMITTED_NOTE = [
+  "<strong>TRIAGE SUMMARY</strong><br><br>",
+  "<strong>Ticket goal:</strong> Review supplier pricing changes before they take effect.<br><br>",
+  "<strong>What needs to be known:</strong> The supplier has announced a dated pricing change for selected subscriptions.<br><br>",
+  "<strong>Next step:</strong> Review affected renewals, quotes and pricing assumptions.<br><br>",
+  "<strong>When:</strong> Complete the review before the effective date.",
+].join("");
+const REGRESSION_61125_PLAIN_NOTE = [
+  "TRIAGE SUMMARY",
+  "",
+  "Ticket goal: Review supplier pricing changes before they take effect.",
+  "",
+  "What needs to be known: The supplier has announced a dated pricing change for selected subscriptions.",
+  "",
+  "Next step: Review affected renewals, quotes and pricing assumptions.",
+  "",
+  "When: Complete the review before the effective date.",
+].join("\n");
+
 const RESOLVED_CLASSIFICATION = {
   priority: "Very Low",
   ...TRIAGE_TEST_RESOLUTION_CLASSIFICATION,
@@ -353,6 +375,7 @@ describe("Tickets Domain", () => {
   function installProductionShaped60745Mocks(options: {
     initialNote?: "accepted" | "ambiguous" | "ambiguous-visible";
     recoveryNote?: "accepted" | "ambiguous" | "ambiguous-visible";
+    ambiguousWriteAccepted?: boolean;
     errorKind?: "http" | "graphql";
   } = {}) {
     const originalUpdatedTime = "2026-08-21T10:24:53.353Z";
@@ -400,6 +423,7 @@ describe("Tickets Domain", () => {
     let noteVisible = false;
     let classificationWriteCount = 0;
     let noteWriteCount = 0;
+    let acceptedPhysicalNoteCount = 0;
 
     const makeAmbiguousError = () => options.errorKind === "graphql"
       ? new SuperOpsError(
@@ -411,6 +435,10 @@ describe("Tickets Domain", () => {
       : new SuperOpsHttpError("rate limited after note submission", 429, "Too Many Requests", 0);
 
     const applyNoteDisposition = (disposition: "accepted" | "ambiguous" | "ambiguous-visible") => {
+      if (disposition === "accepted" || disposition === "ambiguous-visible" ||
+          disposition === "ambiguous" && options.ambiguousWriteAccepted === true) {
+        acceptedPhysicalNoteCount += 1;
+      }
       if (disposition === "accepted" || disposition === "ambiguous-visible") {
         noteVisible = true;
         currentTicket = postNoteTicket;
@@ -465,9 +493,14 @@ describe("Tickets Domain", () => {
       events,
       get classificationWriteCount() { return classificationWriteCount; },
       get noteWriteCount() { return noteWriteCount; },
+      get acceptedPhysicalNoteCount() { return acceptedPhysicalNoteCount; },
       get currentTicket() { return currentTicket; },
       introduceExternalChange() {
         currentTicket = { ...classifiedTicket, updatedTime: externalUpdatedTime };
+      },
+      revealAmbiguousNote() {
+        noteVisible = true;
+        currentTicket = postNoteTicket;
       },
     };
   }
@@ -5231,6 +5264,52 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it("deduplicates the 61125 HTML triage note against its private safe-reader representation", async () => {
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        return { getTicketList: {
+          tickets: [{ ticketId: "ticket-61125", displayId: "61125" }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        } };
+      }
+      if (query.includes("getTicketNoteList")) {
+        return { getTicketNoteList: [{
+          noteId: REGRESSION_61125_NOTE_ID,
+          plainText: REGRESSION_61125_PLAIN_NOTE,
+          privacyType: "PRIVATE",
+        }] };
+      }
+      return {
+        getTicket: {
+          ticketId: "ticket-61125",
+          displayId: "61125",
+          subject: "HTML note regression",
+          status: "New Calls",
+        },
+      };
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["61125"],
+      actions: [{
+        ticketNumber: "61125",
+        contentVerified: true,
+        action: "addNote",
+        note: REGRESSION_61125_SUBMITTED_NOTE,
+      }],
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Updated",
+      noteAdded: false,
+      noteDeduped: true,
+      noteDedupeChecked: true,
+      verified: true,
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
   it("does not treat an identically worded public note as a private-note dedupe match", async () => {
     let privateNoteCreated = false;
     mockClient.query.mockImplementation(async (query: string) => {
@@ -6179,6 +6258,76 @@ describe("Tickets Domain", () => {
         },
       }
     );
+  });
+
+  it("verifies the 61125 private note after SuperOps adds an HTML wrapper", async () => {
+    mockClient.mutate.mockResolvedValue({
+      createTicketNote: {
+        noteId: REGRESSION_61125_NOTE_ID,
+        content: REGRESSION_61125_SUBMITTED_NOTE,
+        privacyType: "PRIVATE",
+      },
+    });
+    mockClient.query.mockResolvedValue({
+      getTicketNoteList: [{
+        noteId: REGRESSION_61125_NOTE_ID,
+        content: `<html>${REGRESSION_61125_SUBMITTED_NOTE}</html>`,
+        privacyType: "PRIVATE",
+      }],
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_add_note", {
+      ticketId: "ticket-61125",
+      content: REGRESSION_61125_SUBMITTED_NOTE,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).not.toBe(true);
+    expect(parsed).toMatchObject({
+      finalOutcome: "NoteAdded",
+      partialWrite: false,
+      verification: {
+        verified: true,
+        noteId: REGRESSION_61125_NOTE_ID,
+        expectedPrivacy: "PRIVATE",
+        privacyVerified: true,
+        contentVerified: true,
+      },
+    });
+  });
+
+  it("does not let an identical public read-back satisfy private-note verification", async () => {
+    mockClient.mutate.mockResolvedValue({
+      createTicketNote: {
+        noteId: "public-readback",
+        content: REGRESSION_61125_SUBMITTED_NOTE,
+        privacyType: "PRIVATE",
+      },
+    });
+    mockClient.query.mockResolvedValue({
+      getTicketNoteList: [{
+        noteId: "public-readback",
+        content: `<html>${REGRESSION_61125_SUBMITTED_NOTE}</html>`,
+        privacyType: "PUBLIC",
+      }],
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_add_note", {
+      ticketId: "ticket-61125",
+      content: REGRESSION_61125_SUBMITTED_NOTE,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(parsed).toMatchObject({
+      finalOutcome: "VerificationFailed",
+      partialWrite: true,
+      verification: {
+        verified: false,
+        contentVerified: true,
+        privacyVerified: false,
+      },
+    });
   });
 
   it("logs time using createWorklogEntries", async () => {
@@ -7188,12 +7337,13 @@ describe("Tickets Domain", () => {
     });
   });
 
-  it("performs one controlled note-only recovery after bounded absence and never replays classification", async () => {
+  it("does not retry an ambiguous private note after bounded absence and never replays classification", async () => {
     await runWithOperationStore({}, async () => {
       const fixture = installProductionShaped60745Mocks({
         initialNote: "ambiguous",
         recoveryNote: "accepted",
         errorKind: "http",
+        ambiguousWriteAccepted: true,
       });
       const operationId = "60745-note-only-recovery";
       await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
@@ -7219,34 +7369,43 @@ describe("Tickets Domain", () => {
         typeof entry === "object" && entry !== null &&
         (entry as { ticketNumber?: string }).ticketNumber === "60745"
       ) as Record<string, unknown> | undefined;
+      const finalView = operationResultView(final) as { totals: Record<string, unknown> };
 
-      expect(final.state).toBe("Completed");
+      expect(final.state).toBe("CompletedWithFailures");
       expect(fixture.classificationWriteCount).toBe(1);
-      expect(fixture.noteWriteCount).toBe(2);
-      expect(fixture.events).toEqual(["classification-1", "note-1", "note-2"]);
+      expect(fixture.noteWriteCount).toBe(1);
+      expect(fixture.acceptedPhysicalNoteCount).toBe(1);
+      expect(final.itemStates["60745"].acceptedPhysicalWrites).toHaveLength(1);
+      expect(compact?.acceptedPhysicalWrites).toHaveLength(1);
+      expect(finalView.totals).toMatchObject({ acceptedPhysicalWrites: 1 });
+      expect(fixture.events).toEqual(["classification-1", "note-1"]);
       expect(final.itemStates["60745"]).toMatchObject({
-        stage: "CompletedAfterAmbiguousWriteVerification",
-        outcome: "Updated",
-        recoveryRetryCount: 1,
-        recoveryRetryOutcome: "Accepted",
-        verificationState: "Verified",
-        humanReconciliationRequired: false,
+        stage: "AmbiguousWriteUnresolved",
+        outcome: "AmbiguousWriteUnresolved",
+        recoveryRetryCount: 0,
+        recoveryRetryOutcome: "NotAttempted",
+        verificationState: "Pending",
+        partialWrite: true,
+        humanReconciliationRequired: true,
+        terminalErrorClass: "AmbiguousWrite",
       });
       expect(compact).toMatchObject({
-        noteAdded: true,
-        noteWriteOutcome: "AcceptedAndVerified",
-        finalNotePresentAndVerified: true,
-        partialWrite: false,
+        finalOutcome: "Failed",
+        noteAdded: false,
+        noteDeduped: false,
+        noteWriteOutcome: "AmbiguousUnresolved",
+        partialWrite: true,
+        humanReconciliationRequired: true,
       });
       expect(fixture.currentTicket).toMatchObject(fixture.target);
     });
   });
 
-  it("reconciles an ambiguous recovery note write when the exact note appears later", async () => {
+  it("verifies an initially ambiguous note when it appears later without a duplicate write", async () => {
     await runWithOperationStore({}, async () => {
       const fixture = installProductionShaped60745Mocks({
         initialNote: "ambiguous",
-        recoveryNote: "ambiguous-visible",
+        ambiguousWriteAccepted: true,
       });
       const operationId = "60745-ambiguous-recovery-note";
       await withSuccessfulContinuationScheduling(() => runWithExecutionConfig({}, () =>
@@ -7267,6 +7426,7 @@ describe("Tickets Domain", () => {
           })
         )
       ));
+      fixture.revealAmbiguousNote();
       const final = await resume60745UntilTerminal(operationId);
       const compact = final.compactResults.find((entry) =>
         typeof entry === "object" && entry !== null &&
@@ -7275,12 +7435,13 @@ describe("Tickets Domain", () => {
 
       expect(final.state).toBe("Completed");
       expect(fixture.classificationWriteCount).toBe(1);
-      expect(fixture.noteWriteCount).toBe(2);
-      expect(fixture.events).toEqual(["classification-1", "note-1", "note-2"]);
+      expect(fixture.noteWriteCount).toBe(1);
+      expect(fixture.acceptedPhysicalNoteCount).toBe(1);
+      expect(fixture.events).toEqual(["classification-1", "note-1"]);
       expect(final.itemStates["60745"]).toMatchObject({
         stage: "CompletedAfterAmbiguousWriteVerification",
         outcome: "Updated",
-        recoveryRetryCount: 1,
+        recoveryRetryCount: 0,
         verificationState: "Verified",
         humanReconciliationRequired: false,
       });
@@ -7293,7 +7454,7 @@ describe("Tickets Domain", () => {
     });
   });
 
-  it("requires human reconciliation after bounded note recovery exhaustion and preserves classification-only partial totals", async () => {
+  it("requires human reconciliation after bounded ambiguous-note reconciliation and preserves classification-only partial totals", async () => {
     await runWithOperationStore({}, async () => {
       const fixture = installProductionShaped60745Mocks({
         initialNote: "ambiguous",
@@ -7325,12 +7486,13 @@ describe("Tickets Domain", () => {
       };
       expect(final.state).toBe("CompletedWithFailures");
       expect(fixture.classificationWriteCount).toBe(1);
-      expect(fixture.noteWriteCount).toBe(2);
+      expect(fixture.noteWriteCount).toBe(1);
       expect(final.itemStates["60745"]).toMatchObject({
         stage: "AmbiguousWriteUnresolved",
         outcome: "AmbiguousWriteUnresolved",
         partialWrite: true,
-        recoveryRetryCount: 1,
+        recoveryRetryCount: 0,
+        recoveryRetryOutcome: "NotAttempted",
         humanReconciliationRequired: true,
         terminalErrorClass: "AmbiguousWrite",
         replaySafe: false,
@@ -7586,7 +7748,7 @@ describe("Tickets Domain", () => {
     });
   });
 
-  it("resumes from an ambiguous note checkpoint after a crash before reconciliation", async () => {
+  it("resumes from an ambiguous note checkpoint after a crash and verifies a later-visible note without retrying", async () => {
     await runWithOperationStore({}, async () => {
       const initial = await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
         { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
@@ -7603,15 +7765,18 @@ describe("Tickets Domain", () => {
       const store = getOperationStore();
       const completeItem = store.completeItem.bind(store);
       let crashAfterAmbiguity = true;
+      let noteAccepted = false;
       store.completeItem = async (params) => {
         const updated = await completeItem(params);
         if (params.patch.stage === "NoteWriteAmbiguous" && crashAfterAmbiguity) {
           crashAfterAmbiguity = false;
+          // The original submission may become visible after the process
+          // loses the response, before the next durable read-only continuation.
+          noteAccepted = true;
           throw new Error("simulated crash after ambiguous note checkpoint");
         }
         return updated;
       };
-      let noteAccepted = false;
       mockClient.query.mockImplementation(async (query: string) => {
         if (query.includes("getTicketList")) return { getTicketList: {
           tickets: [{ ticketId: "ticket-57401", displayId: "57401" }],
@@ -7623,11 +7788,7 @@ describe("Tickets Domain", () => {
         return { getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" } };
       });
       mockClient.mutate
-        .mockRejectedValueOnce(new SuperOpsHttpError("rate limited", 429, "Too Many Requests", 0))
-        .mockImplementationOnce(async () => {
-          noteAccepted = true;
-          return { createTicketNote: { noteId: "note-recovered", privacyType: "PRIVATE" } };
-        });
+        .mockRejectedValueOnce(new SuperOpsHttpError("rate limited", 429, "Too Many Requests", 0));
 
       await expect(runWithExecutionConfig({}, () => runWithExecutionContext(
         "superops_tickets_apply_triage_plan",
@@ -7651,7 +7812,8 @@ describe("Tickets Domain", () => {
       });
 
       let finalRecord = ambiguous;
-      for (let attempt = 0; attempt < 8 && finalRecord?.state !== "Completed"; attempt += 1) {
+      for (let attempt = 0; attempt < 8 &&
+          finalRecord?.state !== "Completed" && finalRecord?.state !== "CompletedWithFailures"; attempt += 1) {
         if (!finalRecord) throw new Error("missing ambiguous note operation");
         const nextEligibleTime = finalRecord.itemStates["57401"].nextEligibleTime;
         await runWithExecutionConfig({}, () => runWithExecutionContext(
@@ -7671,7 +7833,7 @@ describe("Tickets Domain", () => {
       expect(finalRecord.itemStates["57401"]).toMatchObject({
         stage: "CompletedAfterAmbiguousWriteVerification",
         observedMutationResult: "VerifiedApplied",
-        attemptCount: 2,
+        attemptCount: 1,
         verificationState: "Verified",
       });
       expect(operationResultView(finalRecord).totals).toMatchObject({
@@ -7679,7 +7841,7 @@ describe("Tickets Domain", () => {
         updated: 1,
         validationFailed: 0,
       });
-      expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+      expect(mockClient.mutate).toHaveBeenCalledTimes(1);
     });
   });
   it("resumes a pending approved triage update using the real adapter", async () => {
@@ -8377,7 +8539,7 @@ describe("Tickets Domain", () => {
   it.each([
     ["http-429", () => new SuperOpsHttpError("rate limited", 429, "Too Many Requests", 0)],
     ["graphql-throttle", () => new SuperOpsError("GraphQL throttled", "THROTTLED", 0)],
-  ])("reconciles an ambiguous private note after %s before one controlled recovery", async (
+  ])("reconciles an ambiguous private note after %s without retrying the note mutation", async (
     throttleKind,
     throttleError
   ) => {
@@ -8396,7 +8558,7 @@ describe("Tickets Domain", () => {
     if (!stored) throw new Error("missing private-note throttle operation");
 
     const events: string[] = [];
-    let noteVisible = false;
+    const noteVisible = false;
     mockClient.query.mockImplementation(async (query: string) => {
       if (query.includes("getTicketList")) {
         events.push("revalidate-list");
@@ -8412,18 +8574,11 @@ describe("Tickets Domain", () => {
       events.push("revalidate-ticket");
       return { getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" } };
     });
-    let acceptedPrivateNotes = 0;
+    const acceptedPrivateNotes = 0;
     mockClient.mutate
       .mockImplementationOnce(async () => {
         events.push("note-throttled");
         throw throttleError();
-      })
-      .mockImplementationOnce(async (_mutation: string, variables: { input: { privacyType: string } }) => {
-        events.push("note-accepted");
-        expect(variables.input.privacyType).toBe("PRIVATE");
-        acceptedPrivateNotes += 1;
-        noteVisible = true;
-        return { createTicketNote: { noteId: "note-accepted", privacyType: "PRIVATE" } };
       });
 
     await runWithExecutionConfig({}, () =>
@@ -8474,19 +8629,19 @@ describe("Tickets Domain", () => {
       );
       finalRecord = await getOperationStore().get(operationId) ?? finalRecord;
     }
-    expect(finalRecord.state).toBe("Completed");
+    expect(finalRecord.state).toBe("CompletedWithFailures");
     expect(finalRecord.itemStates["57401"]).toMatchObject({
-      stage: "CompletedAfterAmbiguousWriteVerification",
-      outcome: "Updated",
-      verificationState: "Verified",
-      recoveryRetryCount: 1,
-      humanReconciliationRequired: false,
+      stage: "AmbiguousWriteUnresolved",
+      outcome: "AmbiguousWriteUnresolved",
+      verificationState: "Pending",
+      recoveryRetryCount: 0,
+      recoveryRetryOutcome: "NotAttempted",
+      partialWrite: true,
+      humanReconciliationRequired: true,
     });
-    expect(acceptedPrivateNotes).toBe(1);
-    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
-    expect(mockClient.mutate.mock.calls.every(([, variables]) =>
-      variables.input.privacyType === "PRIVATE"
-    )).toBe(true);
+    expect(acceptedPrivateNotes).toBe(0);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(mockClient.mutate.mock.calls[0][1].input.privacyType).toBe("PRIVATE");
   });
 
   function stagedVisibilityAction(note = "JUNK") {
@@ -8869,7 +9024,7 @@ describe("Tickets Domain", () => {
     });
   });
 
-  it("allows one controlled note-only recovery, then requires human reconciliation if still unresolved", async () => {
+  it("requires human reconciliation after bounded note-only ambiguity without retrying", async () => {
     const domain = getTicketsTools();
     await withSuccessfulContinuationScheduling(() => runWithExecutionConfig(
       { SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH: "1" },
@@ -8929,22 +9084,23 @@ describe("Tickets Domain", () => {
       stage: "AmbiguousWriteUnresolved",
       writeAttempted: true,
       writeMayHaveSucceeded: true,
-      partialWrite: false,
+      partialWrite: true,
       verificationState: "Pending",
       errorClass: "AmbiguousWrite",
       reconciliationDisposition: "AmbiguousUnresolved",
-      recoveryRetryCount: 1,
+      recoveryRetryCount: 0,
+      recoveryRetryOutcome: "NotAttempted",
       replaySafe: false,
       humanReconciliationRequired: true,
     });
     expect(finalRecord.itemStates["57401"].nextEligibleTime).toBeUndefined();
     expect(operationResultView(finalRecord).totals).toMatchObject({
       ambiguousUnresolved: 1,
-      partialWrite: 0,
+      partialWrite: 1,
       humanReconciliationRequired: 1,
       validationFailed: 0,
     });
-    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
   });
 
   it("verifies an exact private note found during ambiguous reconciliation without a duplicate write", async () => {
