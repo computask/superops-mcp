@@ -462,6 +462,7 @@ describe("ChatGPT direct mutation policy", () => {
       "superops_alerts_resolve",
       "superops_custom_mutation",
       "superops_custom_query",
+      "superops_navigate",
       "superops_operations_cancel",
       "superops_scripts_execute_on_asset",
       "superops_tickets_add_note",

@@ -186,6 +186,7 @@ export async function blockedToolNamesByCategory(
 const CHATGPT_DIRECT_TRIAGE_PLAN_TOOL_NAME = "superops_tickets_apply_triage_plan";
 const CHATGPT_DIRECT_OPERATION_CANCEL_TOOL_NAME = "superops_operations_cancel";
 const CHATGPT_DIRECT_SCRIPT_EXECUTION_TOOL_NAME = "superops_scripts_execute_on_asset";
+const CHATGPT_DIRECT_NAVIGATION_TOOL_NAME = "superops_navigate";
 
 export type ChatGptDirectToolPolicy = {
   generalMutatingToolsAllowed?: boolean;
@@ -213,6 +214,10 @@ export async function chatGptDirectBlockedToolNames(
   }
 
   const blocked = await blockedToolNamesByCategory(categories);
+  // Navigation only describes tools that are already exposed by tools/list.
+  // Blocking it on the direct route prevents an avoidable discovery turn in
+  // API-triggered automation while leaving the actual read/write tools intact.
+  blocked.add(CHATGPT_DIRECT_NAVIGATION_TOOL_NAME);
   if (policy.reviewedTriagePlanAllowed === true) {
     blocked.delete(CHATGPT_DIRECT_TRIAGE_PLAN_TOOL_NAME);
     blocked.delete(CHATGPT_DIRECT_OPERATION_CANCEL_TOOL_NAME);
@@ -573,7 +578,7 @@ function enrichAuditMetadataFromResult(
   result: ToolResult,
   metadata: AuditMetadata | undefined
 ): AuditMetadata | undefined {
-  if (toolName !== "superops_tickets_triage_snapshot" || result.isError) {
+  if (result.isError) {
     return metadata;
   }
 
@@ -587,18 +592,45 @@ function enrichAuditMetadataFromResult(
       source?: { status?: unknown; page?: unknown; max?: unknown };
       initialCandidateCount?: unknown;
       candidateTicketNumbers?: unknown;
+      operation?: {
+        state?: unknown;
+        complete?: unknown;
+        continuationRequired?: unknown;
+      };
+      results?: Array<{
+        finalOutcome?: unknown;
+        failureStage?: unknown;
+      }>;
     };
-    return {
-      ...metadata,
-      triageSnapshot: {
-        status: parsed.source?.status,
-        page: parsed.source?.page,
-        max: parsed.source?.max,
-        candidateCount: parsed.initialCandidateCount,
-        ticketNumbers: parsed.candidateTicketNumbers,
-        safeRead: true,
-      },
-    };
+    if (toolName === "superops_tickets_triage_snapshot") {
+      return {
+        ...metadata,
+        triageSnapshot: {
+          status: parsed.source?.status,
+          page: parsed.source?.page,
+          max: parsed.source?.max,
+          candidateCount: parsed.initialCandidateCount,
+          ticketNumbers: parsed.candidateTicketNumbers,
+          safeRead: true,
+        },
+      };
+    }
+    if (toolName === "superops_tickets_apply_triage_plan") {
+      const results = Array.isArray(parsed.results) ? parsed.results : [];
+      return {
+        ...metadata,
+        triageApply: {
+          operationState: parsed.operation?.state,
+          complete: parsed.operation?.complete,
+          continuationRequired: parsed.operation?.continuationRequired,
+          finalOutcomes: results.map((item) => item.finalOutcome),
+          failureStages: results
+            .map((item) => item.failureStage)
+            .filter((stage) => typeof stage === "string" && stage.length > 0),
+        },
+      };
+    }
+    return metadata;
   } catch {
     return metadata;
   }
