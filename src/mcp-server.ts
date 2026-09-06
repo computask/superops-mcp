@@ -188,11 +188,29 @@ const CHATGPT_DIRECT_OPERATION_CANCEL_TOOL_NAME = "superops_operations_cancel";
 const CHATGPT_DIRECT_SCRIPT_EXECUTION_TOOL_NAME = "superops_scripts_execute_on_asset";
 const CHATGPT_DIRECT_NAVIGATION_TOOL_NAME = "superops_navigate";
 
+// API-triggered triage must start from its trusted half-open time window. Keep
+// the normal direct read surface available by default, but allow production to
+// opt into a smaller catalogue that removes broad/preparation reads which can
+// otherwise add an unnecessary discovery turn or queue-wide SuperOps call.
+const CHATGPT_DIRECT_TARGETED_TRIAGE_BLOCKED_TOOL_NAMES = [
+  "superops_status",
+  "superops_test_connection",
+  "superops_operations_get",
+  "superops_operations_results",
+  "superops_operations_cancel",
+  "superops_tickets_list",
+  "superops_tickets_recent",
+  "superops_tickets_created_between",
+  "superops_tickets_report",
+  "superops_tickets_triage_snapshot",
+] as const;
+
 export type ChatGptDirectToolPolicy = {
   generalMutatingToolsAllowed?: boolean;
   customMutationsAllowed?: boolean;
   reviewedTriagePlanAllowed?: boolean;
   scriptExecutionAllowed?: boolean;
+  targetedTriageOnly?: boolean;
 };
 
 /**
@@ -229,6 +247,13 @@ export async function chatGptDirectBlockedToolNames(
     blocked.delete(CHATGPT_DIRECT_SCRIPT_EXECUTION_TOOL_NAME);
   } else {
     blocked.add(CHATGPT_DIRECT_SCRIPT_EXECUTION_TOOL_NAME);
+  }
+  // Apply this last so the targeted catalogue remains authoritative even when
+  // a broader direct-route policy has explicitly enabled operation controls.
+  if (policy.targetedTriageOnly === true) {
+    for (const toolName of CHATGPT_DIRECT_TARGETED_TRIAGE_BLOCKED_TOOL_NAMES) {
+      blocked.add(toolName);
+    }
   }
   return blocked;
 }

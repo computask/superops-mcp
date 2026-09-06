@@ -501,6 +501,34 @@ describe("ChatGPT direct mutation policy", () => {
     expect(blocked.has("superops_operations_results")).toBe(false);
   });
 
+  it("removes broad preparation reads from the opt-in targeted triage surface", async () => {
+    const blocked = await chatGptDirectBlockedToolNames({
+      reviewedTriagePlanAllowed: true,
+      targetedTriageOnly: true,
+    });
+
+    for (const name of [
+      "superops_status",
+      "superops_test_connection",
+      "superops_operations_get",
+      "superops_operations_results",
+      "superops_operations_cancel",
+      "superops_tickets_list",
+      "superops_tickets_recent",
+      "superops_tickets_created_between",
+      "superops_tickets_report",
+      "superops_tickets_triage_snapshot",
+      "superops_navigate",
+    ]) {
+      expect(blocked.has(name)).toBe(true);
+    }
+
+    expect(blocked.has("superops_tickets_query")).toBe(false);
+    expect(blocked.has("superops_tickets_triage_evidence_recover")).toBe(false);
+    expect(blocked.has("superops_tickets_field_options")).toBe(false);
+    expect(blocked.has("superops_tickets_apply_triage_plan")).toBe(false);
+  });
+
   it("keeps the reviewed ChatGPT direct mutating surface to durable triage controls only", async () => {
     const blocked = await chatGptDirectBlockedToolNames({
       reviewedTriagePlanAllowed: true,

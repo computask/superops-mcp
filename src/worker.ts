@@ -95,6 +95,7 @@ export interface Env {
   CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS?: string;
   CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN?: string;
   CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION?: string;
+  CHATGPT_DIRECT_TARGETED_TRIAGE_ONLY?: string;
   SUPEROPS_EXECUTION_SUBREQUEST_BUDGET?: string;
   SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN?: string;
   SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH?: string;
@@ -276,6 +277,7 @@ async function blockedToolNamesForWorkerEnv(
         directMutatingToolsAllowed && flagExactlyTrue(env.ENABLE_CUSTOM_MUTATION),
       reviewedTriagePlanAllowed: chatGptDirectReviewedTriagePlanAllowed(env),
       scriptExecutionAllowed: scriptExecutionAllowed(env),
+      targetedTriageOnly: flagExactlyTrue(env.CHATGPT_DIRECT_TARGETED_TRIAGE_ONLY),
     });
   }
 
