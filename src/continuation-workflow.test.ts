@@ -170,7 +170,7 @@ describe("SuperOps continuation Workflow", () => {
     const payload = {
       operationId: "workflow-op",
       ownerHash: stableHash("workflow-owner"),
-      nextEligibleTime: "2026-07-18T00:05:00.000Z",
+      nextEligibleTime: new Date(Date.now() + 60_000).toISOString(),
       scheduleIdentity: "wf-123",
     };
     await workflow.run({
@@ -187,6 +187,45 @@ describe("SuperOps continuation Workflow", () => {
     const record = await getOperationStore().get("workflow-op");
     expect(record).toMatchObject({ wakeAttemptCount: 1, wakeDeliveryCount: 1 });
     expect(JSON.stringify(requests)).not.toContain("note");
+  });
+
+  it("delivers immediately when the durable wake time is already in the past", async () => {
+    const initial = activeRecord();
+    await runWithOperationStore({}, () => getOperationStore().put(initial));
+    const service = { fetch: vi.fn(async () => {
+      await completeWorkflowOperation(initial.operationId, initial.ownerHash);
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) };
+    const workflow = new SuperOpsContinuationWorkflow(undefined, {
+      SUPEROPS_CONTINUATION_SERVICE: service,
+      SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "internal-token",
+    });
+    const step = {
+      sleepUntil: vi.fn(async () => {
+        throw new Error("You can't sleep until a time in the past, time-traveler");
+      }),
+      do: vi.fn(async (_name: string, configOrCallback: unknown, maybeCallback?: () => Promise<unknown>) => {
+        const callback = typeof configOrCallback === "function"
+          ? configOrCallback as () => Promise<unknown>
+          : maybeCallback!;
+        return callback();
+      }),
+    };
+
+    await expect(workflow.run({
+      payload: {
+        operationId: initial.operationId,
+        ownerHash: initial.ownerHash,
+        nextEligibleTime: "2026-07-18T00:05:00.000Z",
+        scheduleIdentity: "wf-past-wake",
+      },
+      timestamp: new Date(),
+      instanceId: "wf-past-wake",
+      workflowName: "test",
+    }, step)).resolves.toEqual({ operationId: initial.operationId, delivered: true });
+
+    expect(step.sleepUntil).not.toHaveBeenCalled();
+    expect(service.fetch).toHaveBeenCalledTimes(1);
   });
 
   it("retries a Too Early internal wake and records only the successful delivery", async () => {

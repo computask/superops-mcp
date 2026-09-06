@@ -200,6 +200,13 @@ const SCHEDULED_TRIAGE_TEST_NOTE = [
   "Next step: Apply the approved policy outcome.",
   "When: During this scheduled triage run.",
 ].join("\n");
+const SCHEDULED_TRIAGE_HTML_NOTE = [
+  "<strong>TRIAGE SUMMARY</strong><br><br>",
+  "<strong>Ticket goal:</strong> Route the ticket under the standing New Calls policy.<br><br>",
+  "<strong>What needs to be known:</strong> The safe evidence was fully retrieved and assessed.<br><br>",
+  "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
+  "<strong>When:</strong> During this scheduled triage run.",
+].join("");
 
 // Privacy-safe semantic fixture for the production-shaped ticket/note IDs in
 // the HTML-rendering regression. It intentionally contains no customer data.
@@ -560,39 +567,31 @@ describe("Tickets Domain", () => {
     const tool = domain.tools.find((candidate) => candidate.name === "superops_tickets_apply_triage_plan");
     type TargetSchema = {
       properties: Record<string, { enum?: string[] }>;
-      anyOf?: Array<{ required: string[] }>;
-      required?: string[];
-    };
-    type ActionSchemaVariant = {
-      properties: Record<string, unknown> & {
-        action: { const: string };
-        target: TargetSchema;
-      };
       required?: string[];
     };
     const actions = tool?.inputSchema.properties.actions as {
       type?: string;
-      items?: { oneOf?: ActionSchemaVariant[] };
+      items?: {
+        type?: string;
+        properties?: Record<string, unknown> & {
+          action?: { enum?: string[] };
+          target?: TargetSchema;
+        };
+        required?: string[];
+        oneOf?: unknown[];
+      };
     };
 
     expect(actions.type).toBe("array");
     expect(actions.items).toBeDefined();
     expect(actions.items).not.toEqual({});
-
-    const variants = actions.items?.oneOf ?? [];
-    expect(variants.map((variant) => variant.properties.action.const)).toEqual([
-      "update", "resolve", "addNote", "leave", "skip",
+    expect(actions.items?.type).toBe("object");
+    expect(actions.items?.oneOf).toBeUndefined();
+    expect(actions.items?.required).toEqual(["ticketNumber", "action"]);
+    expect(actions.items?.properties?.action?.enum).toEqual([
+      "resolve", "update", "addNote", "leave", "skip",
     ]);
-
-    const update = variants.find((variant) => variant.properties.action.const === "update");
-    expect(update?.required).toEqual(
-      expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"])
-    );
-    expect(update?.properties.target.properties.status.enum).toEqual(["Awaiting Engineer"]);
-    expect(update?.properties.target.required).toEqual([
-      "status", "impact", "urgency", "category", "subcategory",
-    ]);
-    expect(update?.properties.target.properties).toEqual(
+    expect(actions.items?.properties?.target?.properties).toEqual(
       expect.objectContaining({
         status: expect.any(Object),
         impact: expect.any(Object),
@@ -606,28 +605,11 @@ describe("Tickets Domain", () => {
         suppressCloseNotification: expect.any(Object),
       })
     );
-
-    const resolve = variants.find((variant) => variant.properties.action.const === "resolve");
-    expect(resolve?.properties.target.properties.status.enum).toEqual(["Resolved"]);
-    expect(resolve?.properties.target.required).toEqual([
-      "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
-    ]);
-    const leave = variants.find((variant) => variant.properties.action.const === "leave");
-    expect(leave?.required).toEqual(
-      expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"])
-    );
-    expect(leave?.properties.target.required).toEqual([
-      "impact", "urgency", "category", "subcategory",
-    ]);
-    expect(update?.properties.target.properties).not.toHaveProperty("resolutionCode");
-    expect(leave?.properties.target.properties).not.toHaveProperty("status");
-    expect(leave?.properties.target.properties).not.toHaveProperty("resolutionCode");
-    expect(leave?.properties.target.properties).toHaveProperty("cause");
-    expect(leave?.properties).toHaveProperty("note");
-    expect(leave?.properties).toHaveProperty("isPublicNote");
-    const addNote = variants.find((variant) => variant.properties.action.const === "addNote");
-    expect(addNote?.required).toEqual(
-      expect.arrayContaining(["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "note"])
+    expect(actions.items?.properties?.target?.properties.status?.enum).toEqual(["Resolved", "Awaiting Engineer"]);
+    expect(actions.items?.properties).toHaveProperty("note");
+    expect(actions.items?.properties).toHaveProperty("isPublicNote");
+    expect(actions.items?.properties?.note).toEqual(
+      expect.objectContaining({ description: expect.stringContaining("<br><br>") })
     );
   });
 
@@ -4941,6 +4923,33 @@ describe("Tickets Domain", () => {
     expect(missingNote.content[0].text).toContain("TRIAGE SUMMARY note is required");
     expect(unsafeOverride.isError).toBe(true);
     expect(unsafeOverride.content[0].text).toContain("prohibits unsafe write overrides");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("accepts the required HTML private-note shape in scheduled triage", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v1",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        note: SCHEDULED_TRIAGE_HTML_NOTE,
+        isPublicNote: true,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("isPublicNote must be explicitly false");
     expect(mockClient.query).not.toHaveBeenCalled();
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });

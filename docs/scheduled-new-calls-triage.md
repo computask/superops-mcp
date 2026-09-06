@@ -152,23 +152,13 @@ Never interpret unavailable, missing, truncated, partial or failed client retrie
 
 PRIVATE TRIAGE NOTE
 
-Every action must contain exactly one approved private-note string in the note field, using plain text with one blank line between every section, formatted exactly as follows:
+Every action must contain exactly one approved private-note string in the note field. New notes must use the following safe HTML form, with the title and each section label wrapped in `<strong>` and exactly two `<br>` elements (`<br><br>`) between retained sections:
 
-TRIAGE SUMMARY
-
-Ticket goal: ...
-
-What needs to be known: ...
-
-Next step: ...
-
-When: ...
+`<strong>TRIAGE SUMMARY</strong><br><br><strong>Ticket goal:</strong> ...<br><br><strong>What needs to be known:</strong> ...<br><br><strong>Next step:</strong> ...<br><br><strong>When:</strong> ...`
 
 Each section must contain specific, non-empty content derived from the verified ticket evidence.
 
-Preserve the blank lines in the submitted note.
-
-Do not use HTML, HTML tags, Markdown headings or literal formatting instructions in the note.
+HTML-escape every dynamic value before inserting it into the note. Do not use Markdown headings, paragraph tags, a single `<br>` for section separation, or unescaped dynamic values. Existing accurate legacy plain-text TRIAGE SUMMARY notes remain valid for deduplication and may be reused.
 
 Set isPublicNote: false.
 

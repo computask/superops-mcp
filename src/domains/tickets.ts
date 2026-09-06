@@ -953,127 +953,62 @@ const TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES = {
   suppressCloseNotification: { type: "boolean", description: "Suppress SuperOps close notification where supported." },
 } as const;
 
-const TRIAGE_PLAN_UPDATE_TARGET_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    status: {
-      type: "string",
-      enum: ["Awaiting Engineer"],
-      description: "Update actions may only move a ticket to Awaiting Engineer.",
-    },
-    impact: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.impact,
-    urgency: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.urgency,
-    category: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.category,
-    subcategory: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.subcategory,
-    cause: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.cause,
-    techGroupName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.techGroupName,
-    clientName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientName,
-    clientId: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientId,
-    suppressCloseNotification: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.suppressCloseNotification,
-  },
-  required: ["status", ...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS],
-} as const;
-
-const TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    ...TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES,
-    status: {
-      type: "string",
-      enum: ["Resolved"],
-      default: DEFAULT_RESOLVE_TICKET_STATUS,
-      description: "Resolve actions may only close to Resolved.",
-    },
-  },
-  required: [...TRIAGE_PLAN_RESOLVE_REQUIRED_CLASSIFICATION_FIELDS],
-} as const;
-
-const TRIAGE_PLAN_LEAVE_TARGET_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    impact: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.impact,
-    urgency: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.urgency,
-    category: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.category,
-    subcategory: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.subcategory,
-    cause: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.cause,
-    clientName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientName,
-    clientId: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientId,
-  },
-  required: [...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS],
-} as const;
-
+// Keep the public schema as one ordinary object with an action discriminator.
+// The Agent connector does not reliably preserve nested oneOf branches, while
+// validateTriagePlanActionShape below remains the authoritative action-specific
+// and scheduled-policy safety gate before any SuperOps call or write.
 const TRIAGE_PLAN_ACTION_SCHEMA = {
-  oneOf: [
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
-        action: { type: "string", const: "update" },
-        target: TRIAGE_PLAN_UPDATE_TARGET_SCHEMA,
-        note: { type: "string", description: "Optional private note to add after the update succeeds." },
-        isPublicNote: { type: "boolean", default: false, description: "Whether the optional note is client-visible." },
-      },
-      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"],
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
+    action: {
+      type: "string",
+      enum: [...TRIAGE_PLAN_ACTION_TYPES],
+      description: "Action discriminator. update, resolve, and leave require the matching classification target; addNote requires note; skip requires only the fixed ticket number and action.",
     },
-    {
+    target: {
       type: "object",
       additionalProperties: false,
       properties: {
-        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
-        action: { type: "string", const: "resolve" },
-        target: TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA,
-        note: { type: "string", description: "Optional private note to add after the resolve succeeds." },
-        isPublicNote: { type: "boolean", default: false, description: "Whether the optional note is client-visible." },
-        allowResolveFullFallbackToUpdate: {
-          type: "boolean",
-          default: false,
-          description: "Allow controlled update fallback only after a SuperOps internal server error.",
-        },
-      },
-      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"],
-    },
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
-        action: { type: "string", const: "addNote" },
-        note: { type: "string", description: "Private note body to add." },
-        isPublicNote: { type: "boolean", default: false, description: "Whether the note is client-visible." },
-      },
-      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "note"],
-    },
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
-        action: { type: "string", const: "leave" },
-        target: TRIAGE_PLAN_LEAVE_TARGET_SCHEMA,
-        note: { type: "string", description: "Optional private triage-summary note to add after classification succeeds." },
-        isPublicNote: { type: "boolean", default: false, description: "Whether the optional note is client-visible." },
-        reason: {
+        status: {
           type: "string",
-          description: "Optional reason for retaining the current status after classification.",
+          enum: [...TRIAGE_PLAN_MUTABLE_STATUSES],
+          description: "Required for update (Awaiting Engineer) and resolve (Resolved); omit for leave because leave retains the current status.",
         },
+        impact: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.impact,
+        urgency: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.urgency,
+        category: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.category,
+        subcategory: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.subcategory,
+        cause: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.cause,
+        resolutionCode: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.resolutionCode,
+        techGroupName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.techGroupName,
+        clientName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientName,
+        clientId: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientId,
+        suppressCloseNotification: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.suppressCloseNotification,
       },
-      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"],
+      description: "Action-specific target. update requires status Awaiting Engineer plus impact, urgency, category, and subcategory; resolve requires status Resolved plus impact, urgency, category, subcategory, cause, and resolutionCode; leave requires impact, urgency, category, and subcategory and must omit status and resolutionCode.",
     },
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
-        action: { type: "string", const: "skip" },
-        reason: { type: "string", description: "Optional reason for skipping this approved candidate." },
-      },
-      required: ["ticketNumber", "action"],
+    note: {
+      type: "string",
+      description: "Private note body. Scheduled triage requires the HTML TRIAGE SUMMARY form with <strong> labels and <br><br> section separators; the server canonicalizes HTML/plain-text equivalents for verification and deduplication.",
     },
-  ],
+    isPublicNote: {
+      type: "boolean",
+      default: false,
+      description: "Whether the note is client-visible. Scheduled triage requires false.",
+    },
+    allowResolveFullFallbackToUpdate: {
+      type: "boolean",
+      default: false,
+      description: "Allow controlled update fallback only after a SuperOps internal server error; scheduled triage prohibits this.",
+    },
+    reason: {
+      type: "string",
+      description: "Optional reason for retaining or skipping the fixed candidate.",
+    },
+  },
+  required: ["ticketNumber", "action"],
 } as const;
 
 interface ApplyTriagePlanResult {
@@ -1679,7 +1614,8 @@ function scheduledTriageNoteValidation(note: unknown): string | undefined {
   if (typeof note !== "string" || note.trim().length === 0) {
     return "a non-empty private TRIAGE SUMMARY note is required";
   }
-  const lines = note.replace(/\r\n?/g, "\n").split("\n").map((line) => line.trim()).filter(Boolean);
+  const canonical = canonicalizeNoteText(note);
+  const lines = (canonical ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
   if (lines[0] !== "TRIAGE SUMMARY") {
     return "the private note must start with TRIAGE SUMMARY";
   }
