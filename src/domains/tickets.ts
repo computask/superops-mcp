@@ -4914,12 +4914,33 @@ async function addNoteForPlan(params: {
   await createNoteForPlan(params);
 }
 
+const LEAVE_CURRENT_CLASSIFICATION_FIELDS = [
+  "impact",
+  "urgency",
+  "category",
+  "subcategory",
+] as const;
+
+function canReuseCurrentLeaveClassification(
+  action: TriagePlanAction,
+  currentTicket: Ticket | undefined
+): boolean {
+  if (action.action !== "leave" || !currentTicket) return false;
+  const target = action.target ?? {};
+  return LEAVE_CURRENT_CLASSIFICATION_FIELDS.every((field) => {
+    const requested = stringValue(target[field]);
+    const current = stringValue((currentTicket as unknown as Record<string, unknown>)[field]);
+    return requested !== undefined && current !== undefined && compareTicketValue(requested, current);
+  });
+}
+
 async function buildApprovedUpdateInput(
   client: SuperOpsClientInstance,
   ticketId: string,
   action: TriagePlanAction,
   defaultStatus?: string,
-  optionFieldsProvider?: TicketOptionFieldsProvider
+  optionFieldsProvider?: TicketOptionFieldsProvider,
+  currentTicket?: Ticket
 ): Promise<Record<string, unknown> | { error: string }> {
   const target = action.target ?? {};
   const input: Record<string, unknown> = { ticketId };
@@ -4974,15 +4995,24 @@ async function buildApprovedUpdateInput(
     input.category = target.category;
   }
 
-  const optionValidationError = await addValidatedTicketOptionUpdates(
-    client,
-    target,
-    input,
-    ["impact", "urgency", "resolutionCode", "cause", "subcategory"],
-    optionFieldsProvider
-  );
-  if (optionValidationError) {
-    return { error: optionValidationError };
+  if (canReuseCurrentLeaveClassification(action, currentTicket)) {
+    for (const field of LEAVE_CURRENT_CLASSIFICATION_FIELDS) {
+      const currentValue = stringValue(
+        (currentTicket as unknown as Record<string, unknown>)[field]
+      );
+      if (currentValue !== undefined) input[field] = currentValue;
+    }
+  } else {
+    const optionValidationError = await addValidatedTicketOptionUpdates(
+      client,
+      target,
+      input,
+      ["impact", "urgency", "resolutionCode", "cause", "subcategory"],
+      optionFieldsProvider
+    );
+    if (optionValidationError) {
+      return { error: optionValidationError };
+    }
   }
 
   const resolvedClient = await resolveClientAccountId(client, {
@@ -7297,7 +7327,7 @@ async function applyApprovedTriageAction(params: {
       result.suppressCloseNotificationRequested = true;
       result.suppressCloseNotificationIncluded = true;
     } else if (action.action === "update" || action.action === "leave") {
-      const dryRunInput = await buildApprovedUpdateInput(client, ticket.ticketId, action);
+      const dryRunInput = await buildApprovedUpdateInput(client, ticket.ticketId, action, undefined, undefined, ticket);
       const dryRunError = (dryRunInput as { error?: unknown }).error;
       if (typeof dryRunError === "string") {
         result.finalOutcome = "Blocked";
@@ -7402,7 +7432,14 @@ async function applyApprovedTriageAction(params: {
       }
       const updateInput = resumeNoteOnly
         ? { ticketId: ticket.ticketId }
-        : await buildApprovedUpdateInput(client, ticket.ticketId, action, undefined, params.optionFieldsProvider);
+        : await buildApprovedUpdateInput(
+            client,
+            ticket.ticketId,
+            action,
+            undefined,
+            params.optionFieldsProvider,
+            ticket
+          );
       const updateError = (updateInput as { error?: unknown }).error;
       if (typeof updateError === "string") {
         result.finalOutcome = "Blocked";
@@ -8085,7 +8122,8 @@ async function buildMissingOnlyRecoveryInput(params: {
           params.ticketId,
           params.action,
           undefined,
-          params.optionFieldsProvider
+          params.optionFieldsProvider,
+          params.ticket
         );
   const error = (fullInput as { error?: unknown }).error;
   if (typeof error === "string") return { error, schemaDependencyFields: [] };

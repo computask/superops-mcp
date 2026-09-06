@@ -4588,7 +4588,6 @@ describe("Tickets Domain", () => {
           ...TRIAGE_TEST_CLASSIFICATION,
         },
       })
-      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
       .mockResolvedValueOnce({
         getTicket: {
           ticketId: "ticket-57402",
@@ -4664,6 +4663,7 @@ describe("Tickets Domain", () => {
       displayId: "57403",
       subject: "Server is down",
       status: "New Calls",
+      ...TRIAGE_TEST_CLASSIFICATION,
       updatedTime: "2026-07-26T09:00:00Z",
     };
     const notes: Array<Record<string, unknown>> = [];
@@ -4727,6 +4727,7 @@ describe("Tickets Domain", () => {
       { method: "createTicketNote", outcome: "Accepted" },
     ]);
     expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("getFields"))).toHaveLength(0);
     expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("query getTicket(")
     )).toHaveLength(2);
     const updateInput = mockClient.mutate.mock.calls
