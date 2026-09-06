@@ -59,8 +59,11 @@ Add this section only when applicable, immediately before `Next step`:
 ```
 
 The server checks the required labels, non-empty sections, controlled state
-wording, `<strong>` labels and `<br><br>` spacing. Dynamic values must be HTML
-escaped by the Agent. Existing v1 notes remain governed by the v1 validator.
+wording (including clear human-readable equivalents), `<strong>` labels and
+`<br><br>` spacing. The Agent should put the canonical state phrase first in
+each history section to avoid an unnecessary validation retry. Dynamic values
+must be HTML escaped by the Agent. Existing v1 notes remain governed by the v1
+validator.
 
 ## Call and rollout boundary
 

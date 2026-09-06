@@ -1959,47 +1959,97 @@ function scheduledTriageV2NoteValidation(
     }
   }
 
-  const stateChecks: Array<{ section: string; phrases: string[]; forbidden?: string[] }> = [
+  const historyStateLineMatches = (section: string, state: string, line: string): boolean => {
+    const text = line.toLowerCase().replace(/[‐‑‒–—]/gu, "-").replace(/\s+/gu, " ").trim();
+    const unknownHistory =
+      /\bunknown\b|\bnot (?:known|established|determined|identified)\b|\b(?:could not|unable to|cannot|can't) (?:determine|establish|confirm|identify)\b|\bno (?:matching |relevant |clear |comparable )?(?:historical )?(?:issue|issues|match|matches|evidence|ticket|tickets)\b|\bnot found in (?:the )?history\b/u.test(text);
+
+    if (section === "Historical issue:") {
+      if (state === "recurrent") {
+        return /\brecurrent\b/u.test(text) &&
+          !/\bnot\s+recurrent\b|\bno\s+(?:recurrence|recurring)\b/u.test(text);
+      }
+      if (state === "not_recurrent") {
+        return /\bnot\s+recurrent\b|\bno\s+(?:recurrence|recurring)\b/u.test(text);
+      }
+      return unknownHistory;
+    }
+
+    if (section === "Historical solution:") {
+      if (state === "prior_solution_found") {
+        if (/\bno\s+(?:prior|previous|earlier|documented)\s+(?:solution|resolution)\b/u.test(text)) {
+          return false;
+        }
+        return /\b(?:prior|previous|earlier|existing|documented)\s+(?:solution|resolution)\s+(?:was\s+)?(?:found|exists?|documented|identified|available)\b/u.test(text) ||
+          /\bpreviously\s+documented\s+(?:solution|resolution)\b/u.test(text);
+      }
+      if (state === "no_prior_solution_found") {
+        return /\bno\s+(?:prior|previous|earlier|documented)\s+(?:solution|resolution)\b/u.test(text) ||
+          /\bno\s+(?:solution|resolution)\s+history\b/u.test(text) ||
+          /\bno\s+(?:matching|documented)\s+(?:solution|resolution)\s+(?:was\s+)?found\b/u.test(text);
+      }
+      return unknownHistory ||
+        /\b(?:no|without)\s+(?:reliable|clear|confirmed)\s+(?:historical\s+)?(?:solution|resolution)\s+(?:evidence|record|history)\b/u.test(text);
+    }
+
+    if (section === "Post-solution recurrence:") {
+      const noRecurrence =
+        /\bno\s+(?:observed\s+)?recurrence\b|\bno\s+recurrence\s+(?:was\s+)?observed\b|\bno\s+post[- ]solution\s+recurrence\b|\bdid\s+not\s+recur\s+after\b/u.test(text);
+      if (state === "observed_recurrence") {
+        return !noRecurrence &&
+          /\bobserved\s+recurrence\b|\brecurrence\s+(?:was\s+)?observed\b|\brecurrence\s+occurred\b|\brecurred\s+after\b/u.test(text);
+      }
+      if (state === "no_observed_recurrence_in_window") {
+        return noRecurrence;
+      }
+      return /\b(?:follow[- ]?up|post[- ]solution follow[- ]?up)\b.{0,35}\b(?:unknown|not known|cannot be determined|undetermined)\b/u.test(text) ||
+        /\b(?:future|later)\s+recurrence\b.{0,25}\b(?:unknown|not known|cannot be determined)\b/u.test(text);
+    }
+
+    if (state === "credible") {
+      return /\bcredible\b/u.test(text) && !/\b(?:not|no)\s+(?:a\s+)?credible\b/u.test(text);
+    }
+    if (state === "watch") {
+      return /\bwatch(?:ing)?\b|\bmonitor(?:ing)?\b/u.test(text) && !/\bno\s+(?:watch|monitor)\b/u.test(text);
+    }
+    if (state === "none") {
+      return /\bnone\b|\bno\s+(?:cross[- ]client|emerging\s+issue)\s+signal\b|\bno\s+signal\s+(?:was\s+)?identified\b/u.test(text);
+    }
+    return unknownHistory;
+  };
+
+  const stateChecks: Array<{ section: string; state: string; canonical: string }> = [
     {
       section: "Historical issue:",
-      phrases: [assessment.issueRecurrence.replace(/_/gu, " ")],
-      forbidden: assessment.issueRecurrence === "recurrent" ? ["not recurrent"] : undefined,
+      state: assessment.issueRecurrence,
+      canonical: assessment.issueRecurrence.replace(/_/gu, " "),
     },
     {
       section: "Historical solution:",
-      phrases: [assessment.solutionHistory.replace(/_/gu, " ")],
-      forbidden: assessment.solutionHistory === "prior_solution_found"
-        ? ["no prior solution found"]
-        : undefined,
+      state: assessment.solutionHistory,
+      canonical: assessment.solutionHistory.replace(/_/gu, " "),
     },
     {
       section: "Post-solution recurrence:",
-      phrases: assessment.postSolutionRecurrence === "follow_up_unknown"
-        ? ["follow up unknown", "follow-up unknown"]
-        : assessment.postSolutionRecurrence === "no_observed_recurrence_in_window"
-          ? ["no observed recurrence"]
-          : ["observed recurrence"],
-      forbidden: assessment.postSolutionRecurrence === "observed_recurrence"
-        ? ["no observed recurrence"]
-        : undefined,
+      state: assessment.postSolutionRecurrence,
+      canonical: assessment.postSolutionRecurrence.replace(/_/gu, " "),
     },
     {
       section: "Cross-client signal:",
-      phrases: [assessment.crossClientSignal.replace(/_/gu, " ")],
-      forbidden: assessment.crossClientSignal === "credible" ? ["not credible"] : undefined,
+      state: assessment.crossClientSignal,
+      canonical: assessment.crossClientSignal.replace(/_/gu, " "),
     },
     {
       section: "Emerging issue:",
-      phrases: [assessment.emergingIssueSignal.replace(/_/gu, " ")],
-      forbidden: assessment.emergingIssueSignal === "credible" ? ["not credible"] : undefined,
+      state: assessment.emergingIssueSignal,
+      canonical: assessment.emergingIssueSignal.replace(/_/gu, " "),
     },
   ];
-  for (const { section, phrases, forbidden = [] } of stateChecks) {
+  for (const { section, state, canonical } of stateChecks) {
     const line = lines.find((candidate) => candidate.startsWith(section));
     const lowerLine = line?.toLowerCase() ?? "";
-    if (forbidden.some((phrase) => lowerLine.includes(phrase)) ||
-        !phrases.some((phrase) => lowerLine.includes(phrase.toLowerCase()))) {
-      return `${section} must explicitly state ${phrases[0]}.`;
+    if (!historyStateLineMatches(section, state, lowerLine)) {
+      return `${section} must explicitly state ${canonical} or an unambiguous equivalent.`;
     }
   }
 }
