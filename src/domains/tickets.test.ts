@@ -4731,6 +4731,13 @@ describe("Tickets Domain", () => {
     expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("getFields"))).toHaveLength(0);
     expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("query getTicket(")
     )).toHaveLength(2);
+    const noteReadInputs = mockClient.query.mock.calls
+      .filter(([query]) => String(query).includes("getTicketNoteList"))
+      .map(([, variables]) => variables);
+    expect(noteReadInputs.length).toBeGreaterThan(0);
+    expect(noteReadInputs).toEqual(
+      noteReadInputs.map(() => ({ input: { ticketId: "ticket-57403" } }))
+    );
     const updateInput = mockClient.mutate.mock.calls
       .find(([mutation]) => !String(mutation).includes("createTicketNote"))?.[1].input;
     expect(updateInput).not.toHaveProperty("status");
@@ -6762,7 +6769,6 @@ describe("Tickets Domain", () => {
         { getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } },
         { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
         { getTicketNoteList: [] },
-        { getTicketNoteList: [] },
         { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
       ],
       mutation: { createTicketNote: { noteId: "note-57400", privacyType: "PRIVATE" } },
@@ -7100,7 +7106,7 @@ describe("Tickets Domain", () => {
       if (!final) throw new Error("missing final checkpointed operation");
       expect(final.state).toBe("Completed");
       expect(ticketReads).toBeGreaterThanOrEqual(8);
-      expect(noteReads).toBeGreaterThan(4);
+      expect(noteReads).toBeGreaterThanOrEqual(4);
       expect(mockClient.mutate.mock.calls.filter(([, variables]) => !variables.input.ticket)).toHaveLength(2);
       expect(mockClient.mutate.mock.calls.filter(([, variables]) => Boolean(variables.input.ticket))).toHaveLength(1);
       expect(final.itemStates[original.displayId]).toMatchObject({
@@ -8732,7 +8738,6 @@ describe("Tickets Domain", () => {
         getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" },
       })
       .mockResolvedValueOnce({ getTicketNoteList: [] })
-      .mockResolvedValueOnce({ getTicketNoteList: [] })
       .mockResolvedValueOnce({
         getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" },
       });
@@ -9156,7 +9161,7 @@ describe("Tickets Domain", () => {
       noteVerificationAttempts: 4,
       terminalReason: "NoteVisibilityUnresolved",
     }));
-    expect(mocks.events).toEqual(["ticket-list", "notes", "notes"]);
+    expect(mocks.events).toEqual(["ticket-list", "notes"]);
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 

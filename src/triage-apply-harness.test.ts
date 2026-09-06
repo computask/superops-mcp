@@ -919,7 +919,6 @@ describe("deterministic end-to-end apply-triage harness", () => {
       "superops.write.classification",
       "superops.read.ticket",
       "superops.read.notes",
-      "superops.read.notes",
       "superops.write.note",
       "superops.read.notes",
       "superops.read.ticket",
@@ -1135,7 +1134,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
     expect(itemResult(record)).toMatchObject({
       finalOutcome: "Resolved",
       noteWriteOutcome: "NoteVerifiedAfterDelay",
-      noteVerificationAttempts: 2,
+      noteVerificationAttempts: 3,
       noteVerifiedAfterDelay: true,
       finalVerificationState: "Verified",
     });

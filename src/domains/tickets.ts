@@ -1593,10 +1593,14 @@ async function collectCanonicalTicketNotes(params: {
     params.ticketId,
     ...(params.additionalTicketIds ?? []),
   ]).slice(0, 2);
-  const initialTicketIds = uniqueTicketIds([
-    ...canonicalTicketIds,
-    displayId,
-  ]);
+  // An approved immutable ticket ID is the canonical identity. Reading the
+  // same note collection again through its display number adds latency and
+  // rate-limit pressure without improving dedupe safety. Keep the display
+  // lookup only for legacy display-number-only callers.
+  const hasCanonicalTicketId = canonicalTicketIds.some((ticketId) => ticketId !== displayId);
+  const initialTicketIds = uniqueTicketIds(
+    hasCanonicalTicketId ? canonicalTicketIds : [...canonicalTicketIds, displayId]
+  );
   for (const ticketId of initialTicketIds) {
     if (!await readTicketId(ticketId)) {
       return { available: false, notes, ticketIdsRead, errors, rateLimitError };
@@ -1604,7 +1608,6 @@ async function collectCanonicalTicketNotes(params: {
     if (matchedRequestedPrivateFingerprint) break;
   }
 
-  const hasCanonicalTicketId = canonicalTicketIds.some((ticketId) => ticketId !== displayId);
   if (notes.length === 0 && displayId && !hasCanonicalTicketId) {
     try {
       const matches = await resolveTicketIdByDisplayId(params.client, displayId);
