@@ -699,7 +699,7 @@ interface ResolveFullParams extends TicketClassificationParams {
 
 
 type TriagePlanActionType = "resolve" | "update" | "addNote" | "leave" | "skip";
-type TriagePolicyMode = "scheduled-new-calls-v1";
+type TriagePolicyMode = "scheduled-new-calls-v1" | "scheduled-new-calls-v2";
 type TriagePolicyDisposition =
   | "customer_request"
   | "server_down"
@@ -717,6 +717,33 @@ type TriagePolicyReason =
   | "newsletter_or_marketing"
   | "automated_digest"
   | "outlook_reaction_digest";
+type TriageHistoryRecurrenceState = "recurrent" | "not_recurrent" | "unknown";
+type TriageHistorySolutionState = "prior_solution_found" | "no_prior_solution_found" | "unknown";
+type TriageHistoryPostSolutionRecurrence =
+  | "observed_recurrence"
+  | "no_observed_recurrence_in_window"
+  | "follow_up_unknown";
+type TriageCrossClientSignal = "none" | "watch" | "credible" | "unknown";
+type TriageEmergingIssueSignal = "none" | "watch" | "credible" | "unknown";
+type TriageHistoryResultState = "complete" | "no_matches" | "unavailable" | "degraded" | "unknown";
+
+interface TriageHistoryAssessment {
+  issueRecurrence: TriageHistoryRecurrenceState;
+  solutionHistory: TriageHistorySolutionState;
+  postSolutionRecurrence: TriageHistoryPostSolutionRecurrence;
+  crossClientSignal: TriageCrossClientSignal;
+  emergingIssueSignal: TriageEmergingIssueSignal;
+  resultState: TriageHistoryResultState;
+  lookbackDays?: number;
+  matchingTicketCount?: number;
+  resolvedMatchingTicketCount?: number;
+  distinctClientCount?: number;
+  distinctRequesterCount?: number;
+  representativeTicketNumbers?: string[];
+  summary?: string;
+  solutionSummary?: string;
+  currentScriptRecommendation?: string;
+}
 type TriageFinalOutcome =
   | "Resolved"
   | "Updated"
@@ -750,6 +777,7 @@ interface TriagePlanAction {
   policyDisposition?: TriagePolicyDisposition;
   contentEvidenceState?: TriageContentEvidenceState;
   policyReason?: TriagePolicyReason;
+  historyAssessment?: TriageHistoryAssessment;
   reason?: string;
   note?: string;
   noteFingerprint?: string;
@@ -781,7 +809,7 @@ interface ApplyTriagePlanParams {
 }
 
 const TRIAGE_PLAN_ACTION_TYPES = ["resolve", "update", "addNote", "leave", "skip"] as const;
-const TRIAGE_POLICY_MODES = ["scheduled-new-calls-v1"] as const;
+const TRIAGE_POLICY_MODES = ["scheduled-new-calls-v1", "scheduled-new-calls-v2"] as const;
 const TRIAGE_POLICY_DISPOSITIONS = [
   "customer_request",
   "server_down",
@@ -802,6 +830,12 @@ const TRIAGE_POLICY_REASONS = [
   "outlook_reaction_digest",
 ] as const;
 const SCHEDULED_NEW_CALLS_POLICY: TriagePolicyMode = "scheduled-new-calls-v1";
+const SCHEDULED_NEW_CALLS_V2_POLICY: TriagePolicyMode = "scheduled-new-calls-v2";
+
+function isScheduledNewCallsPolicy(policyMode: unknown): policyMode is TriagePolicyMode {
+  return policyMode === SCHEDULED_NEW_CALLS_POLICY || policyMode === SCHEDULED_NEW_CALLS_V2_POLICY;
+}
+
 const SCHEDULED_TRIAGE_TASKGROUP_NAME = "TaskGroup";
 const SCHEDULED_TRIAGE_TASKGROUP_ID = "2993553194649526272";
 const TRIAGE_PLAN_MUTABLE_STATUSES = ["Resolved", "Awaiting Engineer"] as const;
@@ -858,6 +892,7 @@ const TRIAGE_PLAN_ACTION_FIELD_NAMES = [
   "policyDisposition",
   "contentEvidenceState",
   "policyReason",
+  "historyAssessment",
   "reason",
   "note",
   "noteFingerprint",
@@ -869,6 +904,130 @@ const TRIAGE_PLAN_ACTION_FIELD_NAMES = [
 ] as const;
 const TRIAGE_PLAN_ACTION_FIELD_SET = new Set<string>(TRIAGE_PLAN_ACTION_FIELD_NAMES);
 const TRIAGE_PLAN_TARGET_FIELD_SET = new Set<string>(TRIAGE_PLAN_ACCEPTED_TARGET_FIELDS);
+
+const TRIAGE_HISTORY_RECURRENCE_STATES = ["recurrent", "not_recurrent", "unknown"] as const;
+const TRIAGE_HISTORY_SOLUTION_STATES = ["prior_solution_found", "no_prior_solution_found", "unknown"] as const;
+const TRIAGE_HISTORY_POST_SOLUTION_STATES = [
+  "observed_recurrence",
+  "no_observed_recurrence_in_window",
+  "follow_up_unknown",
+] as const;
+const TRIAGE_CROSS_CLIENT_SIGNALS = ["none", "watch", "credible", "unknown"] as const;
+const TRIAGE_EMERGING_ISSUE_SIGNALS = ["none", "watch", "credible", "unknown"] as const;
+const TRIAGE_HISTORY_RESULT_STATES = ["complete", "no_matches", "unavailable", "degraded", "unknown"] as const;
+const TRIAGE_HISTORY_ASSESSMENT_FIELD_NAMES = [
+  "issueRecurrence",
+  "solutionHistory",
+  "postSolutionRecurrence",
+  "crossClientSignal",
+  "emergingIssueSignal",
+  "resultState",
+  "lookbackDays",
+  "matchingTicketCount",
+  "resolvedMatchingTicketCount",
+  "distinctClientCount",
+  "distinctRequesterCount",
+  "representativeTicketNumbers",
+  "summary",
+  "solutionSummary",
+  "currentScriptRecommendation",
+] as const;
+
+const TRIAGE_HISTORY_ASSESSMENT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    issueRecurrence: {
+      type: "string",
+      enum: [...TRIAGE_HISTORY_RECURRENCE_STATES],
+      description: "Bounded historical issue recurrence state. Same-client or same-requester evidence is not cross-client evidence.",
+    },
+    solutionHistory: {
+      type: "string",
+      enum: [...TRIAGE_HISTORY_SOLUTION_STATES],
+      description: "Whether bounded historical evidence found an observed prior solution. This is not a guarantee that the solution fixes the current ticket.",
+    },
+    postSolutionRecurrence: {
+      type: "string",
+      enum: [...TRIAGE_HISTORY_POST_SOLUTION_STATES],
+      description: "Whether recurrence was observed after an historical solution, or whether that follow-up evidence is unknown.",
+    },
+    crossClientSignal: {
+      type: "string",
+      enum: [...TRIAGE_CROSS_CLIENT_SIGNALS],
+      description: "Bounded cross-client signal. credible requires at least two verified distinct clients.",
+    },
+    emergingIssueSignal: {
+      type: "string",
+      enum: [...TRIAGE_EMERGING_ISSUE_SIGNALS],
+      description: "Bounded emerging-issue signal; credible is reserved for a genuinely supported cross-client pattern.",
+    },
+    resultState: {
+      type: "string",
+      enum: [...TRIAGE_HISTORY_RESULT_STATES],
+      description: "Overall bounded history result state. unavailable, degraded or unknown must not be treated as no history.",
+    },
+    lookbackDays: {
+      type: "integer",
+      minimum: 1,
+      maximum: 730,
+      description: "Optional bounded history lookback in days.",
+    },
+    matchingTicketCount: {
+      type: "integer",
+      minimum: 0,
+      maximum: 10000,
+      description: "Optional bounded count of matching historical tickets.",
+    },
+    resolvedMatchingTicketCount: {
+      type: "integer",
+      minimum: 0,
+      maximum: 10000,
+      description: "Optional bounded count of matching historical tickets with observed resolution evidence.",
+    },
+    distinctClientCount: {
+      type: "integer",
+      minimum: 0,
+      maximum: 10000,
+      description: "Optional bounded count of verified distinct clients represented by the evidence.",
+    },
+    distinctRequesterCount: {
+      type: "integer",
+      minimum: 0,
+      maximum: 10000,
+      description: "Optional bounded count of verified distinct requesters represented by the evidence.",
+    },
+    representativeTicketNumbers: {
+      type: "array",
+      maxItems: 5,
+      items: { type: "string", pattern: "^[0-9]{1,20}$" },
+      description: "Optional maximum five representative display numbers; never include ticket bodies or attachments.",
+    },
+    summary: {
+      type: "string",
+      maxLength: 280,
+      description: "Optional short sanitized metadata summary; no customer body, HTML or unbounded text.",
+    },
+    solutionSummary: {
+      type: "string",
+      maxLength: 280,
+      description: "Optional short sanitized summary of observed historical solution evidence; advisory only.",
+    },
+    currentScriptRecommendation: {
+      type: "string",
+      maxLength: 280,
+      description: "Optional short sanitized advisory summary for a current script recommendation; never a guarantee or raw script/body.",
+    },
+  },
+  required: [
+    "issueRecurrence",
+    "solutionHistory",
+    "postSolutionRecurrence",
+    "crossClientSignal",
+    "emergingIssueSignal",
+    "resultState",
+  ],
+} as const;
 
 const TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES = {
   ticketNumber: {
@@ -923,6 +1082,7 @@ const TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES = {
     enum: [...TRIAGE_POLICY_REASONS],
     description: "Deterministic reason class binding the verified evidence to policyDisposition.",
   },
+  historyAssessment: TRIAGE_HISTORY_ASSESSMENT_SCHEMA,
   allowWriteIfUpdatedTimeChanged: {
     type: "boolean",
     default: false,
@@ -991,7 +1151,7 @@ const TRIAGE_PLAN_ACTION_SCHEMA = {
     },
     note: {
       type: "string",
-      description: "Private note body. Scheduled triage requires the HTML TRIAGE SUMMARY form with <strong> labels and <br><br> section separators; the server canonicalizes HTML/plain-text equivalents for verification and deduplication.",
+      description: "Private note body. Scheduled v1 accepts the existing TRIAGE SUMMARY shape; scheduled v2 requires HTML <strong> labels and <br><br> section separators, with bounded historical sections. The server canonicalizes HTML/plain-text equivalents for verification and deduplication.",
     },
     isPublicNote: {
       type: "boolean",
@@ -1603,6 +1763,130 @@ function validateTriagePlanActions(actions: unknown[]): string | undefined {
   }
 }
 
+function validateBoundedHistoryText(value: unknown, label: string): string | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return `${label} must be a non-empty short sanitized string`;
+  }
+  const text = value.trim();
+  if (text.length > 280) {
+    return `${label} must be at most 280 characters`;
+  }
+  const containsControlCharacter = [...text].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31);
+  });
+  if (text.includes("<") || text.includes(">") || text.includes("\r") ||
+      text.includes("\n") || containsControlCharacter) {
+    return `${label} must not contain HTML, line breaks or control characters`;
+  }
+  if (/\b(?:bearer|access[ _-]?token|client[ _-]?secret)\b|-----BEGIN(?:\s+[^-]+)?-----/iu.test(text)) {
+    return `${label} contains a credential or private-key marker`;
+  }
+  return undefined;
+}
+
+function validateTriageHistoryAssessment(
+  rawAssessment: unknown,
+  actionIndex: number
+): string | undefined {
+  const label = `actions[${actionIndex}].historyAssessment`;
+  const assessment = jsonRecord(rawAssessment);
+  if (!assessment) return `${label} must be an object.`;
+
+  const unknownFields = Object.keys(assessment).filter(
+    (field) => !(TRIAGE_HISTORY_ASSESSMENT_FIELD_NAMES as readonly string[]).includes(field)
+  );
+  if (unknownFields.length > 0) {
+    return `${label} contains unsupported field(s): ${unknownFields.join(", ")}.`;
+  }
+
+  const enumFields: Array<{
+    field: keyof TriageHistoryAssessment;
+    values: readonly string[];
+  }> = [
+    { field: "issueRecurrence", values: TRIAGE_HISTORY_RECURRENCE_STATES },
+    { field: "solutionHistory", values: TRIAGE_HISTORY_SOLUTION_STATES },
+    { field: "postSolutionRecurrence", values: TRIAGE_HISTORY_POST_SOLUTION_STATES },
+    { field: "crossClientSignal", values: TRIAGE_CROSS_CLIENT_SIGNALS },
+    { field: "emergingIssueSignal", values: TRIAGE_EMERGING_ISSUE_SIGNALS },
+    { field: "resultState", values: TRIAGE_HISTORY_RESULT_STATES },
+  ];
+  for (const { field, values } of enumFields) {
+    const value = assessment[field];
+    if (typeof value !== "string" || !values.includes(value)) {
+      return `${label}.${field} must be one of: ${values.join(", ")}.`;
+    }
+  }
+
+  const countFields = [
+    "lookbackDays",
+    "matchingTicketCount",
+    "resolvedMatchingTicketCount",
+    "distinctClientCount",
+    "distinctRequesterCount",
+  ] as const;
+  for (const field of countFields) {
+    const value = assessment[field];
+    if (value === undefined) continue;
+    const maximum = field === "lookbackDays" ? 730 : 10000;
+    const minimum = field === "lookbackDays" ? 1 : 0;
+    if (typeof value !== "number" || !Number.isInteger(value) || value < minimum || value > maximum) {
+      return `${label}.${field} must be an integer between ${minimum} and ${maximum}.`;
+    }
+  }
+
+  const representativeTicketNumbers = assessment.representativeTicketNumbers;
+  if (representativeTicketNumbers !== undefined) {
+    if (!Array.isArray(representativeTicketNumbers) || representativeTicketNumbers.length > 5) {
+      return `${label}.representativeTicketNumbers must contain at most five ticket numbers.`;
+    }
+    for (const [index, value] of representativeTicketNumbers.entries()) {
+      const ticketNumber = normaliseTicketNumber(value);
+      if (!/^\d{1,20}$/u.test(ticketNumber)) {
+        return `${label}.representativeTicketNumbers[${index}] must be a numeric display ticket number.`;
+      }
+    }
+  }
+
+  for (const field of ["summary", "solutionSummary", "currentScriptRecommendation"] as const) {
+    if (assessment[field] !== undefined) {
+      const textError = validateBoundedHistoryText(assessment[field], `${label}.${field}`);
+      if (textError) return textError;
+    }
+  }
+
+  const matchingTicketCount = assessment.matchingTicketCount;
+  if (assessment.issueRecurrence === "recurrent" &&
+      (typeof matchingTicketCount !== "number" || matchingTicketCount < 1)) {
+    return `${label}.matchingTicketCount must be at least 1 when issueRecurrence is recurrent.`;
+  }
+  if (assessment.issueRecurrence === "not_recurrent" &&
+      (typeof matchingTicketCount !== "number" || matchingTicketCount !== 0)) {
+    return `${label}.matchingTicketCount must be 0 when issueRecurrence is not_recurrent.`;
+  }
+
+  const resolvedMatchingTicketCount = assessment.resolvedMatchingTicketCount;
+  if (assessment.solutionHistory === "prior_solution_found" &&
+      (typeof resolvedMatchingTicketCount !== "number" || resolvedMatchingTicketCount < 1)) {
+    return `${label}.resolvedMatchingTicketCount must be at least 1 when solutionHistory is prior_solution_found.`;
+  }
+  if (assessment.solutionHistory === "no_prior_solution_found" &&
+      (typeof resolvedMatchingTicketCount !== "number" || resolvedMatchingTicketCount !== 0)) {
+    return `${label}.resolvedMatchingTicketCount must be 0 when solutionHistory is no_prior_solution_found.`;
+  }
+
+  if (assessment.crossClientSignal === "credible" &&
+      (assessment.resultState !== "complete" ||
+       typeof assessment.distinctClientCount !== "number" || assessment.distinctClientCount < 2)) {
+    return `${label}.crossClientSignal credible requires resultState complete and at least two verified distinct clients.`;
+  }
+  if (assessment.emergingIssueSignal === "credible" &&
+      (assessment.crossClientSignal !== "credible" ||
+       typeof assessment.distinctClientCount !== "number" || assessment.distinctClientCount < 2)) {
+    return `${label}.emergingIssueSignal credible requires a credible crossClientSignal backed by at least two verified distinct clients.`;
+  }
+}
+
 const SCHEDULED_TRIAGE_NOTE_SECTIONS = [
   "Ticket goal:",
   "What needs to be known:",
@@ -1627,6 +1911,99 @@ function scheduledTriageNoteValidation(note: unknown): string | undefined {
   }
 }
 
+const SCHEDULED_TRIAGE_V2_NOTE_SECTIONS = [
+  "Ticket goal:",
+  "What needs to be known:",
+  "Historical issue:",
+  "Historical solution:",
+  "Post-solution recurrence:",
+  "Cross-client signal:",
+  "Emerging issue:",
+  "Next step:",
+  "When:",
+] as const;
+
+function scheduledTriageV2NoteValidation(
+  note: unknown,
+  assessment: TriageHistoryAssessment
+): string | undefined {
+  if (typeof note !== "string" || note.trim().length === 0) {
+    return "a non-empty private TRIAGE SUMMARY note is required";
+  }
+  const canonical = canonicalizeNoteText(note);
+  const lines = (canonical ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines[0] !== "TRIAGE SUMMARY") {
+    return "the private note must start with TRIAGE SUMMARY";
+  }
+
+  const sections = assessment.currentScriptRecommendation !== undefined
+    ? [...SCHEDULED_TRIAGE_V2_NOTE_SECTIONS.slice(0, -2), "Current script recommendation:", "Next step:", "When:"]
+    : [...SCHEDULED_TRIAGE_V2_NOTE_SECTIONS];
+  const labels = ["TRIAGE SUMMARY", ...sections];
+  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const label of labels) {
+    const strongLabel = new RegExp(`<strong>\\s*${escapeRegExp(label)}\\s*</strong>`, "i");
+    if (!strongLabel.test(note)) {
+      return `the scheduled-new-calls-v2 note requires the <strong>${label}</strong> label`;
+    }
+  }
+  const sectionBreaks = note.match(/<br\s*\/?>\s*<br\s*\/?>/giu)?.length ?? 0;
+  if (sectionBreaks < labels.length - 1) {
+    return "the scheduled-new-calls-v2 note requires <br><br> between each section";
+  }
+
+  for (const section of sections) {
+    const line = lines.find((candidate) => candidate.startsWith(section));
+    if (!line || line.slice(section.length).trim().length === 0) {
+      return `the private note requires a non-empty ${section} section`;
+    }
+  }
+
+  const stateChecks: Array<{ section: string; phrases: string[]; forbidden?: string[] }> = [
+    {
+      section: "Historical issue:",
+      phrases: [assessment.issueRecurrence.replace(/_/gu, " ")],
+      forbidden: assessment.issueRecurrence === "recurrent" ? ["not recurrent"] : undefined,
+    },
+    {
+      section: "Historical solution:",
+      phrases: [assessment.solutionHistory.replace(/_/gu, " ")],
+      forbidden: assessment.solutionHistory === "prior_solution_found"
+        ? ["no prior solution found"]
+        : undefined,
+    },
+    {
+      section: "Post-solution recurrence:",
+      phrases: assessment.postSolutionRecurrence === "follow_up_unknown"
+        ? ["follow up unknown", "follow-up unknown"]
+        : assessment.postSolutionRecurrence === "no_observed_recurrence_in_window"
+          ? ["no observed recurrence"]
+          : ["observed recurrence"],
+      forbidden: assessment.postSolutionRecurrence === "observed_recurrence"
+        ? ["no observed recurrence"]
+        : undefined,
+    },
+    {
+      section: "Cross-client signal:",
+      phrases: [assessment.crossClientSignal.replace(/_/gu, " ")],
+      forbidden: assessment.crossClientSignal === "credible" ? ["not credible"] : undefined,
+    },
+    {
+      section: "Emerging issue:",
+      phrases: [assessment.emergingIssueSignal.replace(/_/gu, " ")],
+      forbidden: assessment.emergingIssueSignal === "credible" ? ["not credible"] : undefined,
+    },
+  ];
+  for (const { section, phrases, forbidden = [] } of stateChecks) {
+    const line = lines.find((candidate) => candidate.startsWith(section));
+    const lowerLine = line?.toLowerCase() ?? "";
+    if (forbidden.some((phrase) => lowerLine.includes(phrase)) ||
+        !phrases.some((phrase) => lowerLine.includes(phrase.toLowerCase()))) {
+      return `${section} must explicitly state ${phrases[0]}.`;
+    }
+  }
+}
+
 function looksLikeServerDownSubject(subject: string): boolean {
   const normalized = subject.toLowerCase().replace(/\s+/g, " ").trim();
   const actor = "(?:server|asset|agent|device|host)";
@@ -1646,23 +2023,27 @@ function validateScheduledNewCallsPolicy(
   expected: string[],
   actions: TriagePlanAction[]
 ): string | undefined {
-  if (request.policyMode !== SCHEDULED_NEW_CALLS_POLICY) return undefined;
+  if (!isScheduledNewCallsPolicy(request.policyMode)) return undefined;
+  const policyLabel = request.policyMode === SCHEDULED_NEW_CALLS_V2_POLICY
+    ? "scheduled-new-calls-v2"
+    : "scheduled-new-calls-v1";
+  const isV2 = request.policyMode === SCHEDULED_NEW_CALLS_V2_POLICY;
 
   if (actions.length !== expected.length) {
-    return "scheduled-new-calls-v1 requires exactly one action for every fixed candidate.";
+    return `${policyLabel} requires exactly one action for every fixed candidate.`;
   }
   const actionNumbers = actions.map((action) => normaliseTicketNumber(action.ticketNumber));
   if (new Set(actionNumbers).size !== actionNumbers.length) {
-    return "scheduled-new-calls-v1 actions must not contain duplicate ticket numbers.";
+    return `${policyLabel} actions must not contain duplicate ticket numbers.`;
   }
   if (expected.some((ticketNumber) => !actionNumbers.includes(ticketNumber)) ||
       actionNumbers.some((ticketNumber) => !expected.includes(ticketNumber))) {
-    return "scheduled-new-calls-v1 actions must exactly cover the fixed candidate set.";
+    return `${policyLabel} actions must exactly cover the fixed candidate set.`;
   }
   if (request.verify === false || request.dedupeNotes === false || request.stopOnFirstFailure === true ||
       request.allowResolveFullFallbackToUpdate === true || request.allowWriteIfUpdatedTimeChanged === true ||
       request.allowWriteWithoutVerifiedContent === true) {
-    return "scheduled-new-calls-v1 requires verification and note dedupe, processes all candidates, and prohibits unsafe write overrides.";
+    return `${policyLabel} requires verification and note dedupe, processes all candidates, and prohibits unsafe write overrides.`;
   }
 
   const expectedActionByDisposition: Record<TriagePolicyDisposition, TriagePlanActionType> = {
@@ -1689,14 +2070,14 @@ function validateScheduledNewCallsPolicy(
     const label = `actions[${index}]`;
     if (!action.policyDisposition ||
         !(TRIAGE_POLICY_DISPOSITIONS as readonly string[]).includes(action.policyDisposition)) {
-      return `${label}.policyDisposition is required for scheduled-new-calls-v1.`;
+      return `${label}.policyDisposition is required for ${policyLabel}.`;
     }
     if (action.action !== expectedActionByDisposition[action.policyDisposition]) {
       return `${label}.action does not match policyDisposition ${action.policyDisposition}.`;
     }
     if (!action.contentEvidenceState ||
         !(TRIAGE_CONTENT_EVIDENCE_STATES as readonly string[]).includes(action.contentEvidenceState)) {
-      return `${label}.contentEvidenceState is required for scheduled-new-calls-v1.`;
+      return `${label}.contentEvidenceState is required for ${policyLabel}.`;
     }
     if (action.contentEvidenceState === "unavailable") {
       return `${label} cannot be submitted because its content evidence is unavailable.`;
@@ -1728,7 +2109,13 @@ function validateScheduledNewCallsPolicy(
         action.contentVerified !== true) {
       return `${label} requires expectedTicketId, expectedSubject, expectedStatus New Calls, expectedUpdatedTime, and contentVerified=true.`;
     }
-    const noteError = scheduledTriageNoteValidation(action.note);
+    if (isV2) {
+      const historyError = validateTriageHistoryAssessment(action.historyAssessment, index);
+      if (historyError) return historyError;
+    }
+    const noteError = isV2
+      ? scheduledTriageV2NoteValidation(action.note, action.historyAssessment as TriageHistoryAssessment)
+      : scheduledTriageNoteValidation(action.note);
     if (noteError) return `${label}: ${noteError}.`;
     if (action.isPublicNote !== false) {
       return `${label}.isPublicNote must be explicitly false.`;
@@ -1736,7 +2123,7 @@ function validateScheduledNewCallsPolicy(
     if (action.allowResolveFullFallbackToUpdate === true ||
         action.allowWriteIfUpdatedTimeChanged === true ||
         action.allowWriteWithoutVerifiedContent === true) {
-      return `${label} cannot enable a write override in scheduled-new-calls-v1.`;
+      return `${label} cannot enable a write override in ${policyLabel}.`;
     }
     if (action.target?.techGroupName !== undefined) {
       return `${label}.target.techGroupName is not allowed; scheduled triage never assigns a technician or technician group.`;
@@ -3892,7 +4279,7 @@ function scheduledPolicyClientFailure(
   action: TriagePlanAction,
   ticket: Ticket
 ): string | undefined {
-  if (policyMode !== SCHEDULED_NEW_CALLS_POLICY ||
+  if (!isScheduledNewCallsPolicy(policyMode) ||
       !(action.action === "resolve" || action.action === "update" || action.action === "leave")) {
     return undefined;
   }
@@ -6078,6 +6465,14 @@ function serializableApplyTriageRequest(
           policyDisposition: action.policyDisposition,
           contentEvidenceState: action.contentEvidenceState,
           policyReason: action.policyReason,
+          historyAssessment: action.historyAssessment
+            ? {
+                ...action.historyAssessment,
+                representativeTicketNumbers: action.historyAssessment.representativeTicketNumbers
+                  ? [...action.historyAssessment.representativeTicketNumbers]
+                  : undefined,
+              }
+            : undefined,
           noteFingerprint: action.note
             ? normalizedNoteFingerprint(action.note)
             : action.noteFingerprint,
@@ -6104,8 +6499,8 @@ function operationRequestApplyTriageParams(
   if (!request || request.kind !== "applyTriagePlan") return undefined;
   return {
     batchId: typeof request.batchId === "string" ? request.batchId : undefined,
-    policyMode: request.policyMode === SCHEDULED_NEW_CALLS_POLICY
-      ? SCHEDULED_NEW_CALLS_POLICY
+    policyMode: isScheduledNewCallsPolicy(request.policyMode)
+      ? request.policyMode
       : undefined,
     expectedCandidateTicketNumbers: Array.isArray(request.expectedCandidateTicketNumbers)
       ? request.expectedCandidateTicketNumbers.map((value) => String(value))
@@ -9719,7 +10114,7 @@ export function getTicketsTools(): DomainTools {
       },      {
         name: "superops_tickets_apply_triage_plan",
         description:
-          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. scheduled-new-calls-v1 enforces a complete standing-policy batch with classification, client assignment, private structured notes, safe routing, verification, dedupe, and no unsafe overrides. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer.",
+          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. scheduled-new-calls-v1 remains the existing standing contract. scheduled-new-calls-v2 adds required bounded historical assessment metadata and HTML history sections without adding SuperOps history reads. Both modes enforce complete candidates, classification, client safety, private notes, verification, dedupe, and no unsafe overrides. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer.",
         inputSchema: {
           type: "object",
           properties: {
@@ -9734,7 +10129,7 @@ export function getTicketsTools(): DomainTools {
             policyMode: {
               type: "string",
               enum: [...TRIAGE_POLICY_MODES],
-              description: "Standing scheduled New Calls contract. Requires an exact complete candidate/action set and rejects the entire submission before any SuperOps work when an invariant is missing.",
+              description: "Standing scheduled New Calls contract. v1 preserves the existing policy; v2 additionally requires bounded historyAssessment metadata and history-aware HTML note sections. Both require an exact complete candidate/action set and reject the entire submission before any SuperOps work when an invariant is missing.",
             },
             expectedCandidateTicketNumbers: {
               type: "array",

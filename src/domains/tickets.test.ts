@@ -207,6 +207,36 @@ const SCHEDULED_TRIAGE_HTML_NOTE = [
   "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
   "<strong>When:</strong> During this scheduled triage run.",
 ].join("");
+const SCHEDULED_TRIAGE_V2_HISTORY = {
+  issueRecurrence: "recurrent",
+  solutionHistory: "prior_solution_found",
+  postSolutionRecurrence: "no_observed_recurrence_in_window",
+  crossClientSignal: "credible",
+  emergingIssueSignal: "credible",
+  resultState: "complete",
+  lookbackDays: 365,
+  matchingTicketCount: 2,
+  resolvedMatchingTicketCount: 2,
+  distinctClientCount: 2,
+  distinctRequesterCount: 1,
+  representativeTicketNumbers: ["57001", "57002"],
+  summary: "Two bounded historical matches were found across two verified clients.",
+  solutionSummary: "A prior observed resolution exists; it is advisory and not a guarantee.",
+  currentScriptRecommendation: "Use the current approved script only as an advisory next step.",
+} as const;
+const SCHEDULED_TRIAGE_V2_HTML_NOTE = [
+  "<strong>TRIAGE SUMMARY</strong><br><br>",
+  "<strong>Ticket goal:</strong> Route the ticket under the standing New Calls policy.<br><br>",
+  "<strong>What needs to be known:</strong> The safe evidence was fully retrieved and assessed.<br><br>",
+  "<strong>Historical issue:</strong> Recurrent based on two bounded historical matches.<br><br>",
+  "<strong>Historical solution:</strong> Prior solution found in observed history; it is advisory.<br><br>",
+  "<strong>Post-solution recurrence:</strong> No observed recurrence in window.<br><br>",
+  "<strong>Cross-client signal:</strong> Credible across two verified clients.<br><br>",
+  "<strong>Emerging issue:</strong> Credible bounded cross-client signal.<br><br>",
+  "<strong>Current script recommendation:</strong> Use the current approved script only as an advisory next step.<br><br>",
+  "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
+  "<strong>When:</strong> During this scheduled triage run.",
+].join("");
 
 // Privacy-safe semantic fixture for the production-shaped ticket/note IDs in
 // the HTML-rendering regression. It intentionally contains no customer data.
@@ -608,6 +638,20 @@ describe("Tickets Domain", () => {
     expect(actions.items?.properties?.target?.properties.status?.enum).toEqual(["Resolved", "Awaiting Engineer"]);
     expect(actions.items?.properties).toHaveProperty("note");
     expect(actions.items?.properties).toHaveProperty("isPublicNote");
+    expect(actions.items?.properties).toHaveProperty("historyAssessment");
+    expect(actions.items?.properties?.historyAssessment).toEqual(
+      expect.objectContaining({
+        type: "object",
+        required: expect.arrayContaining([
+          "issueRecurrence",
+          "solutionHistory",
+          "postSolutionRecurrence",
+          "crossClientSignal",
+          "emergingIssueSignal",
+          "resultState",
+        ]),
+      })
+    );
     expect(actions.items?.properties?.note).toEqual(
       expect.objectContaining({ description: expect.stringContaining("<br><br>") })
     );
@@ -4853,7 +4897,7 @@ describe("Tickets Domain", () => {
 
   it("rejects an unknown scheduled policy mode before any read, ledger write, or mutation", async () => {
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
-      policyMode: "scheduled-new-calls-v2",
+      policyMode: "scheduled-new-calls-v3",
       expectedCandidateTicketNumbers: ["57400"],
       actions: [],
     });
@@ -4952,6 +4996,92 @@ describe("Tickets Domain", () => {
     expect(result.content[0].text).toContain("isPublicNote must be explicitly false");
     expect(mockClient.query).not.toHaveBeenCalled();
     expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("requires bounded history assessment and history-aware HTML notes in scheduled-new-calls-v2", async () => {
+    const baseAction = {
+      ticketNumber: "57400",
+      expectedTicketId: "ticket-57400",
+      expectedSubject: "Customer request",
+      expectedStatus: "New Calls",
+      expectedUpdatedTime: "2026-06-25T10:00:00Z",
+      contentVerified: true,
+      action: "leave",
+      policyDisposition: "customer_request",
+      contentEvidenceState: "meaningful",
+      policyReason: "customer_or_requester_work",
+      note: SCHEDULED_TRIAGE_HTML_NOTE,
+      isPublicNote: false,
+      target: { ...TRIAGE_TEST_CLASSIFICATION },
+    };
+    const missingHistory = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [baseAction],
+    });
+
+    const badHistory = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ...baseAction,
+        historyAssessment: {
+          ...SCHEDULED_TRIAGE_V2_HISTORY,
+          summary: "<raw customer body>",
+        },
+        note: SCHEDULED_TRIAGE_V2_HTML_NOTE,
+      }],
+    });
+
+    const unqualifiedCrossClient = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ...baseAction,
+        historyAssessment: {
+          ...SCHEDULED_TRIAGE_V2_HISTORY,
+          distinctClientCount: 1,
+        },
+        note: SCHEDULED_TRIAGE_V2_HTML_NOTE,
+      }],
+    });
+
+    expect(missingHistory.isError).toBe(true);
+    expect(missingHistory.content[0].text).toContain("historyAssessment");
+    expect(badHistory.isError).toBe(true);
+    expect(badHistory.content[0].text).toContain("must not contain HTML");
+    expect(unqualifiedCrossClient.isError).toBe(true);
+    expect(unqualifiedCrossClient.content[0].text).toContain("at least two verified distinct clients");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("accepts a complete scheduled-new-calls-v2 contract before entering the SuperOps read path", async () => {
+    mockClient.query.mockRejectedValue(new Error("bounded validation-path read failure"));
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_HISTORY,
+        note: SCHEDULED_TRIAGE_V2_HTML_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(mockClient.query).toHaveBeenCalled();
+    expect(result.content[0].text).not.toContain("historyAssessment");
   });
 
   it("forces obvious server-down notifications to remain in New Calls", async () => {
