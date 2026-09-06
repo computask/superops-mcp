@@ -7675,7 +7675,7 @@ async function applyApprovedTriageAction(params: {
       if (!resumeNoteOnly) {
         if (mutationReadback) {
           verified = mutationReadback;
-        } else {
+        } else if (!leaveTargetAlreadyCurrent) {
           try {
             verified = await getTicketByInternalId(client, ticket.ticketId);
           } catch (error) {

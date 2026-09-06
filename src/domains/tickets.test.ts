@@ -4582,6 +4582,71 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).toHaveBeenCalledTimes(1);
   });
 
+  it("does not re-read an unchanged scheduled leave ticket", async () => {
+    const ticketState: Record<string, unknown> = {
+      ticketId: "ticket-57400-leave-read",
+      displayId: "57400",
+      subject: "Unchanged leave target",
+      status: "New Calls",
+      client: { accountId: "client-57400-leave-read", name: "TaskGroup" },
+      ...TRIAGE_TEST_CLASSIFICATION,
+      updatedTime: "2026-07-26T09:00:00Z",
+    };
+    const notes: Array<Record<string, unknown>> = [];
+    const triageNote = [
+      "TRIAGE SUMMARY",
+      "Ticket goal: Confirm the reported request and route it safely.",
+      "What needs to be known: This is a genuine customer request.",
+      "Next step: Service desk reviews the ticket.",
+      "When: At the next New Calls review.",
+    ].join("\n");
+
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketNoteList")) return { getTicketNoteList: notes };
+      return { getTicket: { ...ticketState } };
+    });
+    mockClient.mutate.mockImplementation(async (mutation: string) => {
+      if (mutation.includes("createTicketNote")) {
+        notes.push({ noteId: "note-57400-leave-read", content: triageNote, privacyType: "PRIVATE" });
+        return { createTicketNote: { noteId: "note-57400-leave-read", privacyType: "PRIVATE" } };
+      }
+      throw new Error("An unchanged leave target must not issue an update mutation.");
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v1",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400-leave-read",
+        expectedSubject: "Unchanged leave target",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T09:00:00Z",
+        contentVerified: true,
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        action: "leave",
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+        note: triageNote,
+        isPublicNote: false,
+      }],
+      verify: true,
+      dedupeNotes: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Left",
+      primaryWriteOutcome: "NotRequired",
+      classificationWriteOutcome: "NotRequired",
+      writeAttempted: true,
+      noteAdded: true,
+      verified: true,
+    });
+    expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("query getTicket(")).length).toBe(2);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
+
   it("blocks a null-client triage write unless the approved target includes client name and ID", async () => {
     mockClient.query
       .mockResolvedValueOnce({
