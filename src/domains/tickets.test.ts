@@ -4611,6 +4611,7 @@ describe("Tickets Domain", () => {
       expectedCandidateTicketNumbers: ["57402"],
       actions: [{
         ticketNumber: "57402",
+        expectedClient: "TaskGroup",
         expectedStatus: "Resolved",
         expectedUpdatedTime: "2026-07-26T09:00:00Z",
         contentVerified: true,

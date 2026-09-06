@@ -4728,9 +4728,19 @@ function validateExpectedTicket(
       reason: "Ticket subject no longer matches the approved snapshot identity.",
     };
   }
+  // A null-client scheduled ticket is safely identified by the explicit
+  // fallback target (clientName + clientId), which is validated separately.
+  // Do not compare that fallback name against the current null client or the
+  // approved action is rejected before the client-assignment safety check.
+  const expectedClientName = ticket.client === null && action.target?.clientName && action.target?.clientId
+    ? undefined
+    : action.expectedClient;
+  const expectedClientHash = ticket.client === null && action.target?.clientName && action.target?.clientId
+    ? undefined
+    : action.expectedClientHash;
   if (
-    (action.expectedClient && ticketClientName(ticket) !== action.expectedClient) ||
-    (action.expectedClientHash && stableHash(ticketClientName(ticket)) !== action.expectedClientHash)
+    (expectedClientName && ticketClientName(ticket) !== expectedClientName) ||
+    (expectedClientHash && stableHash(ticketClientName(ticket)) !== expectedClientHash)
   ) {
     return {
       stage: "validateClient",
