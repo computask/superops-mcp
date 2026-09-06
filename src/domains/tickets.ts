@@ -3529,8 +3529,13 @@ function createApplyTicketOptionFieldsProvider(
     const requested = [...new Set(fieldNames)];
     const missing = requested.filter((fieldName) => !fields.has(fieldName));
     if (missing.length > 0) {
-      const fetched = await getTicketOptionFields(client, missing);
-      for (const [fieldName, field] of fetched) fields.set(fieldName, field);
+      // Reuse the same short-lived, tenant/region/field-set scoped cache as
+      // superops_tickets_field_options. The apply path still validates the
+      // returned option values and dependencies before writing; this only
+      // avoids a duplicate metadata read when the Agent has just performed
+      // the bounded field-options lookup in a preceding MCP request.
+      const retrieval = await getTicketOptionFieldsForTool(client, missing);
+      for (const [fieldName, field] of retrieval.fields) fields.set(fieldName, field);
     }
 
     const result = new Map<ValidatedTicketOptionField, SuperOpsField>();

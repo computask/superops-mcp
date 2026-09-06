@@ -4518,6 +4518,70 @@ describe("Tickets Domain", () => {
     expect(mutationInput).not.toHaveProperty("status");
   });
 
+  it("reuses a warm field-options cache inside apply_triage_plan", async () => {
+    const ticketState: Record<string, unknown> = {
+      ticketId: "ticket-57400-cache",
+      displayId: "57400",
+      subject: "Warm field-options cache",
+      status: "New Calls",
+      ...TRIAGE_TEST_CLASSIFICATION,
+      cause: "No Fault Found",
+      updatedTime: "2026-07-26T09:00:00Z",
+    };
+
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getFields")) {
+        return {
+          getFields: [
+            ticketField("impact", ["Low", "High"]),
+            ticketField("urgency", ["Low", "High"]),
+            ticketField("subcategory", ["No Action Needed", "Other"], {
+              columnName: "category",
+              value: "7. Sales call",
+            }),
+            ticketField("cause", ["No Fault Found", "Unknown"]),
+          ],
+        };
+      }
+      return { getTicket: { ...ticketState } };
+    });
+    mockClient.mutate.mockImplementation(async (_mutation: string, variables: { input: Record<string, unknown> }) => {
+      Object.assign(ticketState, variables.input, { updatedTime: "2026-07-26T09:01:00Z" });
+      return { updateTicket: { ...ticketState } };
+    });
+
+    const domain = getTicketsTools();
+    const warmResult = await domain.handleCall("superops_tickets_field_options", {
+      fields: ["impact", "urgency", "subcategory", "cause"],
+    });
+    expect(warmResult.isError).not.toBe(true);
+    expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("getFields"))).toHaveLength(1);
+    mockClient.query.mockClear();
+
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400-cache",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T09:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        target: { ...TRIAGE_TEST_CLASSIFICATION, cause: "Unknown" },
+      }],
+      verify: true,
+      dedupeNotes: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Left",
+      writeAttempted: true,
+      verified: true,
+    });
+    expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("getFields"))).toHaveLength(0);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
+
   it("blocks a null-client triage write unless the approved target includes client name and ID", async () => {
     mockClient.query
       .mockResolvedValueOnce({
