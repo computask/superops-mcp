@@ -2998,32 +2998,47 @@ async function collectSafeTicketContent(params: {
       if (readTicketIds.has(ticketId)) continue;
       readTicketIds.add(ticketId);
 
-      if (safeParams.includeConversations) {
-        try {
-          const ticketConversations = await getTicketConversations(client, ticketId);
+      // These reads are independent. Keep ticket IDs sequential to avoid a
+      // burst against SuperOps, but overlap the conversation and note reads
+      // for each immutable ticket so evidence collection is not needlessly
+      // serialized.
+      const conversationRead = safeParams.includeConversations
+        ? getTicketConversations(client, ticketId)
+        : Promise.resolve(undefined);
+      const noteRead = safeParams.includeNotes
+        ? collectCanonicalTicketNotes({ client, ticketId })
+        : Promise.resolve(undefined);
+      const [conversationResult, noteResult] = await Promise.allSettled([
+        conversationRead,
+        noteRead,
+      ]);
+
+      if (conversationResult.status === "fulfilled") {
+        if (conversationResult.value) {
           conversationReadSucceeded = true;
-          for (const conversation of ticketConversations) {
+          for (const conversation of conversationResult.value) {
             addUniqueConversation(conversations, seenConversationIds, conversation);
           }
-        } catch (error) {
-          contentErrors.push(
-            `Conversations could not be fetched safely: ${safeErrorMessage(error)}`
-          );
         }
+      } else {
+        contentErrors.push(
+          `Conversations could not be fetched safely: ${safeErrorMessage(conversationResult.reason)}`
+        );
       }
 
-      if (safeParams.includeNotes) {
-        try {
-          const ticketNotes = await collectCanonicalTicketNotes({ client, ticketId });
-          if (!ticketNotes.available) {
-            throw new Error(ticketNotes.errors.join("; ") || "Ticket notes were unavailable.");
-          }
+      if (noteResult.status === "fulfilled") {
+        const ticketNotes = noteResult.value;
+        if (ticketNotes && !ticketNotes.available) {
+          contentErrors.push(
+            `Notes could not be fetched safely: ${ticketNotes.errors.join("; ") || "Ticket notes were unavailable."}`
+          );
+        } else if (ticketNotes) {
           for (const note of ticketNotes.notes) {
             addUniqueNote(notes, seenNoteIds, note);
           }
-        } catch (error) {
-          contentErrors.push(`Notes could not be fetched safely: ${safeErrorMessage(error)}`);
         }
+      } else {
+        contentErrors.push(`Notes could not be fetched safely: ${safeErrorMessage(noteResult.reason)}`);
       }
     }
   }
@@ -4940,11 +4955,42 @@ function canReuseCurrentLeaveClassification(
 ): boolean {
   if (action.action !== "leave" || !currentTicket) return false;
   const target = action.target ?? {};
-  return LEAVE_CURRENT_CLASSIFICATION_FIELDS.every((field) => {
+  const classificationMatches = LEAVE_CURRENT_CLASSIFICATION_FIELDS.every((field) => {
     const requested = stringValue(target[field]);
     const current = stringValue((currentTicket as unknown as Record<string, unknown>)[field]);
     return requested !== undefined && current !== undefined && compareTicketValue(requested, current);
   });
+  if (!classificationMatches) return false;
+
+  const requestedCause = stringValue(target.cause);
+  if (requestedCause !== undefined) {
+    const currentCause = stringValue(currentTicket.cause);
+    if (currentCause === undefined || !compareTicketValue(requestedCause, currentCause)) return false;
+  }
+  return true;
+}
+
+function canReuseCurrentLeaveTarget(
+  action: TriagePlanAction,
+  currentTicket: Ticket | undefined
+): boolean {
+  if (!canReuseCurrentLeaveClassification(action, currentTicket)) return false;
+  const target = action.target ?? {};
+  if (Object.keys(target).some((field) =>
+    !(TRIAGE_PLAN_LEAVE_TARGET_FIELDS as readonly string[]).includes(field)
+  )) return false;
+
+  for (const [field, current] of [
+    ["clientId", currentTicket ? ticketClientAccountId(currentTicket) : undefined],
+    ["clientName", currentTicket ? ticketClientName(currentTicket) : undefined],
+  ] as const) {
+    const requested = stringValue(target[field]);
+    if (requested !== undefined &&
+        (current === undefined || !compareTicketValue(requested, current))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function buildApprovedUpdateInput(
@@ -7460,6 +7506,9 @@ async function applyApprovedTriageAction(params: {
         result.failureReason = updateError;
         return result;
       }
+      const leaveTargetAlreadyCurrent = action.action === "leave" &&
+        isScheduledNewCallsPolicy(params.policyMode) &&
+        canReuseCurrentLeaveTarget(action, ticket);
 
       let mutationReadback: Ticket | undefined;
       let notePlan: "none" | "deduped" | "pending" = "none";
@@ -7495,6 +7544,13 @@ async function applyApprovedTriageAction(params: {
         result.verified = true;
         result.finalVerificationState = "Verified";
         result.replaySafe = false;
+      } else if (leaveTargetAlreadyCurrent) {
+        // A scheduled leave action is a request to preserve the current
+        // routing/classification. The lookup above is already the immutable
+        // ticket read used for stale-data validation, so avoid a redundant
+        // updateTicket mutation when every approved target is already equal.
+        result.primaryWriteOutcome = "NotRequired";
+        result.classificationWriteOutcome = "NotRequired";
       } else {
         result.attemptedState = updateInput as Record<string, unknown>;
         const mutationType: DurableMutationType = "update";
@@ -7637,14 +7693,14 @@ async function applyApprovedTriageAction(params: {
           result.finalOutcome = "Failed";
           result.verified = false;
           result.partialWrite = applyResultHasProvenPartialWrite(result);
-          result.writeMayHaveSucceeded = true;
+          result.writeMayHaveSucceeded = leaveTargetAlreadyCurrent ? false : true;
           result.failureStage = "verifyFinalState";
           result.failureReason = `Final state did not match requested target fields: ${JSON.stringify(finalVerification.mismatches)}`;
           result.finalVerificationState = "Failed";
           return result;
         }
         result.verified = true;
-        result.writeMayHaveSucceeded = true;
+        if (!leaveTargetAlreadyCurrent) result.writeMayHaveSucceeded = true;
         result.verifiedState = result.finalState;
         result.finalVerificationState = "Verified";
         result.partialWrite = false;

@@ -974,6 +974,43 @@ describe("deterministic end-to-end apply-triage harness", () => {
     harness.assertGlobalInvariants(terminal);
   });
 
+  it("scheduled leave skips a redundant classification mutation when the target is already current", async () => {
+    const harness = new TriageHarness("scheduled-leave-noop", { classified: true });
+    const action = {
+      ...leaveAction(),
+      expectedSubject: "Anonymised junk call",
+      policyDisposition: "customer_request",
+      contentEvidenceState: "meaningful",
+      policyReason: "customer_or_requester_work",
+      note: SCHEDULED_TRIAGE_NOTE,
+      isPublicNote: false,
+    };
+    const { parsed } = await harness.invoke({
+      policyMode: "scheduled-new-calls-v1",
+      actions: [action],
+    });
+    const result = firstResult(parsed);
+    const record = await harness.record();
+
+    expect(result).toMatchObject({
+      finalOutcome: "Left",
+      primaryWriteOutcome: "NotRequired",
+      classificationWriteOutcome: "NotRequired",
+      noteAdded: true,
+      noteDedupeChecked: true,
+      finalVerificationState: "Verified",
+      verified: true,
+    });
+    expect(harness.history.count("superops.write.classification")).toBe(0);
+    expect(harness.history.count("superops.write.note")).toBe(1);
+    expect(harness.superops.ticket).toMatchObject({
+      status: "New Calls",
+      client: { accountId: CLIENT_ID, name: "TaskGroup" },
+      ...CLASSIFICATION,
+    });
+    harness.assertGlobalInvariants(record);
+  });
+
   it("scheduled policy blocks a null-client ticket unless the exact TaskGroup target is supplied", async () => {
     const harness = new TriageHarness("scheduled-client-guard");
     const scheduled = scheduledResolveAction();
