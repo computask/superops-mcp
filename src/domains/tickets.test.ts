@@ -625,8 +625,8 @@ describe("Tickets Domain", () => {
       items?: {
         type?: string;
         properties?: Record<string, unknown> & {
-          action?: { enum?: string[] };
-          target?: TargetSchema;
+          action?: { enum?: string[]; description?: string };
+          target?: TargetSchema & { description?: string };
         };
         required?: string[];
         oneOf?: unknown[];
@@ -642,6 +642,12 @@ describe("Tickets Domain", () => {
     expect(actions.items?.properties?.action?.enum).toEqual([
       "resolve", "update", "addNote", "leave", "skip",
     ]);
+    expect(actions.items?.properties?.action?.description).toContain(
+      "leave specifically requires non-empty impact, urgency, category, and subcategory"
+    );
+    expect(actions.items?.properties?.target?.description).toContain(
+      "leave requires non-empty impact, urgency, category, and subcategory"
+    );
     expect(actions.items?.properties?.target?.properties).toEqual(
       expect.objectContaining({
         status: expect.any(Object),
@@ -4684,7 +4690,7 @@ describe("Tickets Domain", () => {
         return { createTicketNote: { noteId: "note-57403", privacyType: "PRIVATE" } };
       }
       Object.assign(ticketState, variables.input, { updatedTime: "2026-07-26T09:01:00Z" });
-      return { updateTicket: { ticketId: "ticket-57403" } };
+      return { updateTicket: { ...ticketState } };
     });
 
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
@@ -4721,6 +4727,8 @@ describe("Tickets Domain", () => {
       { method: "createTicketNote", outcome: "Accepted" },
     ]);
     expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("query getTicket(")
+    )).toHaveLength(2);
     const updateInput = mockClient.mutate.mock.calls
       .find(([mutation]) => !String(mutation).includes("createTicketNote"))?.[1].input;
     expect(updateInput).not.toHaveProperty("status");

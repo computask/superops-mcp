@@ -1125,7 +1125,7 @@ const TRIAGE_PLAN_ACTION_SCHEMA = {
     action: {
       type: "string",
       enum: [...TRIAGE_PLAN_ACTION_TYPES],
-      description: "Action discriminator. update, resolve, and leave require the matching classification target; addNote requires note; skip requires only the fixed ticket number and action.",
+      description: "Action discriminator. update, resolve, and leave require a matching target; leave specifically requires non-empty impact, urgency, category, and subcategory and must retain the current status. addNote requires note; skip requires only the fixed ticket number and action.",
     },
     target: {
       type: "object",
@@ -1147,7 +1147,7 @@ const TRIAGE_PLAN_ACTION_SCHEMA = {
         clientId: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientId,
         suppressCloseNotification: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.suppressCloseNotification,
       },
-      description: "Action-specific target. update requires status Awaiting Engineer plus impact, urgency, category, and subcategory; resolve requires status Resolved plus impact, urgency, category, subcategory, cause, and resolutionCode; leave requires impact, urgency, category, and subcategory and must omit status and resolutionCode.",
+      description: "Action-specific target. update requires status Awaiting Engineer plus impact, urgency, category, and subcategory; resolve requires status Resolved plus impact, urgency, category, subcategory, cause, and resolutionCode; leave requires non-empty impact, urgency, category, and subcategory (copy existing values when retaining classification), must omit status and resolutionCode, and must not assign a technician or tech group.",
     },
     note: {
       type: "string",
@@ -4613,6 +4613,38 @@ function verifyFinalTargetState(
   return { mismatches };
 }
 
+function mutationReadbackSupportsTarget(
+  action: TriagePlanAction,
+  mutationResult: Ticket
+): boolean {
+  if (!Object.prototype.hasOwnProperty.call(mutationResult, "ticketId") ||
+      !Object.prototype.hasOwnProperty.call(mutationResult, "updatedTime")) {
+    return false;
+  }
+
+  const target = action.target ?? {};
+  for (const field of [
+    "status", "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
+  ] as const) {
+    if (target[field] !== undefined && !Object.prototype.hasOwnProperty.call(mutationResult, field)) {
+      return false;
+    }
+  }
+
+  // updateTicket returns techGroup but not the full client object. Keep the
+  // canonical ticket read for client-targeted actions so client identity stays
+  // independently verified.
+  if (target.techGroupName !== undefined &&
+      !Object.prototype.hasOwnProperty.call(mutationResult, "techGroup")) {
+    return false;
+  }
+  if (target.clientName !== undefined || target.clientId !== undefined) {
+    return false;
+  }
+
+  return true;
+}
+
 function baseApplyResult(
   ticketNumber: string,
   action?: TriagePlanAction,
@@ -7379,6 +7411,7 @@ async function applyApprovedTriageAction(params: {
         return result;
       }
 
+      let mutationReadback: Ticket | undefined;
       let notePlan: "none" | "deduped" | "pending" = "none";
       try {
         notePlan = await checkNoteForPlan({
@@ -7427,6 +7460,9 @@ async function applyApprovedTriageAction(params: {
               client,
               updateInput as Record<string, unknown>
             );
+            if (mutationReadbackSupportsTarget(action, mutationResult)) {
+              mutationReadback = { ...ticket, ...mutationResult };
+            }
             result.primaryWriteOutcome = "Accepted";
             result.writeMayHaveSucceeded = true;
             recordPhysicalWrite(result, result.primaryWriteMethod ?? "updateTicket", "Accepted");
@@ -7526,19 +7562,23 @@ async function applyApprovedTriageAction(params: {
       }
       let verified: Ticket = ticket;
       if (!resumeNoteOnly) {
-        try {
-          verified = await getTicketByInternalId(client, ticket.ticketId);
-        } catch (error) {
-          if (isExecutionStopError(error)) throw error;
-          if (isRateLimitError(error)) {
-            return markRateLimitedReadResult(result, error, "getTicket.verifyFinalState");
+        if (mutationReadback) {
+          verified = mutationReadback;
+        } else {
+          try {
+            verified = await getTicketByInternalId(client, ticket.ticketId);
+          } catch (error) {
+            if (isExecutionStopError(error)) throw error;
+            if (isRateLimitError(error)) {
+              return markRateLimitedReadResult(result, error, "getTicket.verifyFinalState");
+            }
+            result.finalOutcome = "Failed";
+            result.partialWrite = applyResultHasProvenPartialWrite(result);
+            result.writeMayHaveSucceeded = true;
+            result.failureStage = "verifyFinalState";
+            result.failureReason = safeErrorMessage(error);
+            return result;
           }
-          result.finalOutcome = "Failed";
-          result.partialWrite = applyResultHasProvenPartialWrite(result);
-          result.writeMayHaveSucceeded = true;
-          result.failureStage = "verifyFinalState";
-          result.failureReason = safeErrorMessage(error);
-          return result;
         }
         result.finalState = ticketFinalState(verified);
         result.observedFinalState = result.finalState;
@@ -7635,6 +7675,9 @@ async function applyApprovedTriageAction(params: {
         let postNoteTicket = verified;
         if (result.noteAdded && params.verify) {
           try {
+            // This read both confirms that the verified ticket target survived
+            // note creation and captures the new updatedTime used by a delayed
+            // note-visibility continuation.
             postNoteTicket = await getTicketByInternalId(client, ticket.ticketId);
           } catch (error) {
             if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
