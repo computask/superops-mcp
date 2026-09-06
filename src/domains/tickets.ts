@@ -142,7 +142,7 @@ interface TicketOptionFieldsRetrieval {
   fields: Map<ValidatedTicketOptionField, SuperOpsField>;
   metadata: {
     source: "fresh" | "cache";
-    cacheStatus: "miss" | "fallback" | "unavailable";
+    cacheStatus: "hit" | "miss" | "fallback" | "unavailable";
     cacheTtlSeconds: number;
     cachedAt?: string;
     expiresAt?: string;
@@ -3498,6 +3498,32 @@ async function getTicketOptionFields(
   return byName;
 }
 
+type TicketOptionFieldsProvider = (
+  fieldNames: readonly ValidatedTicketOptionField[]
+) => Promise<Map<ValidatedTicketOptionField, SuperOpsField>>;
+
+function createApplyTicketOptionFieldsProvider(
+  client: SuperOpsClientInstance
+): TicketOptionFieldsProvider {
+  const fields = new Map<ValidatedTicketOptionField, SuperOpsField>();
+
+  return async (fieldNames) => {
+    const requested = [...new Set(fieldNames)];
+    const missing = requested.filter((fieldName) => !fields.has(fieldName));
+    if (missing.length > 0) {
+      const fetched = await getTicketOptionFields(client, missing);
+      for (const [fieldName, field] of fetched) fields.set(fieldName, field);
+    }
+
+    const result = new Map<ValidatedTicketOptionField, SuperOpsField>();
+    for (const fieldName of requested) {
+      const field = fields.get(fieldName);
+      if (field) result.set(fieldName, field);
+    }
+    return result;
+  };
+}
+
 function cloneTicketOptionFields(
   fields: Map<ValidatedTicketOptionField, SuperOpsField>
 ): Map<ValidatedTicketOptionField, SuperOpsField> {
@@ -3738,6 +3764,27 @@ async function getTicketOptionFieldsForTool(
   let retryAfterPresent = false;
   let lastError: unknown;
 
+  // Field metadata is immutable enough for the bounded TTL and is already
+  // scoped by tenant, region, and exact requested field set.  A warm cache hit
+  // avoids spending a SuperOps read before the caller reaches the apply path;
+  // apply_triage_plan still performs its own live validation before writing.
+  const initialCacheLookup = await readTicketOptionFieldsCache(cacheIdentity);
+  if (initialCacheLookup.entry) {
+    return {
+      fields: cloneTicketOptionFields(initialCacheLookup.entry.fields),
+      metadata: {
+        source: "cache",
+        cacheStatus: "hit",
+        cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
+        ...cacheEntryMetadata(initialCacheLookup.entry),
+        attempts: 0,
+        retried: false,
+        rateLimited: false,
+        retryAfterPresent: false,
+      },
+    };
+  }
+
   while (attempts < maxAttempts) {
     attempts += 1;
     try {
@@ -3784,17 +3831,17 @@ async function getTicketOptionFieldsForTool(
     }
   }
 
-  const cacheLookup = isRateLimitError(lastError)
+  const fallbackCacheLookup = isRateLimitError(lastError)
     ? await readTicketOptionFieldsCache(cacheIdentity)
     : { available: false, valid: false, readFailed: false, nativeAvailable: Boolean(defaultFieldOptionsNativeCache()) };
-  if (isRateLimitError(lastError) && cacheLookup.entry) {
+  if (isRateLimitError(lastError) && fallbackCacheLookup.entry) {
     return {
-      fields: cloneTicketOptionFields(cacheLookup.entry.fields),
+      fields: cloneTicketOptionFields(fallbackCacheLookup.entry.fields),
       metadata: {
         source: "cache",
         cacheStatus: "fallback",
         cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
-        ...cacheEntryMetadata(cacheLookup.entry),
+        ...cacheEntryMetadata(fallbackCacheLookup.entry),
         attempts,
         retried: attempts > 1,
         rateLimited: true,
@@ -3815,10 +3862,10 @@ async function getTicketOptionFieldsForTool(
     rateLimited: isRateLimitError(lastError),
     attempts,
     retryAfterPresent,
-    cacheEntryAvailable: cacheLookup.available,
-    cacheEntryValid: cacheLookup.valid,
-    cacheReadFailed: cacheLookup.readFailed,
-    nativeCacheAvailable: cacheLookup.nativeAvailable,
+    cacheEntryAvailable: fallbackCacheLookup.available,
+    cacheEntryValid: fallbackCacheLookup.valid,
+    cacheReadFailed: fallbackCacheLookup.readFailed,
+    nativeCacheAvailable: fallbackCacheLookup.nativeAvailable,
     finalReason: safeErrorMessage(lastError),
   };
 }
@@ -3830,14 +3877,17 @@ async function addValidatedTicketOptionUpdates(
   client: SuperOpsClientInstance,
   params: TicketClassificationParams,
   input: Record<string, unknown>,
-  allowedFields: readonly ValidatedTicketOptionField[] = VALIDATED_TICKET_OPTION_FIELDS
+  allowedFields: readonly ValidatedTicketOptionField[] = VALIDATED_TICKET_OPTION_FIELDS,
+  optionFieldsProvider?: TicketOptionFieldsProvider
 ): Promise<string | undefined> {
   const fieldsToValidate = requestedValidatedOptionFields(params, allowedFields);
   if (fieldsToValidate.length === 0) {
     return undefined;
   }
 
-  const fields = await getTicketOptionFields(client, fieldsToValidate);
+  const fields = optionFieldsProvider
+    ? await optionFieldsProvider(fieldsToValidate)
+    : await getTicketOptionFields(client, fieldsToValidate);
 
   for (const fieldName of fieldsToValidate) {
     const field = fields.get(fieldName);
@@ -4836,7 +4886,8 @@ async function buildApprovedUpdateInput(
   client: SuperOpsClientInstance,
   ticketId: string,
   action: TriagePlanAction,
-  defaultStatus?: string
+  defaultStatus?: string,
+  optionFieldsProvider?: TicketOptionFieldsProvider
 ): Promise<Record<string, unknown> | { error: string }> {
   const target = action.target ?? {};
   const input: Record<string, unknown> = { ticketId };
@@ -4895,7 +4946,8 @@ async function buildApprovedUpdateInput(
     client,
     target,
     input,
-    ["impact", "urgency", "resolutionCode", "cause", "subcategory"]
+    ["impact", "urgency", "resolutionCode", "cause", "subcategory"],
+    optionFieldsProvider
   );
   if (optionValidationError) {
     return { error: optionValidationError };
@@ -5055,7 +5107,8 @@ function actionWithSnapshotExpectationsRelaxedForStagedResume(action: TriagePlan
 async function buildStagedResolveClassificationInput(
   client: SuperOpsClientInstance,
   ticketId: string,
-  action: TriagePlanAction
+  action: TriagePlanAction,
+  optionFieldsProvider?: TicketOptionFieldsProvider
 ): Promise<Record<string, unknown> | { error: string }> {
   const target = action.target ?? {};
   if (target.techGroupName !== undefined) {
@@ -5075,7 +5128,8 @@ async function buildStagedResolveClassificationInput(
     client,
     target,
     input,
-    ["impact", "urgency", "resolutionCode", "cause", "subcategory"]
+    ["impact", "urgency", "resolutionCode", "cause", "subcategory"],
+    optionFieldsProvider
   );
   if (optionValidationError) {
     return { error: optionValidationError };
@@ -5373,6 +5427,7 @@ async function applyStagedResolveAction(params: {
   resumeStage?: OperationItemState["stage"];
   noteVisibilityPriorAttempts?: number;
   resumeUpdatedTimeExpectation?: string;
+  optionFieldsProvider?: TicketOptionFieldsProvider;
   beforeNoteCheck?: () => Promise<void>;
   afterPreflightValidation?: () => Promise<void>;
   beforeMutation?: (
@@ -5405,7 +5460,12 @@ async function applyStagedResolveAction(params: {
 
   const classificationAction = stagedResolveClassificationAction(action);
   const finalAction = stagedResolveFinalAction(action);
-  const classificationInput = await buildStagedResolveClassificationInput(client, params.resolvedTicketId, action);
+  const classificationInput = await buildStagedResolveClassificationInput(
+    client,
+    params.resolvedTicketId,
+    action,
+    params.optionFieldsProvider
+  );
   const classificationInputError = (classificationInput as { error?: unknown }).error;
   if (typeof classificationInputError === "string") {
     return markStagedFailure({
@@ -7008,6 +7068,7 @@ async function applyApprovedTriageAction(params: {
   resumeWriteAttempted?: boolean;
   resumeWriteMayHaveSucceeded?: boolean;
   resumePartialWrite?: boolean;
+  optionFieldsProvider?: TicketOptionFieldsProvider;
   beforeNoteCheck?: () => Promise<void>;
   afterPreflightValidation?: () => Promise<void>;
   beforeMutation?: (
@@ -7180,7 +7241,12 @@ async function applyApprovedTriageAction(params: {
 
   if (params.dryRun) {
     if (action.action === "resolve") {
-      const classificationInput = await buildStagedResolveClassificationInput(client, ticket.ticketId, action);
+      const classificationInput = await buildStagedResolveClassificationInput(
+        client,
+        ticket.ticketId,
+        action,
+        params.optionFieldsProvider
+      );
       const classificationError = (classificationInput as { error?: unknown }).error;
       const statusInput = buildStagedResolveStatusInput(ticket.ticketId, action.target?.status);
       const statusError = (statusInput as { error?: unknown }).error;
@@ -7290,6 +7356,7 @@ async function applyApprovedTriageAction(params: {
           result,
           verify: params.verify,
           dedupeNotes: params.dedupeNotes,
+          optionFieldsProvider: params.optionFieldsProvider,
           resumeStage: params.resumeStage,
           noteVisibilityPriorAttempts: params.noteVisibilityPriorAttempts,
           resumeUpdatedTimeExpectation: params.resumeUpdatedTimeExpectation,
@@ -7303,7 +7370,7 @@ async function applyApprovedTriageAction(params: {
       }
       const updateInput = resumeNoteOnly
         ? { ticketId: ticket.ticketId }
-        : await buildApprovedUpdateInput(client, ticket.ticketId, action);
+        : await buildApprovedUpdateInput(client, ticket.ticketId, action, undefined, params.optionFieldsProvider);
       const updateError = (updateInput as { error?: unknown }).error;
       if (typeof updateError === "string") {
         result.finalOutcome = "Blocked";
@@ -7958,13 +8025,25 @@ async function buildMissingOnlyRecoveryInput(params: {
   action: TriagePlanAction;
   mutationType: DurableMutationType;
   ticket: Ticket;
+  optionFieldsProvider?: TicketOptionFieldsProvider;
 }): Promise<{ input?: Record<string, unknown>; schemaDependencyFields: string[]; error?: string }> {
   const stageAction = reconciliationActionForMutation(params.action, params.mutationType);
   const fullInput = params.mutationType === "classification"
-    ? await buildStagedResolveClassificationInput(params.client, params.ticketId, params.action)
+    ? await buildStagedResolveClassificationInput(
+        params.client,
+        params.ticketId,
+        params.action,
+        params.optionFieldsProvider
+      )
     : params.mutationType === "status" || params.mutationType === "resolveFallback"
       ? buildStagedResolveStatusInput(params.ticketId, params.action.target?.status)
-      : await buildApprovedUpdateInput(params.client, params.ticketId, params.action);
+      : await buildApprovedUpdateInput(
+          params.client,
+          params.ticketId,
+          params.action,
+          undefined,
+          params.optionFieldsProvider
+        );
   const error = (fullInput as { error?: unknown }).error;
   if (typeof error === "string") return { error, schemaDependencyFields: [] };
 
@@ -8103,6 +8182,7 @@ async function ambiguityCheckedTriageResult(params: {
   previousRetryCount: number;
   ambiguityStage: OperationItemState["stage"];
   fallbackAlreadyAttempted?: boolean;
+  optionFieldsProvider?: TicketOptionFieldsProvider;
   beforeNoteCheck?: () => Promise<void>;
   afterPreflightValidation?: () => Promise<void>;
   beforeMutation?: (
@@ -8237,6 +8317,7 @@ async function ambiguityCheckedTriageResult(params: {
         allowResolveFullFallbackToUpdate: applyParams.allowResolveFullFallbackToUpdate ?? false,
         allowWriteIfUpdatedTimeChanged: applyParams.allowWriteIfUpdatedTimeChanged ?? false,
         allowWriteWithoutVerifiedContent: applyParams.allowWriteWithoutVerifiedContent ?? false,
+        optionFieldsProvider: params.optionFieldsProvider,
         resumeStage,
         resumeUpdatedTimeExpectation: ticket.updatedTime,
         resumeWriteAttempted: true,
@@ -8811,6 +8892,7 @@ async function ambiguityCheckedTriageResult(params: {
     action,
     mutationType,
     ticket: freshTicket,
+    optionFieldsProvider: params.optionFieldsProvider,
   });
   if (recoveryInput.error || !recoveryInput.input) {
     return {
@@ -8956,6 +9038,7 @@ function createApplyTriageContinuationAdapter(
   client: SuperOpsClientInstance,
   liveParams?: ApplyTriagePlanParams
 ): OperationContinuationAdapter {
+  const optionFieldsProvider = createApplyTicketOptionFieldsProvider(client);
   return {
     toolName: "superops_tickets_apply_triage_plan",
     estimateItemSubrequests(record, itemKey) {
@@ -9726,6 +9809,7 @@ function createApplyTriageContinuationAdapter(
             previousRetryCount: claim.item.retryCount,
             ambiguityStage: claim.item.stage,
             fallbackAlreadyAttempted: claim.item.fallbackAttempted === true,
+            optionFieldsProvider,
             beforeNoteCheck,
             afterPreflightValidation,
             beforeMutation,
@@ -9749,6 +9833,7 @@ function createApplyTriageContinuationAdapter(
                 storedParams.allowWriteIfUpdatedTimeChanged ?? false,
               allowWriteWithoutVerifiedContent:
                 storedParams.allowWriteWithoutVerifiedContent ?? false,
+              optionFieldsProvider,
               resumeStage: resumeStageOverride,
               noteVisibilityPriorAttempts: claim.item.retryCount,
               resumeUpdatedTimeExpectation: expectedCurrentUpdatedTimeForItem(claim.item, action),

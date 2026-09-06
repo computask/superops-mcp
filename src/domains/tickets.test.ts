@@ -1282,6 +1282,31 @@ describe("Tickets Domain", () => {
     expect(cachedPayload).toMatchObject({ tenant: "example", region: "us", fields: ["priority"] });
   });
 
+  it("uses a warm caches.default field-options entry before making a fresh SuperOps read", async () => {
+    const nativeCache = installFieldOptionsNativeCache();
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
+    const domain = getTicketsTools();
+
+    await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+    expect(nativeCache.put).toHaveBeenCalledTimes(1);
+
+    mockClient.query.mockReset();
+    const cached = await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+    const parsed = JSON.parse(cached.content[0].text);
+
+    expect(cached.isError).not.toBe(true);
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(nativeCache.match).toHaveBeenCalledTimes(2);
+    expect(parsed.priority.options[0].value).toBe("Very Low");
+    expect(parsed._metadata.retrieval).toMatchObject({
+      source: "cache",
+      cacheStatus: "hit",
+      attempts: 0,
+      retried: false,
+      rateLimited: false,
+    });
+  });
+
   it("retrieves caches.default field-options entries across invocations after transient rate-limit retries fail", async () => {
     const nativeCache = installFieldOptionsNativeCache();
     mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
@@ -1291,6 +1316,7 @@ describe("Tickets Domain", () => {
     expect(nativeCache.put).toHaveBeenCalledTimes(1);
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
     const fallback = await runWithExecutionConfig(
@@ -1301,7 +1327,7 @@ describe("Tickets Domain", () => {
 
     expect(fallback.isError).not.toBe(true);
     expect(mockClient.query).toHaveBeenCalledTimes(2);
-    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(parsed.priority.options[0].value).toBe("Very Low");
     expect(parsed._metadata.retrieval).toMatchObject({ source: "cache", cacheStatus: "fallback", rateLimited: true });
   });
@@ -1313,6 +1339,7 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
     vi.mocked(getCredentials).mockReturnValue({ apiToken: "secret-token", subdomain: "other", region: "us" });
@@ -1322,7 +1349,7 @@ describe("Tickets Domain", () => {
     );
 
     expect(result.isError).toBe(true);
-    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(JSON.parse(result.content[0].text)).toMatchObject({ cacheEntryAvailable: false, cacheEntryValid: false });
   });
 
@@ -1333,6 +1360,7 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
     vi.mocked(getCredentials).mockReturnValue({ apiToken: "secret-token", subdomain: "example", region: "eu" });
@@ -1342,7 +1370,7 @@ describe("Tickets Domain", () => {
     );
 
     expect(result.isError).toBe(true);
-    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(JSON.parse(result.content[0].text)).toMatchObject({ cacheEntryAvailable: false, cacheEntryValid: false });
   });
 
@@ -1353,6 +1381,7 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
     const result = await runWithExecutionConfig(
@@ -1361,7 +1390,7 @@ describe("Tickets Domain", () => {
     );
 
     expect(result.isError).toBe(true);
-    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(JSON.parse(result.content[0].text)).toMatchObject({ cacheEntryAvailable: false, cacheEntryValid: false });
   });
 
@@ -1374,6 +1403,7 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     vi.setSystemTime(new Date("2026-07-22T00:05:01.000Z"));
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
@@ -1384,7 +1414,7 @@ describe("Tickets Domain", () => {
     const parsed = JSON.parse(result.content[0].text);
 
     expect(result.isError).toBe(true);
-    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(parsed).toMatchObject({ cacheEntryAvailable: true, cacheEntryValid: false, rateLimited: true, nativeCacheAvailable: true });
   });
 
@@ -1398,7 +1428,7 @@ describe("Tickets Domain", () => {
 
     expect(result.isError).not.toBe(true);
     expect(parsed.priority.options[0].value).toBe("Very Low");
-    expect(nativeCache.match).not.toHaveBeenCalled();
+    expect(nativeCache.match).toHaveBeenCalledTimes(1);
   });
 
   it("does not let cache write failure break successful fresh field-options lookup", async () => {
@@ -1421,13 +1451,14 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("Invalid metadata request", "BAD_USER_INPUT"));
     const result = await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
     const parsed = JSON.parse(result.content[0].text);
 
     expect(result.isError).toBe(true);
-    expect(nativeCache.match).not.toHaveBeenCalled();
+    expect(nativeCache.match).toHaveBeenCalledTimes(2);
     expect(mockClient.query).toHaveBeenCalledTimes(1);
     expect(parsed).toMatchObject({ errorClass: "SuperOpsGraphQLError", rateLimited: false, attempts: 1, cacheEntryAvailable: false });
   });
