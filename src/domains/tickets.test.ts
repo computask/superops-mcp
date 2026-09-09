@@ -4711,6 +4711,76 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it("treats an omitted client field as an unassigned ticket when the approved TaskGroup fallback is supplied", async () => {
+    const ticketState: Record<string, unknown> = {
+      ticketId: "ticket-57402-omitted-client",
+      displayId: "57402",
+      subject: "Omitted client field",
+      status: "New Calls",
+      updatedTime: "2026-07-26T08:59:00Z",
+    };
+    const notes: Array<Record<string, unknown>> = [];
+    const triageNote = "<strong>TRIAGE SUMMARY</strong><br><br><strong>Ticket goal:</strong> Confirm the request.<br><br><strong>What needs to be known:</strong> Safe evidence was recovered.<br><br><strong>Next step:</strong> Service desk reviews the ticket.<br><br><strong>When:</strong> At the next New Calls review.";
+
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketNoteList")) return { getTicketNoteList: notes };
+      if (query.includes("getTicketList")) {
+        return {
+          getTicketList: {
+            tickets: [{ ticketId: "ticket-57402-omitted-client", displayId: "57402" }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        };
+      }
+      if (query.includes("getTicket")) return { getTicket: { ...ticketState } };
+      return { getFields: RESOLVED_OPTION_FIELDS };
+    });
+    mockClient.mutate.mockImplementation(async (mutation: string, variables: { input: Record<string, unknown> }) => {
+      if (mutation.includes("createTicketNote")) {
+        notes.push({ noteId: "note-57402-omitted-client", content: triageNote, privacyType: "PRIVATE" });
+        return { createTicketNote: { noteId: "note-57402-omitted-client", privacyType: "PRIVATE" } };
+      }
+      Object.assign(ticketState, variables.input, { updatedTime: "2026-07-26T09:00:00Z" });
+      return { updateTicket: { ...ticketState, client: { accountId: "2993553194649526272", name: "TaskGroup" } } };
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57402"],
+      actions: [{
+        ticketNumber: "57402",
+        expectedTicketId: "ticket-57402-omitted-client",
+        expectedSubject: "Omitted client field",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T08:59:00Z",
+        contentVerified: true,
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        action: "leave",
+        target: {
+          ...TRIAGE_TEST_CLASSIFICATION,
+          clientName: "TaskGroup",
+          clientId: "2993553194649526272",
+        },
+        note: triageNote,
+        isPublicNote: false,
+        historyAssessment: SCHEDULED_TRIAGE_V2_NO_HISTORY,
+      }],
+      verify: true,
+      dedupeNotes: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      ticketNumber: "57402",
+      finalOutcome: "Left",
+      noteAdded: true,
+      verified: true,
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+  });
+
   it("assigns TaskGroup to an already-resolved ticket without replaying its resolve or note writes", async () => {
     mockClient.query
       .mockResolvedValueOnce({

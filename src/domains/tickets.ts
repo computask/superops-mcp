@@ -4450,7 +4450,12 @@ function scheduledPolicyClientFailure(
 
   const targetName = action.target?.clientName?.trim();
   const targetId = action.target?.clientId?.trim();
-  if (ticket.client === null) {
+  // The safe ticket query explicitly requests `client`, but SuperOps may
+  // omit a null scalar/object instead of serialising it as null. Both forms
+  // mean that this ticket has no assigned client and therefore require the
+  // exact approved TaskGroup fallback. A genuinely unavailable client field
+  // is surfaced as a GraphQL/read failure before this policy check.
+  if (ticket.client === null || ticket.client === undefined) {
     if (targetName !== SCHEDULED_TRIAGE_TASKGROUP_NAME || targetId !== SCHEDULED_TRIAGE_TASKGROUP_ID) {
       return `A scheduled New Calls ticket with no client must target ${SCHEDULED_TRIAGE_TASKGROUP_NAME} (${SCHEDULED_TRIAGE_TASKGROUP_ID}).`;
     }
