@@ -432,8 +432,11 @@ terminal.
 
 The isolated v7 contract adds the parallel
 `policyMode: "scheduled-new-calls-v2"`. V2 keeps the same fixed-candidate and
-durable write path, but requires bounded `historyAssessment` metadata and
-history-aware HTML note sections for every candidate. The history connector is
+durable write path, but requires bounded `historyAssessment` metadata for every
+candidate. Its HTML note contains the required triage sections plus only the
+history sections that are supported and relevant; unavailable, degraded,
+unknown, no-match, and no-solution states do not create empty history sections.
+The history connector is
 outside this MCP boundary: v2 never calls Supabase or Ticket History and adds
 no SuperOps history reads. It distinguishes recurrence, observed historical
 solutions, post-solution recurrence, cross-client signals and emerging issue

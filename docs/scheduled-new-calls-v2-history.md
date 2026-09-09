@@ -35,35 +35,46 @@ recommendation is advisory and must not be presented as a promised fix. If the
 assessment includes `currentScriptRecommendation`, the note must include the
 corresponding section.
 
-## Required v2 note
+## V2 note
 
-The private note must use HTML labels and two line breaks between sections:
+The private note must use HTML labels and two line breaks between sections. The
+core sections are always required:
 
 ```html
 <strong>TRIAGE SUMMARY</strong><br><br>
 <strong>Ticket goal:</strong> ...<br><br>
 <strong>What needs to be known:</strong> ...<br><br>
-<strong>Historical issue:</strong> Recurrent, not recurrent, or unknown ...<br><br>
-<strong>Historical solution:</strong> Prior solution found, no prior solution found, or unknown ...<br><br>
-<strong>Post-solution recurrence:</strong> Observed recurrence, no observed recurrence in window, or follow-up unknown ...<br><br>
-<strong>Cross-client signal:</strong> None, watch, credible, or unknown ...<br><br>
-<strong>Emerging issue:</strong> None, watch, credible, or unknown ...<br><br>
 <strong>Next step:</strong> ...<br><br>
 <strong>When:</strong> ...
 ```
 
-Add this section only when applicable, immediately before `Next step`:
+Add these history sections only when their state is relevant and supported:
+
+- `Historical issue` only for `issueRecurrence: recurrent`;
+- `Historical solution` only for `solutionHistory: prior_solution_found`; and
+  `Post-solution recurrence` only for `postSolutionRecurrence:
+  observed_recurrence` with a prior solution;
+- `Cross-client signal` only for `crossClientSignal: watch` or `credible`; and
+- `Emerging issue` only for `emergingIssueSignal: watch` or `credible`.
+
+For no matches, no prior solution, unavailable/degraded/unknown history, and
+no-signal states, omit the corresponding sections rather than writing an empty
+or negative section. The structured `historyAssessment` still records those
+states for auditability.
+
+Add this section only when a non-empty recommendation is present, immediately
+before `Next step`:
 
 ```html
 <strong>Current script recommendation:</strong> Advisory recommendation only ...<br><br>
 ```
 
-The server checks the required labels, non-empty sections, controlled state
-wording (including clear human-readable equivalents), `<strong>` labels and
-`<br><br>` spacing. The Agent should put the canonical state phrase first in
-each history section to avoid an unnecessary validation retry. Dynamic values
-must be HTML escaped by the Agent. Existing v1 notes remain governed by the v1
-validator.
+The server checks the required labels, non-empty sections, relevant optional
+sections, controlled state wording (including clear human-readable
+equivalents), `<strong>` labels and `<br><br>` spacing. The Agent should put
+the canonical state phrase first in each included history section to avoid an
+unnecessary validation retry. Dynamic values must be HTML escaped by the
+Agent. Existing v1 notes remain governed by the v1 validator.
 
 ## Call and rollout boundary
 

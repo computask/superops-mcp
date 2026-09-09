@@ -210,7 +210,7 @@ const SCHEDULED_TRIAGE_HTML_NOTE = [
 const SCHEDULED_TRIAGE_V2_HISTORY = {
   issueRecurrence: "recurrent",
   solutionHistory: "prior_solution_found",
-  postSolutionRecurrence: "no_observed_recurrence_in_window",
+  postSolutionRecurrence: "observed_recurrence",
   crossClientSignal: "credible",
   emergingIssueSignal: "credible",
   resultState: "complete",
@@ -230,7 +230,7 @@ const SCHEDULED_TRIAGE_V2_HTML_NOTE = [
   "<strong>What needs to be known:</strong> The safe evidence was fully retrieved and assessed.<br><br>",
   "<strong>Historical issue:</strong> Recurrent based on two bounded historical matches.<br><br>",
   "<strong>Historical solution:</strong> Prior solution found in observed history; it is advisory.<br><br>",
-  "<strong>Post-solution recurrence:</strong> No observed recurrence in window.<br><br>",
+  "<strong>Post-solution recurrence:</strong> Observed recurrence after the prior solution.<br><br>",
   "<strong>Cross-client signal:</strong> Credible across two verified clients.<br><br>",
   "<strong>Emerging issue:</strong> Credible bounded cross-client signal.<br><br>",
   "<strong>Current script recommendation:</strong> Use the current approved script only as an advisory next step.<br><br>",
@@ -241,11 +241,7 @@ const SCHEDULED_TRIAGE_V2_NATURAL_HTML_NOTE = [
   "<strong>TRIAGE SUMMARY</strong><br><br>",
   "<strong>Ticket goal:</strong> Route the ticket under the standing New Calls policy.<br><br>",
   "<strong>What needs to be known:</strong> The safe evidence was fully retrieved and assessed.<br><br>",
-  "<strong>Historical issue:</strong> No matching historical issue was found in the bounded lookback.<br><br>",
   "<strong>Historical solution:</strong> A previous solution was found in observed history; it is advisory.<br><br>",
-  "<strong>Post-solution recurrence:</strong> Follow-up is unknown from the available window.<br><br>",
-  "<strong>Cross-client signal:</strong> None identified.<br><br>",
-  "<strong>Emerging issue:</strong> No emerging issue signal identified.<br><br>",
   "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
   "<strong>When:</strong> During this scheduled triage run.",
 ].join("");
@@ -258,6 +254,23 @@ const SCHEDULED_TRIAGE_V2_NATURAL_HISTORY = {
   resultState: "complete",
   resolvedMatchingTicketCount: 1,
 } as const;
+const SCHEDULED_TRIAGE_V2_NO_HISTORY = {
+  issueRecurrence: "unknown",
+  solutionHistory: "no_prior_solution_found",
+  postSolutionRecurrence: "follow_up_unknown",
+  crossClientSignal: "none",
+  emergingIssueSignal: "none",
+  resultState: "no_matches",
+  matchingTicketCount: 0,
+  resolvedMatchingTicketCount: 0,
+} as const;
+const SCHEDULED_TRIAGE_V2_NO_HISTORY_HTML_NOTE = [
+  "<strong>TRIAGE SUMMARY</strong><br><br>",
+  "<strong>Ticket goal:</strong> Route the ticket under the standing New Calls policy.<br><br>",
+  "<strong>What needs to be known:</strong> The safe evidence was fully retrieved and assessed.<br><br>",
+  "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
+  "<strong>When:</strong> During this scheduled triage run.",
+].join("");
 
 // Privacy-safe semantic fixture for the production-shaped ticket/note IDs in
 // the HTML-rendering regression. It intentionally contains no customer data.
@@ -5309,6 +5322,68 @@ describe("Tickets Domain", () => {
     expect(mockClient.query).toHaveBeenCalled();
     expect(result.content[0].text).not.toContain("Historical issue");
     expect(result.content[0].text).not.toContain("Historical solution");
+  });
+
+  it("accepts a v2 note with no history sections when bounded history has no matches", async () => {
+    mockClient.query.mockRejectedValue(new Error("bounded validation-path read failure"));
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_NO_HISTORY,
+        note: SCHEDULED_TRIAGE_V2_NO_HISTORY_HTML_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(mockClient.query).toHaveBeenCalled();
+    expect(result.content[0].text).not.toContain("must include the relevant");
+    expect(result.content[0].text).not.toContain("must omit the irrelevant");
+  });
+
+  it("rejects an irrelevant v2 history section instead of persisting it", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_NO_HISTORY,
+        note: [
+          SCHEDULED_TRIAGE_V2_NO_HISTORY_HTML_NOTE.replace(
+            "<strong>Next step:</strong>",
+            "<strong>Historical issue:</strong> No matching historical issue was found.<br><br><strong>Next step:</strong>",
+          ),
+        ].join(""),
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("must omit the irrelevant");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
   it("forces obvious server-down notifications to remain in New Calls", async () => {

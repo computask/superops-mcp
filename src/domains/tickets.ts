@@ -1914,17 +1914,42 @@ function scheduledTriageNoteValidation(note: unknown): string | undefined {
   }
 }
 
-const SCHEDULED_TRIAGE_V2_NOTE_SECTIONS = [
+const SCHEDULED_TRIAGE_V2_BASE_NOTE_SECTIONS = [
   "Ticket goal:",
   "What needs to be known:",
+  "Next step:",
+  "When:",
+] as const;
+
+const SCHEDULED_TRIAGE_V2_HISTORY_NOTE_SECTIONS = [
   "Historical issue:",
   "Historical solution:",
   "Post-solution recurrence:",
   "Cross-client signal:",
   "Emerging issue:",
-  "Next step:",
-  "When:",
 ] as const;
+
+function scheduledTriageV2RelevantHistorySections(
+  assessment: TriageHistoryAssessment
+): Set<string> {
+  const relevant = new Set<string>();
+  if (assessment.issueRecurrence === "recurrent") {
+    relevant.add("Historical issue:");
+  }
+  if (assessment.solutionHistory === "prior_solution_found") {
+    relevant.add("Historical solution:");
+    if (assessment.postSolutionRecurrence === "observed_recurrence") {
+      relevant.add("Post-solution recurrence:");
+    }
+  }
+  if (assessment.crossClientSignal === "watch" || assessment.crossClientSignal === "credible") {
+    relevant.add("Cross-client signal:");
+  }
+  if (assessment.emergingIssueSignal === "watch" || assessment.emergingIssueSignal === "credible") {
+    relevant.add("Emerging issue:");
+  }
+  return relevant;
+}
 
 function scheduledTriageV2NoteValidation(
   note: unknown,
@@ -1939,11 +1964,26 @@ function scheduledTriageV2NoteValidation(
     return "the private note must start with TRIAGE SUMMARY";
   }
 
-  const sections = assessment.currentScriptRecommendation !== undefined
-    ? [...SCHEDULED_TRIAGE_V2_NOTE_SECTIONS.slice(0, -2), "Current script recommendation:", "Next step:", "When:"]
-    : [...SCHEDULED_TRIAGE_V2_NOTE_SECTIONS];
+  const relevantHistorySections = scheduledTriageV2RelevantHistorySections(assessment);
+  const sections = [
+    SCHEDULED_TRIAGE_V2_BASE_NOTE_SECTIONS[0],
+    SCHEDULED_TRIAGE_V2_BASE_NOTE_SECTIONS[1],
+    ...SCHEDULED_TRIAGE_V2_HISTORY_NOTE_SECTIONS.filter((section) => relevantHistorySections.has(section)),
+    ...(assessment.currentScriptRecommendation !== undefined ? ["Current script recommendation:"] : []),
+    SCHEDULED_TRIAGE_V2_BASE_NOTE_SECTIONS[2],
+    SCHEDULED_TRIAGE_V2_BASE_NOTE_SECTIONS[3],
+  ];
   const labels = ["TRIAGE SUMMARY", ...sections];
   const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const label of SCHEDULED_TRIAGE_V2_HISTORY_NOTE_SECTIONS) {
+    const present = new RegExp(`<strong>\\s*${escapeRegExp(label)}\\s*</strong>`, "i").test(note);
+    const relevant = relevantHistorySections.has(label);
+    if (present !== relevant) {
+      return relevant
+        ? `the scheduled-new-calls-v2 note must include the relevant <strong>${label}</strong> section`
+        : `the scheduled-new-calls-v2 note must omit the irrelevant <strong>${label}</strong> section`;
+    }
+  }
   for (const label of labels) {
     const strongLabel = new RegExp(`<strong>\\s*${escapeRegExp(label)}\\s*</strong>`, "i");
     if (!strongLabel.test(note)) {
@@ -2049,6 +2089,7 @@ function scheduledTriageV2NoteValidation(
     },
   ];
   for (const { section, state, canonical } of stateChecks) {
+    if (!relevantHistorySections.has(section)) continue;
     const line = lines.find((candidate) => candidate.startsWith(section));
     const lowerLine = line?.toLowerCase() ?? "";
     if (!historyStateLineMatches(section, state, lowerLine)) {
@@ -10404,7 +10445,7 @@ export function getTicketsTools(): DomainTools {
       },      {
         name: "superops_tickets_apply_triage_plan",
         description:
-          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. scheduled-new-calls-v1 remains the existing standing contract. scheduled-new-calls-v2 adds required bounded historical assessment metadata and HTML history sections without adding SuperOps history reads. Both modes enforce complete candidates, classification, client safety, private notes, verification, dedupe, and no unsafe overrides. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer.",
+          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. scheduled-new-calls-v1 remains the existing standing contract. scheduled-new-calls-v2 adds required bounded historical assessment metadata and relevant-only HTML history sections without adding SuperOps history reads. Both modes enforce complete candidates, classification, client safety, private notes, verification, dedupe, and no unsafe overrides. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer.",
         inputSchema: {
           type: "object",
           properties: {
@@ -10419,7 +10460,7 @@ export function getTicketsTools(): DomainTools {
             policyMode: {
               type: "string",
               enum: [...TRIAGE_POLICY_MODES],
-              description: "Standing scheduled New Calls contract. v1 preserves the existing policy; v2 additionally requires bounded historyAssessment metadata and history-aware HTML note sections. Both require an exact complete candidate/action set and reject the entire submission before any SuperOps work when an invariant is missing.",
+              description: "Standing scheduled New Calls contract. v1 preserves the existing policy; v2 additionally requires bounded historyAssessment metadata and requires HTML history sections only when their state is relevant and supported. Both require an exact complete candidate/action set and reject the entire submission before any SuperOps work when an invariant is missing.",
             },
             expectedCandidateTicketNumbers: {
               type: "array",
