@@ -445,12 +445,22 @@ signals require at least two verified clients. See
 [`docs/scheduled-new-calls-v2-history.md`](docs/scheduled-new-calls-v2-history.md).
 Switching the Agent policy back to v1 is the immediate rollback.
 
+The targeted email trigger uses the additional
+`policyMode: "email-new-calls-v2"`. It keeps the same v2 history, evidence,
+stale-write, note-deduplication and durable continuation safeguards, but adds a
+hard routing rule: any email ticket that needs a human reply, clarification,
+investigation or follow-up must use `leave` and remain in `New Calls`, even when
+the subject is technical. Only a conclusively no-action email may use
+`resolve` and move to `Resolved`. The existing full-queue scheduled policies
+retain their separate `engineer_review` routing behaviour.
+
 ### Approved Triage Plan Execution
 
 `superops_tickets_apply_triage_plan` is a write/high-risk Phase 3 tool for
 applying a fixed snapshot candidate set. In manual mode, use it only after the
 Phase 2 pre-write table has been approved. The separately configured
-`scheduled-new-calls-v1` and `scheduled-new-calls-v2` modes use the standing
+`scheduled-new-calls-v1`, `scheduled-new-calls-v2`, and targeted
+`email-new-calls-v2` modes use the standing
 policy authorization above and
 must satisfy its stricter production gate instead of pausing for per-ticket
 approval. The tool requires

@@ -84,6 +84,18 @@ describe("SuperOpsClient execution instrumentation", () => {
     expect(result).toEqual({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(diagnostics?.subrequests).toMatchObject({ used: 1, budget: 5, safetyMargin: 1 });
+    expect(diagnostics?.requestTrace).toEqual([
+      expect.objectContaining({
+        index: 1,
+        type: "initialRead",
+        operationType: "query",
+        operationName: "Test",
+        status: 200,
+        retryCount: 0,
+        ok: true,
+      }),
+    ]);
+    expect(diagnostics?.requestTraceTruncated).toBe(false);
     expect(JSON.stringify(diagnostics)).not.toContain("secret-token");
   });
 

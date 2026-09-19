@@ -662,6 +662,17 @@ export function finishExecution(reason: string): void {
 export function executionDiagnostics(): Record<string, unknown> | undefined {
   const state = getExecutionState();
   if (!state) return undefined;
+  const requestTrace = state.requests.slice(0, 128).map((request) => ({
+    index: request.index,
+    type: request.type,
+    operationType: request.operationType,
+    operationName: request.operationName,
+    itemKey: request.itemKey,
+    status: request.status,
+    retryCount: request.retryCount,
+    durationMs: request.durationMs,
+    ok: request.ok,
+  }));
   return {
     invocationId: state.invocationId,
     executionTraceId: state.operationId,
@@ -697,6 +708,8 @@ export function executionDiagnostics(): Record<string, unknown> | undefined {
       delaysMs: state.retryDelaysMs,
       details: state.retryDelayDetails,
     },
+    requestTrace,
+    requestTraceTruncated: state.requests.length > requestTrace.length,
     requestsByType: state.requests.reduce<Record<string, number>>((counts, request) => {
       counts[request.type] = (counts[request.type] ?? 0) + 1;
       return counts;

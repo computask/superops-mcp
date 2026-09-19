@@ -1275,7 +1275,7 @@ describe("Cloudflare Worker entrypoint", () => {
           jsonrpc: "2.0",
           id: 32,
           method: "tools/call",
-          params: { name: "superops_tickets_list", arguments: {} },
+          params: { name: "superops_tickets_triage_snapshot", arguments: {} },
         },
         {},
         { "X-Request-Id": "audit-failure-1" }
@@ -1290,10 +1290,26 @@ describe("Cloudflare Worker entrypoint", () => {
       expect(body.result?.content?.[0]?.text).not.toContain("SUPEROPS_API_TOKEN");
       expect(body.result?.content?.[0]?.text).not.toContain(" at ");
 
+      const telemetry = body.result?.content
+        ?.map((item) => {
+          try {
+            return JSON.parse(String(item.text)) as { mcpExecution?: { failureDiagnostics?: unknown[] } };
+          } catch {
+            return undefined;
+          }
+        })
+        .find((item) => item?.mcpExecution !== undefined)?.mcpExecution;
+      expect(telemetry?.failureDiagnostics).toEqual([
+        expect.objectContaining({
+          stage: "mcp_tool",
+          message: expect.stringContaining("credentials"),
+        }),
+      ]);
+
       const records = auditRecords(logSpy);
       expect(records[0]).toMatchObject({
         requestId: "audit-failure-1",
-        toolName: "superops_tickets_list",
+        toolName: "superops_tickets_triage_snapshot",
         success: false,
       });
       expect(String(records[0].errorSummary)).toContain("credentials");

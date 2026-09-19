@@ -1204,7 +1204,7 @@ describe("Tickets Domain", () => {
     expect(parsed._metadata.retrieval).toMatchObject({ source: "fresh", attempts: 1, retried: false, rateLimited: false });
   });
 
-  it("retries one GraphQL rate_limit_exceeded field-options response internally and then succeeds", async () => {
+  it("does not multiply a rate-limited field-options response after client retries", async () => {
     mockClient.query
       .mockRejectedValueOnce(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"))
       .mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
@@ -1216,13 +1216,12 @@ describe("Tickets Domain", () => {
     );
     const parsed = JSON.parse(result.content[0].text);
 
-    expect(result.isError).not.toBe(true);
-    expect(mockClient.query).toHaveBeenCalledTimes(2);
-    expect(parsed.priority.options[0].value).toBe("Very Low");
-    expect(parsed._metadata.retrieval).toMatchObject({ source: "fresh", attempts: 2, retried: true });
+    expect(result.isError).toBe(true);
+    expect(mockClient.query).toHaveBeenCalledTimes(1);
+    expect(parsed).toMatchObject({ errorClass: "SuperOpsRateLimit", rateLimited: true, attempts: 1 });
   });
 
-  it("retries HTTP 429 field-options responses with Retry-After metadata", async () => {
+  it("preserves HTTP 429 Retry-After metadata without a second outer read", async () => {
     mockClient.query
       .mockRejectedValueOnce(new SuperOpsHttpError("HTTP error: 429 Too Many Requests", 429, "Too Many Requests", 1))
       .mockResolvedValueOnce({ getFields: [ticketField("impact", ["Low"])] });
@@ -1234,12 +1233,12 @@ describe("Tickets Domain", () => {
     );
     const parsed = JSON.parse(result.content[0].text);
 
-    expect(mockClient.query).toHaveBeenCalledTimes(2);
-    expect(parsed.impact.options[0].value).toBe("Low");
-    expect(parsed._metadata.retrieval).toMatchObject({ attempts: 2, retried: true, retryAfterPresent: true });
+    expect(result.isError).toBe(true);
+    expect(mockClient.query).toHaveBeenCalledTimes(1);
+    expect(parsed).toMatchObject({ errorClass: "SuperOpsRateLimit", rateLimited: true, attempts: 1, retryAfterPresent: true });
   });
 
-  it("recognises DataFetchingException field-options wrappers containing rate_limit_exceeded", async () => {
+  it("recognises DataFetchingException rate limits without a second outer read", async () => {
     mockClient.query
       .mockRejectedValueOnce(new SuperOpsError(
         "Exception while fetching data for getFields",
@@ -1256,9 +1255,9 @@ describe("Tickets Domain", () => {
     );
     const parsed = JSON.parse(result.content[0].text);
 
-    expect(mockClient.query).toHaveBeenCalledTimes(2);
-    expect(parsed.urgency.options[0].value).toBe("Low");
-    expect(parsed._metadata.retrieval.retried).toBe(true);
+    expect(result.isError).toBe(true);
+    expect(mockClient.query).toHaveBeenCalledTimes(1);
+    expect(parsed).toMatchObject({ errorClass: "SuperOpsRateLimit", rateLimited: true, attempts: 1 });
   });
 
   it("bounds field-options retry attempts and returns structured rate-limit errors", async () => {
@@ -1276,8 +1275,8 @@ describe("Tickets Domain", () => {
     const parsed = JSON.parse(result.content[0].text);
 
     expect(result.isError).toBe(true);
-    expect(mockClient.query).toHaveBeenCalledTimes(2);
-    expect(parsed).toMatchObject({ errorClass: "SuperOpsRateLimit", rateLimited: true, attempts: 2, cacheEntryAvailable: false });
+    expect(mockClient.query).toHaveBeenCalledTimes(1);
+    expect(parsed).toMatchObject({ errorClass: "SuperOpsRateLimit", rateLimited: true, attempts: 1, cacheEntryAvailable: false });
   });
 
   it("writes successful field-options lookups to caches.default", async () => {
@@ -1345,7 +1344,7 @@ describe("Tickets Domain", () => {
     const parsed = JSON.parse(fallback.content[0].text);
 
     expect(fallback.isError).not.toBe(true);
-    expect(mockClient.query).toHaveBeenCalledTimes(2);
+    expect(mockClient.query).toHaveBeenCalledTimes(1);
     expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(parsed.priority.options[0].value).toBe("Very Low");
     expect(parsed._metadata.retrieval).toMatchObject({ source: "cache", cacheStatus: "fallback", rateLimited: true });
@@ -5365,6 +5364,62 @@ describe("Tickets Domain", () => {
     expect(result.content[0].text).not.toContain("historyAssessment");
   });
 
+  it("keeps engineer-review email tickets in New Calls under the targeted email policy", async () => {
+    mockClient.query.mockRejectedValue(new Error("bounded validation-path read failure"));
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "email-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer VPN issue",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "engineer_review",
+        contentEvidenceState: "meaningful",
+        policyReason: "actionable_engineer_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_HISTORY,
+        note: SCHEDULED_TRIAGE_V2_HTML_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(mockClient.query).toHaveBeenCalled();
+    expect(result.content[0].text).not.toContain("does not match policyDisposition engineer_review");
+  });
+
+  it("rejects Awaiting Engineer routing in the targeted email policy before SuperOps work", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "email-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer VPN issue",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "update",
+        policyDisposition: "engineer_review",
+        contentEvidenceState: "meaningful",
+        policyReason: "actionable_engineer_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_HISTORY,
+        note: SCHEDULED_TRIAGE_V2_HTML_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
+      }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("does not match policyDisposition engineer_review");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
   it("accepts unambiguous natural wording for v2 history states", async () => {
     mockClient.query.mockRejectedValue(new Error("bounded validation-path read failure"));
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
@@ -5391,6 +5446,46 @@ describe("Tickets Domain", () => {
 
     expect(mockClient.query).toHaveBeenCalled();
     expect(result.content[0].text).not.toContain("Historical issue");
+    expect(result.content[0].text).not.toContain("Historical solution");
+  });
+
+  it("accepts the explicit v2 history enum tokens used by the Agent note contract", async () => {
+    mockClient.query.mockRejectedValue(new Error("bounded validation-path read failure"));
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_HISTORY,
+        note: [
+          "<strong>TRIAGE SUMMARY</strong><br><br>",
+          "<strong>Ticket goal:</strong> Route the ticket under the standing New Calls policy.<br><br>",
+          "<strong>What needs to be known:</strong> The safe evidence was fully retrieved and assessed.<br><br>",
+          "<strong>Historical issue:</strong> issueRecurrence=recurrent; matchingTicketCount=2.<br><br>",
+          "<strong>Historical solution:</strong> solutionHistory=prior_solution_found; resolvedMatchingTicketCount=2.<br><br>",
+          "<strong>Post-solution recurrence:</strong> postSolutionRecurrence=observed_recurrence.<br><br>",
+          "<strong>Cross-client signal:</strong> crossClientSignal=credible; distinctClientCount=2.<br><br>",
+          "<strong>Emerging issue:</strong> emergingIssueSignal=credible; distinctClientCount=2.<br><br>",
+          "<strong>Current script recommendation:</strong> currentScriptRecommendation=Use the approved script as an advisory next step.<br><br>",
+          "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
+          "<strong>When:</strong> During this scheduled triage run.",
+        ].join(""),
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(mockClient.query).toHaveBeenCalled();
     expect(result.content[0].text).not.toContain("Historical solution");
   });
 

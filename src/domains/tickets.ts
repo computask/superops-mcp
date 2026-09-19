@@ -33,7 +33,6 @@ import {
   ExecutionTimeoutBudgetExceededError,
   getExecutionConfig,
   hasExecutionBudgetFor,
-  recordRetryDelay,
 } from "../execution.js";
 import {
   runOperationContinuation,
@@ -115,10 +114,8 @@ const STATUS_EQUALS_OPERATOR = "is";
 const STATUS_IN_OPERATOR = "in";
 const TICKET_FIELD_MODULE = "TICKET";
 const CLIENT_LOOKUP_PAGE_SIZE = 200;
-const FIELD_OPTIONS_MAX_INTERNAL_ATTEMPTS = 2;
 /** Short Cloudflare Cache API TTL for tenant field metadata; SuperOps option sets change rarely. */
 const FIELD_OPTIONS_CACHE_TTL_MS = 5 * 60 * 1000;
-const FIELD_OPTIONS_RETRY_ENDPOINT = "SuperOps GraphQL /msp getFields";
 
 const CLIENT_NAME_ALIASES: Record<string, string> = {
   "task group": "TaskGroup",
@@ -699,7 +696,10 @@ interface ResolveFullParams extends TicketClassificationParams {
 
 
 type TriagePlanActionType = "resolve" | "update" | "addNote" | "leave" | "skip";
-type TriagePolicyMode = "scheduled-new-calls-v1" | "scheduled-new-calls-v2";
+type TriagePolicyMode =
+  | "scheduled-new-calls-v1"
+  | "scheduled-new-calls-v2"
+  | "email-new-calls-v2";
 type TriagePolicyDisposition =
   | "customer_request"
   | "server_down"
@@ -809,7 +809,11 @@ interface ApplyTriagePlanParams {
 }
 
 const TRIAGE_PLAN_ACTION_TYPES = ["resolve", "update", "addNote", "leave", "skip"] as const;
-const TRIAGE_POLICY_MODES = ["scheduled-new-calls-v1", "scheduled-new-calls-v2"] as const;
+const TRIAGE_POLICY_MODES = [
+  "scheduled-new-calls-v1",
+  "scheduled-new-calls-v2",
+  "email-new-calls-v2",
+] as const;
 const TRIAGE_POLICY_DISPOSITIONS = [
   "customer_request",
   "server_down",
@@ -831,9 +835,12 @@ const TRIAGE_POLICY_REASONS = [
 ] as const;
 const SCHEDULED_NEW_CALLS_POLICY: TriagePolicyMode = "scheduled-new-calls-v1";
 const SCHEDULED_NEW_CALLS_V2_POLICY: TriagePolicyMode = "scheduled-new-calls-v2";
+const EMAIL_NEW_CALLS_V2_POLICY: TriagePolicyMode = "email-new-calls-v2";
 
 function isScheduledNewCallsPolicy(policyMode: unknown): policyMode is TriagePolicyMode {
-  return policyMode === SCHEDULED_NEW_CALLS_POLICY || policyMode === SCHEDULED_NEW_CALLS_V2_POLICY;
+  return policyMode === SCHEDULED_NEW_CALLS_POLICY ||
+    policyMode === SCHEDULED_NEW_CALLS_V2_POLICY ||
+    policyMode === EMAIL_NEW_CALLS_V2_POLICY;
 }
 
 const SCHEDULED_TRIAGE_TASKGROUP_NAME = "TaskGroup";
@@ -2007,6 +2014,22 @@ function scheduledTriageV2NoteValidation(
     const unknownHistory =
       /\bunknown\b|\bnot (?:known|established|determined|identified)\b|\b(?:could not|unable to|cannot|can't) (?:determine|establish|confirm|identify)\b|\bno (?:matching |relevant |clear |comparable )?(?:historical )?(?:issue|issues|match|matches|evidence|ticket|tickets)\b|\bnot found in (?:the )?history\b/u.test(text);
 
+    // The Workspace Agent is instructed to carry the machine-readable enum
+    // into each positive history section. Accept that explicit token as
+    // authoritative evidence of the same state, while retaining the natural
+    // language checks below for older/manual callers.
+    const enumFieldBySection: Record<string, string> = {
+      "Historical issue:": "issueRecurrence",
+      "Historical solution:": "solutionHistory",
+      "Post-solution recurrence:": "postSolutionRecurrence",
+      "Cross-client signal:": "crossClientSignal",
+      "Emerging issue:": "emergingIssueSignal",
+    };
+    const enumField = enumFieldBySection[section];
+    if (enumField && new RegExp(`\\b${escapeRegExp(enumField.toLowerCase())}=${escapeRegExp(state.toLowerCase())}\\b`, "u").test(text)) {
+      return true;
+    }
+
     if (section === "Historical issue:") {
       if (state === "recurrent") {
         return /\brecurrent\b/u.test(text) &&
@@ -2118,10 +2141,14 @@ function validateScheduledNewCallsPolicy(
   actions: TriagePlanAction[]
 ): string | undefined {
   if (!isScheduledNewCallsPolicy(request.policyMode)) return undefined;
-  const policyLabel = request.policyMode === SCHEDULED_NEW_CALLS_V2_POLICY
-    ? "scheduled-new-calls-v2"
-    : "scheduled-new-calls-v1";
-  const isV2 = request.policyMode === SCHEDULED_NEW_CALLS_V2_POLICY;
+  const policyLabel = request.policyMode === EMAIL_NEW_CALLS_V2_POLICY
+    ? "email-new-calls-v2"
+    : request.policyMode === SCHEDULED_NEW_CALLS_V2_POLICY
+      ? "scheduled-new-calls-v2"
+      : "scheduled-new-calls-v1";
+  const isV2 = request.policyMode === SCHEDULED_NEW_CALLS_V2_POLICY ||
+    request.policyMode === EMAIL_NEW_CALLS_V2_POLICY;
+  const isEmailNewCalls = request.policyMode === EMAIL_NEW_CALLS_V2_POLICY;
 
   if (actions.length !== expected.length) {
     return `${policyLabel} requires exactly one action for every fixed candidate.`;
@@ -2144,7 +2171,10 @@ function validateScheduledNewCallsPolicy(
     customer_request: "leave",
     server_down: "leave",
     manual_intake: "leave",
-    engineer_review: "update",
+    // Targeted email triage must not route a ticket away from New Calls just
+    // because its subject is technical. The full-queue policy retains the
+    // older engineer-review routing behaviour.
+    engineer_review: isEmailNewCalls ? "leave" : "update",
     resolve_no_action: "resolve",
   };
   const expectedReasonsByDisposition: Record<TriagePolicyDisposition, readonly TriagePolicyReason[]> = {
@@ -3776,55 +3806,15 @@ async function writeTicketOptionFieldsCache(
 
   ticketFieldOptionsCache.set(identity.memoryKey, entry);
 }
-function fieldOptionsRetryDelay(error: unknown, attempt: number): {
-  delayMs: number;
-  retryAfterPresent: boolean;
-  suppliedDelayMs?: number;
-  source: "retry-after" | "backoff";
-} {
-  const config = getExecutionConfig();
-  const retryAfterSeconds =
-    error instanceof SuperOpsHttpError || error instanceof SuperOpsError
-      ? error.retryAfter
-      : undefined;
-  if (typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds)) {
-    const suppliedDelayMs = Math.max(0, Math.ceil(retryAfterSeconds * 1000));
-    return {
-      delayMs: Math.min(config.maxSingleDelayMs, suppliedDelayMs),
-      retryAfterPresent: true,
-      suppliedDelayMs,
-      source: "retry-after",
-    };
-  }
-
-  const base = config.backoffBaseDelayMs * 2 ** Math.max(0, attempt - 1);
-  const jitter = config.backoffJitterRatio <= 0
-    ? 0
-    : base * config.backoffJitterRatio * Math.random();
-  return {
-    delayMs: Math.min(config.maxSingleDelayMs, Math.ceil(base + jitter)),
-    retryAfterPresent: false,
-    source: "backoff",
-  };
-}
-
-function sleep(ms: number): Promise<void> {
-  if (ms <= 0) return Promise.resolve();
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function getTicketOptionFieldsForTool(
   client: SuperOpsClientInstance,
   fieldNames: ValidatedTicketOptionField[]
 ): Promise<TicketOptionFieldsRetrieval> {
   const cacheIdentity = fieldOptionsCacheIdentity(fieldNames);
-  const config = getExecutionConfig();
-  const maxAttempts = Math.max(
-    1,
-    Math.min(FIELD_OPTIONS_MAX_INTERNAL_ATTEMPTS, config.maxReadRetryAttempts)
-  );
-  const startedMs = Date.now();
-  let attempts = 0;
+  // SuperOpsClient.query owns the bounded upstream retry policy. This helper
+  // deliberately performs one client call only; retrying here would multiply
+  // an already-exhausted client retry sequence and amplify a throttle.
+  const attempts = 1;
   let retryAfterPresent = false;
   let lastError: unknown;
 
@@ -3849,50 +3839,25 @@ async function getTicketOptionFieldsForTool(
     };
   }
 
-  while (attempts < maxAttempts) {
-    attempts += 1;
-    try {
-      const fields = await getTicketOptionFields(client, fieldNames);
-      await writeTicketOptionFieldsCache(cacheIdentity, fields);
-      return {
-        fields,
-        metadata: {
-          source: "fresh",
-          cacheStatus: cacheIdentity ? "miss" : "unavailable",
-          cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
-          attempts,
-          retried: attempts > 1,
-          rateLimited: false,
-          retryAfterPresent,
-        },
-      };
-    } catch (error) {
-      lastError = error;
-      if (!isRateLimitError(error) || attempts >= maxAttempts) break;
-      const retry = fieldOptionsRetryDelay(error, attempts);
-      retryAfterPresent ||= retry.retryAfterPresent;
-      const elapsedAfterDelay = Date.now() - startedMs + retry.delayMs;
-      if (
-        elapsedAfterDelay > config.maxRetryDurationMs ||
-        !hasExecutionBudgetFor(1) ||
-        elapsedAfterDelay + config.safeRemainingTimeMs >= config.maxDurationMs
-      ) {
-        break;
-      }
-      recordRetryDelay({
-        attempt: attempts,
-        source: retry.source,
-        retryAfterSupplied: retry.retryAfterPresent,
-        suppliedDelayMs: retry.suppliedDelayMs,
-        parsedDelayMs: retry.suppliedDelayMs ?? retry.delayMs,
-        cappedDelayMs: retry.delayMs,
-        actualDelayMs: retry.delayMs,
-        endpoint: FIELD_OPTIONS_RETRY_ENDPOINT,
-        operationType: "query",
-        operationName: "getFields",
-      });
-      await sleep(retry.delayMs);
-    }
+  try {
+    const fields = await getTicketOptionFields(client, fieldNames);
+    await writeTicketOptionFieldsCache(cacheIdentity, fields);
+    return {
+      fields,
+      metadata: {
+        source: "fresh",
+        cacheStatus: cacheIdentity ? "miss" : "unavailable",
+        cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
+        attempts,
+        retried: false,
+        rateLimited: false,
+        retryAfterPresent: false,
+      },
+    };
+  } catch (error) {
+    lastError = error;
+    retryAfterPresent = (error instanceof SuperOpsHttpError || error instanceof SuperOpsError) &&
+      typeof error.retryAfter === "number" && Number.isFinite(error.retryAfter);
   }
 
   const fallbackCacheLookup = isRateLimitError(lastError)
@@ -3926,6 +3891,10 @@ async function getTicketOptionFieldsForTool(
     rateLimited: isRateLimitError(lastError),
     attempts,
     retryAfterPresent,
+    retryAfterSeconds:
+      lastError instanceof SuperOpsHttpError || lastError instanceof SuperOpsError
+        ? lastError.retryAfter
+        : undefined,
     cacheEntryAvailable: fallbackCacheLookup.available,
     cacheEntryValid: fallbackCacheLookup.valid,
     cacheReadFailed: fallbackCacheLookup.readFailed,
@@ -10450,7 +10419,7 @@ export function getTicketsTools(): DomainTools {
       },      {
         name: "superops_tickets_apply_triage_plan",
         description:
-          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. scheduled-new-calls-v1 remains the existing standing contract. scheduled-new-calls-v2 adds required bounded historical assessment metadata and relevant-only HTML history sections without adding SuperOps history reads. Both modes enforce complete candidates, classification, client safety, private notes, verification, dedupe, and no unsafe overrides. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer.",
+          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. scheduled-new-calls-v1 remains the existing full-queue standing contract. scheduled-new-calls-v2 adds required bounded historical assessment metadata and relevant-only HTML history sections without adding SuperOps history reads. email-new-calls-v2 is the bounded email-trigger contract: every ticket needing human follow-up stays in New Calls via action leave, while only conclusively no-action items may resolve. All modes enforce complete candidates, classification, client safety, private notes, verification, dedupe, and no unsafe overrides. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer where the selected policy permits them.",
         inputSchema: {
           type: "object",
           properties: {
@@ -10465,7 +10434,7 @@ export function getTicketsTools(): DomainTools {
             policyMode: {
               type: "string",
               enum: [...TRIAGE_POLICY_MODES],
-              description: "Standing scheduled New Calls contract. v1 preserves the existing policy; v2 additionally requires bounded historyAssessment metadata and requires HTML history sections only when their state is relevant and supported. Both require an exact complete candidate/action set and reject the entire submission before any SuperOps work when an invariant is missing.",
+              description: "Standing New Calls contract. v1 and v2 preserve the existing full-queue policies; email-new-calls-v2 is for the bounded EMAIL trigger and requires all human-follow-up tickets to use leave so they remain in New Calls. V2 modes additionally require bounded historyAssessment metadata and relevant-only HTML history sections. Each mode requires an exact complete candidate/action set and rejects the entire submission before any SuperOps work when an invariant is missing.",
             },
             expectedCandidateTicketNumbers: {
               type: "array",

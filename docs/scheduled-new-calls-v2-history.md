@@ -3,7 +3,9 @@
 `scheduled-new-calls-v2` is a parallel contract for the existing durable
 `superops_tickets_apply_triage_plan` path. It does not replace or alter
 `scheduled-new-calls-v1`, and it does not make the SuperOps MCP call Supabase or
-the Ticket History connector.
+the Ticket History connector. The targeted email trigger uses the related
+`email-new-calls-v2` contract, which applies the same v2 history and safety
+rules while requiring all human-follow-up tickets to remain in `New Calls`.
 
 ## History boundary
 
@@ -90,6 +92,8 @@ the existing `superops_triage_emerging_issue_upsert` path. That upsert remains
 separate from the per-ticket apply plan and must not be used for same-client or
 same-requester recurrence.
 
-To roll back immediately, change the Agent policy mode back to
-`scheduled-new-calls-v1`. The v1 code path and its standing instruction remain
-unchanged.
+To roll back the targeted routing change, change the Agent policy mode back to
+`scheduled-new-calls-v2` only if the caller explicitly accepts the older
+`engineer_review` to `Awaiting Engineer` behaviour. To roll back the v2
+history contract, use `scheduled-new-calls-v1`. The v1 code path and its
+standing instruction remain unchanged.
