@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   assertExecutionBudget,
   classifyCloudflarePlatformLimit,
+  executionDiagnostics,
   executionConfigFromEnv,
   ExecutionCpuBudgetExceededError,
   getExecutionState,
@@ -161,6 +162,54 @@ describe("execution safety limits", () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  it("exposes a complete bounded mixed-provider request timeline without secrets", () => {
+    const trace = runWithExecutionConfig(
+      { SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED: "false" },
+      () => runWithExecutionContext("telemetry-trace-test", () => {
+        const superops = recordTypedSubrequestStart({
+          type: "initialRead",
+          operationType: "query",
+          operationName: "getTicketList",
+          endpoint: "https://api.superops.ai/msp?apiToken=secret-token",
+        });
+        recordSubrequestFinish(superops, 200, true, {
+          outcome: "success",
+          httpStatus: 200,
+          responseHadData: true,
+        });
+        const internal = recordTypedSubrequestStart({
+          type: "custom",
+          operationType: "durableObject",
+          operationName: "operationStoreRead",
+        });
+        recordSubrequestFinish(internal, "operationStoreRateLimited", false, {
+          outcome: "rate_limited",
+          rateLimited: true,
+        });
+        return executionDiagnostics()?.requestTrace;
+      })
+    );
+
+    expect(trace).toEqual([
+      expect.objectContaining({
+        provider: "superops",
+        endpointHost: "api.superops.ai",
+        httpStatus: 200,
+        outcome: "success",
+        responseHadData: true,
+      }),
+      expect.objectContaining({
+        provider: "internal",
+        operationType: "durableObject",
+        status: "operationStoreRateLimited",
+        outcome: "rate_limited",
+        rateLimited: true,
+      }),
+    ]);
+    expect(JSON.stringify(trace)).not.toContain("secret-token");
+    expect(JSON.stringify(trace)).not.toContain("apiToken");
   });
 
   it("stops cooperatively before the configured CPU guard", () => {

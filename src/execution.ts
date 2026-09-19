@@ -104,6 +104,8 @@ export interface SubrequestRecord {
   ok?: boolean;
   /** Host only; never persist a URL that could contain credentials. */
   endpoint?: string;
+  /** Set when the attempt finishes; retained for bounded diagnostic timelines. */
+  completedAt?: string;
   outcome?: SubrequestOutcome;
   errorClass?: string;
   httpStatus?: number;
@@ -641,6 +643,8 @@ export function recordSubrequestFinish(
   if (!started.record) return;
   started.record.status = status;
   started.record.ok = ok;
+  const completedAt = new Date().toISOString();
+  started.record.completedAt = completedAt;
   started.record.durationMs = Date.now() - started.startedMs;
   started.record.outcome = details.outcome ?? (ok ? "success" : "internal_error");
   started.record.errorClass = details.errorClass;
@@ -773,12 +777,23 @@ export function executionDiagnostics(): Record<string, unknown> | undefined {
   if (!state) return undefined;
   const requestTrace = state.requests.slice(0, 128).map((request) => ({
     index: request.index,
+    provider: request.endpoint ? "superops" : "internal",
     type: request.type,
     operationType: request.operationType,
     operationName: request.operationName,
     itemKey: request.itemKey,
-    status: request.status,
+    status: safeDiagnosticStatus(request.status),
     retryCount: request.retryCount,
+    startedAt: request.startedAt,
+    completedAt: request.completedAt,
+    endpointHost: request.endpoint,
+    httpStatus: request.httpStatus,
+    outcome: request.outcome,
+    errorClass: safeDiagnosticToken(request.errorClass),
+    graphqlCode: request.graphqlCode,
+    rateLimited: request.rateLimited,
+    retryAfterSupplied: request.retryAfterSupplied,
+    responseHadData: request.responseHadData,
     durationMs: request.durationMs,
     ok: request.ok,
   }));
@@ -847,6 +862,8 @@ function stateRequestsForLog(): Record<string, unknown>[] {
   return state.requests.map((request) => ({
     index: request.index,
     startedAt: request.startedAt,
+    completedAt: request.completedAt,
+    provider: request.endpoint ? "superops" : "internal",
     type: request.type,
     operationType: safeDiagnosticToken(request.operationType),
     operationName: safeDiagnosticToken(request.operationName),

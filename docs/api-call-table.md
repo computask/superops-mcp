@@ -23,6 +23,14 @@ to a known number in the tenant-scoped timeline view. Queue/metadata calls can
 legitimately have no single ticket number. `execution_trace_id`, `invocation_id`
 and `request_id` link to MCP diagnostics; a trigger batch ID is not invented.
 
+The triage response's bounded `mcpExecution.requestTrace` now carries the same
+safe mixed timeline for callback correlation: each entry identifies `provider`
+(`superops` or `internal`), start/finish timestamps, endpoint host, operation
+purpose/name, status, HTTP/GraphQL outcome, retry/rate-limit flags, and duration.
+The D1 table remains authoritative for the complete SuperOps-attempt history;
+internal Durable Object/service-binding/workflow entries are deliberately
+labelled separately and must not be counted as SuperOps API calls.
+
 Every call from this deployed MCP is instrumented, including non-Agent callers
 and continuations. Calls from other software using the same SuperOps tenant are
 outside this collector. No sampling is configured. Platform log truncation,
@@ -75,7 +83,11 @@ declarations are deliberately outside the main MCP compiler scope.
 Deploy collector using `wrangler.api-call-log.jsonc`; apply its D1 migrations
 before enabling the producer's `tail_consumers` binding. The collector has no
 SuperOps credentials or HTTP endpoint. Keep the existing producer runtime vars
-and routes when deploying. No Agent schema or prompt refresh is required.
+and routes when deploying. After deploying the MCP source, refresh the isolated
+trigger project's result-callback schema and published Agent instructions so
+they accept and copy the expanded safe request trace. Until that refresh is
+published, the private D1 table still captures the exact SuperOps attempts, but
+callback history may retain only the older aggregate telemetry.
 
 To stop capture immediately set collector `AUDIT_ENABLED=false`, or detach the
 producer's `tail_consumers`. The existing producer flag

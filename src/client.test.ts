@@ -89,14 +89,22 @@ describe("SuperOpsClient execution instrumentation", () => {
     expect(diagnostics?.requestTrace).toEqual([
       expect.objectContaining({
         index: 1,
+        provider: "superops",
         type: "initialRead",
         operationType: "query",
         operationName: "Test",
         status: 200,
         retryCount: 0,
+        endpointHost: "api.superops.ai",
+        httpStatus: 200,
+        outcome: "success",
+        responseHadData: true,
         ok: true,
       }),
     ]);
+    const request = (diagnostics?.requestTrace as Array<Record<string, unknown>> | undefined)?.[0];
+    expect(request?.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(request?.completedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(diagnostics?.requestTraceTruncated).toBe(false);
     expect(JSON.stringify(diagnostics)).not.toContain("secret-token");
   });
