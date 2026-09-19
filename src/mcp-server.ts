@@ -665,7 +665,11 @@ function enrichAuditMetadataFromResult(
 }
 
 function isTriageTelemetryTool(toolName: string): boolean {
-  return toolName === "superops_tickets_triage_snapshot" ||
+  return toolName === "superops_tickets_query" ||
+    toolName === "superops_tickets_get_safe" ||
+    toolName === "superops_tickets_get_safe_by_number" ||
+    toolName === "superops_tickets_field_options" ||
+    toolName === "superops_tickets_triage_snapshot" ||
     toolName === "superops_tickets_triage_evidence_recover" ||
     toolName === "superops_tickets_apply_triage_plan";
 }
