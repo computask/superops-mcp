@@ -59,6 +59,42 @@ All standard SuperOps traffic is one GraphQL POST per client attempt to the US o
 
 The maximum normal counted calls in an MCP invocation are therefore 37 with the committed 45/8 configuration. The dedicated harness uses 37 for its initial invocation and 12 for each deliberately constrained continuation invocation, and checks each invocation against its own effective budget.
 
+## Redacted per-attempt API telemetry
+
+The shared client now emits one `superops.api_call` JSON log event for every
+outbound attempt, including retries, and one `superops.api_retry` event when a
+retry is actually scheduled. These events are emitted from the SO MCP
+execution layer, where the real GraphQL operation and upstream response are
+known; the trigger Worker cannot provide this detail.
+
+The events contain only bounded operational metadata: invocation and
+execution-trace IDs, tool name, request purpose, GraphQL operation type/name,
+safe ticket item key when available, SuperOps endpoint host, attempt number,
+HTTP status, stable outcome/error class, GraphQL error code when it is a
+token-shaped provider code, rate-limit and `Retry-After` presence, retry
+cause/delay, response-data presence, and duration. Query documents, variables,
+request headers, response bodies, note text, customer content, API keys, and
+other credentials are never included. Endpoint values are reduced to the
+hostname before they enter the execution record or log.
+
+`SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED` controls these events and defaults to
+enabled; setting it to `false` is the immediate rollback switch. Wrangler
+observability is configured to persist Worker logs in Cloudflare's private
+observability platform. To watch the events live from the authenticated
+deployment, use:
+
+```powershell
+npx wrangler tail superops-mcp --format json --search "superops.api_call"
+npx wrangler tail superops-mcp --format json --search "rate_limited"
+```
+
+The private `superops-api-call-log` Tail Worker additionally persists start and
+finish metadata in D1, one row per actual SuperOps attempt, including retries
+and failures. It runs after the producing invocation, without a synchronous
+database write or additional SuperOps call in the triage path. The table and
+per-minute/ticket views have bounded retention; see [API call table](api-call-table.md)
+for access, completeness limitations, SQL queries and rollback.
+
 ## Mutation classification
 
 - Durable: `superops_tickets_apply_triage_plan`. Primary production write path; mutation type, target hash, note fingerprint/ID, response observation, fallback, checkpoint, and verification state are authoritative.

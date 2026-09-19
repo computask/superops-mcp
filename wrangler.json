@@ -12,6 +12,15 @@
     "crons": ["0 2 * * *"]
   },
   "keep_vars": true,
+  "tail_consumers": [{ "service": "superops-api-call-log" }],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true
+    }
+  },
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV",
@@ -52,6 +61,7 @@
     "SUPEROPS_OPERATION_RETENTION_SECONDS": "86400",
     "SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS": "21600",
     "SUPEROPS_EXECUTION_CONCURRENCY": "1",
+    "SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED": "true",
     "SUPEROPS_CONTINUATION_ENABLED": "true",
     "SUPEROPS_DURABLE_RETRY_ENABLED": "true",
     "SUPEROPS_EXECUTION_CPU_GUARD_MS": "20000",

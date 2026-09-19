@@ -413,8 +413,10 @@ For ticket triage, call `superops_tickets_triage_snapshot` with the exact config
 ### Scheduled New Calls Triage
 
 The standing daily New Calls workflow uses the same public mutation with
-`policyMode: "scheduled-new-calls-v1"`; it does not add or expose another write
-tool. This mode is intended for a separately authorised scheduled ChatGPT task
+`policyMode: "scheduled-new-calls-v1"` or the history-aware
+`policyMode: "scheduled-new-calls-v2"`; it does not add or expose another write
+tool. V2 additionally requires bounded `historyAssessment` metadata on every
+fixed action. These modes are intended for a separately authorised scheduled ChatGPT task
 and does not pause for a per-ticket approval table. Production rejects the whole
 submission before operation creation or SuperOps access unless actions exactly
 cover the fixed snapshot and every action has verified evidence, immutable New
@@ -435,8 +437,9 @@ terminal.
 `superops_tickets_apply_triage_plan` is a write/high-risk Phase 3 tool for
 applying a fixed snapshot candidate set. In manual mode, use it only after the
 Phase 2 pre-write table has been approved. The separately configured
-`scheduled-new-calls-v1` mode uses the standing policy authorization above and
-must satisfy its stricter production gate instead of pausing for per-ticket
+`scheduled-new-calls-v1` and `scheduled-new-calls-v2` modes use the standing
+policy authorization above and must satisfy their stricter production gates
+instead of pausing for per-ticket
 approval. The tool requires
 `expectedCandidateTicketNumbers` and returns a result for every
 expected ticket even when no action is supplied. To resume an existing nonterminal
