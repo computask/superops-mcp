@@ -719,7 +719,7 @@ function safeFailureDiagnosticMessage(value: unknown): string | undefined {
     .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
     .replace(/((?:token|secret|password|api[_-]?key|authorization|cookie)\s*[:=]\s*)\S+/gi, "$1[redacted]")
     .replace(/https?:\/\/\S+/gi, "[redacted-url]")
-    .replace(/[A-Za-z]:\\[^\s)\"']+/g, "[redacted-path]")
+    .replace(/[A-Za-z]:\\[^\s)"']+/g, "[redacted-path]")
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")
     .replace(/\b(subject|description|content|note|requester|client|company|customer)\s*[:=]\s*[^;]+/gi, "$1: [redacted]");
   return message.length > 512 ? `${message.slice(0, 512)}...` : message;
