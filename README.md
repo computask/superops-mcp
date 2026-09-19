@@ -413,10 +413,8 @@ For ticket triage, call `superops_tickets_triage_snapshot` with the exact config
 ### Scheduled New Calls Triage
 
 The standing daily New Calls workflow uses the same public mutation with
-`policyMode: "scheduled-new-calls-v1"` or the history-aware
-`policyMode: "scheduled-new-calls-v2"`; it does not add or expose another write
-tool. V2 additionally requires bounded `historyAssessment` metadata on every
-fixed action. These modes are intended for a separately authorised scheduled ChatGPT task
+`policyMode: "scheduled-new-calls-v1"`; it does not add or expose another write
+tool. This mode is intended for a separately authorised scheduled ChatGPT task
 and does not pause for a per-ticket approval table. Production rejects the whole
 submission before operation creation or SuperOps access unless actions exactly
 cover the fixed snapshot and every action has verified evidence, immutable New
@@ -432,14 +430,39 @@ reuse of an accurate existing private triage summary for note dedupe, one full
 submission, and durable follow-through or same-operation compact recovery until
 terminal.
 
+The isolated v7 contract adds the parallel
+`policyMode: "scheduled-new-calls-v2"`. V2 keeps the same fixed-candidate and
+durable write path, but requires bounded `historyAssessment` metadata for every
+candidate. Its HTML note contains the required triage sections plus only the
+history sections that are supported and relevant; unavailable, degraded,
+unknown, no-match, and no-solution states do not create empty history sections.
+The history connector is
+outside this MCP boundary: v2 never calls Supabase or Ticket History and adds
+no SuperOps history reads. It distinguishes recurrence, observed historical
+solutions, post-solution recurrence, cross-client signals and emerging issue
+signals, with explicit `unknown`/`degraded` states. Credible cross-client
+signals require at least two verified clients. See
+[`docs/scheduled-new-calls-v2-history.md`](docs/scheduled-new-calls-v2-history.md).
+Switching the Agent policy back to v1 is the immediate rollback.
+
+The targeted email trigger uses the additional
+`policyMode: "email-new-calls-v2"`. It keeps the same v2 history, evidence,
+stale-write, note-deduplication and durable continuation safeguards, but adds a
+hard routing rule: any email ticket that needs a human reply, clarification,
+investigation or follow-up must use `leave` and remain in `New Calls`, even when
+the subject is technical. Only a conclusively no-action email may use
+`resolve` and move to `Resolved`. The existing full-queue scheduled policies
+retain their separate `engineer_review` routing behaviour.
+
 ### Approved Triage Plan Execution
 
 `superops_tickets_apply_triage_plan` is a write/high-risk Phase 3 tool for
 applying a fixed snapshot candidate set. In manual mode, use it only after the
 Phase 2 pre-write table has been approved. The separately configured
-`scheduled-new-calls-v1` and `scheduled-new-calls-v2` modes use the standing
-policy authorization above and must satisfy their stricter production gates
-instead of pausing for per-ticket
+`scheduled-new-calls-v1`, `scheduled-new-calls-v2`, and targeted
+`email-new-calls-v2` modes use the standing
+policy authorization above and
+must satisfy its stricter production gate instead of pausing for per-ticket
 approval. The tool requires
 `expectedCandidateTicketNumbers` and returns a result for every
 expected ticket even when no action is supplied. To resume an existing nonterminal

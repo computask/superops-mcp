@@ -25,6 +25,7 @@ import {
   classifyTool,
   errorSummaryFromResult,
   sanitizeError,
+  sanitizeText,
   sanitizeToolResult,
   toolAuditMetadata,
   type ToolResult,
@@ -32,6 +33,7 @@ import {
   type AuditMetadata,
 } from "./audit.js";
 import {
+  executionDiagnostics,
   finishExecution,
   logExecutionDiagnostics,
   runWithExecutionContext,
@@ -186,12 +188,31 @@ export async function blockedToolNamesByCategory(
 const CHATGPT_DIRECT_TRIAGE_PLAN_TOOL_NAME = "superops_tickets_apply_triage_plan";
 const CHATGPT_DIRECT_OPERATION_CANCEL_TOOL_NAME = "superops_operations_cancel";
 const CHATGPT_DIRECT_SCRIPT_EXECUTION_TOOL_NAME = "superops_scripts_execute_on_asset";
+const CHATGPT_DIRECT_NAVIGATION_TOOL_NAME = "superops_navigate";
+
+// API-triggered triage must start from its trusted half-open time window. Keep
+// the normal direct read surface available by default, but allow production to
+// opt into a smaller catalogue that removes broad/preparation reads which can
+// otherwise add an unnecessary discovery turn or queue-wide SuperOps call.
+const CHATGPT_DIRECT_TARGETED_TRIAGE_BLOCKED_TOOL_NAMES = [
+  "superops_status",
+  "superops_test_connection",
+  "superops_operations_get",
+  "superops_operations_results",
+  "superops_operations_cancel",
+  "superops_tickets_list",
+  "superops_tickets_recent",
+  "superops_tickets_created_between",
+  "superops_tickets_report",
+  "superops_tickets_triage_snapshot",
+] as const;
 
 export type ChatGptDirectToolPolicy = {
   generalMutatingToolsAllowed?: boolean;
   customMutationsAllowed?: boolean;
   reviewedTriagePlanAllowed?: boolean;
   scriptExecutionAllowed?: boolean;
+  targetedTriageOnly?: boolean;
 };
 
 /**
@@ -213,6 +234,10 @@ export async function chatGptDirectBlockedToolNames(
   }
 
   const blocked = await blockedToolNamesByCategory(categories);
+  // Navigation only describes tools that are already exposed by tools/list.
+  // Blocking it on the direct route prevents an avoidable discovery turn in
+  // API-triggered automation while leaving the actual read/write tools intact.
+  blocked.add(CHATGPT_DIRECT_NAVIGATION_TOOL_NAME);
   if (policy.reviewedTriagePlanAllowed === true) {
     blocked.delete(CHATGPT_DIRECT_TRIAGE_PLAN_TOOL_NAME);
     blocked.delete(CHATGPT_DIRECT_OPERATION_CANCEL_TOOL_NAME);
@@ -224,6 +249,13 @@ export async function chatGptDirectBlockedToolNames(
     blocked.delete(CHATGPT_DIRECT_SCRIPT_EXECUTION_TOOL_NAME);
   } else {
     blocked.add(CHATGPT_DIRECT_SCRIPT_EXECUTION_TOOL_NAME);
+  }
+  // Apply this last so the targeted catalogue remains authoritative even when
+  // a broader direct-route policy has explicitly enabled operation controls.
+  if (policy.targetedTriageOnly === true) {
+    for (const toolName of CHATGPT_DIRECT_TARGETED_TRIAGE_BLOCKED_TOOL_NAMES) {
+      blocked.add(toolName);
+    }
   }
   return blocked;
 }
@@ -573,7 +605,7 @@ function enrichAuditMetadataFromResult(
   result: ToolResult,
   metadata: AuditMetadata | undefined
 ): AuditMetadata | undefined {
-  if (toolName !== "superops_tickets_triage_snapshot" || result.isError) {
+  if (result.isError) {
     return metadata;
   }
 
@@ -587,21 +619,234 @@ function enrichAuditMetadataFromResult(
       source?: { status?: unknown; page?: unknown; max?: unknown };
       initialCandidateCount?: unknown;
       candidateTicketNumbers?: unknown;
+      operation?: {
+        state?: unknown;
+        complete?: unknown;
+        continuationRequired?: unknown;
+      };
+      results?: Array<{
+        finalOutcome?: unknown;
+        failureStage?: unknown;
+      }>;
     };
-    return {
-      ...metadata,
-      triageSnapshot: {
-        status: parsed.source?.status,
-        page: parsed.source?.page,
-        max: parsed.source?.max,
-        candidateCount: parsed.initialCandidateCount,
-        ticketNumbers: parsed.candidateTicketNumbers,
-        safeRead: true,
-      },
-    };
+    if (toolName === "superops_tickets_triage_snapshot") {
+      return {
+        ...metadata,
+        triageSnapshot: {
+          status: parsed.source?.status,
+          page: parsed.source?.page,
+          max: parsed.source?.max,
+          candidateCount: parsed.initialCandidateCount,
+          ticketNumbers: parsed.candidateTicketNumbers,
+          safeRead: true,
+        },
+      };
+    }
+    if (toolName === "superops_tickets_apply_triage_plan") {
+      const results = Array.isArray(parsed.results) ? parsed.results : [];
+      return {
+        ...metadata,
+        triageApply: {
+          operationState: parsed.operation?.state,
+          complete: parsed.operation?.complete,
+          continuationRequired: parsed.operation?.continuationRequired,
+          finalOutcomes: results.map((item) => item.finalOutcome),
+          failureStages: results
+            .map((item) => item.failureStage)
+            .filter((stage) => typeof stage === "string" && stage.length > 0),
+        },
+      };
+    }
+    return metadata;
   } catch {
     return metadata;
   }
+}
+
+function isTriageTelemetryTool(toolName: string): boolean {
+  return toolName === "superops_tickets_triage_snapshot" ||
+    toolName === "superops_tickets_triage_evidence_recover" ||
+    toolName === "superops_tickets_apply_triage_plan";
+}
+
+function safeRetryTrace(details: unknown): unknown[] | undefined {
+  if (!Array.isArray(details)) return undefined;
+  return details.flatMap((value) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+    const item = value as Record<string, unknown>;
+    const required = [
+      "attempt",
+      "source",
+      "retryAfterSupplied",
+      "parsedDelayMs",
+      "cappedDelayMs",
+      "actualDelayMs",
+    ];
+    if (!required.every((key) => key in item)) return [];
+    return [{
+      attempt: item.attempt,
+      source: item.source,
+      retryAfterSupplied: item.retryAfterSupplied,
+      suppliedDelayMs: item.suppliedDelayMs,
+      parsedDelayMs: item.parsedDelayMs,
+      cappedDelayMs: item.cappedDelayMs,
+      actualDelayMs: item.actualDelayMs,
+      operationName: item.operationName,
+      itemKey: item.itemKey,
+    }];
+  });
+}
+
+const SAFE_FAILURE_DIAGNOSTIC_TOKEN = /^[A-Za-z0-9._:-]{1,128}$/;
+const SAFE_FAILURE_DIAGNOSTIC_OPERATION = /^[A-Za-z_][A-Za-z0-9_]{0,96}$/;
+const SAFE_FAILURE_DIAGNOSTIC_ITEM = /^[A-Za-z0-9._:#-]{1,128}$/;
+
+function safeFailureDiagnosticToken(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_FAILURE_DIAGNOSTIC_TOKEN.test(value)
+    ? value
+    : undefined;
+}
+
+function safeFailureDiagnosticMessage(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  let message = sanitizeText(value)
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (message.length === 0) return undefined;
+  message = message
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/((?:token|secret|password|api[_-]?key|authorization|cookie)\s*[:=]\s*)\S+/gi, "$1[redacted]")
+    .replace(/https?:\/\/\S+/gi, "[redacted-url]")
+    .replace(/[A-Za-z]:\\[^\s)\"']+/g, "[redacted-path]")
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")
+    .replace(/\b(subject|description|content|note|requester|client|company|customer)\s*[:=]\s*[^;]+/gi, "$1: [redacted]");
+  return message.length > 512 ? `${message.slice(0, 512)}...` : message;
+}
+
+function triageFailureDiagnostics(
+  toolName: string,
+  result: ToolResult,
+  diagnostics: Record<string, unknown>,
+): Array<Record<string, unknown>> | undefined {
+  const entries: Array<Record<string, unknown>> = [];
+  const requestTrace = Array.isArray(diagnostics.requestTrace)
+    ? diagnostics.requestTrace.filter(
+      (value): value is Record<string, unknown> =>
+        typeof value === "object" && value !== null && !Array.isArray(value),
+    )
+    : [];
+  const failedRequest = [...requestTrace].reverse().find((request) =>
+    request.ok === false ||
+    (typeof request.status === "number" && request.status >= 400) ||
+    request.status === "networkError" ||
+    request.status === "requestTimeout",
+  );
+
+  if (result.isError) {
+    const diagnostic: Record<string, unknown> = {
+      stage: "mcp_tool",
+      message: safeFailureDiagnosticMessage(errorSummaryFromResult(result)),
+    };
+    if (failedRequest) {
+      if (typeof failedRequest.status === "number") diagnostic.httpStatus = failedRequest.status;
+      if (typeof failedRequest.index === "number") diagnostic.requestIndex = failedRequest.index;
+      if (typeof failedRequest.operationName === "string" && SAFE_FAILURE_DIAGNOSTIC_OPERATION.test(failedRequest.operationName)) {
+        diagnostic.operationName = failedRequest.operationName;
+      }
+      if (typeof failedRequest.itemKey === "string" && SAFE_FAILURE_DIAGNOSTIC_ITEM.test(failedRequest.itemKey)) {
+        diagnostic.itemKey = failedRequest.itemKey;
+      }
+    }
+    if (diagnostic.message !== undefined || diagnostic.httpStatus !== undefined) {
+      entries.push(diagnostic);
+    }
+  }
+
+  if (toolName === "superops_tickets_apply_triage_plan") {
+    const text = result.content.find((item) => item.type === "text")?.text;
+    if (text) {
+      try {
+        const parsed = JSON.parse(text) as { results?: unknown };
+        if (Array.isArray(parsed.results)) {
+          for (const value of parsed.results) {
+            if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+            const item = value as Record<string, unknown>;
+            const stage = safeFailureDiagnosticToken(item.failureStage);
+            const errorType = safeFailureDiagnosticToken(
+              item.primaryGraphqlClassification ?? item.terminalFailureClass ?? item.initialFailureClass,
+            );
+            const errorCode = safeFailureDiagnosticToken(
+              item.primaryGraphqlCode ?? item.terminalFailureClass ?? item.terminalReason,
+            );
+            const message = safeFailureDiagnosticMessage(
+              item.failureReason ?? item.terminalFailureReason ?? item.initialFailureReason,
+            );
+            const itemKey = typeof item.ticketNumber === "string" && SAFE_FAILURE_DIAGNOSTIC_ITEM.test(item.ticketNumber)
+              ? item.ticketNumber
+              : undefined;
+            if (stage === undefined && errorType === undefined && errorCode === undefined && message === undefined) continue;
+            entries.push({
+              ...(stage === undefined ? {} : { stage }),
+              ...(errorType === undefined ? {} : { errorType }),
+              ...(errorCode === undefined ? {} : { errorCode }),
+              ...(message === undefined ? {} : { message }),
+              ...(itemKey === undefined ? {} : { itemKey }),
+            });
+            if (entries.length >= 32) break;
+          }
+        }
+      } catch {
+        // The normal tool-result sanitizer already handles malformed text;
+        // diagnostic telemetry remains optional and bounded.
+      }
+    }
+  }
+
+  return entries.length > 0 ? entries.slice(0, 32) : undefined;
+}
+
+function appendTriageExecutionTelemetry(
+  toolName: string,
+  result: ToolResult,
+): ToolResult {
+  if (!isTriageTelemetryTool(toolName)) return result;
+  const diagnostics = executionDiagnostics();
+  if (!diagnostics) return result;
+
+  const subrequests = diagnostics.subrequests as {
+    used?: unknown;
+    budget?: unknown;
+    safetyMargin?: unknown;
+  } | undefined;
+  const retries = diagnostics.retries as {
+    count?: unknown;
+    details?: unknown;
+  } | undefined;
+  const trace = {
+    executionTraceId: diagnostics.executionTraceId,
+    invocationId: diagnostics.invocationId,
+    operationId: diagnostics.operationId,
+    toolName: diagnostics.toolName,
+    durationMs: diagnostics.durationMs,
+    subrequestsUsed: subrequests?.used,
+    subrequestBudget: subrequests?.budget,
+    subrequestSafetyMargin: subrequests?.safetyMargin,
+    retryCount: retries?.count,
+    requestsByType: diagnostics.requestsByType,
+    requestTrace: diagnostics.requestTrace,
+    requestTraceTruncated: diagnostics.requestTraceTruncated,
+    retryTrace: safeRetryTrace(retries?.details),
+    failureDiagnostics: triageFailureDiagnostics(toolName, result, diagnostics),
+  };
+
+  return {
+    ...result,
+    content: [
+      ...result.content,
+      { type: "text", text: JSON.stringify({ mcpExecution: trace }) },
+    ],
+  };
 }
 
 /**
@@ -663,7 +908,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           metadata,
         });
         logExecutionDiagnostics(!result.isError, errorSummary);
-        return result as never;
+        return appendTriageExecutionTelemetry(name, result) as never;
       } catch (error) {
         const result = errorResult(sanitizeError(error));
         const errorSummary = errorSummaryFromResult(result);
@@ -676,7 +921,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           metadata,
         });
         logExecutionDiagnostics(false, errorSummary);
-        return result as never;
+        return appendTriageExecutionTelemetry(name, result) as never;
       }
     });
   });

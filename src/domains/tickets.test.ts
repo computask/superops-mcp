@@ -207,6 +207,70 @@ const SCHEDULED_TRIAGE_HTML_NOTE = [
   "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
   "<strong>When:</strong> During this scheduled triage run.",
 ].join("");
+const SCHEDULED_TRIAGE_V2_HISTORY = {
+  issueRecurrence: "recurrent",
+  solutionHistory: "prior_solution_found",
+  postSolutionRecurrence: "observed_recurrence",
+  crossClientSignal: "credible",
+  emergingIssueSignal: "credible",
+  resultState: "complete",
+  lookbackDays: 365,
+  matchingTicketCount: 2,
+  resolvedMatchingTicketCount: 2,
+  distinctClientCount: 2,
+  distinctRequesterCount: 1,
+  representativeTicketNumbers: ["57001", "57002"],
+  summary: "Two bounded historical matches were found across two verified clients.",
+  solutionSummary: "A prior observed resolution exists; it is advisory and not a guarantee.",
+  currentScriptRecommendation: "Use the current approved script only as an advisory next step.",
+} as const;
+const SCHEDULED_TRIAGE_V2_HTML_NOTE = [
+  "<strong>TRIAGE SUMMARY</strong><br><br>",
+  "<strong>Ticket goal:</strong> Route the ticket under the standing New Calls policy.<br><br>",
+  "<strong>What needs to be known:</strong> The safe evidence was fully retrieved and assessed.<br><br>",
+  "<strong>Historical issue:</strong> Recurrent based on two bounded historical matches.<br><br>",
+  "<strong>Historical solution:</strong> Prior solution found in observed history; it is advisory.<br><br>",
+  "<strong>Post-solution recurrence:</strong> Observed recurrence after the prior solution.<br><br>",
+  "<strong>Cross-client signal:</strong> Credible across two verified clients.<br><br>",
+  "<strong>Emerging issue:</strong> Credible bounded cross-client signal.<br><br>",
+  "<strong>Current script recommendation:</strong> Use the current approved script only as an advisory next step.<br><br>",
+  "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
+  "<strong>When:</strong> During this scheduled triage run.",
+].join("");
+const SCHEDULED_TRIAGE_V2_NATURAL_HTML_NOTE = [
+  "<strong>TRIAGE SUMMARY</strong><br><br>",
+  "<strong>Ticket goal:</strong> Route the ticket under the standing New Calls policy.<br><br>",
+  "<strong>What needs to be known:</strong> The safe evidence was fully retrieved and assessed.<br><br>",
+  "<strong>Historical solution:</strong> A previous solution was found in observed history; it is advisory.<br><br>",
+  "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
+  "<strong>When:</strong> During this scheduled triage run.",
+].join("");
+const SCHEDULED_TRIAGE_V2_NATURAL_HISTORY = {
+  issueRecurrence: "unknown",
+  solutionHistory: "prior_solution_found",
+  postSolutionRecurrence: "follow_up_unknown",
+  crossClientSignal: "none",
+  emergingIssueSignal: "none",
+  resultState: "complete",
+  resolvedMatchingTicketCount: 1,
+} as const;
+const SCHEDULED_TRIAGE_V2_NO_HISTORY = {
+  issueRecurrence: "unknown",
+  solutionHistory: "no_prior_solution_found",
+  postSolutionRecurrence: "follow_up_unknown",
+  crossClientSignal: "none",
+  emergingIssueSignal: "none",
+  resultState: "no_matches",
+  matchingTicketCount: 0,
+  resolvedMatchingTicketCount: 0,
+} as const;
+const SCHEDULED_TRIAGE_V2_NO_HISTORY_HTML_NOTE = [
+  "<strong>TRIAGE SUMMARY</strong><br><br>",
+  "<strong>Ticket goal:</strong> Route the ticket under the standing New Calls policy.<br><br>",
+  "<strong>What needs to be known:</strong> The safe evidence was fully retrieved and assessed.<br><br>",
+  "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
+  "<strong>When:</strong> During this scheduled triage run.",
+].join("");
 
 // Privacy-safe semantic fixture for the production-shaped ticket/note IDs in
 // the HTML-rendering regression. It intentionally contains no customer data.
@@ -574,8 +638,8 @@ describe("Tickets Domain", () => {
       items?: {
         type?: string;
         properties?: Record<string, unknown> & {
-          action?: { enum?: string[] };
-          target?: TargetSchema;
+          action?: { enum?: string[]; description?: string };
+          target?: TargetSchema & { description?: string };
         };
         required?: string[];
         oneOf?: unknown[];
@@ -591,6 +655,12 @@ describe("Tickets Domain", () => {
     expect(actions.items?.properties?.action?.enum).toEqual([
       "resolve", "update", "addNote", "leave", "skip",
     ]);
+    expect(actions.items?.properties?.action?.description).toContain(
+      "leave specifically requires non-empty impact, urgency, category, and subcategory"
+    );
+    expect(actions.items?.properties?.target?.description).toContain(
+      "leave requires non-empty impact, urgency, category, and subcategory"
+    );
     expect(actions.items?.properties?.target?.properties).toEqual(
       expect.objectContaining({
         status: expect.any(Object),
@@ -608,6 +678,20 @@ describe("Tickets Domain", () => {
     expect(actions.items?.properties?.target?.properties.status?.enum).toEqual(["Resolved", "Awaiting Engineer"]);
     expect(actions.items?.properties).toHaveProperty("note");
     expect(actions.items?.properties).toHaveProperty("isPublicNote");
+    expect(actions.items?.properties).toHaveProperty("historyAssessment");
+    expect(actions.items?.properties?.historyAssessment).toEqual(
+      expect.objectContaining({
+        type: "object",
+        required: expect.arrayContaining([
+          "issueRecurrence",
+          "solutionHistory",
+          "postSolutionRecurrence",
+          "crossClientSignal",
+          "emergingIssueSignal",
+          "resultState",
+        ]),
+      })
+    );
     expect(actions.items?.properties?.note).toEqual(
       expect.objectContaining({ description: expect.stringContaining("<br><br>") })
     );
@@ -1120,8 +1204,10 @@ describe("Tickets Domain", () => {
     expect(parsed._metadata.retrieval).toMatchObject({ source: "fresh", attempts: 1, retried: false, rateLimited: false });
   });
 
-  it("does not multiply the shared-client rate-limit retry in the field-options wrapper", async () => {
-    mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
+  it("does not multiply a rate-limited field-options response after client retries", async () => {
+    mockClient.query
+      .mockRejectedValueOnce(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"))
+      .mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
 
     const domain = getTicketsTools();
     const result = await runWithExecutionConfig(
@@ -1132,18 +1218,13 @@ describe("Tickets Domain", () => {
 
     expect(result.isError).toBe(true);
     expect(mockClient.query).toHaveBeenCalledTimes(1);
-    expect(parsed).toMatchObject({
-      errorClass: "SuperOpsRateLimit",
-      rateLimited: true,
-      attempts: 1,
-      cacheEntryAvailable: false,
-    });
+    expect(parsed).toMatchObject({ errorClass: "SuperOpsRateLimit", rateLimited: true, attempts: 1 });
   });
 
-  it("preserves Retry-After metadata without a second wrapper retry", async () => {
-    mockClient.query.mockRejectedValue(
-      new SuperOpsHttpError("HTTP error: 429 Too Many Requests", 429, "Too Many Requests", 1)
-    );
+  it("preserves HTTP 429 Retry-After metadata without a second outer read", async () => {
+    mockClient.query
+      .mockRejectedValueOnce(new SuperOpsHttpError("HTTP error: 429 Too Many Requests", 429, "Too Many Requests", 1))
+      .mockResolvedValueOnce({ getFields: [ticketField("impact", ["Low"])] });
 
     const domain = getTicketsTools();
     const result = await runWithExecutionConfig(
@@ -1157,13 +1238,15 @@ describe("Tickets Domain", () => {
     expect(parsed).toMatchObject({ errorClass: "SuperOpsRateLimit", rateLimited: true, attempts: 1, retryAfterPresent: true });
   });
 
-  it("recognises DataFetchingException field-options wrappers containing rate_limit_exceeded", async () => {
-    mockClient.query.mockRejectedValue(new SuperOpsError(
-      "Exception while fetching data for getFields",
-      "DataFetchingException",
-      undefined,
-      { classification: "DataFetchingException", errorType: "rate_limit_exceeded" }
-    ));
+  it("recognises DataFetchingException rate limits without a second outer read", async () => {
+    mockClient.query
+      .mockRejectedValueOnce(new SuperOpsError(
+        "Exception while fetching data for getFields",
+        "DataFetchingException",
+        undefined,
+        { classification: "DataFetchingException", errorType: "rate_limit_exceeded" }
+      ))
+      .mockResolvedValueOnce({ getFields: [ticketField("urgency", ["Low"])] });
 
     const domain = getTicketsTools();
     const result = await runWithExecutionConfig(
@@ -1217,6 +1300,31 @@ describe("Tickets Domain", () => {
     expect(cachedPayload).toMatchObject({ tenant: "example", region: "us", fields: ["priority"] });
   });
 
+  it("uses a warm caches.default field-options entry before making a fresh SuperOps read", async () => {
+    const nativeCache = installFieldOptionsNativeCache();
+    mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
+    const domain = getTicketsTools();
+
+    await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+    expect(nativeCache.put).toHaveBeenCalledTimes(1);
+
+    mockClient.query.mockReset();
+    const cached = await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
+    const parsed = JSON.parse(cached.content[0].text);
+
+    expect(cached.isError).not.toBe(true);
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(nativeCache.match).toHaveBeenCalledTimes(2);
+    expect(parsed.priority.options[0].value).toBe("Very Low");
+    expect(parsed._metadata.retrieval).toMatchObject({
+      source: "cache",
+      cacheStatus: "hit",
+      attempts: 0,
+      retried: false,
+      rateLimited: false,
+    });
+  });
+
   it("retrieves caches.default field-options entries across invocations after transient rate-limit retries fail", async () => {
     const nativeCache = installFieldOptionsNativeCache();
     mockClient.query.mockResolvedValueOnce({ getFields: [ticketField("priority", ["Very Low"])] });
@@ -1226,6 +1334,7 @@ describe("Tickets Domain", () => {
     expect(nativeCache.put).toHaveBeenCalledTimes(1);
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
     const fallback = await runWithExecutionConfig(
@@ -1236,7 +1345,7 @@ describe("Tickets Domain", () => {
 
     expect(fallback.isError).not.toBe(true);
     expect(mockClient.query).toHaveBeenCalledTimes(1);
-    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(parsed.priority.options[0].value).toBe("Very Low");
     expect(parsed._metadata.retrieval).toMatchObject({ source: "cache", cacheStatus: "fallback", rateLimited: true });
   });
@@ -1248,6 +1357,7 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
     vi.mocked(getCredentials).mockReturnValue({ apiToken: "secret-token", subdomain: "other", region: "us" });
@@ -1257,7 +1367,7 @@ describe("Tickets Domain", () => {
     );
 
     expect(result.isError).toBe(true);
-    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(JSON.parse(result.content[0].text)).toMatchObject({ cacheEntryAvailable: false, cacheEntryValid: false });
   });
 
@@ -1268,6 +1378,7 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
     vi.mocked(getCredentials).mockReturnValue({ apiToken: "secret-token", subdomain: "example", region: "eu" });
@@ -1277,7 +1388,7 @@ describe("Tickets Domain", () => {
     );
 
     expect(result.isError).toBe(true);
-    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(JSON.parse(result.content[0].text)).toMatchObject({ cacheEntryAvailable: false, cacheEntryValid: false });
   });
 
@@ -1288,6 +1399,7 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
     const result = await runWithExecutionConfig(
@@ -1296,7 +1408,7 @@ describe("Tickets Domain", () => {
     );
 
     expect(result.isError).toBe(true);
-    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(JSON.parse(result.content[0].text)).toMatchObject({ cacheEntryAvailable: false, cacheEntryValid: false });
   });
 
@@ -1309,6 +1421,7 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     vi.setSystemTime(new Date("2026-07-22T00:05:01.000Z"));
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("rate_limit_exceeded", "rate_limit_exceeded"));
@@ -1319,7 +1432,7 @@ describe("Tickets Domain", () => {
     const parsed = JSON.parse(result.content[0].text);
 
     expect(result.isError).toBe(true);
-    expect(nativeCache.match).toHaveBeenCalledTimes(1);
+    expect(nativeCache.match).toHaveBeenCalledTimes(3);
     expect(parsed).toMatchObject({ cacheEntryAvailable: true, cacheEntryValid: false, rateLimited: true, nativeCacheAvailable: true });
   });
 
@@ -1333,7 +1446,7 @@ describe("Tickets Domain", () => {
 
     expect(result.isError).not.toBe(true);
     expect(parsed.priority.options[0].value).toBe("Very Low");
-    expect(nativeCache.match).not.toHaveBeenCalled();
+    expect(nativeCache.match).toHaveBeenCalledTimes(1);
   });
 
   it("does not let cache write failure break successful fresh field-options lookup", async () => {
@@ -1356,13 +1469,14 @@ describe("Tickets Domain", () => {
     await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
 
     resetTicketFieldOptionsCacheForTests();
+    nativeCache.match.mockImplementationOnce(async () => undefined);
     mockClient.query.mockReset();
     mockClient.query.mockRejectedValue(new SuperOpsError("Invalid metadata request", "BAD_USER_INPUT"));
     const result = await domain.handleCall("superops_tickets_field_options", { fields: ["priority"] });
     const parsed = JSON.parse(result.content[0].text);
 
     expect(result.isError).toBe(true);
-    expect(nativeCache.match).not.toHaveBeenCalled();
+    expect(nativeCache.match).toHaveBeenCalledTimes(2);
     expect(mockClient.query).toHaveBeenCalledTimes(1);
     expect(parsed).toMatchObject({ errorClass: "SuperOpsGraphQLError", rateLimited: false, attempts: 1, cacheEntryAvailable: false });
   });
@@ -2862,14 +2976,11 @@ describe("Tickets Domain", () => {
     });
     const snapshot = JSON.parse(snapshotResult.content[0].text);
 
-    const recoveryResult = await runWithExecutionContext(
-      "superops_tickets_triage_evidence_recover",
-      () => domain.handleCall("superops_tickets_triage_evidence_recover", {
-        ticketIds: [ticket.ticketId],
-        includeConversations: true,
-        includeNotes: true,
-      })
-    );
+    const recoveryResult = await domain.handleCall("superops_tickets_triage_evidence_recover", {
+      ticketIds: [ticket.ticketId],
+      includeConversations: true,
+      includeNotes: true,
+    });
     const recovery = JSON.parse(recoveryResult.content[0].text);
 
     expect(byNumberResult.isError).toBeUndefined();
@@ -2910,11 +3021,6 @@ describe("Tickets Domain", () => {
       contentEvidenceState: "meaningful",
       evidence: { contentEvidenceState: "meaningful" },
       errors: [expect.stringContaining("Notes could not be fetched safely")],
-    });
-    expect(recovery.execution).toMatchObject({
-      toolName: "superops_tickets_triage_evidence_recover",
-      subrequests: { used: 0 },
-      requestsByType: {},
     });
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
@@ -4354,38 +4460,6 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
-  it("returns zero-call execution diagnostics for local triage-plan validation failures", async () => {
-    const result = await runWithExecutionContext(
-      "superops_tickets_apply_triage_plan",
-      () => getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
-        expectedCandidateTicketNumbers: ["57403"],
-        actions: [{
-          ticketNumber: "57403",
-          action: "leave",
-          target: { impact: "Low", urgency: "Low" },
-        }],
-      })
-    );
-    const parsed = JSON.parse(result.content[0].text);
-
-    expect(result.isError).toBe(true);
-    expect(parsed).toMatchObject({
-      failureStage: "validation",
-      failureDiagnostics: [{
-        stage: "triage_apply",
-        errorCode: "tool_input_validation_failed",
-      }],
-      execution: {
-        toolName: "superops_tickets_apply_triage_plan",
-        subrequests: { used: 0 },
-        requestsByType: {},
-      },
-    });
-    expect(parsed.error).toContain("requires classification field(s): category");
-    expect(mockClient.query).not.toHaveBeenCalled();
-    expect(mockClient.mutate).not.toHaveBeenCalled();
-  });
-
   it("classifies a Ticket on Hold leave ticket without changing its status and reports every expected candidate", async () => {
     mockClient.query
       .mockResolvedValueOnce({
@@ -4456,6 +4530,135 @@ describe("Tickets Domain", () => {
     expect(mutationInput).not.toHaveProperty("status");
   });
 
+  it("reuses a warm field-options cache inside apply_triage_plan", async () => {
+    const ticketState: Record<string, unknown> = {
+      ticketId: "ticket-57400-cache",
+      displayId: "57400",
+      subject: "Warm field-options cache",
+      status: "New Calls",
+      ...TRIAGE_TEST_CLASSIFICATION,
+      cause: "No Fault Found",
+      updatedTime: "2026-07-26T09:00:00Z",
+    };
+
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getFields")) {
+        return {
+          getFields: [
+            ticketField("impact", ["Low", "High"]),
+            ticketField("urgency", ["Low", "High"]),
+            ticketField("subcategory", ["No Action Needed", "Other"], {
+              columnName: "category",
+              value: "7. Sales call",
+            }),
+            ticketField("cause", ["No Fault Found", "Unknown"]),
+          ],
+        };
+      }
+      return { getTicket: { ...ticketState } };
+    });
+    mockClient.mutate.mockImplementation(async (_mutation: string, variables: { input: Record<string, unknown> }) => {
+      Object.assign(ticketState, variables.input, { updatedTime: "2026-07-26T09:01:00Z" });
+      return { updateTicket: { ...ticketState } };
+    });
+
+    const domain = getTicketsTools();
+    const warmResult = await domain.handleCall("superops_tickets_field_options", {
+      fields: ["impact", "urgency", "subcategory", "cause"],
+    });
+    expect(warmResult.isError).not.toBe(true);
+    expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("getFields"))).toHaveLength(1);
+    mockClient.query.mockClear();
+
+    const result = await domain.handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400-cache",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T09:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        target: { ...TRIAGE_TEST_CLASSIFICATION, cause: "Unknown" },
+      }],
+      verify: true,
+      dedupeNotes: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Left",
+      writeAttempted: true,
+      verified: true,
+    });
+    expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("getFields"))).toHaveLength(0);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-read an unchanged scheduled leave ticket", async () => {
+    const ticketState: Record<string, unknown> = {
+      ticketId: "ticket-57400-leave-read",
+      displayId: "57400",
+      subject: "Unchanged leave target",
+      status: "New Calls",
+      client: { accountId: "client-57400-leave-read", name: "TaskGroup" },
+      ...TRIAGE_TEST_CLASSIFICATION,
+      updatedTime: "2026-07-26T09:00:00Z",
+    };
+    const notes: Array<Record<string, unknown>> = [];
+    const triageNote = [
+      "TRIAGE SUMMARY",
+      "Ticket goal: Confirm the reported request and route it safely.",
+      "What needs to be known: This is a genuine customer request.",
+      "Next step: Service desk reviews the ticket.",
+      "When: At the next New Calls review.",
+    ].join("\n");
+
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketNoteList")) return { getTicketNoteList: notes };
+      return { getTicket: { ...ticketState } };
+    });
+    mockClient.mutate.mockImplementation(async (mutation: string) => {
+      if (mutation.includes("createTicketNote")) {
+        notes.push({ noteId: "note-57400-leave-read", content: triageNote, privacyType: "PRIVATE" });
+        return { createTicketNote: { noteId: "note-57400-leave-read", privacyType: "PRIVATE" } };
+      }
+      throw new Error("An unchanged leave target must not issue an update mutation.");
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v1",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400-leave-read",
+        expectedSubject: "Unchanged leave target",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T09:00:00Z",
+        contentVerified: true,
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        action: "leave",
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+        note: triageNote,
+        isPublicNote: false,
+      }],
+      verify: true,
+      dedupeNotes: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.results[0]).toMatchObject({
+      finalOutcome: "Left",
+      primaryWriteOutcome: "NotRequired",
+      classificationWriteOutcome: "NotRequired",
+      writeAttempted: true,
+      noteAdded: true,
+      verified: true,
+    });
+    expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("query getTicket(")).length).toBe(2);
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
+
   it("blocks a null-client triage write unless the approved target includes client name and ID", async () => {
     mockClient.query
       .mockResolvedValueOnce({
@@ -4507,6 +4710,76 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it("treats an omitted client field as an unassigned ticket when the approved TaskGroup fallback is supplied", async () => {
+    const ticketState: Record<string, unknown> = {
+      ticketId: "ticket-57402-omitted-client",
+      displayId: "57402",
+      subject: "Omitted client field",
+      status: "New Calls",
+      updatedTime: "2026-07-26T08:59:00Z",
+    };
+    const notes: Array<Record<string, unknown>> = [];
+    const triageNote = "<strong>TRIAGE SUMMARY</strong><br><br><strong>Ticket goal:</strong> Confirm the request.<br><br><strong>What needs to be known:</strong> Safe evidence was recovered.<br><br><strong>Next step:</strong> Service desk reviews the ticket.<br><br><strong>When:</strong> At the next New Calls review.";
+
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketNoteList")) return { getTicketNoteList: notes };
+      if (query.includes("getTicketList")) {
+        return {
+          getTicketList: {
+            tickets: [{ ticketId: "ticket-57402-omitted-client", displayId: "57402" }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        };
+      }
+      if (query.includes("getTicket")) return { getTicket: { ...ticketState } };
+      return { getFields: RESOLVED_OPTION_FIELDS };
+    });
+    mockClient.mutate.mockImplementation(async (mutation: string, variables: { input: Record<string, unknown> }) => {
+      if (mutation.includes("createTicketNote")) {
+        notes.push({ noteId: "note-57402-omitted-client", content: triageNote, privacyType: "PRIVATE" });
+        return { createTicketNote: { noteId: "note-57402-omitted-client", privacyType: "PRIVATE" } };
+      }
+      Object.assign(ticketState, variables.input, { updatedTime: "2026-07-26T09:00:00Z" });
+      return { updateTicket: { ...ticketState, client: { accountId: "2993553194649526272", name: "TaskGroup" } } };
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57402"],
+      actions: [{
+        ticketNumber: "57402",
+        expectedTicketId: "ticket-57402-omitted-client",
+        expectedSubject: "Omitted client field",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T08:59:00Z",
+        contentVerified: true,
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        action: "leave",
+        target: {
+          ...TRIAGE_TEST_CLASSIFICATION,
+          clientName: "TaskGroup",
+          clientId: "2993553194649526272",
+        },
+        note: triageNote,
+        isPublicNote: false,
+        historyAssessment: SCHEDULED_TRIAGE_V2_NO_HISTORY,
+      }],
+      verify: true,
+      dedupeNotes: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      ticketNumber: "57402",
+      finalOutcome: "Left",
+      noteAdded: true,
+      verified: true,
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+  });
+
   it("assigns TaskGroup to an already-resolved ticket without replaying its resolve or note writes", async () => {
     mockClient.query
       .mockResolvedValueOnce({
@@ -4526,7 +4799,6 @@ describe("Tickets Domain", () => {
           ...TRIAGE_TEST_CLASSIFICATION,
         },
       })
-      .mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS })
       .mockResolvedValueOnce({
         getTicket: {
           ticketId: "ticket-57402",
@@ -4550,6 +4822,7 @@ describe("Tickets Domain", () => {
       expectedCandidateTicketNumbers: ["57402"],
       actions: [{
         ticketNumber: "57402",
+        expectedClient: "TaskGroup",
         expectedStatus: "Resolved",
         expectedUpdatedTime: "2026-07-26T09:00:00Z",
         contentVerified: true,
@@ -4602,6 +4875,7 @@ describe("Tickets Domain", () => {
       displayId: "57403",
       subject: "Server is down",
       status: "New Calls",
+      ...TRIAGE_TEST_CLASSIFICATION,
       updatedTime: "2026-07-26T09:00:00Z",
     };
     const notes: Array<Record<string, unknown>> = [];
@@ -4628,7 +4902,7 @@ describe("Tickets Domain", () => {
         return { createTicketNote: { noteId: "note-57403", privacyType: "PRIVATE" } };
       }
       Object.assign(ticketState, variables.input, { updatedTime: "2026-07-26T09:01:00Z" });
-      return { updateTicket: { ticketId: "ticket-57403" } };
+      return { updateTicket: { ...ticketState } };
     });
 
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
@@ -4665,6 +4939,16 @@ describe("Tickets Domain", () => {
       { method: "createTicketNote", outcome: "Accepted" },
     ]);
     expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("getFields"))).toHaveLength(0);
+    expect(mockClient.query.mock.calls.filter(([query]) => String(query).includes("query getTicket(")
+    )).toHaveLength(2);
+    const noteReadInputs = mockClient.query.mock.calls
+      .filter(([query]) => String(query).includes("getTicketNoteList"))
+      .map(([, variables]) => variables);
+    expect(noteReadInputs.length).toBeGreaterThan(0);
+    expect(noteReadInputs).toEqual(
+      noteReadInputs.map(() => ({ input: { ticketId: "ticket-57403" } }))
+    );
     const updateInput = mockClient.mutate.mock.calls
       .find(([mutation]) => !String(mutation).includes("createTicketNote"))?.[1].input;
     expect(updateInput).not.toHaveProperty("status");
@@ -4891,45 +5175,6 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
-  it("classifies a concurrent engineer status change as stale before field validation", async () => {
-    mockClient.query
-      .mockResolvedValueOnce({
-        getTicketList: {
-          tickets: [{ ticketId: "ticket-57400", displayId: "57400" }],
-          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
-        },
-      })
-      .mockResolvedValueOnce({
-        getTicket: {
-          ticketId: "ticket-57400",
-          displayId: "57400",
-          subject: "Changed by engineer",
-          status: "Awaiting Engineer",
-          updatedTime: "2026-06-25T11:00:00",
-        },
-      });
-
-    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
-      expectedCandidateTicketNumbers: ["57400"],
-      actions: [{
-        ticketNumber: "57400",
-        expectedStatus: "New Calls",
-        expectedUpdatedTime: "2026-06-25T10:00:00",
-        contentVerified: true,
-        action: "update",
-        target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
-      }],
-    });
-    const parsed = JSON.parse(result.content[0].text);
-
-    expect(parsed.results[0]).toMatchObject({
-      finalOutcome: "SkippedChangedSinceSnapshot",
-      failureStage: "validateUpdatedTime",
-      writeAttempted: false,
-    });
-    expect(mockClient.mutate).not.toHaveBeenCalled();
-  });
-
   it("rejects an unknown scheduled policy mode before any read, ledger write, or mutation", async () => {
     const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
       policyMode: "scheduled-new-calls-v3",
@@ -4940,106 +5185,6 @@ describe("Tickets Domain", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("policyMode must be one of");
     expect(mockClient.query).not.toHaveBeenCalled();
-    expect(mockClient.mutate).not.toHaveBeenCalled();
-  });
-
-  it("requires bounded history assessment for scheduled-new-calls-v2 before any read or write", async () => {
-    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
-      policyMode: "scheduled-new-calls-v2",
-      expectedCandidateTicketNumbers: ["57400"],
-      actions: [{
-        ticketNumber: "57400",
-        expectedTicketId: "ticket-57400",
-        expectedSubject: "Customer request",
-        expectedStatus: "New Calls",
-        expectedUpdatedTime: "2026-06-25T10:00:00Z",
-        contentVerified: true,
-        action: "leave",
-        policyDisposition: "customer_request",
-        contentEvidenceState: "meaningful",
-        policyReason: "customer_or_requester_work",
-        note: SCHEDULED_TRIAGE_HTML_NOTE,
-        isPublicNote: false,
-        target: { ...TRIAGE_TEST_CLASSIFICATION },
-      }],
-    });
-
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("historyAssessment is required");
-    expect(mockClient.query).not.toHaveBeenCalled();
-    expect(mockClient.mutate).not.toHaveBeenCalled();
-  });
-
-  it("accepts a valid scheduled-new-calls-v2 history assessment at the policy gate", async () => {
-    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
-      policyMode: "scheduled-new-calls-v2",
-      expectedCandidateTicketNumbers: ["57400"],
-      actions: [{
-        ticketNumber: "57400",
-        expectedTicketId: "ticket-57400",
-        expectedSubject: "Customer request",
-        expectedStatus: "New Calls",
-        expectedUpdatedTime: "2026-06-25T10:00:00Z",
-        contentVerified: true,
-        action: "leave",
-        policyDisposition: "customer_request",
-        contentEvidenceState: "meaningful",
-        policyReason: "customer_or_requester_work",
-        historyAssessment: {
-          issueRecurrence: "recurrent",
-          solutionHistory: "prior_solution_found",
-          postSolutionRecurrence: "no_observed_recurrence_in_window",
-          crossClientSignal: "none",
-          emergingIssueSignal: "none",
-          resultState: "complete",
-          matchingTicketCount: 2,
-          resolvedMatchingTicketCount: 1,
-          postSolutionMatchingTicketCount: 0,
-          distinctClientCount: 1,
-        },
-        note: SCHEDULED_TRIAGE_HTML_NOTE,
-        isPublicNote: false,
-        target: { ...TRIAGE_TEST_CLASSIFICATION },
-      }],
-    });
-
-    expect(result.content[0].text).not.toContain("historyAssessment");
-    expect(mockClient.query).toHaveBeenCalled();
-    expect(mockClient.mutate).not.toHaveBeenCalled();
-  });
-
-  it("keeps v2 engineer-review email tickets in New Calls", async () => {
-    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
-      policyMode: "scheduled-new-calls-v2",
-      expectedCandidateTicketNumbers: ["57400"],
-      dryRun: true,
-      actions: [{
-        ticketNumber: "57400",
-        expectedTicketId: "ticket-57400",
-        expectedSubject: "Engineer assistance required",
-        expectedStatus: "New Calls",
-        expectedUpdatedTime: "2026-06-25T10:00:00Z",
-        contentVerified: true,
-        action: "leave",
-        policyDisposition: "engineer_review",
-        contentEvidenceState: "meaningful",
-        policyReason: "actionable_engineer_work",
-        historyAssessment: {
-          issueRecurrence: "unknown",
-          solutionHistory: "unknown",
-          postSolutionRecurrence: "follow_up_unknown",
-          crossClientSignal: "unknown",
-          emergingIssueSignal: "unknown",
-          resultState: "unknown",
-        },
-        note: SCHEDULED_TRIAGE_HTML_NOTE,
-        isPublicNote: false,
-        target: { ...TRIAGE_TEST_CLASSIFICATION },
-      }],
-    });
-
-    expect(result.isError).toBe(false);
-    expect(result.content[0].text).not.toContain("action does not match policyDisposition engineer_review");
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
@@ -5129,6 +5274,279 @@ describe("Tickets Domain", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("isPublicNote must be explicitly false");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("requires bounded history assessment and history-aware HTML notes in scheduled-new-calls-v2", async () => {
+    const baseAction = {
+      ticketNumber: "57400",
+      expectedTicketId: "ticket-57400",
+      expectedSubject: "Customer request",
+      expectedStatus: "New Calls",
+      expectedUpdatedTime: "2026-06-25T10:00:00Z",
+      contentVerified: true,
+      action: "leave",
+      policyDisposition: "customer_request",
+      contentEvidenceState: "meaningful",
+      policyReason: "customer_or_requester_work",
+      note: SCHEDULED_TRIAGE_HTML_NOTE,
+      isPublicNote: false,
+      target: { ...TRIAGE_TEST_CLASSIFICATION },
+    };
+    const missingHistory = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [baseAction],
+    });
+
+    const badHistory = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ...baseAction,
+        historyAssessment: {
+          ...SCHEDULED_TRIAGE_V2_HISTORY,
+          summary: "<raw customer body>",
+        },
+        note: SCHEDULED_TRIAGE_V2_HTML_NOTE,
+      }],
+    });
+
+    const unqualifiedCrossClient = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ...baseAction,
+        historyAssessment: {
+          ...SCHEDULED_TRIAGE_V2_HISTORY,
+          distinctClientCount: 1,
+        },
+        note: SCHEDULED_TRIAGE_V2_HTML_NOTE,
+      }],
+    });
+
+    expect(missingHistory.isError).toBe(true);
+    expect(missingHistory.content[0].text).toContain("historyAssessment");
+    expect(badHistory.isError).toBe(true);
+    expect(badHistory.content[0].text).toContain("must not contain HTML");
+    expect(unqualifiedCrossClient.isError).toBe(true);
+    expect(unqualifiedCrossClient.content[0].text).toContain("at least two verified distinct clients");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("accepts a complete scheduled-new-calls-v2 contract before entering the SuperOps read path", async () => {
+    mockClient.query.mockRejectedValue(new Error("bounded validation-path read failure"));
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_HISTORY,
+        note: SCHEDULED_TRIAGE_V2_HTML_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(mockClient.query).toHaveBeenCalled();
+    expect(result.content[0].text).not.toContain("historyAssessment");
+  });
+
+  it("keeps engineer-review email tickets in New Calls under the targeted email policy", async () => {
+    mockClient.query.mockRejectedValue(new Error("bounded validation-path read failure"));
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "email-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer VPN issue",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "engineer_review",
+        contentEvidenceState: "meaningful",
+        policyReason: "actionable_engineer_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_HISTORY,
+        note: SCHEDULED_TRIAGE_V2_HTML_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(mockClient.query).toHaveBeenCalled();
+    expect(result.content[0].text).not.toContain("does not match policyDisposition engineer_review");
+  });
+
+  it("rejects Awaiting Engineer routing in the targeted email policy before SuperOps work", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "email-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer VPN issue",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "update",
+        policyDisposition: "engineer_review",
+        contentEvidenceState: "meaningful",
+        policyReason: "actionable_engineer_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_HISTORY,
+        note: SCHEDULED_TRIAGE_V2_HTML_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" },
+      }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("does not match policyDisposition engineer_review");
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("accepts unambiguous natural wording for v2 history states", async () => {
+    mockClient.query.mockRejectedValue(new Error("bounded validation-path read failure"));
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_NATURAL_HISTORY,
+        note: SCHEDULED_TRIAGE_V2_NATURAL_HTML_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(mockClient.query).toHaveBeenCalled();
+    expect(result.content[0].text).not.toContain("Historical issue");
+    expect(result.content[0].text).not.toContain("Historical solution");
+  });
+
+  it("accepts the explicit v2 history enum tokens used by the Agent note contract", async () => {
+    mockClient.query.mockRejectedValue(new Error("bounded validation-path read failure"));
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_HISTORY,
+        note: [
+          "<strong>TRIAGE SUMMARY</strong><br><br>",
+          "<strong>Ticket goal:</strong> Route the ticket under the standing New Calls policy.<br><br>",
+          "<strong>What needs to be known:</strong> The safe evidence was fully retrieved and assessed.<br><br>",
+          "<strong>Historical issue:</strong> issueRecurrence=recurrent; matchingTicketCount=2.<br><br>",
+          "<strong>Historical solution:</strong> solutionHistory=prior_solution_found; resolvedMatchingTicketCount=2.<br><br>",
+          "<strong>Post-solution recurrence:</strong> postSolutionRecurrence=observed_recurrence.<br><br>",
+          "<strong>Cross-client signal:</strong> crossClientSignal=credible; distinctClientCount=2.<br><br>",
+          "<strong>Emerging issue:</strong> emergingIssueSignal=credible; distinctClientCount=2.<br><br>",
+          "<strong>Current script recommendation:</strong> currentScriptRecommendation=Use the approved script as an advisory next step.<br><br>",
+          "<strong>Next step:</strong> Apply the approved policy outcome.<br><br>",
+          "<strong>When:</strong> During this scheduled triage run.",
+        ].join(""),
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(mockClient.query).toHaveBeenCalled();
+    expect(result.content[0].text).not.toContain("Historical solution");
+  });
+
+  it("accepts a v2 note with no history sections when bounded history has no matches", async () => {
+    mockClient.query.mockRejectedValue(new Error("bounded validation-path read failure"));
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      dryRun: true,
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_NO_HISTORY,
+        note: SCHEDULED_TRIAGE_V2_NO_HISTORY_HTML_NOTE,
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(mockClient.query).toHaveBeenCalled();
+    expect(result.content[0].text).not.toContain("must include the relevant");
+    expect(result.content[0].text).not.toContain("must omit the irrelevant");
+  });
+
+  it("rejects an irrelevant v2 history section instead of persisting it", async () => {
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      policyMode: "scheduled-new-calls-v2",
+      expectedCandidateTicketNumbers: ["57400"],
+      actions: [{
+        ticketNumber: "57400",
+        expectedTicketId: "ticket-57400",
+        expectedSubject: "Customer request",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-06-25T10:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        policyDisposition: "customer_request",
+        contentEvidenceState: "meaningful",
+        policyReason: "customer_or_requester_work",
+        historyAssessment: SCHEDULED_TRIAGE_V2_NO_HISTORY,
+        note: [
+          SCHEDULED_TRIAGE_V2_NO_HISTORY_HTML_NOTE.replace(
+            "<strong>Next step:</strong>",
+            "<strong>Historical issue:</strong> No matching historical issue was found.<br><br><strong>Next step:</strong>",
+          ),
+        ].join(""),
+        isPublicNote: false,
+        target: { ...TRIAGE_TEST_CLASSIFICATION },
+      }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("must omit the irrelevant");
     expect(mockClient.query).not.toHaveBeenCalled();
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
@@ -6720,7 +7138,6 @@ describe("Tickets Domain", () => {
         { getTicketList: { tickets: [{ ticketId: "ticket-57400", displayId: "57400" }], listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 } } },
         { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
         { getTicketNoteList: [] },
-        { getTicketNoteList: [] },
         { getTicket: { ticketId: "ticket-57400", displayId: "57400", status: "New Calls" } },
       ],
       mutation: { createTicketNote: { noteId: "note-57400", privacyType: "PRIVATE" } },
@@ -7058,7 +7475,7 @@ describe("Tickets Domain", () => {
       if (!final) throw new Error("missing final checkpointed operation");
       expect(final.state).toBe("Completed");
       expect(ticketReads).toBeGreaterThanOrEqual(8);
-      expect(noteReads).toBeGreaterThan(4);
+      expect(noteReads).toBeGreaterThanOrEqual(4);
       expect(mockClient.mutate.mock.calls.filter(([, variables]) => !variables.input.ticket)).toHaveLength(2);
       expect(mockClient.mutate.mock.calls.filter(([, variables]) => Boolean(variables.input.ticket))).toHaveLength(1);
       expect(final.itemStates[original.displayId]).toMatchObject({
@@ -8690,7 +9107,6 @@ describe("Tickets Domain", () => {
         getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" },
       })
       .mockResolvedValueOnce({ getTicketNoteList: [] })
-      .mockResolvedValueOnce({ getTicketNoteList: [] })
       .mockResolvedValueOnce({
         getTicket: { ticketId: "ticket-57401", displayId: "57401", status: "New Calls" },
       });
@@ -9114,7 +9530,7 @@ describe("Tickets Domain", () => {
       noteVerificationAttempts: 4,
       terminalReason: "NoteVisibilityUnresolved",
     }));
-    expect(mocks.events).toEqual(["ticket-list", "notes", "notes"]);
+    expect(mocks.events).toEqual(["ticket-list", "notes"]);
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 

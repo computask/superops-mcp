@@ -462,6 +462,7 @@ describe("ChatGPT direct mutation policy", () => {
       "superops_alerts_resolve",
       "superops_custom_mutation",
       "superops_custom_query",
+      "superops_navigate",
       "superops_operations_cancel",
       "superops_scripts_execute_on_asset",
       "superops_tickets_add_note",
@@ -498,6 +499,34 @@ describe("ChatGPT direct mutation policy", () => {
     expect(blocked.has("superops_custom_query")).toBe(true);
     expect(blocked.has("superops_scripts_execute_on_asset")).toBe(true);
     expect(blocked.has("superops_operations_results")).toBe(false);
+  });
+
+  it("removes broad preparation reads from the opt-in targeted triage surface", async () => {
+    const blocked = await chatGptDirectBlockedToolNames({
+      reviewedTriagePlanAllowed: true,
+      targetedTriageOnly: true,
+    });
+
+    for (const name of [
+      "superops_status",
+      "superops_test_connection",
+      "superops_operations_get",
+      "superops_operations_results",
+      "superops_operations_cancel",
+      "superops_tickets_list",
+      "superops_tickets_recent",
+      "superops_tickets_created_between",
+      "superops_tickets_report",
+      "superops_tickets_triage_snapshot",
+      "superops_navigate",
+    ]) {
+      expect(blocked.has(name)).toBe(true);
+    }
+
+    expect(blocked.has("superops_tickets_query")).toBe(false);
+    expect(blocked.has("superops_tickets_triage_evidence_recover")).toBe(false);
+    expect(blocked.has("superops_tickets_field_options")).toBe(false);
+    expect(blocked.has("superops_tickets_apply_triage_plan")).toBe(false);
   });
 
   it("keeps the reviewed ChatGPT direct mutating surface to durable triage controls only", async () => {
@@ -1246,7 +1275,7 @@ describe("Cloudflare Worker entrypoint", () => {
           jsonrpc: "2.0",
           id: 32,
           method: "tools/call",
-          params: { name: "superops_tickets_list", arguments: {} },
+          params: { name: "superops_tickets_triage_snapshot", arguments: {} },
         },
         {},
         { "X-Request-Id": "audit-failure-1" }
@@ -1261,10 +1290,26 @@ describe("Cloudflare Worker entrypoint", () => {
       expect(body.result?.content?.[0]?.text).not.toContain("SUPEROPS_API_TOKEN");
       expect(body.result?.content?.[0]?.text).not.toContain(" at ");
 
+      const telemetry = body.result?.content
+        ?.map((item) => {
+          try {
+            return JSON.parse(String(item.text)) as { mcpExecution?: { failureDiagnostics?: unknown[] } };
+          } catch {
+            return undefined;
+          }
+        })
+        .find((item) => item?.mcpExecution !== undefined)?.mcpExecution;
+      expect(telemetry?.failureDiagnostics).toEqual([
+        expect.objectContaining({
+          stage: "mcp_tool",
+          message: expect.stringContaining("credentials"),
+        }),
+      ]);
+
       const records = auditRecords(logSpy);
       expect(records[0]).toMatchObject({
         requestId: "audit-failure-1",
-        toolName: "superops_tickets_list",
+        toolName: "superops_tickets_triage_snapshot",
         success: false,
       });
       expect(String(records[0].errorSummary)).toContain("credentials");
