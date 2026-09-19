@@ -518,6 +518,7 @@ describe("ChatGPT direct mutation policy", () => {
       "superops_tickets_created_between",
       "superops_tickets_report",
       "superops_tickets_triage_snapshot",
+      "superops_tickets_field_options",
       "superops_navigate",
     ]) {
       expect(blocked.has(name)).toBe(true);
@@ -525,8 +526,50 @@ describe("ChatGPT direct mutation policy", () => {
 
     expect(blocked.has("superops_tickets_query")).toBe(false);
     expect(blocked.has("superops_tickets_triage_evidence_recover")).toBe(false);
-    expect(blocked.has("superops_tickets_field_options")).toBe(false);
     expect(blocked.has("superops_tickets_apply_triage_plan")).toBe(false);
+  });
+
+  it("hides standalone field-option discovery from the targeted direct triage route", async () => {
+    const env = chatGptEnv({
+      SUPEROPS_API_TOKEN: "test-token",
+      SUPEROPS_SUBDOMAIN: "acme",
+      CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
+      CHATGPT_DIRECT_TARGETED_TRIAGE_ONLY: "true",
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+    });
+    const token = await getOAuthAccessToken(env);
+
+    const list = await mcp(
+      { jsonrpc: "2.0", id: 711, method: "tools/list", params: {} },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+    const listBody = (await list.json()) as { result?: { tools?: PublishedTool[] } };
+    const names = (listBody.result?.tools ?? []).map((tool) => tool.name);
+
+    expect(names).toContain("superops_tickets_query");
+    expect(names).toContain("superops_tickets_triage_evidence_recover");
+    expect(names).toContain("superops_tickets_apply_triage_plan");
+    expect(names).not.toContain("superops_tickets_field_options");
+
+    const call = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 712,
+        method: "tools/call",
+        params: { name: "superops_tickets_field_options", arguments: {} },
+      },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+    const callBody = (await call.json()) as {
+      result?: { isError?: boolean; content?: { text?: string }[] };
+    };
+    expect(callBody.result?.isError).toBe(true);
+    expect(callBody.result?.content?.[0]?.text).toMatch(/disabled/i);
   });
 
   it("keeps the reviewed ChatGPT direct mutating surface to durable triage controls only", async () => {

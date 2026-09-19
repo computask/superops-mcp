@@ -205,6 +205,7 @@ const CHATGPT_DIRECT_TARGETED_TRIAGE_BLOCKED_TOOL_NAMES = [
   "superops_tickets_created_between",
   "superops_tickets_report",
   "superops_tickets_triage_snapshot",
+  "superops_tickets_field_options",
 ] as const;
 
 export type ChatGptDirectToolPolicy = {
