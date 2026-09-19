@@ -1287,6 +1287,10 @@ describe("Cloudflare Worker entrypoint", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toContain("credentials");
+      // Keep the safe trace in the primary content item as well as the
+      // backwards-compatible telemetry item: some MCP clients expose only
+      // the first text item to the model.
+      expect(body.result?.content?.[0]?.text).toContain("mcpExecution");
       expect(body.result?.content?.[0]?.text).not.toContain("SUPEROPS_API_TOKEN");
       expect(body.result?.content?.[0]?.text).not.toContain(" at ");
 

@@ -841,11 +841,43 @@ function appendTriageExecutionTelemetry(
     failureDiagnostics: triageFailureDiagnostics(toolName, result, diagnostics),
   };
 
+  // Some MCP clients expose only the first text content item to the model even
+  // though the protocol permits multiple content items. Keep the original
+  // result shape for existing clients, but also place the safe telemetry in
+  // the primary text item so the Agent cannot silently lose the call trace.
+  const telemetryText = JSON.stringify({ mcpExecution: trace });
+  const [firstContent, ...remainingContent] = result.content;
+  if (firstContent?.type === "text") {
+    let primaryText = firstContent.text;
+    try {
+      const parsed = JSON.parse(primaryText) as unknown;
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        primaryText = JSON.stringify({
+          ...(parsed as Record<string, unknown>),
+          mcpExecution: trace,
+        }, null, 2);
+      } else {
+        primaryText = `${primaryText}\n\n${telemetryText}`;
+      }
+    } catch {
+      primaryText = `${primaryText}\n\n${telemetryText}`;
+    }
+
+    return {
+      ...result,
+      content: [
+        { ...firstContent, text: primaryText },
+        ...remainingContent,
+        { type: "text", text: telemetryText },
+      ],
+    };
+  }
+
   return {
     ...result,
     content: [
       ...result.content,
-      { type: "text", text: JSON.stringify({ mcpExecution: trace }) },
+      { type: "text", text: telemetryText },
     ],
   };
 }
