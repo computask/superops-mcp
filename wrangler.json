@@ -65,6 +65,7 @@
     "SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED": "true",
     "SUPEROPS_CONTINUATION_ENABLED": "true",
     "SUPEROPS_DURABLE_RETRY_ENABLED": "true",
+    "SUPEROPS_RATE_LIMIT_PROBE_ENABLED": "true",
     "SUPEROPS_EXECUTION_CPU_GUARD_MS": "20000",
     "SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT": "100",
     "SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_ATTEMPTS": "10",
@@ -81,6 +82,10 @@
       {
         "name": "SUPEROPS_SCRIPT_CATALOGUE",
         "class_name": "SuperOpsScriptCatalogue"
+      },
+      {
+        "name": "SUPEROPS_RATE_LIMIT_PROBE",
+        "class_name": "SuperOpsRateLimitProbe"
       }
     ]
   },
@@ -90,6 +95,10 @@
       "storage": "sqlite"
     },
     "SuperOpsScriptCatalogue": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "SuperOpsRateLimitProbe": {
       "type": "durable-object",
       "storage": "sqlite"
     }

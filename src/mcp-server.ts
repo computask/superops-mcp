@@ -49,6 +49,7 @@ import {
   getOperationStore,
   operationResultView,
 } from "./operation-store.js";
+import { type RateLimitProbeAdapter } from "./rate-limit-probe.js";
 
 // Lazy-loaded domain modules
 const domainCache = new Map<Domain, DomainTools>();
@@ -168,6 +169,7 @@ async function getAllDomainTools(): Promise<ToolDefinition[]> {
 
 export type McpServerOptions = {
   blockedToolNames?: ReadonlySet<string>;
+  rateLimitProbe?: RateLimitProbeAdapter;
 };
 
 export async function blockedToolNamesByCategory(
@@ -394,7 +396,8 @@ function errorResult(message: string): ToolResult {
 
 async function executeToolCall(
   name: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  rateLimitProbe?: RateLimitProbeAdapter
 ): Promise<ToolResult> {
   const blockedReason = blockedToolReason(name);
   if (blockedReason) {
@@ -548,6 +551,12 @@ async function executeToolCall(
   }
   if (name === "superops_triage_emerging_issue_upsert") {
     return handleTriageEmergingIssueUpsert(args);
+  }
+  if (name.startsWith("superops_rate_limit_probe_")) {
+    if (!rateLimitProbe) {
+      return errorResult("The rate-limit probe is disabled on this MCP runtime.");
+    }
+    return rateLimitProbe.handleCall(name, args);
   }
   // Check for credential issues before domain calls
   const creds = getCredentials();
@@ -909,7 +918,14 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
   // by the current route/runtime policy.
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const domainTools = await getAllDomainTools();
-    const tools = [navigationTool, statusTool, testConnectionTool, ...operationTools, ...domainTools];
+    const tools = [
+      navigationTool,
+      statusTool,
+      testConnectionTool,
+      ...operationTools,
+      ...domainTools,
+      ...(options.rateLimitProbe?.tools ?? []),
+    ];
     return {
       tools: tools
         .filter((tool) => !blockedToolNames.has(tool.name))
@@ -929,9 +945,9 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
       try {
         const result = boundedToolResult(
           sanitizeToolResult(
-            blockedToolNames.has(name)
+              blockedToolNames.has(name)
               ? errorResult(`${name} is disabled by this MCP server configuration.`)
-              : await executeToolCall(name, args)
+              : await executeToolCall(name, args, options.rateLimitProbe)
           )
         );
         metadata = enrichAuditMetadataFromResult(name, result, metadata);
