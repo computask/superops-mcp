@@ -6,7 +6,7 @@ import type { ToolResult } from "./audit.js";
  *
  * This does not use SuperOpsClient.query(): the normal client deliberately
  * retries reads, which would hide the first upstream rejection. The probe
- * sends one minimal getClientList query per attempt, records only bounded
+ * sends one minimal list query per attempt, records only bounded
  * response metadata, and never persists the response body.
  */
 
@@ -16,14 +16,28 @@ const PROBE_REQUEST_TIMEOUT_MS = 8_000;
 const MAX_EVENTS_PER_RUN = 10_000;
 const MAX_RESULTS_PAGE_SIZE = 200;
 
-const RATE_LIMIT_PROBE_QUERY = `
-  query RateLimitProbe($input: ListInfoInput!) {
-    getClientList(input: $input) {
-      clients { accountId }
-      listInfo { page pageSize hasMore totalCount }
+export type RateLimitProbeTask = "getClientList" | "getTicketList";
+
+const DEFAULT_RATE_LIMIT_PROBE_TASK: RateLimitProbeTask = "getClientList";
+
+const RATE_LIMIT_PROBE_QUERIES: Record<RateLimitProbeTask, string> = {
+  getClientList: `
+    query getClientList($input: ListInfoInput!) {
+      getClientList(input: $input) {
+        clients { accountId }
+        listInfo { page pageSize hasMore totalCount }
+      }
     }
-  }
-`;
+  `,
+  getTicketList: `
+    query getTicketList($input: ListInfoInput!) {
+      getTicketList(input: $input) {
+        tickets { ticketId displayId }
+        listInfo { page pageSize hasMore totalCount }
+      }
+    }
+  `,
+};
 
 const RATE_LIMIT_PROBE_VARIABLES = {
   input: {
@@ -36,8 +50,17 @@ export const RATE_LIMIT_PROBE_TOOLS: ToolDefinition[] = [
   {
     name: "superops_rate_limit_probe_start",
     description:
-      "Start one fixed 30-minute, read-only SuperOps API rate-limit probe. It sends only a minimal getClientList query, bypasses MCP read retries, records safe per-attempt outcomes, and never writes tickets or stores response content. Only one probe may run at a time.",
-    inputSchema: { type: "object", properties: {} },
+      "Start one fixed 30-minute, read-only SuperOps API rate-limit probe for getClientList or getTicketList. It bypasses MCP read retries, records safe per-attempt outcomes, and never writes tickets or stores response content. Only one probe may run at a time. Defaults to getClientList.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: {
+          type: "string",
+          enum: ["getClientList", "getTicketList"],
+          description: "The exact read operation to probe. Defaults to getClientList.",
+        },
+      },
+    },
   },
   {
     name: "superops_rate_limit_probe_status",
@@ -127,6 +150,7 @@ interface ProbeHeaders {
 interface ProbeEvent {
   version: 1;
   runId: string;
+  task: RateLimitProbeTask;
   sequence: number;
   phase: string;
   targetRequestsPerMinute: number;
@@ -151,6 +175,7 @@ interface ProbeEvent {
 interface ProbeRun {
   version: 1;
   runId: string;
+  task: RateLimitProbeTask;
   status: ProbeStatus;
   startedAt: string;
   deadlineAt: string;
@@ -239,6 +264,12 @@ function safeReason(value: unknown): string | undefined {
   return reason || undefined;
 }
 
+function parseProbeTask(value: unknown): RateLimitProbeTask {
+  if (value === undefined || value === null || value === "") return DEFAULT_RATE_LIMIT_PROBE_TASK;
+  if (value === "getClientList" || value === "getTicketList") return value;
+  throw new Error("task must be getClientList or getTicketList.");
+}
+
 function endpointFor(region: string | undefined): "api.superops.ai" | "euapi.superops.ai" {
   return region === "eu" ? "euapi.superops.ai" : "api.superops.ai";
 }
@@ -293,6 +324,7 @@ function phaseFor(startedAt: number, now = Date.now()): ProbePhase {
 function emitAttemptStarted(params: {
   callId: string;
   runId: string;
+  task: RateLimitProbeTask;
   tenant: string;
   endpointHost: string;
   startedAt: string;
@@ -306,13 +338,14 @@ function emitAttemptStarted(params: {
     invocationId: `rate-limit-probe-${params.runId}`,
     executionTraceId: params.runId,
     toolName: "superops_rate_limit_probe",
+    task: params.task,
     callIndex: params.sequence,
     tenant: safeTenant(params.tenant),
     endpointHost: params.endpointHost,
     endpointPath: "/msp",
     requestPurpose: "initialRead",
     operationType: "query",
-    operationName: "RateLimitProbe",
+    operationName: params.task,
     attempt: 1,
   }));
 }
@@ -327,13 +360,14 @@ function emitAttemptFinished(event: ProbeEvent, callId: string): void {
     invocationId: `rate-limit-probe-${event.runId}`,
     executionTraceId: event.runId,
     toolName: "superops_rate_limit_probe",
+    task: event.task,
     callIndex: event.sequence,
     tenant: safeTenant(event.tenant),
     endpointHost: event.endpointHost,
     endpointPath: "/msp",
     requestPurpose: "initialRead",
     operationType: "query",
-    operationName: "RateLimitProbe",
+    operationName: event.task,
     attempt: 1,
     durationMs: event.durationMs,
     ok: event.ok,
@@ -419,11 +453,13 @@ async function performProbeAttempt(params: {
 }): Promise<ProbeEvent> {
   const endpointHost = params.run.endpointHost;
   const endpoint = `https://${endpointHost}/msp`;
+  const task = params.run.task ?? DEFAULT_RATE_LIMIT_PROBE_TASK;
   const startedAt = new Date().toISOString();
   const callId = uuid();
   emitAttemptStarted({
     callId,
     runId: params.run.runId,
+    task,
     tenant: params.run.tenant,
     endpointHost,
     startedAt,
@@ -447,7 +483,7 @@ async function performProbeAttempt(params: {
         Authorization: `Bearer ${params.apiToken}`,
         CustomerSubDomain: params.run.tenant,
       },
-      body: JSON.stringify({ query: RATE_LIMIT_PROBE_QUERY, variables: RATE_LIMIT_PROBE_VARIABLES }),
+      body: JSON.stringify({ query: RATE_LIMIT_PROBE_QUERIES[task], variables: RATE_LIMIT_PROBE_VARIABLES }),
       signal: controller.signal,
     });
     httpStatus = response.status;
@@ -506,6 +542,7 @@ async function performProbeAttempt(params: {
   const event: ProbeEvent = {
     version: 1,
     runId: params.run.runId,
+    task,
     sequence: params.sequence,
     phase: params.phase.name,
     targetRequestsPerMinute: params.phase.requestsPerMinute,
@@ -532,6 +569,7 @@ function resultSummary(run: ProbeRun): Record<string, unknown> {
   const elapsedMs = Math.max(0, Date.parse(run.finishedAt ?? new Date().toISOString()) - Date.parse(run.startedAt));
   return {
     runId: run.runId,
+    task: run.task ?? DEFAULT_RATE_LIMIT_PROBE_TASK,
     status: run.status,
     startedAt: run.startedAt,
     deadlineAt: run.deadlineAt,
@@ -585,13 +623,14 @@ export class SuperOpsRateLimitProbe {
     return finished;
   }
 
-  private async start(): Promise<Record<string, unknown>> {
+  private async start(taskInput?: unknown): Promise<Record<string, unknown>> {
     if (this.env.SUPEROPS_RATE_LIMIT_PROBE_ENABLED !== "true") {
       throw new Error("The rate-limit probe is disabled by SUPEROPS_RATE_LIMIT_PROBE_ENABLED.");
     }
     const token = this.env.SUPEROPS_API_TOKEN?.trim();
     const tenant = this.env.SUPEROPS_SUBDOMAIN?.trim().toLowerCase();
     if (!token || !tenant) throw new Error("Probe requires the configured SuperOps Worker credentials.");
+    const task = parseProbeTask(taskInput);
     const existing = await this.activeRun();
     if (existing?.status === "running" && Date.parse(existing.deadlineAt) > Date.now()) {
       return { accepted: false, reason: "already_running", ...resultSummary(existing) };
@@ -600,6 +639,7 @@ export class SuperOpsRateLimitProbe {
     const run: ProbeRun = {
       version: 1,
       runId: uuid(),
+      task,
       status: "running",
       startedAt: startedAt.toISOString(),
       deadlineAt: new Date(startedAt.getTime() + PROBE_DURATION_MS).toISOString(),
@@ -619,6 +659,7 @@ export class SuperOpsRateLimitProbe {
     return {
       accepted: true,
       ...resultSummary(run),
+      task,
       schedule: "60/90/100/120/150/30 requests per minute, five minutes per phase, no automatic retries",
     };
   }
@@ -721,7 +762,7 @@ export class SuperOpsRateLimitProbe {
     try {
       const body = await request.json() as Record<string, unknown>;
       const action = body.action;
-      if (action === "start") return jsonResponse(await this.start());
+      if (action === "start") return jsonResponse(await this.start(body.task));
       if (action === "status") return jsonResponse(await this.status(typeof body.runId === "string" ? body.runId : undefined));
       if (action === "results") {
         const runId = typeof body.runId === "string" ? body.runId : "";
@@ -777,7 +818,7 @@ export function createRateLimitProbeAdapter(params: {
       try {
         switch (name) {
           case "superops_rate_limit_probe_start":
-            return { content: [{ type: "text", text: JSON.stringify(await callProbe(namespace, params.tenantKey, "start"), null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(await callProbe(namespace, params.tenantKey, "start", { task: args.task }), null, 2) }] };
           case "superops_rate_limit_probe_status":
             return { content: [{ type: "text", text: JSON.stringify(await callProbe(namespace, params.tenantKey, "status", { runId: typeof args.runId === "string" ? args.runId : undefined }), null, 2) }] };
           case "superops_rate_limit_probe_results": {

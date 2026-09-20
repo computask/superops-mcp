@@ -81,4 +81,65 @@ describe("read-only rate-limit probe", () => {
     });
     expect(logs.join("\n")).not.toMatch(/secret-token-never-log|private-client-id/);
   });
+
+  it("selects getTicketList when requested and records the task without storing ticket data", async () => {
+    const harness = fakeState();
+    const requests: Array<{ query?: string; variables?: unknown }> = [];
+    const fetcher = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)) as { query?: string; variables?: unknown });
+      return new Response(JSON.stringify({
+        data: { getTicketList: { tickets: [{ ticketId: "private-ticket-id", displayId: "62609" }], listInfo: { page: 1 } } },
+      }));
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    const probe = new SuperOpsRateLimitProbe(harness.state, {
+      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      SUPEROPS_SUBDOMAIN: "computaskltd",
+      SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
+    });
+    const started = await probe.fetch(new Request("https://probe.local/state", {
+      method: "POST",
+      body: JSON.stringify({ action: "start", task: "getTicketList" }),
+    }));
+    const startedBody = await started.json() as { runId: string; task: string };
+    expect(startedBody.task).toBe("getTicketList");
+
+    await probe.alarm();
+
+    const statusResponse = await probe.fetch(new Request("https://probe.local/state", {
+      method: "POST",
+      body: JSON.stringify({ action: "status", runId: startedBody.runId }),
+    }));
+    const status = await statusResponse.json() as Record<string, unknown>;
+    expect(status.task).toBe("getTicketList");
+    expect(fetcher).toHaveBeenCalledTimes(10);
+    expect(requests[0]?.query).toContain("getTicketList");
+    expect(requests[0]?.query).not.toContain("getClientList");
+
+    const resultsResponse = await probe.fetch(new Request("https://probe.local/state", {
+      method: "POST",
+      body: JSON.stringify({ action: "results", runId: startedBody.runId, limit: 20 }),
+    }));
+    const results = await resultsResponse.json() as { events: Array<Record<string, unknown>> };
+    expect(results.events).toHaveLength(10);
+    expect(results.events[0]).toMatchObject({ task: "getTicketList", outcome: "success" });
+    expect(JSON.stringify(results)).not.toContain("private-ticket-id");
+  });
+
+  it("rejects an unsupported probe task", async () => {
+    const harness = fakeState();
+    const probe = new SuperOpsRateLimitProbe(harness.state, {
+      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      SUPEROPS_SUBDOMAIN: "computaskltd",
+      SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
+    });
+
+    const response = await probe.fetch(new Request("https://probe.local/state", {
+      method: "POST",
+      body: JSON.stringify({ action: "start", task: "getAssetList" }),
+    }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "task must be getClientList or getTicketList." });
+  });
 });
