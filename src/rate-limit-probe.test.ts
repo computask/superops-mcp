@@ -174,7 +174,40 @@ describe("read-only rate-limit probe", () => {
       body: JSON.stringify({ action: "start", task: "getAssetList" }),
     }));
     expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: "task must be getClientList or getTicketList." });
+    expect(await response.json()).toEqual({ error: "task must be getClientList, getTicketList, or getTicketListOpenQueue." });
+  });
+
+  it("supports the exact filtered open-ticket request", async () => {
+    const harness = fakeState();
+    const requests: Array<{ query?: string; variables?: unknown }> = [];
+    const fetcher = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)) as { query?: string; variables?: unknown });
+      return new Response(JSON.stringify({
+        data: { getTicketList: { tickets: [], listInfo: { totalCount: 0 } } },
+      }));
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    const probe = new SuperOpsRateLimitProbe(harness.state, {
+      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      SUPEROPS_SUBDOMAIN: "computaskltd",
+      SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
+    });
+    const started = await probe.fetch(new Request("https://probe.local/state", {
+      method: "POST",
+      body: JSON.stringify({ action: "start", task: "getTicketListOpenQueue" }),
+    }));
+    const startedBody = await started.json() as { runId: string; task: string };
+    await probe.alarm();
+
+    expect(startedBody.task).toBe("getTicketListOpenQueue");
+    expect(requests).toHaveLength(10);
+    expect(requests[0]?.query).toContain("pageSize: 10000");
+    expect(requests[0]?.query).toContain('attribute: "status"');
+    expect(requests[0]?.query).toContain('"Waiting on third party"');
+    expect(requests[0]?.query).toContain("updatedTime");
+    expect(requests[0]?.query).toContain("createdTime");
+    expect(requests[0]?.variables).toEqual({});
   });
 
   it("rejects an unsupported probe profile", async () => {

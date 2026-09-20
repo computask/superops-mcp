@@ -17,7 +17,7 @@ const PROBE_REQUEST_TIMEOUT_MS = 8_000;
 const MAX_EVENTS_PER_RUN = 10_000;
 const MAX_RESULTS_PAGE_SIZE = 200;
 
-export type RateLimitProbeTask = "getClientList" | "getTicketList";
+export type RateLimitProbeTask = "getClientList" | "getTicketList" | "getTicketListOpenQueue";
 export type RateLimitProbeProfile = "standard" | "oneMinute100";
 
 const DEFAULT_RATE_LIMIT_PROBE_TASK: RateLimitProbeTask = "getClientList";
@@ -40,27 +40,64 @@ const RATE_LIMIT_PROBE_QUERIES: Record<RateLimitProbeTask, string> = {
       }
     }
   `,
+  getTicketListOpenQueue: `
+    query getTicketList {
+      getTicketList(input: {
+        page: 1,
+        pageSize: 10000,
+        condition: {
+          attribute: "status",
+          operator: "includes",
+          value: [
+            "New Calls",
+            "Awaiting Engineer",
+            "Awaiting 2nd Line Engineer",
+            "Awaiting Approval",
+            "Awaiting Customer Reply",
+            "Awaiting Quote",
+            "Setup Info",
+            "Ticket on Hold",
+            "Waiting on third party",
+            "Worked on"
+          ]
+        }
+      }) {
+        tickets {
+          ticketId
+          status
+          updatedTime
+          createdTime
+        }
+        listInfo {
+          totalCount
+        }
+      }
+    }
+  `,
 };
 
-const RATE_LIMIT_PROBE_VARIABLES = {
-  input: {
-    page: 1,
-    pageSize: 1,
+const RATE_LIMIT_PROBE_VARIABLES: Record<RateLimitProbeTask, Record<string, unknown>> = {
+  getClientList: {
+    input: { page: 1, pageSize: 1 },
   },
+  getTicketList: {
+    input: { page: 1, pageSize: 1 },
+  },
+  getTicketListOpenQueue: {},
 };
 
 export const RATE_LIMIT_PROBE_TOOLS: ToolDefinition[] = [
   {
     name: "superops_rate_limit_probe_start",
     description:
-      "Start one read-only SuperOps API rate-limit probe for getClientList or getTicketList. The standard profile runs for 30 minutes; oneMinute100 sends 100 requests over one minute. It bypasses MCP read retries, records safe per-attempt outcomes, and never writes tickets or stores response content. Only one probe may run at a time. Defaults to getClientList and the standard profile.",
+      "Start one read-only SuperOps API rate-limit probe for getClientList, getTicketList, or the filtered getTicketListOpenQueue request. The standard profile runs for 30 minutes; oneMinute100 sends 100 requests over one minute. It bypasses MCP read retries, records safe per-attempt outcomes, and never writes tickets or stores response content. Only one probe may run at a time. Defaults to getClientList and the standard profile.",
     inputSchema: {
       type: "object",
       properties: {
         task: {
           type: "string",
-          enum: ["getClientList", "getTicketList"],
-          description: "The exact read operation to probe. Defaults to getClientList.",
+          enum: ["getClientList", "getTicketList", "getTicketListOpenQueue"],
+          description: "The exact read operation to probe. getTicketListOpenQueue uses the large page-10000 open-status filter. Defaults to getClientList.",
         },
         profile: {
           type: "string",
@@ -296,14 +333,18 @@ function safeReason(value: unknown): string | undefined {
 
 function parseProbeTask(value: unknown): RateLimitProbeTask {
   if (value === undefined || value === null || value === "") return DEFAULT_RATE_LIMIT_PROBE_TASK;
-  if (value === "getClientList" || value === "getTicketList") return value;
-  throw new Error("task must be getClientList or getTicketList.");
+  if (value === "getClientList" || value === "getTicketList" || value === "getTicketListOpenQueue") return value;
+  throw new Error("task must be getClientList, getTicketList, or getTicketListOpenQueue.");
 }
 
 function parseProbeProfile(value: unknown): RateLimitProbeProfile {
   if (value === undefined || value === null || value === "") return DEFAULT_RATE_LIMIT_PROBE_PROFILE;
   if (value === "standard" || value === "oneMinute100") return value;
   throw new Error("profile must be standard or oneMinute100.");
+}
+
+function graphqlOperationName(task: RateLimitProbeTask): string {
+  return task === "getTicketListOpenQueue" ? "getTicketList" : task;
 }
 
 function profileFor(run: ProbeRun): (typeof RATE_LIMIT_PROBE_PROFILES)[RateLimitProbeProfile] {
@@ -385,7 +426,7 @@ function emitAttemptStarted(params: {
     endpointPath: "/msp",
     requestPurpose: "initialRead",
     operationType: "query",
-    operationName: params.task,
+    operationName: graphqlOperationName(params.task),
     attempt: 1,
   }));
 }
@@ -407,7 +448,7 @@ function emitAttemptFinished(event: ProbeEvent, callId: string): void {
     endpointPath: "/msp",
     requestPurpose: "initialRead",
     operationType: "query",
-    operationName: event.task,
+    operationName: graphqlOperationName(event.task),
     attempt: 1,
     durationMs: event.durationMs,
     ok: event.ok,
@@ -523,7 +564,7 @@ async function performProbeAttempt(params: {
         Authorization: `Bearer ${params.apiToken}`,
         CustomerSubDomain: params.run.tenant,
       },
-      body: JSON.stringify({ query: RATE_LIMIT_PROBE_QUERIES[task], variables: RATE_LIMIT_PROBE_VARIABLES }),
+      body: JSON.stringify({ query: RATE_LIMIT_PROBE_QUERIES[task], variables: RATE_LIMIT_PROBE_VARIABLES[task] }),
       signal: controller.signal,
     });
     httpStatus = response.status;

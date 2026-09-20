@@ -248,6 +248,7 @@ function probeOperatorPage(): Response {
   <label>Task
     <select name="task">
       <option value="getTicketList">getTicketList</option>
+      <option value="getTicketListOpenQueue">getTicketListOpenQueue</option>
       <option value="getClientList">getClientList</option>
     </select>
   </label>
