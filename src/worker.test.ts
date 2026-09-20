@@ -588,6 +588,31 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(body.status).toBe("ok");
   });
 
+  it("requires an allowed Cloudflare Access identity for the rate-limit probe operator route", async () => {
+    const res = await worker.fetch(
+      new Request(`https://${DIRECT_HOST}/internal/rate-limit-probe`),
+      chatGptEnv()
+    );
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toMatchObject({ error: "Forbidden" });
+  });
+
+  it("does not expose the rate-limit probe operator route without the production probe binding", async () => {
+    const res = await worker.fetch(
+      new Request(`https://${DIRECT_HOST}/internal/rate-limit-probe`, {
+        method: "POST",
+        headers: {
+          "CF-Access-Jwt-Assertion": await cloudflareAccessJwt(),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ action: "start", task: "getTicketList" }),
+      }),
+      chatGptEnv()
+    );
+    expect(res.status).toBe(503);
+    await expect(res.json()).resolves.toMatchObject({ error: expect.stringContaining("unavailable") });
+  });
+
   it("answers CORS preflight", async () => {
     const res = await worker.fetch(
       new Request("http://worker.local/mcp", { method: "OPTIONS" }),

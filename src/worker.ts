@@ -208,6 +208,134 @@ async function handleMcp(
   }
 }
 
+async function rateLimitProbeAdapterForEnv(
+  env: Env
+): Promise<ReturnType<typeof createRateLimitProbeAdapter> | undefined> {
+  if (
+    (env.AUTH_MODE ?? "env") === "gateway" ||
+    env.SUPEROPS_RATE_LIMIT_PROBE_ENABLED !== "true" ||
+    !env.SUPEROPS_API_TOKEN ||
+    !env.SUPEROPS_SUBDOMAIN
+  ) {
+    return undefined;
+  }
+
+  return createRateLimitProbeAdapter({
+    namespace: env.SUPEROPS_RATE_LIMIT_PROBE,
+    tenantKey: await envTenantOwnerHash({
+      subdomain: env.SUPEROPS_SUBDOMAIN.trim() || "default",
+      region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
+    }),
+    enabled: true,
+  });
+}
+
+function probeOperatorPage(): Response {
+  return new Response(`<!doctype html>
+<meta charset="utf-8">
+<title>SuperOps rate-limit probe</title>
+<h1>SuperOps rate-limit probe</h1>
+<p>This authenticated operator page runs only the isolated read-only probe.</p>
+<form method="post" action="/internal/rate-limit-probe">
+  <label>Action
+    <select name="action">
+      <option value="start">Start</option>
+      <option value="status">Status</option>
+      <option value="results">Results</option>
+      <option value="stop">Stop</option>
+    </select>
+  </label>
+  <label>Task
+    <select name="task">
+      <option value="getTicketList">getTicketList</option>
+      <option value="getClientList">getClientList</option>
+    </select>
+  </label>
+  <label>Run ID <input name="runId" autocomplete="off"></label>
+  <label>Cursor <input name="cursor" inputmode="numeric"></label>
+  <label>Limit <input name="limit" inputmode="numeric" value="200"></label>
+  <button type="submit">Run</button>
+</form>`, {
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+async function handleInternalRateLimitProbe(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const accessUser = await requireAllowedAccessUser(request, env);
+  if (accessUser instanceof Response) return accessUser;
+
+  if (request.method !== "GET" && request.method !== "POST") {
+    return json({ error: "Method not allowed" }, 405);
+  }
+
+  const url = new URL(request.url);
+  const params: Record<string, unknown> = Object.fromEntries(url.searchParams.entries());
+  if (request.method === "POST") {
+    const contentType = request.headers.get("Content-Type")?.toLowerCase() ?? "";
+    try {
+      if (contentType.includes("application/json")) {
+        const body = await request.json() as unknown;
+        if (body && typeof body === "object" && !Array.isArray(body)) {
+          Object.assign(params, body);
+        }
+      } else {
+        const form = await request.formData();
+        for (const [key, value] of form.entries()) {
+          if (typeof value === "string") params[key] = value;
+        }
+      }
+    } catch {
+      return json({ error: "Invalid probe request body" }, 400);
+    }
+  }
+
+  const action = typeof params.action === "string" ? params.action : undefined;
+  if (!action) return probeOperatorPage();
+  if (request.method === "GET" && (action === "start" || action === "stop")) {
+    return json({ error: "Start and stop require POST" }, 405);
+  }
+
+  const rateLimitProbe = await rateLimitProbeAdapterForEnv(env);
+  if (!rateLimitProbe) {
+    return json({ error: "The rate-limit probe is unavailable on this Worker." }, 503);
+  }
+
+  const toolName = action === "start"
+    ? "superops_rate_limit_probe_start"
+    : action === "status"
+      ? "superops_rate_limit_probe_status"
+      : action === "results"
+        ? "superops_rate_limit_probe_results"
+        : action === "stop"
+          ? "superops_rate_limit_probe_stop"
+          : undefined;
+  if (!toolName) return json({ error: "Unknown probe action" }, 400);
+
+  const args: Record<string, unknown> = {};
+  for (const key of ["task", "runId", "reason"]) {
+    if (typeof params[key] === "string" && params[key]) args[key] = params[key];
+  }
+  for (const key of ["cursor", "limit"]) {
+    if (typeof params[key] === "string" && /^\d+$/.test(params[key])) {
+      args[key] = Number(params[key]);
+    } else if (typeof params[key] === "number" && Number.isFinite(params[key])) {
+      args[key] = Math.trunc(params[key]);
+    }
+  }
+
+  const result = await rateLimitProbe.handleCall(toolName, args);
+  const text = result.content.find((block) => block.type === "text")?.text;
+  if (!text) return json({ error: "Probe returned no safe result" }, 500);
+  try {
+    return json(JSON.parse(text), result.isError ? 400 : 200);
+  } catch {
+    return json({ error: "Probe returned an invalid safe result" }, 500);
+  }
+}
+
 function ensureExecutionContext(
   ctx: WorkerExecutionContext | undefined
 ): WorkerExecutionContext {
@@ -881,6 +1009,10 @@ async function handleBaseWorkerFetch(
     return handleInternalContinuation(request, env, executionContext);
   }
 
+  if (url.pathname === "/internal/rate-limit-probe") {
+    return handleInternalRateLimitProbe(request, env);
+  }
+
   // CORS preflight
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -927,19 +1059,9 @@ async function handleBaseWorkerFetch(
       };
     }
 
-    const rateLimitProbe = !isGatewayMode &&
-      env.SUPEROPS_RATE_LIMIT_PROBE_ENABLED === "true" &&
-      env.SUPEROPS_API_TOKEN &&
-      env.SUPEROPS_SUBDOMAIN
-        ? createRateLimitProbeAdapter({
-            namespace: env.SUPEROPS_RATE_LIMIT_PROBE,
-            tenantKey: await envTenantOwnerHash({
-              subdomain: env.SUPEROPS_SUBDOMAIN ?? "default",
-              region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
-            }),
-            enabled: true,
-          })
-        : undefined;
+    const rateLimitProbe = isGatewayMode
+      ? undefined
+      : await rateLimitProbeAdapterForEnv(env);
 
     // Propagate credentials through AsyncLocalStorage so getCredentials()/
     // getClient() resolve them (process.env is unavailable on workerd).
