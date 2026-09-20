@@ -84,6 +84,8 @@ export interface Env {
   SUPEROPS_SCRIPT_CATALOGUE?: unknown;
   SUPEROPS_RATE_LIMIT_PROBE?: unknown;
   SUPEROPS_RATE_LIMIT_PROBE_ENABLED?: string;
+  /** Temporary, route-local operator credential used only for the live probe run. */
+  SUPEROPS_RATE_LIMIT_PROBE_OPERATOR_TOKEN?: string;
   SUPEROPS_SCRIPT_CATALOGUE_ADMIN_TOKEN?: string;
   SUPEROPS_CONTINUATION_WORKFLOW?: {
     createBatch(options: Array<{ id: string; params: Record<string, unknown> }>): Promise<Array<{ id: string }>>;
@@ -264,7 +266,12 @@ async function handleInternalRateLimitProbe(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const accessUser = await requireAllowedAccessUser(request, env);
+  const operatorToken = env.SUPEROPS_RATE_LIMIT_PROBE_OPERATOR_TOKEN?.trim();
+  const presentedOperatorToken = request.headers.get("X-SuperOps-Rate-Limit-Probe-Token")?.trim();
+  const accessUser =
+    operatorToken && presentedOperatorToken === operatorToken
+      ? { email: "temporary-probe-operator" }
+      : await requireAllowedAccessUser(request, env);
   if (accessUser instanceof Response) return accessUser;
 
   if (request.method !== "GET" && request.method !== "POST") {
