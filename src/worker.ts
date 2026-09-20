@@ -251,6 +251,12 @@ function probeOperatorPage(): Response {
       <option value="getClientList">getClientList</option>
     </select>
   </label>
+  <label>Profile
+    <select name="profile">
+      <option value="standard">standard</option>
+      <option value="oneMinute100">oneMinute100</option>
+    </select>
+  </label>
   <label>Run ID <input name="runId" autocomplete="off"></label>
   <label>Cursor <input name="cursor" inputmode="numeric"></label>
   <label>Limit <input name="limit" inputmode="numeric" value="200"></label>
@@ -315,7 +321,7 @@ async function handleInternalRateLimitProbe(
   if (!toolName) return json({ error: "Unknown probe action" }, 400);
 
   const args: Record<string, unknown> = {};
-  for (const key of ["task", "runId", "reason"]) {
+  for (const key of ["task", "profile", "runId", "reason"]) {
     if (typeof params[key] === "string" && params[key]) args[key] = params[key];
   }
   for (const key of ["cursor", "limit"]) {

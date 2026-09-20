@@ -127,6 +127,40 @@ describe("read-only rate-limit probe", () => {
     expect(JSON.stringify(results)).not.toContain("private-ticket-id");
   });
 
+  it("supports the one-minute 100-per-minute profile", async () => {
+    const harness = fakeState();
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      data: { getTicketList: { tickets: [{ ticketId: "private-ticket-id", displayId: "62609" }], listInfo: { page: 1 } } },
+    })));
+    vi.stubGlobal("fetch", fetcher);
+
+    const probe = new SuperOpsRateLimitProbe(harness.state, {
+      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      SUPEROPS_SUBDOMAIN: "computaskltd",
+      SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
+    });
+    const started = await probe.fetch(new Request("https://probe.local/state", {
+      method: "POST",
+      body: JSON.stringify({ action: "start", task: "getTicketList", profile: "oneMinute100" }),
+    }));
+    const startedBody = await started.json() as { runId: string; profile: string; startedAt: string; deadlineAt: string };
+    expect(startedBody.profile).toBe("oneMinute100");
+    expect(Date.parse(startedBody.deadlineAt) - Date.parse(startedBody.startedAt)).toBe(60_000);
+
+    await probe.alarm();
+
+    expect(fetcher).toHaveBeenCalledTimes(16);
+    const statusResponse = await probe.fetch(new Request("https://probe.local/state", {
+      method: "POST",
+      body: JSON.stringify({ action: "status", runId: startedBody.runId }),
+    }));
+    await expect(statusResponse.json()).resolves.toMatchObject({
+      profile: "oneMinute100",
+      currentPhase: "burst_100_per_minute",
+      currentTargetRequestsPerMinute: 100,
+    });
+  });
+
   it("rejects an unsupported probe task", async () => {
     const harness = fakeState();
     const probe = new SuperOpsRateLimitProbe(harness.state, {
@@ -141,5 +175,21 @@ describe("read-only rate-limit probe", () => {
     }));
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: "task must be getClientList or getTicketList." });
+  });
+
+  it("rejects an unsupported probe profile", async () => {
+    const harness = fakeState();
+    const probe = new SuperOpsRateLimitProbe(harness.state, {
+      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      SUPEROPS_SUBDOMAIN: "computaskltd",
+      SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
+    });
+
+    const response = await probe.fetch(new Request("https://probe.local/state", {
+      method: "POST",
+      body: JSON.stringify({ action: "start", profile: "burst" }),
+    }));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "profile must be standard or oneMinute100." });
   });
 });

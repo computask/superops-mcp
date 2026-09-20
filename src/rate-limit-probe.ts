@@ -11,14 +11,17 @@ import type { ToolResult } from "./audit.js";
  */
 
 const PROBE_DURATION_MS = 30 * 60 * 1_000;
+const ONE_MINUTE_BURST_DURATION_MS = 60 * 1_000;
 const PROBE_INTERVAL_MS = 10_000;
 const PROBE_REQUEST_TIMEOUT_MS = 8_000;
 const MAX_EVENTS_PER_RUN = 10_000;
 const MAX_RESULTS_PAGE_SIZE = 200;
 
 export type RateLimitProbeTask = "getClientList" | "getTicketList";
+export type RateLimitProbeProfile = "standard" | "oneMinute100";
 
 const DEFAULT_RATE_LIMIT_PROBE_TASK: RateLimitProbeTask = "getClientList";
+const DEFAULT_RATE_LIMIT_PROBE_PROFILE: RateLimitProbeProfile = "standard";
 
 const RATE_LIMIT_PROBE_QUERIES: Record<RateLimitProbeTask, string> = {
   getClientList: `
@@ -50,7 +53,7 @@ export const RATE_LIMIT_PROBE_TOOLS: ToolDefinition[] = [
   {
     name: "superops_rate_limit_probe_start",
     description:
-      "Start one fixed 30-minute, read-only SuperOps API rate-limit probe for getClientList or getTicketList. It bypasses MCP read retries, records safe per-attempt outcomes, and never writes tickets or stores response content. Only one probe may run at a time. Defaults to getClientList.",
+      "Start one read-only SuperOps API rate-limit probe for getClientList or getTicketList. The standard profile runs for 30 minutes; oneMinute100 sends 100 requests over one minute. It bypasses MCP read retries, records safe per-attempt outcomes, and never writes tickets or stores response content. Only one probe may run at a time. Defaults to getClientList and the standard profile.",
     inputSchema: {
       type: "object",
       properties: {
@@ -58,6 +61,11 @@ export const RATE_LIMIT_PROBE_TOOLS: ToolDefinition[] = [
           type: "string",
           enum: ["getClientList", "getTicketList"],
           description: "The exact read operation to probe. Defaults to getClientList.",
+        },
+        profile: {
+          type: "string",
+          enum: ["standard", "oneMinute100"],
+          description: "Probe schedule. Defaults to the standard 30-minute profile.",
         },
       },
     },
@@ -141,6 +149,27 @@ export const RATE_LIMIT_PROBE_PHASES: readonly ProbePhase[] = [
   { name: "recovery_30_per_minute", startSecond: 1_500, endSecond: 1_800, requestsPerMinute: 30 },
 ];
 
+const ONE_MINUTE_BURST_PHASES: readonly ProbePhase[] = [
+  { name: "burst_100_per_minute", startSecond: 0, endSecond: 60, requestsPerMinute: 100 },
+];
+
+const RATE_LIMIT_PROBE_PROFILES: Record<RateLimitProbeProfile, {
+  durationMs: number;
+  phases: readonly ProbePhase[];
+  schedule: string;
+}> = {
+  standard: {
+    durationMs: PROBE_DURATION_MS,
+    phases: RATE_LIMIT_PROBE_PHASES,
+    schedule: "60/90/100/120/150/30 requests per minute, five minutes per phase, no automatic retries",
+  },
+  oneMinute100: {
+    durationMs: ONE_MINUTE_BURST_DURATION_MS,
+    phases: ONE_MINUTE_BURST_PHASES,
+    schedule: "100 requests per minute for one minute, no automatic retries",
+  },
+};
+
 interface ProbeHeaders {
   rateLimitLimit?: number;
   rateLimitRemaining?: number;
@@ -176,6 +205,7 @@ interface ProbeRun {
   version: 1;
   runId: string;
   task: RateLimitProbeTask;
+  profile: RateLimitProbeProfile;
   status: ProbeStatus;
   startedAt: string;
   deadlineAt: string;
@@ -270,6 +300,16 @@ function parseProbeTask(value: unknown): RateLimitProbeTask {
   throw new Error("task must be getClientList or getTicketList.");
 }
 
+function parseProbeProfile(value: unknown): RateLimitProbeProfile {
+  if (value === undefined || value === null || value === "") return DEFAULT_RATE_LIMIT_PROBE_PROFILE;
+  if (value === "standard" || value === "oneMinute100") return value;
+  throw new Error("profile must be standard or oneMinute100.");
+}
+
+function profileFor(run: ProbeRun): (typeof RATE_LIMIT_PROBE_PROFILES)[RateLimitProbeProfile] {
+  return RATE_LIMIT_PROBE_PROFILES[run.profile ?? DEFAULT_RATE_LIMIT_PROBE_PROFILE];
+}
+
 function endpointFor(region: string | undefined): "api.superops.ai" | "euapi.superops.ai" {
   return region === "eu" ? "euapi.superops.ai" : "api.superops.ai";
 }
@@ -315,10 +355,10 @@ function rateLimitHeaders(headers: Headers): ProbeHeaders {
   };
 }
 
-function phaseFor(startedAt: number, now = Date.now()): ProbePhase {
+function phaseFor(startedAt: number, phases: readonly ProbePhase[], now = Date.now()): ProbePhase {
   const elapsedSecond = Math.max(0, (now - startedAt) / 1_000);
-  return RATE_LIMIT_PROBE_PHASES.find((phase) => elapsedSecond < phase.endSecond)
-    ?? RATE_LIMIT_PROBE_PHASES[RATE_LIMIT_PROBE_PHASES.length - 1];
+  return phases.find((phase) => elapsedSecond < phase.endSecond)
+    ?? phases[phases.length - 1];
 }
 
 function emitAttemptStarted(params: {
@@ -566,10 +606,12 @@ async function performProbeAttempt(params: {
 }
 
 function resultSummary(run: ProbeRun): Record<string, unknown> {
+  const profile = profileFor(run);
   const elapsedMs = Math.max(0, Date.parse(run.finishedAt ?? new Date().toISOString()) - Date.parse(run.startedAt));
   return {
     runId: run.runId,
     task: run.task ?? DEFAULT_RATE_LIMIT_PROBE_TASK,
+    profile: run.profile ?? DEFAULT_RATE_LIMIT_PROBE_PROFILE,
     status: run.status,
     startedAt: run.startedAt,
     deadlineAt: run.deadlineAt,
@@ -591,7 +633,8 @@ function resultSummary(run: ProbeRun): Record<string, unknown> {
     lastOutcome: run.lastOutcome,
     lastHttpStatus: run.lastHttpStatus,
     stoppedReason: run.stoppedReason,
-    phases: RATE_LIMIT_PROBE_PHASES,
+    phases: profile.phases,
+    schedule: profile.schedule,
     interpretation: "Probe outcomes are attributable to this probe, but SuperOps limits may be tenant-wide; concurrent non-probe calls are a possible confounder.",
   };
 }
@@ -623,7 +666,7 @@ export class SuperOpsRateLimitProbe {
     return finished;
   }
 
-  private async start(taskInput?: unknown): Promise<Record<string, unknown>> {
+  private async start(taskInput?: unknown, profileInput?: unknown): Promise<Record<string, unknown>> {
     if (this.env.SUPEROPS_RATE_LIMIT_PROBE_ENABLED !== "true") {
       throw new Error("The rate-limit probe is disabled by SUPEROPS_RATE_LIMIT_PROBE_ENABLED.");
     }
@@ -631,6 +674,8 @@ export class SuperOpsRateLimitProbe {
     const tenant = this.env.SUPEROPS_SUBDOMAIN?.trim().toLowerCase();
     if (!token || !tenant) throw new Error("Probe requires the configured SuperOps Worker credentials.");
     const task = parseProbeTask(taskInput);
+    const profileName = parseProbeProfile(profileInput);
+    const profile = RATE_LIMIT_PROBE_PROFILES[profileName];
     const existing = await this.activeRun();
     if (existing?.status === "running" && Date.parse(existing.deadlineAt) > Date.now()) {
       return { accepted: false, reason: "already_running", ...resultSummary(existing) };
@@ -640,9 +685,10 @@ export class SuperOpsRateLimitProbe {
       version: 1,
       runId: uuid(),
       task,
+      profile: profileName,
       status: "running",
       startedAt: startedAt.toISOString(),
-      deadlineAt: new Date(startedAt.getTime() + PROBE_DURATION_MS).toISOString(),
+      deadlineAt: new Date(startedAt.getTime() + profile.durationMs).toISOString(),
       endpointHost: endpointFor(this.env.SUPEROPS_REGION),
       tenant: safeTenant(tenant),
       nextSequence: 1,
@@ -660,7 +706,8 @@ export class SuperOpsRateLimitProbe {
       accepted: true,
       ...resultSummary(run),
       task,
-      schedule: "60/90/100/120/150/30 requests per minute, five minutes per phase, no automatic retries",
+      profile: profileName,
+      schedule: profile.schedule,
     };
   }
 
@@ -710,7 +757,7 @@ export class SuperOpsRateLimitProbe {
       await this.finishRun(run, "completed");
       return;
     }
-    const phase = phaseFor(Date.parse(run.startedAt), now);
+    const phase = phaseFor(Date.parse(run.startedAt), profileFor(run).phases, now);
     const requestedBatch = phase.requestsPerMinute / (60_000 / PROBE_INTERVAL_MS) + run.fractionalBatch;
     const batchSize = Math.max(1, Math.min(25, Math.floor(requestedBatch)));
     const nextFractionalBatch = requestedBatch - batchSize;
@@ -762,7 +809,7 @@ export class SuperOpsRateLimitProbe {
     try {
       const body = await request.json() as Record<string, unknown>;
       const action = body.action;
-      if (action === "start") return jsonResponse(await this.start(body.task));
+      if (action === "start") return jsonResponse(await this.start(body.task, body.profile));
       if (action === "status") return jsonResponse(await this.status(typeof body.runId === "string" ? body.runId : undefined));
       if (action === "results") {
         const runId = typeof body.runId === "string" ? body.runId : "";
@@ -818,7 +865,7 @@ export function createRateLimitProbeAdapter(params: {
       try {
         switch (name) {
           case "superops_rate_limit_probe_start":
-            return { content: [{ type: "text", text: JSON.stringify(await callProbe(namespace, params.tenantKey, "start", { task: args.task }), null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(await callProbe(namespace, params.tenantKey, "start", { task: args.task, profile: args.profile }), null, 2) }] };
           case "superops_rate_limit_probe_status":
             return { content: [{ type: "text", text: JSON.stringify(await callProbe(namespace, params.tenantKey, "status", { runId: typeof args.runId === "string" ? args.runId : undefined }), null, 2) }] };
           case "superops_rate_limit_probe_results": {
