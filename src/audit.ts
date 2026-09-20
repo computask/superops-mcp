@@ -44,6 +44,13 @@ export interface AuditMetadata {
     verify?: unknown;
     fallbackAllowed?: unknown;
   };
+  triageApply?: {
+    operationState?: unknown;
+    complete?: unknown;
+    continuationRequired?: unknown;
+    finalOutcomes?: unknown;
+    failureStages?: unknown;
+  };
   ticketReporting?: {
     createdFrom?: unknown;
     createdTo?: unknown;
@@ -548,6 +555,7 @@ export function auditToolCall(args: {
     changedFields: args.metadata?.changedFields,
     triageSnapshot: args.metadata?.triageSnapshot,
     triagePlan: args.metadata?.triagePlan,
+    triageApply: args.metadata?.triageApply,
     ticketReporting: args.metadata?.ticketReporting,
     customGraphql: args.metadata,
   };

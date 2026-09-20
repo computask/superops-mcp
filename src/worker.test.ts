@@ -462,6 +462,7 @@ describe("ChatGPT direct mutation policy", () => {
       "superops_alerts_resolve",
       "superops_custom_mutation",
       "superops_custom_query",
+      "superops_navigate",
       "superops_operations_cancel",
       "superops_scripts_execute_on_asset",
       "superops_tickets_add_note",
@@ -498,6 +499,34 @@ describe("ChatGPT direct mutation policy", () => {
     expect(blocked.has("superops_custom_query")).toBe(true);
     expect(blocked.has("superops_scripts_execute_on_asset")).toBe(true);
     expect(blocked.has("superops_operations_results")).toBe(false);
+  });
+
+  it("removes broad preparation reads from the opt-in targeted triage surface", async () => {
+    const blocked = await chatGptDirectBlockedToolNames({
+      reviewedTriagePlanAllowed: true,
+      targetedTriageOnly: true,
+    });
+
+    for (const name of [
+      "superops_status",
+      "superops_test_connection",
+      "superops_operations_get",
+      "superops_operations_results",
+      "superops_operations_cancel",
+      "superops_tickets_list",
+      "superops_tickets_recent",
+      "superops_tickets_created_between",
+      "superops_tickets_report",
+      "superops_tickets_triage_snapshot",
+      "superops_tickets_field_options",
+      "superops_navigate",
+    ]) {
+      expect(blocked.has(name)).toBe(true);
+    }
+
+    expect(blocked.has("superops_tickets_query")).toBe(false);
+    expect(blocked.has("superops_tickets_triage_evidence_recover")).toBe(false);
+    expect(blocked.has("superops_tickets_apply_triage_plan")).toBe(false);
   });
 
   it("keeps the reviewed ChatGPT direct mutating surface to durable triage controls only", async () => {
@@ -1246,7 +1275,7 @@ describe("Cloudflare Worker entrypoint", () => {
           jsonrpc: "2.0",
           id: 32,
           method: "tools/call",
-          params: { name: "superops_tickets_list", arguments: {} },
+          params: { name: "superops_tickets_triage_snapshot", arguments: {} },
         },
         {},
         { "X-Request-Id": "audit-failure-1" }
@@ -1258,13 +1287,33 @@ describe("Cloudflare Worker entrypoint", () => {
       };
       expect(body.result?.isError).toBe(true);
       expect(body.result?.content?.[0]?.text).toContain("credentials");
+      // Keep the safe trace in the primary content item as well as the
+      // backwards-compatible telemetry item: some MCP clients expose only
+      // the first text item to the model.
+      expect(body.result?.content?.[0]?.text).toContain("mcpExecution");
       expect(body.result?.content?.[0]?.text).not.toContain("SUPEROPS_API_TOKEN");
       expect(body.result?.content?.[0]?.text).not.toContain(" at ");
+
+      const telemetry = body.result?.content
+        ?.map((item) => {
+          try {
+            return JSON.parse(String(item.text)) as { mcpExecution?: { failureDiagnostics?: unknown[] } };
+          } catch {
+            return undefined;
+          }
+        })
+        .find((item) => item?.mcpExecution !== undefined)?.mcpExecution;
+      expect(telemetry?.failureDiagnostics).toEqual([
+        expect.objectContaining({
+          stage: "mcp_tool",
+          message: expect.stringContaining("credentials"),
+        }),
+      ]);
 
       const records = auditRecords(logSpy);
       expect(records[0]).toMatchObject({
         requestId: "audit-failure-1",
-        toolName: "superops_tickets_list",
+        toolName: "superops_tickets_triage_snapshot",
         success: false,
       });
       expect(String(records[0].errorSummary)).toContain("credentials");
@@ -2007,6 +2056,49 @@ describe("Cloudflare Worker entrypoint", () => {
       "expectedCandidateTicketNumbers is required"
     );
     expect(callBody.result?.content?.[0]?.text).not.toMatch(/disabled/i);
+  });
+
+  it("hides standalone field-option discovery from the targeted direct triage route", async () => {
+    const env = chatGptEnv({
+      SUPEROPS_API_TOKEN: "test-token",
+      SUPEROPS_SUBDOMAIN: "acme",
+      CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
+      CHATGPT_DIRECT_TARGETED_TRIAGE_ONLY: "true",
+      SUPEROPS_CONTINUATION_ENABLED: "true",
+      SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+    });
+    const token = await getOAuthAccessToken(env);
+
+    const list = await mcp(
+      { jsonrpc: "2.0", id: 711, method: "tools/list", params: {} },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+    const listBody = (await list.json()) as { result?: { tools?: PublishedTool[] } };
+    const names = (listBody.result?.tools ?? []).map((tool) => tool.name);
+
+    expect(names).toContain("superops_tickets_query");
+    expect(names).toContain("superops_tickets_triage_evidence_recover");
+    expect(names).toContain("superops_tickets_apply_triage_plan");
+    expect(names).not.toContain("superops_tickets_field_options");
+
+    const call = await mcp(
+      {
+        jsonrpc: "2.0",
+        id: 712,
+        method: "tools/call",
+        params: { name: "superops_tickets_field_options", arguments: {} },
+      },
+      env,
+      { Authorization: `Bearer ${token}` },
+      `${AUTH_SERVER}/mcp`
+    );
+    const callBody = (await call.json()) as {
+      result?: { isError?: boolean; content?: { text?: string }[] };
+    };
+    expect(callBody.result?.isError).toBe(true);
+    expect(callBody.result?.content?.[0]?.text).toMatch(/disabled/i);
   });
 
   it("propagates continuation scheduler bindings through the ChatGPT direct MCP route", async () => {

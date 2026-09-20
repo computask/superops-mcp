@@ -33,7 +33,6 @@ import {
   ExecutionTimeoutBudgetExceededError,
   getExecutionConfig,
   hasExecutionBudgetFor,
-  recordRetryDelay,
 } from "../execution.js";
 import {
   runOperationContinuation,
@@ -115,10 +114,8 @@ const STATUS_EQUALS_OPERATOR = "is";
 const STATUS_IN_OPERATOR = "in";
 const TICKET_FIELD_MODULE = "TICKET";
 const CLIENT_LOOKUP_PAGE_SIZE = 200;
-const FIELD_OPTIONS_MAX_INTERNAL_ATTEMPTS = 2;
 /** Short Cloudflare Cache API TTL for tenant field metadata; SuperOps option sets change rarely. */
 const FIELD_OPTIONS_CACHE_TTL_MS = 5 * 60 * 1000;
-const FIELD_OPTIONS_RETRY_ENDPOINT = "SuperOps GraphQL /msp getFields";
 
 const CLIENT_NAME_ALIASES: Record<string, string> = {
   "task group": "TaskGroup",
@@ -142,7 +139,7 @@ interface TicketOptionFieldsRetrieval {
   fields: Map<ValidatedTicketOptionField, SuperOpsField>;
   metadata: {
     source: "fresh" | "cache";
-    cacheStatus: "miss" | "fallback" | "unavailable";
+    cacheStatus: "hit" | "miss" | "fallback" | "unavailable";
     cacheTtlSeconds: number;
     cachedAt?: string;
     expiresAt?: string;
@@ -699,7 +696,10 @@ interface ResolveFullParams extends TicketClassificationParams {
 
 
 type TriagePlanActionType = "resolve" | "update" | "addNote" | "leave" | "skip";
-type TriagePolicyMode = "scheduled-new-calls-v1";
+type TriagePolicyMode =
+  | "scheduled-new-calls-v1"
+  | "scheduled-new-calls-v2"
+  | "email-new-calls-v2";
 type TriagePolicyDisposition =
   | "customer_request"
   | "server_down"
@@ -717,6 +717,33 @@ type TriagePolicyReason =
   | "newsletter_or_marketing"
   | "automated_digest"
   | "outlook_reaction_digest";
+type TriageHistoryRecurrenceState = "recurrent" | "not_recurrent" | "unknown";
+type TriageHistorySolutionState = "prior_solution_found" | "no_prior_solution_found" | "unknown";
+type TriageHistoryPostSolutionRecurrence =
+  | "observed_recurrence"
+  | "no_observed_recurrence_in_window"
+  | "follow_up_unknown";
+type TriageCrossClientSignal = "none" | "watch" | "credible" | "unknown";
+type TriageEmergingIssueSignal = "none" | "watch" | "credible" | "unknown";
+type TriageHistoryResultState = "complete" | "no_matches" | "unavailable" | "degraded" | "unknown";
+
+interface TriageHistoryAssessment {
+  issueRecurrence: TriageHistoryRecurrenceState;
+  solutionHistory: TriageHistorySolutionState;
+  postSolutionRecurrence: TriageHistoryPostSolutionRecurrence;
+  crossClientSignal: TriageCrossClientSignal;
+  emergingIssueSignal: TriageEmergingIssueSignal;
+  resultState: TriageHistoryResultState;
+  lookbackDays?: number;
+  matchingTicketCount?: number;
+  resolvedMatchingTicketCount?: number;
+  distinctClientCount?: number;
+  distinctRequesterCount?: number;
+  representativeTicketNumbers?: string[];
+  summary?: string;
+  solutionSummary?: string;
+  currentScriptRecommendation?: string;
+}
 type TriageFinalOutcome =
   | "Resolved"
   | "Updated"
@@ -750,6 +777,7 @@ interface TriagePlanAction {
   policyDisposition?: TriagePolicyDisposition;
   contentEvidenceState?: TriageContentEvidenceState;
   policyReason?: TriagePolicyReason;
+  historyAssessment?: TriageHistoryAssessment;
   reason?: string;
   note?: string;
   noteFingerprint?: string;
@@ -781,7 +809,11 @@ interface ApplyTriagePlanParams {
 }
 
 const TRIAGE_PLAN_ACTION_TYPES = ["resolve", "update", "addNote", "leave", "skip"] as const;
-const TRIAGE_POLICY_MODES = ["scheduled-new-calls-v1"] as const;
+const TRIAGE_POLICY_MODES = [
+  "scheduled-new-calls-v1",
+  "scheduled-new-calls-v2",
+  "email-new-calls-v2",
+] as const;
 const TRIAGE_POLICY_DISPOSITIONS = [
   "customer_request",
   "server_down",
@@ -802,6 +834,15 @@ const TRIAGE_POLICY_REASONS = [
   "outlook_reaction_digest",
 ] as const;
 const SCHEDULED_NEW_CALLS_POLICY: TriagePolicyMode = "scheduled-new-calls-v1";
+const SCHEDULED_NEW_CALLS_V2_POLICY: TriagePolicyMode = "scheduled-new-calls-v2";
+const EMAIL_NEW_CALLS_V2_POLICY: TriagePolicyMode = "email-new-calls-v2";
+
+function isScheduledNewCallsPolicy(policyMode: unknown): policyMode is TriagePolicyMode {
+  return policyMode === SCHEDULED_NEW_CALLS_POLICY ||
+    policyMode === SCHEDULED_NEW_CALLS_V2_POLICY ||
+    policyMode === EMAIL_NEW_CALLS_V2_POLICY;
+}
+
 const SCHEDULED_TRIAGE_TASKGROUP_NAME = "TaskGroup";
 const SCHEDULED_TRIAGE_TASKGROUP_ID = "2993553194649526272";
 const TRIAGE_PLAN_MUTABLE_STATUSES = ["Resolved", "Awaiting Engineer"] as const;
@@ -858,6 +899,7 @@ const TRIAGE_PLAN_ACTION_FIELD_NAMES = [
   "policyDisposition",
   "contentEvidenceState",
   "policyReason",
+  "historyAssessment",
   "reason",
   "note",
   "noteFingerprint",
@@ -869,6 +911,130 @@ const TRIAGE_PLAN_ACTION_FIELD_NAMES = [
 ] as const;
 const TRIAGE_PLAN_ACTION_FIELD_SET = new Set<string>(TRIAGE_PLAN_ACTION_FIELD_NAMES);
 const TRIAGE_PLAN_TARGET_FIELD_SET = new Set<string>(TRIAGE_PLAN_ACCEPTED_TARGET_FIELDS);
+
+const TRIAGE_HISTORY_RECURRENCE_STATES = ["recurrent", "not_recurrent", "unknown"] as const;
+const TRIAGE_HISTORY_SOLUTION_STATES = ["prior_solution_found", "no_prior_solution_found", "unknown"] as const;
+const TRIAGE_HISTORY_POST_SOLUTION_STATES = [
+  "observed_recurrence",
+  "no_observed_recurrence_in_window",
+  "follow_up_unknown",
+] as const;
+const TRIAGE_CROSS_CLIENT_SIGNALS = ["none", "watch", "credible", "unknown"] as const;
+const TRIAGE_EMERGING_ISSUE_SIGNALS = ["none", "watch", "credible", "unknown"] as const;
+const TRIAGE_HISTORY_RESULT_STATES = ["complete", "no_matches", "unavailable", "degraded", "unknown"] as const;
+const TRIAGE_HISTORY_ASSESSMENT_FIELD_NAMES = [
+  "issueRecurrence",
+  "solutionHistory",
+  "postSolutionRecurrence",
+  "crossClientSignal",
+  "emergingIssueSignal",
+  "resultState",
+  "lookbackDays",
+  "matchingTicketCount",
+  "resolvedMatchingTicketCount",
+  "distinctClientCount",
+  "distinctRequesterCount",
+  "representativeTicketNumbers",
+  "summary",
+  "solutionSummary",
+  "currentScriptRecommendation",
+] as const;
+
+const TRIAGE_HISTORY_ASSESSMENT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    issueRecurrence: {
+      type: "string",
+      enum: [...TRIAGE_HISTORY_RECURRENCE_STATES],
+      description: "Bounded historical issue recurrence state. Same-client or same-requester evidence is not cross-client evidence.",
+    },
+    solutionHistory: {
+      type: "string",
+      enum: [...TRIAGE_HISTORY_SOLUTION_STATES],
+      description: "Whether bounded historical evidence found an observed prior solution. This is not a guarantee that the solution fixes the current ticket.",
+    },
+    postSolutionRecurrence: {
+      type: "string",
+      enum: [...TRIAGE_HISTORY_POST_SOLUTION_STATES],
+      description: "Whether recurrence was observed after an historical solution, or whether that follow-up evidence is unknown.",
+    },
+    crossClientSignal: {
+      type: "string",
+      enum: [...TRIAGE_CROSS_CLIENT_SIGNALS],
+      description: "Bounded cross-client signal. credible requires at least two verified distinct clients.",
+    },
+    emergingIssueSignal: {
+      type: "string",
+      enum: [...TRIAGE_EMERGING_ISSUE_SIGNALS],
+      description: "Bounded emerging-issue signal; credible is reserved for a genuinely supported cross-client pattern.",
+    },
+    resultState: {
+      type: "string",
+      enum: [...TRIAGE_HISTORY_RESULT_STATES],
+      description: "Overall bounded history result state. unavailable, degraded or unknown must not be treated as no history.",
+    },
+    lookbackDays: {
+      type: "integer",
+      minimum: 1,
+      maximum: 730,
+      description: "Optional bounded history lookback in days.",
+    },
+    matchingTicketCount: {
+      type: "integer",
+      minimum: 0,
+      maximum: 10000,
+      description: "Optional bounded count of matching historical tickets.",
+    },
+    resolvedMatchingTicketCount: {
+      type: "integer",
+      minimum: 0,
+      maximum: 10000,
+      description: "Optional bounded count of matching historical tickets with observed resolution evidence.",
+    },
+    distinctClientCount: {
+      type: "integer",
+      minimum: 0,
+      maximum: 10000,
+      description: "Optional bounded count of verified distinct clients represented by the evidence.",
+    },
+    distinctRequesterCount: {
+      type: "integer",
+      minimum: 0,
+      maximum: 10000,
+      description: "Optional bounded count of verified distinct requesters represented by the evidence.",
+    },
+    representativeTicketNumbers: {
+      type: "array",
+      maxItems: 5,
+      items: { type: "string", pattern: "^[0-9]{1,20}$" },
+      description: "Optional maximum five representative display numbers; never include ticket bodies or attachments.",
+    },
+    summary: {
+      type: "string",
+      maxLength: 280,
+      description: "Optional short sanitized metadata summary; no customer body, HTML or unbounded text.",
+    },
+    solutionSummary: {
+      type: "string",
+      maxLength: 280,
+      description: "Optional short sanitized summary of observed historical solution evidence; advisory only.",
+    },
+    currentScriptRecommendation: {
+      type: "string",
+      maxLength: 280,
+      description: "Optional short sanitized advisory summary for a current script recommendation; never a guarantee or raw script/body.",
+    },
+  },
+  required: [
+    "issueRecurrence",
+    "solutionHistory",
+    "postSolutionRecurrence",
+    "crossClientSignal",
+    "emergingIssueSignal",
+    "resultState",
+  ],
+} as const;
 
 const TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES = {
   ticketNumber: {
@@ -923,6 +1089,7 @@ const TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES = {
     enum: [...TRIAGE_POLICY_REASONS],
     description: "Deterministic reason class binding the verified evidence to policyDisposition.",
   },
+  historyAssessment: TRIAGE_HISTORY_ASSESSMENT_SCHEMA,
   allowWriteIfUpdatedTimeChanged: {
     type: "boolean",
     default: false,
@@ -953,127 +1120,62 @@ const TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES = {
   suppressCloseNotification: { type: "boolean", description: "Suppress SuperOps close notification where supported." },
 } as const;
 
-const TRIAGE_PLAN_UPDATE_TARGET_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    status: {
-      type: "string",
-      enum: ["Awaiting Engineer"],
-      description: "Update actions may only move a ticket to Awaiting Engineer.",
-    },
-    impact: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.impact,
-    urgency: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.urgency,
-    category: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.category,
-    subcategory: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.subcategory,
-    cause: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.cause,
-    techGroupName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.techGroupName,
-    clientName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientName,
-    clientId: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientId,
-    suppressCloseNotification: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.suppressCloseNotification,
-  },
-  required: ["status", ...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS],
-} as const;
-
-const TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    ...TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES,
-    status: {
-      type: "string",
-      enum: ["Resolved"],
-      default: DEFAULT_RESOLVE_TICKET_STATUS,
-      description: "Resolve actions may only close to Resolved.",
-    },
-  },
-  required: [...TRIAGE_PLAN_RESOLVE_REQUIRED_CLASSIFICATION_FIELDS],
-} as const;
-
-const TRIAGE_PLAN_LEAVE_TARGET_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    impact: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.impact,
-    urgency: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.urgency,
-    category: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.category,
-    subcategory: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.subcategory,
-    cause: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.cause,
-    clientName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientName,
-    clientId: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientId,
-  },
-  required: [...TRIAGE_PLAN_REQUIRED_CLASSIFICATION_FIELDS],
-} as const;
-
+// Keep the public schema as one ordinary object with an action discriminator.
+// The Agent connector does not reliably preserve nested oneOf branches, while
+// validateTriagePlanActionShape below remains the authoritative action-specific
+// and scheduled-policy safety gate before any SuperOps call or write.
 const TRIAGE_PLAN_ACTION_SCHEMA = {
-  oneOf: [
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
-        action: { type: "string", const: "update" },
-        target: TRIAGE_PLAN_UPDATE_TARGET_SCHEMA,
-        note: { type: "string", description: "Optional private note to add after the update succeeds." },
-        isPublicNote: { type: "boolean", default: false, description: "Whether the optional note is client-visible." },
-      },
-      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"],
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
+    action: {
+      type: "string",
+      enum: [...TRIAGE_PLAN_ACTION_TYPES],
+      description: "Action discriminator. update, resolve, and leave require a matching target; leave specifically requires non-empty impact, urgency, category, and subcategory and must retain the current status. addNote requires note; skip requires only the fixed ticket number and action.",
     },
-    {
+    target: {
       type: "object",
       additionalProperties: false,
       properties: {
-        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
-        action: { type: "string", const: "resolve" },
-        target: TRIAGE_PLAN_RESOLVE_TARGET_SCHEMA,
-        note: { type: "string", description: "Optional private note to add after the resolve succeeds." },
-        isPublicNote: { type: "boolean", default: false, description: "Whether the optional note is client-visible." },
-        allowResolveFullFallbackToUpdate: {
-          type: "boolean",
-          default: false,
-          description: "Allow controlled update fallback only after a SuperOps internal server error.",
-        },
-      },
-      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"],
-    },
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
-        action: { type: "string", const: "addNote" },
-        note: { type: "string", description: "Private note body to add." },
-        isPublicNote: { type: "boolean", default: false, description: "Whether the note is client-visible." },
-      },
-      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "note"],
-    },
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
-        action: { type: "string", const: "leave" },
-        target: TRIAGE_PLAN_LEAVE_TARGET_SCHEMA,
-        note: { type: "string", description: "Optional private triage-summary note to add after classification succeeds." },
-        isPublicNote: { type: "boolean", default: false, description: "Whether the optional note is client-visible." },
-        reason: {
+        status: {
           type: "string",
-          description: "Optional reason for retaining the current status after classification.",
+          enum: [...TRIAGE_PLAN_MUTABLE_STATUSES],
+          description: "Required for update (Awaiting Engineer) and resolve (Resolved); omit for leave because leave retains the current status.",
         },
+        impact: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.impact,
+        urgency: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.urgency,
+        category: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.category,
+        subcategory: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.subcategory,
+        cause: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.cause,
+        resolutionCode: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.resolutionCode,
+        techGroupName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.techGroupName,
+        clientName: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientName,
+        clientId: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.clientId,
+        suppressCloseNotification: TRIAGE_PLAN_TARGET_SCHEMA_PROPERTIES.suppressCloseNotification,
       },
-      required: ["ticketNumber", "expectedUpdatedTime", "contentVerified", "action", "target"],
+      description: "Action-specific target. update requires status Awaiting Engineer plus impact, urgency, category, and subcategory; resolve requires status Resolved plus impact, urgency, category, subcategory, cause, and resolutionCode; leave requires non-empty impact, urgency, category, and subcategory (copy existing values when retaining classification), must omit status and resolutionCode, and must not assign a technician or tech group.",
     },
-    {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        ...TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES,
-        action: { type: "string", const: "skip" },
-        reason: { type: "string", description: "Optional reason for skipping this approved candidate." },
-      },
-      required: ["ticketNumber", "action"],
+    note: {
+      type: "string",
+      description: "Private note body. Scheduled v1 accepts the existing TRIAGE SUMMARY shape; scheduled v2 requires HTML <strong> labels and <br><br> section separators, with bounded historical sections. The server canonicalizes HTML/plain-text equivalents for verification and deduplication.",
     },
-  ],
+    isPublicNote: {
+      type: "boolean",
+      default: false,
+      description: "Whether the note is client-visible. Scheduled triage requires false.",
+    },
+    allowResolveFullFallbackToUpdate: {
+      type: "boolean",
+      default: false,
+      description: "Allow controlled update fallback only after a SuperOps internal server error; scheduled triage prohibits this.",
+    },
+    reason: {
+      type: "string",
+      description: "Optional reason for retaining or skipping the fixed candidate.",
+    },
+  },
+  required: ["ticketNumber", "action"],
 } as const;
 
 interface ApplyTriagePlanResult {
@@ -1498,10 +1600,14 @@ async function collectCanonicalTicketNotes(params: {
     params.ticketId,
     ...(params.additionalTicketIds ?? []),
   ]).slice(0, 2);
-  const initialTicketIds = uniqueTicketIds([
-    ...canonicalTicketIds,
-    displayId,
-  ]);
+  // An approved immutable ticket ID is the canonical identity. Reading the
+  // same note collection again through its display number adds latency and
+  // rate-limit pressure without improving dedupe safety. Keep the display
+  // lookup only for legacy display-number-only callers.
+  const hasCanonicalTicketId = canonicalTicketIds.some((ticketId) => ticketId !== displayId);
+  const initialTicketIds = uniqueTicketIds(
+    hasCanonicalTicketId ? canonicalTicketIds : [...canonicalTicketIds, displayId]
+  );
   for (const ticketId of initialTicketIds) {
     if (!await readTicketId(ticketId)) {
       return { available: false, notes, ticketIdsRead, errors, rateLimitError };
@@ -1509,7 +1615,6 @@ async function collectCanonicalTicketNotes(params: {
     if (matchedRequestedPrivateFingerprint) break;
   }
 
-  const hasCanonicalTicketId = canonicalTicketIds.some((ticketId) => ticketId !== displayId);
   if (notes.length === 0 && displayId && !hasCanonicalTicketId) {
     try {
       const matches = await resolveTicketIdByDisplayId(params.client, displayId);
@@ -1668,6 +1773,130 @@ function validateTriagePlanActions(actions: unknown[]): string | undefined {
   }
 }
 
+function validateBoundedHistoryText(value: unknown, label: string): string | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return `${label} must be a non-empty short sanitized string`;
+  }
+  const text = value.trim();
+  if (text.length > 280) {
+    return `${label} must be at most 280 characters`;
+  }
+  const containsControlCharacter = [...text].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31);
+  });
+  if (text.includes("<") || text.includes(">") || text.includes("\r") ||
+      text.includes("\n") || containsControlCharacter) {
+    return `${label} must not contain HTML, line breaks or control characters`;
+  }
+  if (/\b(?:bearer|access[ _-]?token|client[ _-]?secret)\b|-----BEGIN(?:\s+[^-]+)?-----/iu.test(text)) {
+    return `${label} contains a credential or private-key marker`;
+  }
+  return undefined;
+}
+
+function validateTriageHistoryAssessment(
+  rawAssessment: unknown,
+  actionIndex: number
+): string | undefined {
+  const label = `actions[${actionIndex}].historyAssessment`;
+  const assessment = jsonRecord(rawAssessment);
+  if (!assessment) return `${label} must be an object.`;
+
+  const unknownFields = Object.keys(assessment).filter(
+    (field) => !(TRIAGE_HISTORY_ASSESSMENT_FIELD_NAMES as readonly string[]).includes(field)
+  );
+  if (unknownFields.length > 0) {
+    return `${label} contains unsupported field(s): ${unknownFields.join(", ")}.`;
+  }
+
+  const enumFields: Array<{
+    field: keyof TriageHistoryAssessment;
+    values: readonly string[];
+  }> = [
+    { field: "issueRecurrence", values: TRIAGE_HISTORY_RECURRENCE_STATES },
+    { field: "solutionHistory", values: TRIAGE_HISTORY_SOLUTION_STATES },
+    { field: "postSolutionRecurrence", values: TRIAGE_HISTORY_POST_SOLUTION_STATES },
+    { field: "crossClientSignal", values: TRIAGE_CROSS_CLIENT_SIGNALS },
+    { field: "emergingIssueSignal", values: TRIAGE_EMERGING_ISSUE_SIGNALS },
+    { field: "resultState", values: TRIAGE_HISTORY_RESULT_STATES },
+  ];
+  for (const { field, values } of enumFields) {
+    const value = assessment[field];
+    if (typeof value !== "string" || !values.includes(value)) {
+      return `${label}.${field} must be one of: ${values.join(", ")}.`;
+    }
+  }
+
+  const countFields = [
+    "lookbackDays",
+    "matchingTicketCount",
+    "resolvedMatchingTicketCount",
+    "distinctClientCount",
+    "distinctRequesterCount",
+  ] as const;
+  for (const field of countFields) {
+    const value = assessment[field];
+    if (value === undefined) continue;
+    const maximum = field === "lookbackDays" ? 730 : 10000;
+    const minimum = field === "lookbackDays" ? 1 : 0;
+    if (typeof value !== "number" || !Number.isInteger(value) || value < minimum || value > maximum) {
+      return `${label}.${field} must be an integer between ${minimum} and ${maximum}.`;
+    }
+  }
+
+  const representativeTicketNumbers = assessment.representativeTicketNumbers;
+  if (representativeTicketNumbers !== undefined) {
+    if (!Array.isArray(representativeTicketNumbers) || representativeTicketNumbers.length > 5) {
+      return `${label}.representativeTicketNumbers must contain at most five ticket numbers.`;
+    }
+    for (const [index, value] of representativeTicketNumbers.entries()) {
+      const ticketNumber = normaliseTicketNumber(value);
+      if (!/^\d{1,20}$/u.test(ticketNumber)) {
+        return `${label}.representativeTicketNumbers[${index}] must be a numeric display ticket number.`;
+      }
+    }
+  }
+
+  for (const field of ["summary", "solutionSummary", "currentScriptRecommendation"] as const) {
+    if (assessment[field] !== undefined) {
+      const textError = validateBoundedHistoryText(assessment[field], `${label}.${field}`);
+      if (textError) return textError;
+    }
+  }
+
+  const matchingTicketCount = assessment.matchingTicketCount;
+  if (assessment.issueRecurrence === "recurrent" &&
+      (typeof matchingTicketCount !== "number" || matchingTicketCount < 1)) {
+    return `${label}.matchingTicketCount must be at least 1 when issueRecurrence is recurrent.`;
+  }
+  if (assessment.issueRecurrence === "not_recurrent" &&
+      (typeof matchingTicketCount !== "number" || matchingTicketCount !== 0)) {
+    return `${label}.matchingTicketCount must be 0 when issueRecurrence is not_recurrent.`;
+  }
+
+  const resolvedMatchingTicketCount = assessment.resolvedMatchingTicketCount;
+  if (assessment.solutionHistory === "prior_solution_found" &&
+      (typeof resolvedMatchingTicketCount !== "number" || resolvedMatchingTicketCount < 1)) {
+    return `${label}.resolvedMatchingTicketCount must be at least 1 when solutionHistory is prior_solution_found.`;
+  }
+  if (assessment.solutionHistory === "no_prior_solution_found" &&
+      (typeof resolvedMatchingTicketCount !== "number" || resolvedMatchingTicketCount !== 0)) {
+    return `${label}.resolvedMatchingTicketCount must be 0 when solutionHistory is no_prior_solution_found.`;
+  }
+
+  if (assessment.crossClientSignal === "credible" &&
+      (assessment.resultState !== "complete" ||
+       typeof assessment.distinctClientCount !== "number" || assessment.distinctClientCount < 2)) {
+    return `${label}.crossClientSignal credible requires resultState complete and at least two verified distinct clients.`;
+  }
+  if (assessment.emergingIssueSignal === "credible" &&
+      (assessment.crossClientSignal !== "credible" ||
+       typeof assessment.distinctClientCount !== "number" || assessment.distinctClientCount < 2)) {
+    return `${label}.emergingIssueSignal credible requires a credible crossClientSignal backed by at least two verified distinct clients.`;
+  }
+}
+
 const SCHEDULED_TRIAGE_NOTE_SECTIONS = [
   "Ticket goal:",
   "What needs to be known:",
@@ -1679,7 +1908,8 @@ function scheduledTriageNoteValidation(note: unknown): string | undefined {
   if (typeof note !== "string" || note.trim().length === 0) {
     return "a non-empty private TRIAGE SUMMARY note is required";
   }
-  const lines = note.replace(/\r\n?/g, "\n").split("\n").map((line) => line.trim()).filter(Boolean);
+  const canonical = canonicalizeNoteText(note);
+  const lines = (canonical ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
   if (lines[0] !== "TRIAGE SUMMARY") {
     return "the private note must start with TRIAGE SUMMARY";
   }
@@ -1687,6 +1917,206 @@ function scheduledTriageNoteValidation(note: unknown): string | undefined {
     const line = lines.find((candidate) => candidate.startsWith(section));
     if (!line || line.slice(section.length).trim().length === 0) {
       return `the private note requires a non-empty ${section} section`;
+    }
+  }
+}
+
+const SCHEDULED_TRIAGE_V2_BASE_NOTE_SECTIONS = [
+  "Ticket goal:",
+  "What needs to be known:",
+  "Next step:",
+  "When:",
+] as const;
+
+const SCHEDULED_TRIAGE_V2_HISTORY_NOTE_SECTIONS = [
+  "Historical issue:",
+  "Historical solution:",
+  "Post-solution recurrence:",
+  "Cross-client signal:",
+  "Emerging issue:",
+] as const;
+
+function scheduledTriageV2RelevantHistorySections(
+  assessment: TriageHistoryAssessment
+): Set<string> {
+  const relevant = new Set<string>();
+  if (assessment.issueRecurrence === "recurrent") {
+    relevant.add("Historical issue:");
+  }
+  if (assessment.solutionHistory === "prior_solution_found") {
+    relevant.add("Historical solution:");
+    if (assessment.postSolutionRecurrence === "observed_recurrence") {
+      relevant.add("Post-solution recurrence:");
+    }
+  }
+  if (assessment.crossClientSignal === "watch" || assessment.crossClientSignal === "credible") {
+    relevant.add("Cross-client signal:");
+  }
+  if (assessment.emergingIssueSignal === "watch" || assessment.emergingIssueSignal === "credible") {
+    relevant.add("Emerging issue:");
+  }
+  return relevant;
+}
+
+function scheduledTriageV2NoteValidation(
+  note: unknown,
+  assessment: TriageHistoryAssessment
+): string | undefined {
+  if (typeof note !== "string" || note.trim().length === 0) {
+    return "a non-empty private TRIAGE SUMMARY note is required";
+  }
+  const canonical = canonicalizeNoteText(note);
+  const lines = (canonical ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines[0] !== "TRIAGE SUMMARY") {
+    return "the private note must start with TRIAGE SUMMARY";
+  }
+
+  const relevantHistorySections = scheduledTriageV2RelevantHistorySections(assessment);
+  const sections = [
+    SCHEDULED_TRIAGE_V2_BASE_NOTE_SECTIONS[0],
+    SCHEDULED_TRIAGE_V2_BASE_NOTE_SECTIONS[1],
+    ...SCHEDULED_TRIAGE_V2_HISTORY_NOTE_SECTIONS.filter((section) => relevantHistorySections.has(section)),
+    ...(assessment.currentScriptRecommendation !== undefined ? ["Current script recommendation:"] : []),
+    SCHEDULED_TRIAGE_V2_BASE_NOTE_SECTIONS[2],
+    SCHEDULED_TRIAGE_V2_BASE_NOTE_SECTIONS[3],
+  ];
+  const labels = ["TRIAGE SUMMARY", ...sections];
+  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const label of SCHEDULED_TRIAGE_V2_HISTORY_NOTE_SECTIONS) {
+    const present = new RegExp(`<strong>\\s*${escapeRegExp(label)}\\s*</strong>`, "i").test(note);
+    const relevant = relevantHistorySections.has(label);
+    if (present !== relevant) {
+      return relevant
+        ? `the scheduled-new-calls-v2 note must include the relevant <strong>${label}</strong> section`
+        : `the scheduled-new-calls-v2 note must omit the irrelevant <strong>${label}</strong> section`;
+    }
+  }
+  for (const label of labels) {
+    const strongLabel = new RegExp(`<strong>\\s*${escapeRegExp(label)}\\s*</strong>`, "i");
+    if (!strongLabel.test(note)) {
+      return `the scheduled-new-calls-v2 note requires the <strong>${label}</strong> label`;
+    }
+  }
+  const sectionBreaks = note.match(/<br\s*\/?>\s*<br\s*\/?>/giu)?.length ?? 0;
+  if (sectionBreaks < labels.length - 1) {
+    return "the scheduled-new-calls-v2 note requires <br><br> between each section";
+  }
+
+  for (const section of sections) {
+    const line = lines.find((candidate) => candidate.startsWith(section));
+    if (!line || line.slice(section.length).trim().length === 0) {
+      return `the private note requires a non-empty ${section} section`;
+    }
+  }
+
+  const historyStateLineMatches = (section: string, state: string, line: string): boolean => {
+    const text = line.toLowerCase().replace(/[‐‑‒–—]/gu, "-").replace(/\s+/gu, " ").trim();
+    const unknownHistory =
+      /\bunknown\b|\bnot (?:known|established|determined|identified)\b|\b(?:could not|unable to|cannot|can't) (?:determine|establish|confirm|identify)\b|\bno (?:matching |relevant |clear |comparable )?(?:historical )?(?:issue|issues|match|matches|evidence|ticket|tickets)\b|\bnot found in (?:the )?history\b/u.test(text);
+
+    // The Workspace Agent is instructed to carry the machine-readable enum
+    // into each positive history section. Accept that explicit token as
+    // authoritative evidence of the same state, while retaining the natural
+    // language checks below for older/manual callers.
+    const enumFieldBySection: Record<string, string> = {
+      "Historical issue:": "issueRecurrence",
+      "Historical solution:": "solutionHistory",
+      "Post-solution recurrence:": "postSolutionRecurrence",
+      "Cross-client signal:": "crossClientSignal",
+      "Emerging issue:": "emergingIssueSignal",
+    };
+    const enumField = enumFieldBySection[section];
+    if (enumField && new RegExp(`\\b${escapeRegExp(enumField.toLowerCase())}=${escapeRegExp(state.toLowerCase())}\\b`, "u").test(text)) {
+      return true;
+    }
+
+    if (section === "Historical issue:") {
+      if (state === "recurrent") {
+        return /\brecurrent\b/u.test(text) &&
+          !/\bnot\s+recurrent\b|\bno\s+(?:recurrence|recurring)\b/u.test(text);
+      }
+      if (state === "not_recurrent") {
+        return /\bnot\s+recurrent\b|\bno\s+(?:recurrence|recurring)\b/u.test(text);
+      }
+      return unknownHistory;
+    }
+
+    if (section === "Historical solution:") {
+      if (state === "prior_solution_found") {
+        if (/\bno\s+(?:prior|previous|earlier|documented)\s+(?:solution|resolution)\b/u.test(text)) {
+          return false;
+        }
+        return /\b(?:prior|previous|earlier|existing|documented)\s+(?:solution|resolution)\s+(?:was\s+)?(?:found|exists?|documented|identified|available)\b/u.test(text) ||
+          /\bpreviously\s+documented\s+(?:solution|resolution)\b/u.test(text);
+      }
+      if (state === "no_prior_solution_found") {
+        return /\bno\s+(?:prior|previous|earlier|documented)\s+(?:solution|resolution)\b/u.test(text) ||
+          /\bno\s+(?:solution|resolution)\s+history\b/u.test(text) ||
+          /\bno\s+(?:matching|documented)\s+(?:solution|resolution)\s+(?:was\s+)?found\b/u.test(text);
+      }
+      return unknownHistory ||
+        /\b(?:no|without)\s+(?:reliable|clear|confirmed)\s+(?:historical\s+)?(?:solution|resolution)\s+(?:evidence|record|history)\b/u.test(text);
+    }
+
+    if (section === "Post-solution recurrence:") {
+      const noRecurrence =
+        /\bno\s+(?:observed\s+)?recurrence\b|\bno\s+recurrence\s+(?:was\s+)?observed\b|\bno\s+post[- ]solution\s+recurrence\b|\bdid\s+not\s+recur\s+after\b/u.test(text);
+      if (state === "observed_recurrence") {
+        return !noRecurrence &&
+          /\bobserved\s+recurrence\b|\brecurrence\s+(?:was\s+)?observed\b|\brecurrence\s+occurred\b|\brecurred\s+after\b/u.test(text);
+      }
+      if (state === "no_observed_recurrence_in_window") {
+        return noRecurrence;
+      }
+      return /\b(?:follow[- ]?up|post[- ]solution follow[- ]?up)\b.{0,35}\b(?:unknown|not known|cannot be determined|undetermined)\b/u.test(text) ||
+        /\b(?:future|later)\s+recurrence\b.{0,25}\b(?:unknown|not known|cannot be determined)\b/u.test(text);
+    }
+
+    if (state === "credible") {
+      return /\bcredible\b/u.test(text) && !/\b(?:not|no)\s+(?:a\s+)?credible\b/u.test(text);
+    }
+    if (state === "watch") {
+      return /\bwatch(?:ing)?\b|\bmonitor(?:ing)?\b/u.test(text) && !/\bno\s+(?:watch|monitor)\b/u.test(text);
+    }
+    if (state === "none") {
+      return /\bnone\b|\bno\s+(?:cross[- ]client|emerging\s+issue)\s+signal\b|\bno\s+signal\s+(?:was\s+)?identified\b/u.test(text);
+    }
+    return unknownHistory;
+  };
+
+  const stateChecks: Array<{ section: string; state: string; canonical: string }> = [
+    {
+      section: "Historical issue:",
+      state: assessment.issueRecurrence,
+      canonical: assessment.issueRecurrence.replace(/_/gu, " "),
+    },
+    {
+      section: "Historical solution:",
+      state: assessment.solutionHistory,
+      canonical: assessment.solutionHistory.replace(/_/gu, " "),
+    },
+    {
+      section: "Post-solution recurrence:",
+      state: assessment.postSolutionRecurrence,
+      canonical: assessment.postSolutionRecurrence.replace(/_/gu, " "),
+    },
+    {
+      section: "Cross-client signal:",
+      state: assessment.crossClientSignal,
+      canonical: assessment.crossClientSignal.replace(/_/gu, " "),
+    },
+    {
+      section: "Emerging issue:",
+      state: assessment.emergingIssueSignal,
+      canonical: assessment.emergingIssueSignal.replace(/_/gu, " "),
+    },
+  ];
+  for (const { section, state, canonical } of stateChecks) {
+    if (!relevantHistorySections.has(section)) continue;
+    const line = lines.find((candidate) => candidate.startsWith(section));
+    const lowerLine = line?.toLowerCase() ?? "";
+    if (!historyStateLineMatches(section, state, lowerLine)) {
+      return `${section} must explicitly state ${canonical} or an unambiguous equivalent.`;
     }
   }
 }
@@ -1710,30 +2140,41 @@ function validateScheduledNewCallsPolicy(
   expected: string[],
   actions: TriagePlanAction[]
 ): string | undefined {
-  if (request.policyMode !== SCHEDULED_NEW_CALLS_POLICY) return undefined;
+  if (!isScheduledNewCallsPolicy(request.policyMode)) return undefined;
+  const policyLabel = request.policyMode === EMAIL_NEW_CALLS_V2_POLICY
+    ? "email-new-calls-v2"
+    : request.policyMode === SCHEDULED_NEW_CALLS_V2_POLICY
+      ? "scheduled-new-calls-v2"
+      : "scheduled-new-calls-v1";
+  const isV2 = request.policyMode === SCHEDULED_NEW_CALLS_V2_POLICY ||
+    request.policyMode === EMAIL_NEW_CALLS_V2_POLICY;
+  const isEmailNewCalls = request.policyMode === EMAIL_NEW_CALLS_V2_POLICY;
 
   if (actions.length !== expected.length) {
-    return "scheduled-new-calls-v1 requires exactly one action for every fixed candidate.";
+    return `${policyLabel} requires exactly one action for every fixed candidate.`;
   }
   const actionNumbers = actions.map((action) => normaliseTicketNumber(action.ticketNumber));
   if (new Set(actionNumbers).size !== actionNumbers.length) {
-    return "scheduled-new-calls-v1 actions must not contain duplicate ticket numbers.";
+    return `${policyLabel} actions must not contain duplicate ticket numbers.`;
   }
   if (expected.some((ticketNumber) => !actionNumbers.includes(ticketNumber)) ||
       actionNumbers.some((ticketNumber) => !expected.includes(ticketNumber))) {
-    return "scheduled-new-calls-v1 actions must exactly cover the fixed candidate set.";
+    return `${policyLabel} actions must exactly cover the fixed candidate set.`;
   }
   if (request.verify === false || request.dedupeNotes === false || request.stopOnFirstFailure === true ||
       request.allowResolveFullFallbackToUpdate === true || request.allowWriteIfUpdatedTimeChanged === true ||
       request.allowWriteWithoutVerifiedContent === true) {
-    return "scheduled-new-calls-v1 requires verification and note dedupe, processes all candidates, and prohibits unsafe write overrides.";
+    return `${policyLabel} requires verification and note dedupe, processes all candidates, and prohibits unsafe write overrides.`;
   }
 
   const expectedActionByDisposition: Record<TriagePolicyDisposition, TriagePlanActionType> = {
     customer_request: "leave",
     server_down: "leave",
     manual_intake: "leave",
-    engineer_review: "update",
+    // Targeted email triage must not route a ticket away from New Calls just
+    // because its subject is technical. The full-queue policy retains the
+    // older engineer-review routing behaviour.
+    engineer_review: isEmailNewCalls ? "leave" : "update",
     resolve_no_action: "resolve",
   };
   const expectedReasonsByDisposition: Record<TriagePolicyDisposition, readonly TriagePolicyReason[]> = {
@@ -1753,14 +2194,14 @@ function validateScheduledNewCallsPolicy(
     const label = `actions[${index}]`;
     if (!action.policyDisposition ||
         !(TRIAGE_POLICY_DISPOSITIONS as readonly string[]).includes(action.policyDisposition)) {
-      return `${label}.policyDisposition is required for scheduled-new-calls-v1.`;
+      return `${label}.policyDisposition is required for ${policyLabel}.`;
     }
     if (action.action !== expectedActionByDisposition[action.policyDisposition]) {
       return `${label}.action does not match policyDisposition ${action.policyDisposition}.`;
     }
     if (!action.contentEvidenceState ||
         !(TRIAGE_CONTENT_EVIDENCE_STATES as readonly string[]).includes(action.contentEvidenceState)) {
-      return `${label}.contentEvidenceState is required for scheduled-new-calls-v1.`;
+      return `${label}.contentEvidenceState is required for ${policyLabel}.`;
     }
     if (action.contentEvidenceState === "unavailable") {
       return `${label} cannot be submitted because its content evidence is unavailable.`;
@@ -1792,7 +2233,13 @@ function validateScheduledNewCallsPolicy(
         action.contentVerified !== true) {
       return `${label} requires expectedTicketId, expectedSubject, expectedStatus New Calls, expectedUpdatedTime, and contentVerified=true.`;
     }
-    const noteError = scheduledTriageNoteValidation(action.note);
+    if (isV2) {
+      const historyError = validateTriageHistoryAssessment(action.historyAssessment, index);
+      if (historyError) return historyError;
+    }
+    const noteError = isV2
+      ? scheduledTriageV2NoteValidation(action.note, action.historyAssessment as TriageHistoryAssessment)
+      : scheduledTriageNoteValidation(action.note);
     if (noteError) return `${label}: ${noteError}.`;
     if (action.isPublicNote !== false) {
       return `${label}.isPublicNote must be explicitly false.`;
@@ -1800,7 +2247,7 @@ function validateScheduledNewCallsPolicy(
     if (action.allowResolveFullFallbackToUpdate === true ||
         action.allowWriteIfUpdatedTimeChanged === true ||
         action.allowWriteWithoutVerifiedContent === true) {
-      return `${label} cannot enable a write override in scheduled-new-calls-v1.`;
+      return `${label} cannot enable a write override in ${policyLabel}.`;
     }
     if (action.target?.techGroupName !== undefined) {
       return `${label}.target.techGroupName is not allowed; scheduled triage never assigns a technician or technician group.`;
@@ -2622,32 +3069,47 @@ async function collectSafeTicketContent(params: {
       if (readTicketIds.has(ticketId)) continue;
       readTicketIds.add(ticketId);
 
-      if (safeParams.includeConversations) {
-        try {
-          const ticketConversations = await getTicketConversations(client, ticketId);
+      // These reads are independent. Keep ticket IDs sequential to avoid a
+      // burst against SuperOps, but overlap the conversation and note reads
+      // for each immutable ticket so evidence collection is not needlessly
+      // serialized.
+      const conversationRead = safeParams.includeConversations
+        ? getTicketConversations(client, ticketId)
+        : Promise.resolve(undefined);
+      const noteRead = safeParams.includeNotes
+        ? collectCanonicalTicketNotes({ client, ticketId })
+        : Promise.resolve(undefined);
+      const [conversationResult, noteResult] = await Promise.allSettled([
+        conversationRead,
+        noteRead,
+      ]);
+
+      if (conversationResult.status === "fulfilled") {
+        if (conversationResult.value) {
           conversationReadSucceeded = true;
-          for (const conversation of ticketConversations) {
+          for (const conversation of conversationResult.value) {
             addUniqueConversation(conversations, seenConversationIds, conversation);
           }
-        } catch (error) {
-          contentErrors.push(
-            `Conversations could not be fetched safely: ${safeErrorMessage(error)}`
-          );
         }
+      } else {
+        contentErrors.push(
+          `Conversations could not be fetched safely: ${safeErrorMessage(conversationResult.reason)}`
+        );
       }
 
-      if (safeParams.includeNotes) {
-        try {
-          const ticketNotes = await collectCanonicalTicketNotes({ client, ticketId });
-          if (!ticketNotes.available) {
-            throw new Error(ticketNotes.errors.join("; ") || "Ticket notes were unavailable.");
-          }
+      if (noteResult.status === "fulfilled") {
+        const ticketNotes = noteResult.value;
+        if (ticketNotes && !ticketNotes.available) {
+          contentErrors.push(
+            `Notes could not be fetched safely: ${ticketNotes.errors.join("; ") || "Ticket notes were unavailable."}`
+          );
+        } else if (ticketNotes) {
           for (const note of ticketNotes.notes) {
             addUniqueNote(notes, seenNoteIds, note);
           }
-        } catch (error) {
-          contentErrors.push(`Notes could not be fetched safely: ${safeErrorMessage(error)}`);
         }
+      } else {
+        contentErrors.push(`Notes could not be fetched safely: ${safeErrorMessage(noteResult.reason)}`);
       }
     }
   }
@@ -3125,6 +3587,37 @@ async function getTicketOptionFields(
   return byName;
 }
 
+type TicketOptionFieldsProvider = (
+  fieldNames: readonly ValidatedTicketOptionField[]
+) => Promise<Map<ValidatedTicketOptionField, SuperOpsField>>;
+
+function createApplyTicketOptionFieldsProvider(
+  client: SuperOpsClientInstance
+): TicketOptionFieldsProvider {
+  const fields = new Map<ValidatedTicketOptionField, SuperOpsField>();
+
+  return async (fieldNames) => {
+    const requested = [...new Set(fieldNames)];
+    const missing = requested.filter((fieldName) => !fields.has(fieldName));
+    if (missing.length > 0) {
+      // Reuse the same short-lived, tenant/region/field-set scoped cache as
+      // superops_tickets_field_options. The apply path still validates the
+      // returned option values and dependencies before writing; this only
+      // avoids a duplicate metadata read when the Agent has just performed
+      // the bounded field-options lookup in a preceding MCP request.
+      const retrieval = await getTicketOptionFieldsForTool(client, missing);
+      for (const [fieldName, field] of retrieval.fields) fields.set(fieldName, field);
+    }
+
+    const result = new Map<ValidatedTicketOptionField, SuperOpsField>();
+    for (const fieldName of requested) {
+      const field = fields.get(fieldName);
+      if (field) result.set(fieldName, field);
+    }
+    return result;
+  };
+}
+
 function cloneTicketOptionFields(
   fields: Map<ValidatedTicketOptionField, SuperOpsField>
 ): Map<ValidatedTicketOptionField, SuperOpsField> {
@@ -3313,115 +3806,71 @@ async function writeTicketOptionFieldsCache(
 
   ticketFieldOptionsCache.set(identity.memoryKey, entry);
 }
-function fieldOptionsRetryDelay(error: unknown, attempt: number): {
-  delayMs: number;
-  retryAfterPresent: boolean;
-  suppliedDelayMs?: number;
-  source: "retry-after" | "backoff";
-} {
-  const config = getExecutionConfig();
-  const retryAfterSeconds =
-    error instanceof SuperOpsHttpError || error instanceof SuperOpsError
-      ? error.retryAfter
-      : undefined;
-  if (typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds)) {
-    const suppliedDelayMs = Math.max(0, Math.ceil(retryAfterSeconds * 1000));
-    return {
-      delayMs: Math.min(config.maxSingleDelayMs, suppliedDelayMs),
-      retryAfterPresent: true,
-      suppliedDelayMs,
-      source: "retry-after",
-    };
-  }
-
-  const base = config.backoffBaseDelayMs * 2 ** Math.max(0, attempt - 1);
-  const jitter = config.backoffJitterRatio <= 0
-    ? 0
-    : base * config.backoffJitterRatio * Math.random();
-  return {
-    delayMs: Math.min(config.maxSingleDelayMs, Math.ceil(base + jitter)),
-    retryAfterPresent: false,
-    source: "backoff",
-  };
-}
-
-function sleep(ms: number): Promise<void> {
-  if (ms <= 0) return Promise.resolve();
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function getTicketOptionFieldsForTool(
   client: SuperOpsClientInstance,
   fieldNames: ValidatedTicketOptionField[]
 ): Promise<TicketOptionFieldsRetrieval> {
   const cacheIdentity = fieldOptionsCacheIdentity(fieldNames);
-  const config = getExecutionConfig();
-  const maxAttempts = Math.max(
-    1,
-    Math.min(FIELD_OPTIONS_MAX_INTERNAL_ATTEMPTS, config.maxReadRetryAttempts)
-  );
-  const startedMs = Date.now();
-  let attempts = 0;
+  // SuperOpsClient.query owns the bounded upstream retry policy. This helper
+  // deliberately performs one client call only; retrying here would multiply
+  // an already-exhausted client retry sequence and amplify a throttle.
+  const attempts = 1;
   let retryAfterPresent = false;
   let lastError: unknown;
 
-  while (attempts < maxAttempts) {
-    attempts += 1;
-    try {
-      const fields = await getTicketOptionFields(client, fieldNames);
-      await writeTicketOptionFieldsCache(cacheIdentity, fields);
-      return {
-        fields,
-        metadata: {
-          source: "fresh",
-          cacheStatus: cacheIdentity ? "miss" : "unavailable",
-          cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
-          attempts,
-          retried: attempts > 1,
-          rateLimited: false,
-          retryAfterPresent,
-        },
-      };
-    } catch (error) {
-      lastError = error;
-      if (!isRateLimitError(error) || attempts >= maxAttempts) break;
-      const retry = fieldOptionsRetryDelay(error, attempts);
-      retryAfterPresent ||= retry.retryAfterPresent;
-      const elapsedAfterDelay = Date.now() - startedMs + retry.delayMs;
-      if (
-        elapsedAfterDelay > config.maxRetryDurationMs ||
-        !hasExecutionBudgetFor(1) ||
-        elapsedAfterDelay + config.safeRemainingTimeMs >= config.maxDurationMs
-      ) {
-        break;
-      }
-      recordRetryDelay({
-        attempt: attempts,
-        source: retry.source,
-        retryAfterSupplied: retry.retryAfterPresent,
-        suppliedDelayMs: retry.suppliedDelayMs,
-        parsedDelayMs: retry.suppliedDelayMs ?? retry.delayMs,
-        cappedDelayMs: retry.delayMs,
-        actualDelayMs: retry.delayMs,
-        endpoint: FIELD_OPTIONS_RETRY_ENDPOINT,
-        operationType: "query",
-        operationName: "getFields",
-      });
-      await sleep(retry.delayMs);
-    }
+  // Field metadata is immutable enough for the bounded TTL and is already
+  // scoped by tenant, region, and exact requested field set.  A warm cache hit
+  // avoids spending a SuperOps read before the caller reaches the apply path;
+  // apply_triage_plan still performs its own live validation before writing.
+  const initialCacheLookup = await readTicketOptionFieldsCache(cacheIdentity);
+  if (initialCacheLookup.entry) {
+    return {
+      fields: cloneTicketOptionFields(initialCacheLookup.entry.fields),
+      metadata: {
+        source: "cache",
+        cacheStatus: "hit",
+        cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
+        ...cacheEntryMetadata(initialCacheLookup.entry),
+        attempts: 0,
+        retried: false,
+        rateLimited: false,
+        retryAfterPresent: false,
+      },
+    };
   }
 
-  const cacheLookup = isRateLimitError(lastError)
+  try {
+    const fields = await getTicketOptionFields(client, fieldNames);
+    await writeTicketOptionFieldsCache(cacheIdentity, fields);
+    return {
+      fields,
+      metadata: {
+        source: "fresh",
+        cacheStatus: cacheIdentity ? "miss" : "unavailable",
+        cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
+        attempts,
+        retried: false,
+        rateLimited: false,
+        retryAfterPresent: false,
+      },
+    };
+  } catch (error) {
+    lastError = error;
+    retryAfterPresent = (error instanceof SuperOpsHttpError || error instanceof SuperOpsError) &&
+      typeof error.retryAfter === "number" && Number.isFinite(error.retryAfter);
+  }
+
+  const fallbackCacheLookup = isRateLimitError(lastError)
     ? await readTicketOptionFieldsCache(cacheIdentity)
     : { available: false, valid: false, readFailed: false, nativeAvailable: Boolean(defaultFieldOptionsNativeCache()) };
-  if (isRateLimitError(lastError) && cacheLookup.entry) {
+  if (isRateLimitError(lastError) && fallbackCacheLookup.entry) {
     return {
-      fields: cloneTicketOptionFields(cacheLookup.entry.fields),
+      fields: cloneTicketOptionFields(fallbackCacheLookup.entry.fields),
       metadata: {
         source: "cache",
         cacheStatus: "fallback",
         cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
-        ...cacheEntryMetadata(cacheLookup.entry),
+        ...cacheEntryMetadata(fallbackCacheLookup.entry),
         attempts,
         retried: attempts > 1,
         rateLimited: true,
@@ -3442,10 +3891,14 @@ async function getTicketOptionFieldsForTool(
     rateLimited: isRateLimitError(lastError),
     attempts,
     retryAfterPresent,
-    cacheEntryAvailable: cacheLookup.available,
-    cacheEntryValid: cacheLookup.valid,
-    cacheReadFailed: cacheLookup.readFailed,
-    nativeCacheAvailable: cacheLookup.nativeAvailable,
+    retryAfterSeconds:
+      lastError instanceof SuperOpsHttpError || lastError instanceof SuperOpsError
+        ? lastError.retryAfter
+        : undefined,
+    cacheEntryAvailable: fallbackCacheLookup.available,
+    cacheEntryValid: fallbackCacheLookup.valid,
+    cacheReadFailed: fallbackCacheLookup.readFailed,
+    nativeCacheAvailable: fallbackCacheLookup.nativeAvailable,
     finalReason: safeErrorMessage(lastError),
   };
 }
@@ -3457,14 +3910,17 @@ async function addValidatedTicketOptionUpdates(
   client: SuperOpsClientInstance,
   params: TicketClassificationParams,
   input: Record<string, unknown>,
-  allowedFields: readonly ValidatedTicketOptionField[] = VALIDATED_TICKET_OPTION_FIELDS
+  allowedFields: readonly ValidatedTicketOptionField[] = VALIDATED_TICKET_OPTION_FIELDS,
+  optionFieldsProvider?: TicketOptionFieldsProvider
 ): Promise<string | undefined> {
   const fieldsToValidate = requestedValidatedOptionFields(params, allowedFields);
   if (fieldsToValidate.length === 0) {
     return undefined;
   }
 
-  const fields = await getTicketOptionFields(client, fieldsToValidate);
+  const fields = optionFieldsProvider
+    ? await optionFieldsProvider(fieldsToValidate)
+    : await getTicketOptionFields(client, fieldsToValidate);
 
   for (const fieldName of fieldsToValidate) {
     const field = fields.get(fieldName);
@@ -3956,14 +4412,19 @@ function scheduledPolicyClientFailure(
   action: TriagePlanAction,
   ticket: Ticket
 ): string | undefined {
-  if (policyMode !== SCHEDULED_NEW_CALLS_POLICY ||
+  if (!isScheduledNewCallsPolicy(policyMode) ||
       !(action.action === "resolve" || action.action === "update" || action.action === "leave")) {
     return undefined;
   }
 
   const targetName = action.target?.clientName?.trim();
   const targetId = action.target?.clientId?.trim();
-  if (ticket.client === null) {
+  // The safe ticket query explicitly requests `client`, but SuperOps may
+  // omit a null scalar/object instead of serialising it as null. Both forms
+  // mean that this ticket has no assigned client and therefore require the
+  // exact approved TaskGroup fallback. A genuinely unavailable client field
+  // is surfaced as a GraphQL/read failure before this policy check.
+  if (ticket.client === null || ticket.client === undefined) {
     if (targetName !== SCHEDULED_TRIAGE_TASKGROUP_NAME || targetId !== SCHEDULED_TRIAGE_TASKGROUP_ID) {
       return `A scheduled New Calls ticket with no client must target ${SCHEDULED_TRIAGE_TASKGROUP_NAME} (${SCHEDULED_TRIAGE_TASKGROUP_ID}).`;
     }
@@ -4190,6 +4651,38 @@ function verifyFinalTargetState(
   return { mismatches };
 }
 
+function mutationReadbackSupportsTarget(
+  action: TriagePlanAction,
+  mutationResult: Ticket
+): boolean {
+  if (!Object.prototype.hasOwnProperty.call(mutationResult, "ticketId") ||
+      !Object.prototype.hasOwnProperty.call(mutationResult, "updatedTime")) {
+    return false;
+  }
+
+  const target = action.target ?? {};
+  for (const field of [
+    "status", "impact", "urgency", "category", "subcategory", "cause", "resolutionCode",
+  ] as const) {
+    if (target[field] !== undefined && !Object.prototype.hasOwnProperty.call(mutationResult, field)) {
+      return false;
+    }
+  }
+
+  // updateTicket returns techGroup but not the full client object. Keep the
+  // canonical ticket read for client-targeted actions so client identity stays
+  // independently verified.
+  if (target.techGroupName !== undefined &&
+      !Object.prototype.hasOwnProperty.call(mutationResult, "techGroup")) {
+    return false;
+  }
+  if (target.clientName !== undefined || target.clientId !== undefined) {
+    return false;
+  }
+
+  return true;
+}
+
 function baseApplyResult(
   ticketNumber: string,
   action?: TriagePlanAction,
@@ -4273,9 +4766,19 @@ function validateExpectedTicket(
       reason: "Ticket subject no longer matches the approved snapshot identity.",
     };
   }
+  // A null-client scheduled ticket is safely identified by the explicit
+  // fallback target (clientName + clientId), which is validated separately.
+  // Do not compare that fallback name against the current null client or the
+  // approved action is rejected before the client-assignment safety check.
+  const expectedClientName = ticket.client === null && action.target?.clientName && action.target?.clientId
+    ? undefined
+    : action.expectedClient;
+  const expectedClientHash = ticket.client === null && action.target?.clientName && action.target?.clientId
+    ? undefined
+    : action.expectedClientHash;
   if (
-    (action.expectedClient && ticketClientName(ticket) !== action.expectedClient) ||
-    (action.expectedClientHash && stableHash(ticketClientName(ticket)) !== action.expectedClientHash)
+    (expectedClientName && ticketClientName(ticket) !== expectedClientName) ||
+    (expectedClientHash && stableHash(ticketClientName(ticket)) !== expectedClientHash)
   ) {
     return {
       stage: "validateClient",
@@ -4459,11 +4962,64 @@ async function addNoteForPlan(params: {
   await createNoteForPlan(params);
 }
 
+const LEAVE_CURRENT_CLASSIFICATION_FIELDS = [
+  "impact",
+  "urgency",
+  "category",
+  "subcategory",
+] as const;
+
+function canReuseCurrentLeaveClassification(
+  action: TriagePlanAction,
+  currentTicket: Ticket | undefined
+): boolean {
+  if (action.action !== "leave" || !currentTicket) return false;
+  const target = action.target ?? {};
+  const classificationMatches = LEAVE_CURRENT_CLASSIFICATION_FIELDS.every((field) => {
+    const requested = stringValue(target[field]);
+    const current = stringValue((currentTicket as unknown as Record<string, unknown>)[field]);
+    return requested !== undefined && current !== undefined && compareTicketValue(requested, current);
+  });
+  if (!classificationMatches) return false;
+
+  const requestedCause = stringValue(target.cause);
+  if (requestedCause !== undefined) {
+    const currentCause = stringValue(currentTicket.cause);
+    if (currentCause === undefined || !compareTicketValue(requestedCause, currentCause)) return false;
+  }
+  return true;
+}
+
+function canReuseCurrentLeaveTarget(
+  action: TriagePlanAction,
+  currentTicket: Ticket | undefined
+): boolean {
+  if (!canReuseCurrentLeaveClassification(action, currentTicket)) return false;
+  const target = action.target ?? {};
+  if (Object.keys(target).some((field) =>
+    !(TRIAGE_PLAN_LEAVE_TARGET_FIELDS as readonly string[]).includes(field)
+  )) return false;
+
+  for (const [field, current] of [
+    ["clientId", currentTicket ? ticketClientAccountId(currentTicket) : undefined],
+    ["clientName", currentTicket ? ticketClientName(currentTicket) : undefined],
+  ] as const) {
+    const requested = stringValue(target[field]);
+    if (requested !== undefined &&
+        (current === undefined || !compareTicketValue(requested, current))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 async function buildApprovedUpdateInput(
   client: SuperOpsClientInstance,
   ticketId: string,
   action: TriagePlanAction,
-  defaultStatus?: string
+  defaultStatus?: string,
+  optionFieldsProvider?: TicketOptionFieldsProvider,
+  currentTicket?: Ticket
 ): Promise<Record<string, unknown> | { error: string }> {
   const target = action.target ?? {};
   const input: Record<string, unknown> = { ticketId };
@@ -4518,14 +5074,24 @@ async function buildApprovedUpdateInput(
     input.category = target.category;
   }
 
-  const optionValidationError = await addValidatedTicketOptionUpdates(
-    client,
-    target,
-    input,
-    ["impact", "urgency", "resolutionCode", "cause", "subcategory"]
-  );
-  if (optionValidationError) {
-    return { error: optionValidationError };
+  if (canReuseCurrentLeaveClassification(action, currentTicket)) {
+    for (const field of LEAVE_CURRENT_CLASSIFICATION_FIELDS) {
+      const currentValue = stringValue(
+        (currentTicket as unknown as Record<string, unknown>)[field]
+      );
+      if (currentValue !== undefined) input[field] = currentValue;
+    }
+  } else {
+    const optionValidationError = await addValidatedTicketOptionUpdates(
+      client,
+      target,
+      input,
+      ["impact", "urgency", "resolutionCode", "cause", "subcategory"],
+      optionFieldsProvider
+    );
+    if (optionValidationError) {
+      return { error: optionValidationError };
+    }
   }
 
   const resolvedClient = await resolveClientAccountId(client, {
@@ -4682,7 +5248,8 @@ function actionWithSnapshotExpectationsRelaxedForStagedResume(action: TriagePlan
 async function buildStagedResolveClassificationInput(
   client: SuperOpsClientInstance,
   ticketId: string,
-  action: TriagePlanAction
+  action: TriagePlanAction,
+  optionFieldsProvider?: TicketOptionFieldsProvider
 ): Promise<Record<string, unknown> | { error: string }> {
   const target = action.target ?? {};
   if (target.techGroupName !== undefined) {
@@ -4702,7 +5269,8 @@ async function buildStagedResolveClassificationInput(
     client,
     target,
     input,
-    ["impact", "urgency", "resolutionCode", "cause", "subcategory"]
+    ["impact", "urgency", "resolutionCode", "cause", "subcategory"],
+    optionFieldsProvider
   );
   if (optionValidationError) {
     return { error: optionValidationError };
@@ -5000,6 +5568,7 @@ async function applyStagedResolveAction(params: {
   resumeStage?: OperationItemState["stage"];
   noteVisibilityPriorAttempts?: number;
   resumeUpdatedTimeExpectation?: string;
+  optionFieldsProvider?: TicketOptionFieldsProvider;
   beforeNoteCheck?: () => Promise<void>;
   afterPreflightValidation?: () => Promise<void>;
   beforeMutation?: (
@@ -5032,7 +5601,12 @@ async function applyStagedResolveAction(params: {
 
   const classificationAction = stagedResolveClassificationAction(action);
   const finalAction = stagedResolveFinalAction(action);
-  const classificationInput = await buildStagedResolveClassificationInput(client, params.resolvedTicketId, action);
+  const classificationInput = await buildStagedResolveClassificationInput(
+    client,
+    params.resolvedTicketId,
+    action,
+    params.optionFieldsProvider
+  );
   const classificationInputError = (classificationInput as { error?: unknown }).error;
   if (typeof classificationInputError === "string") {
     return markStagedFailure({
@@ -6142,6 +6716,14 @@ function serializableApplyTriageRequest(
           policyDisposition: action.policyDisposition,
           contentEvidenceState: action.contentEvidenceState,
           policyReason: action.policyReason,
+          historyAssessment: action.historyAssessment
+            ? {
+                ...action.historyAssessment,
+                representativeTicketNumbers: action.historyAssessment.representativeTicketNumbers
+                  ? [...action.historyAssessment.representativeTicketNumbers]
+                  : undefined,
+              }
+            : undefined,
           noteFingerprint: action.note
             ? normalizedNoteFingerprint(action.note)
             : action.noteFingerprint,
@@ -6168,8 +6750,8 @@ function operationRequestApplyTriageParams(
   if (!request || request.kind !== "applyTriagePlan") return undefined;
   return {
     batchId: typeof request.batchId === "string" ? request.batchId : undefined,
-    policyMode: request.policyMode === SCHEDULED_NEW_CALLS_POLICY
-      ? SCHEDULED_NEW_CALLS_POLICY
+    policyMode: isScheduledNewCallsPolicy(request.policyMode)
+      ? request.policyMode
       : undefined,
     expectedCandidateTicketNumbers: Array.isArray(request.expectedCandidateTicketNumbers)
       ? request.expectedCandidateTicketNumbers.map((value) => String(value))
@@ -6627,6 +7209,7 @@ async function applyApprovedTriageAction(params: {
   resumeWriteAttempted?: boolean;
   resumeWriteMayHaveSucceeded?: boolean;
   resumePartialWrite?: boolean;
+  optionFieldsProvider?: TicketOptionFieldsProvider;
   beforeNoteCheck?: () => Promise<void>;
   afterPreflightValidation?: () => Promise<void>;
   beforeMutation?: (
@@ -6799,7 +7382,12 @@ async function applyApprovedTriageAction(params: {
 
   if (params.dryRun) {
     if (action.action === "resolve") {
-      const classificationInput = await buildStagedResolveClassificationInput(client, ticket.ticketId, action);
+      const classificationInput = await buildStagedResolveClassificationInput(
+        client,
+        ticket.ticketId,
+        action,
+        params.optionFieldsProvider
+      );
       const classificationError = (classificationInput as { error?: unknown }).error;
       const statusInput = buildStagedResolveStatusInput(ticket.ticketId, action.target?.status);
       const statusError = (statusInput as { error?: unknown }).error;
@@ -6818,7 +7406,7 @@ async function applyApprovedTriageAction(params: {
       result.suppressCloseNotificationRequested = true;
       result.suppressCloseNotificationIncluded = true;
     } else if (action.action === "update" || action.action === "leave") {
-      const dryRunInput = await buildApprovedUpdateInput(client, ticket.ticketId, action);
+      const dryRunInput = await buildApprovedUpdateInput(client, ticket.ticketId, action, undefined, undefined, ticket);
       const dryRunError = (dryRunInput as { error?: unknown }).error;
       if (typeof dryRunError === "string") {
         result.finalOutcome = "Blocked";
@@ -6909,6 +7497,7 @@ async function applyApprovedTriageAction(params: {
           result,
           verify: params.verify,
           dedupeNotes: params.dedupeNotes,
+          optionFieldsProvider: params.optionFieldsProvider,
           resumeStage: params.resumeStage,
           noteVisibilityPriorAttempts: params.noteVisibilityPriorAttempts,
           resumeUpdatedTimeExpectation: params.resumeUpdatedTimeExpectation,
@@ -6922,7 +7511,14 @@ async function applyApprovedTriageAction(params: {
       }
       const updateInput = resumeNoteOnly
         ? { ticketId: ticket.ticketId }
-        : await buildApprovedUpdateInput(client, ticket.ticketId, action);
+        : await buildApprovedUpdateInput(
+            client,
+            ticket.ticketId,
+            action,
+            undefined,
+            params.optionFieldsProvider,
+            ticket
+          );
       const updateError = (updateInput as { error?: unknown }).error;
       if (typeof updateError === "string") {
         result.finalOutcome = "Blocked";
@@ -6930,7 +7526,11 @@ async function applyApprovedTriageAction(params: {
         result.failureReason = updateError;
         return result;
       }
+      const leaveTargetAlreadyCurrent = action.action === "leave" &&
+        isScheduledNewCallsPolicy(params.policyMode) &&
+        canReuseCurrentLeaveTarget(action, ticket);
 
+      let mutationReadback: Ticket | undefined;
       let notePlan: "none" | "deduped" | "pending" = "none";
       try {
         notePlan = await checkNoteForPlan({
@@ -6964,6 +7564,13 @@ async function applyApprovedTriageAction(params: {
         result.verified = true;
         result.finalVerificationState = "Verified";
         result.replaySafe = false;
+      } else if (leaveTargetAlreadyCurrent) {
+        // A scheduled leave action is a request to preserve the current
+        // routing/classification. The lookup above is already the immutable
+        // ticket read used for stale-data validation, so avoid a redundant
+        // updateTicket mutation when every approved target is already equal.
+        result.primaryWriteOutcome = "NotRequired";
+        result.classificationWriteOutcome = "NotRequired";
       } else {
         result.attemptedState = updateInput as Record<string, unknown>;
         const mutationType: DurableMutationType = "update";
@@ -6979,6 +7586,9 @@ async function applyApprovedTriageAction(params: {
               client,
               updateInput as Record<string, unknown>
             );
+            if (mutationReadbackSupportsTarget(action, mutationResult)) {
+              mutationReadback = { ...ticket, ...mutationResult };
+            }
             result.primaryWriteOutcome = "Accepted";
             result.writeMayHaveSucceeded = true;
             recordPhysicalWrite(result, result.primaryWriteMethod ?? "updateTicket", "Accepted");
@@ -7078,19 +7688,23 @@ async function applyApprovedTriageAction(params: {
       }
       let verified: Ticket = ticket;
       if (!resumeNoteOnly) {
-        try {
-          verified = await getTicketByInternalId(client, ticket.ticketId);
-        } catch (error) {
-          if (isExecutionStopError(error)) throw error;
-          if (isRateLimitError(error)) {
-            return markRateLimitedReadResult(result, error, "getTicket.verifyFinalState");
+        if (mutationReadback) {
+          verified = mutationReadback;
+        } else if (!leaveTargetAlreadyCurrent) {
+          try {
+            verified = await getTicketByInternalId(client, ticket.ticketId);
+          } catch (error) {
+            if (isExecutionStopError(error)) throw error;
+            if (isRateLimitError(error)) {
+              return markRateLimitedReadResult(result, error, "getTicket.verifyFinalState");
+            }
+            result.finalOutcome = "Failed";
+            result.partialWrite = applyResultHasProvenPartialWrite(result);
+            result.writeMayHaveSucceeded = true;
+            result.failureStage = "verifyFinalState";
+            result.failureReason = safeErrorMessage(error);
+            return result;
           }
-          result.finalOutcome = "Failed";
-          result.partialWrite = applyResultHasProvenPartialWrite(result);
-          result.writeMayHaveSucceeded = true;
-          result.failureStage = "verifyFinalState";
-          result.failureReason = safeErrorMessage(error);
-          return result;
         }
         result.finalState = ticketFinalState(verified);
         result.observedFinalState = result.finalState;
@@ -7099,14 +7713,14 @@ async function applyApprovedTriageAction(params: {
           result.finalOutcome = "Failed";
           result.verified = false;
           result.partialWrite = applyResultHasProvenPartialWrite(result);
-          result.writeMayHaveSucceeded = true;
+          result.writeMayHaveSucceeded = leaveTargetAlreadyCurrent ? false : true;
           result.failureStage = "verifyFinalState";
           result.failureReason = `Final state did not match requested target fields: ${JSON.stringify(finalVerification.mismatches)}`;
           result.finalVerificationState = "Failed";
           return result;
         }
         result.verified = true;
-        result.writeMayHaveSucceeded = true;
+        if (!leaveTargetAlreadyCurrent) result.writeMayHaveSucceeded = true;
         result.verifiedState = result.finalState;
         result.finalVerificationState = "Verified";
         result.partialWrite = false;
@@ -7187,6 +7801,9 @@ async function applyApprovedTriageAction(params: {
         let postNoteTicket = verified;
         if (result.noteAdded && params.verify) {
           try {
+            // This read both confirms that the verified ticket target survived
+            // note creation and captures the new updatedTime used by a delayed
+            // note-visibility continuation.
             postNoteTicket = await getTicketByInternalId(client, ticket.ticketId);
           } catch (error) {
             if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
@@ -7577,13 +8194,26 @@ async function buildMissingOnlyRecoveryInput(params: {
   action: TriagePlanAction;
   mutationType: DurableMutationType;
   ticket: Ticket;
+  optionFieldsProvider?: TicketOptionFieldsProvider;
 }): Promise<{ input?: Record<string, unknown>; schemaDependencyFields: string[]; error?: string }> {
   const stageAction = reconciliationActionForMutation(params.action, params.mutationType);
   const fullInput = params.mutationType === "classification"
-    ? await buildStagedResolveClassificationInput(params.client, params.ticketId, params.action)
+    ? await buildStagedResolveClassificationInput(
+        params.client,
+        params.ticketId,
+        params.action,
+        params.optionFieldsProvider
+      )
     : params.mutationType === "status" || params.mutationType === "resolveFallback"
       ? buildStagedResolveStatusInput(params.ticketId, params.action.target?.status)
-      : await buildApprovedUpdateInput(params.client, params.ticketId, params.action);
+      : await buildApprovedUpdateInput(
+          params.client,
+          params.ticketId,
+          params.action,
+          undefined,
+          params.optionFieldsProvider,
+          params.ticket
+        );
   const error = (fullInput as { error?: unknown }).error;
   if (typeof error === "string") return { error, schemaDependencyFields: [] };
 
@@ -7722,6 +8352,7 @@ async function ambiguityCheckedTriageResult(params: {
   previousRetryCount: number;
   ambiguityStage: OperationItemState["stage"];
   fallbackAlreadyAttempted?: boolean;
+  optionFieldsProvider?: TicketOptionFieldsProvider;
   beforeNoteCheck?: () => Promise<void>;
   afterPreflightValidation?: () => Promise<void>;
   beforeMutation?: (
@@ -7856,6 +8487,7 @@ async function ambiguityCheckedTriageResult(params: {
         allowResolveFullFallbackToUpdate: applyParams.allowResolveFullFallbackToUpdate ?? false,
         allowWriteIfUpdatedTimeChanged: applyParams.allowWriteIfUpdatedTimeChanged ?? false,
         allowWriteWithoutVerifiedContent: applyParams.allowWriteWithoutVerifiedContent ?? false,
+        optionFieldsProvider: params.optionFieldsProvider,
         resumeStage,
         resumeUpdatedTimeExpectation: ticket.updatedTime,
         resumeWriteAttempted: true,
@@ -8430,6 +9062,7 @@ async function ambiguityCheckedTriageResult(params: {
     action,
     mutationType,
     ticket: freshTicket,
+    optionFieldsProvider: params.optionFieldsProvider,
   });
   if (recoveryInput.error || !recoveryInput.input) {
     return {
@@ -8575,6 +9208,7 @@ function createApplyTriageContinuationAdapter(
   client: SuperOpsClientInstance,
   liveParams?: ApplyTriagePlanParams
 ): OperationContinuationAdapter {
+  const optionFieldsProvider = createApplyTicketOptionFieldsProvider(client);
   return {
     toolName: "superops_tickets_apply_triage_plan",
     estimateItemSubrequests(record, itemKey) {
@@ -9345,6 +9979,7 @@ function createApplyTriageContinuationAdapter(
             previousRetryCount: claim.item.retryCount,
             ambiguityStage: claim.item.stage,
             fallbackAlreadyAttempted: claim.item.fallbackAttempted === true,
+            optionFieldsProvider,
             beforeNoteCheck,
             afterPreflightValidation,
             beforeMutation,
@@ -9368,6 +10003,7 @@ function createApplyTriageContinuationAdapter(
                 storedParams.allowWriteIfUpdatedTimeChanged ?? false,
               allowWriteWithoutVerifiedContent:
                 storedParams.allowWriteWithoutVerifiedContent ?? false,
+              optionFieldsProvider,
               resumeStage: resumeStageOverride,
               noteVisibilityPriorAttempts: claim.item.retryCount,
               resumeUpdatedTimeExpectation: expectedCurrentUpdatedTimeForItem(claim.item, action),
@@ -9783,7 +10419,7 @@ export function getTicketsTools(): DomainTools {
       },      {
         name: "superops_tickets_apply_triage_plan",
         description:
-          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. scheduled-new-calls-v1 enforces a complete standing-policy batch with classification, client assignment, private structured notes, safe routing, verification, dedupe, and no unsafe overrides. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer.",
+          "Write/high-risk tool. Applies an approved fixed-candidate ticket triage plan from any configured status queue. scheduled-new-calls-v1 remains the existing full-queue standing contract. scheduled-new-calls-v2 adds required bounded historical assessment metadata and relevant-only HTML history sections without adding SuperOps history reads. email-new-calls-v2 is the bounded email-trigger contract: every ticket needing human follow-up stays in New Calls via action leave, while only conclusively no-action items may resolve. All modes enforce complete candidates, classification, client safety, private notes, verification, dedupe, and no unsafe overrides. Resolve requires full resolution classification; update and leave require active classification, allow optional cause, and prohibit resolution code. Leave retains status, and status changes are restricted to Resolved or Awaiting Engineer where the selected policy permits them.",
         inputSchema: {
           type: "object",
           properties: {
@@ -9798,7 +10434,7 @@ export function getTicketsTools(): DomainTools {
             policyMode: {
               type: "string",
               enum: [...TRIAGE_POLICY_MODES],
-              description: "Standing scheduled New Calls contract. Requires an exact complete candidate/action set and rejects the entire submission before any SuperOps work when an invariant is missing.",
+              description: "Standing New Calls contract. v1 and v2 preserve the existing full-queue policies; email-new-calls-v2 is for the bounded EMAIL trigger and requires all human-follow-up tickets to use leave so they remain in New Calls. V2 modes additionally require bounded historyAssessment metadata and relevant-only HTML history sections. Each mode requires an exact complete candidate/action set and rejects the entire submission before any SuperOps work when an invariant is missing.",
             },
             expectedCandidateTicketNumbers: {
               type: "array",

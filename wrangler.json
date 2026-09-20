@@ -12,6 +12,15 @@
     "crons": ["0 2 * * *"]
   },
   "keep_vars": true,
+  "tail_consumers": [{ "service": "superops-api-call-log" }],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true
+    }
+  },
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV",
@@ -36,6 +45,7 @@
     "CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS": "false",
     "CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN": "true",
     "CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION": "false",
+    "CHATGPT_DIRECT_TARGETED_TRIAGE_ONLY": "true",
     "SUPEROPS_EXECUTION_SUBREQUEST_BUDGET": "45",
     "SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN": "8",
     "SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH": "25",
@@ -52,8 +62,10 @@
     "SUPEROPS_OPERATION_RETENTION_SECONDS": "86400",
     "SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS": "21600",
     "SUPEROPS_EXECUTION_CONCURRENCY": "1",
+    "SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED": "true",
     "SUPEROPS_CONTINUATION_ENABLED": "true",
     "SUPEROPS_DURABLE_RETRY_ENABLED": "true",
+    "SUPEROPS_RATE_LIMIT_PROBE_ENABLED": "true",
     "SUPEROPS_EXECUTION_CPU_GUARD_MS": "20000",
     "SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT": "100",
     "SUPEROPS_EXECUTION_MAX_DURABLE_RETRY_ATTEMPTS": "10",
@@ -70,6 +82,10 @@
       {
         "name": "SUPEROPS_SCRIPT_CATALOGUE",
         "class_name": "SuperOpsScriptCatalogue"
+      },
+      {
+        "name": "SUPEROPS_RATE_LIMIT_PROBE",
+        "class_name": "SuperOpsRateLimitProbe"
       }
     ]
   },
@@ -79,6 +95,10 @@
       "storage": "sqlite"
     },
     "SuperOpsScriptCatalogue": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "SuperOpsRateLimitProbe": {
       "type": "durable-object",
       "storage": "sqlite"
     }

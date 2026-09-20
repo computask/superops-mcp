@@ -6,8 +6,10 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { getCredentials, resetClient, SuperOpsClient, SuperOpsError } from "./client.js";
 import {
   executionDiagnostics,
+  getExecutionState,
   runWithExecutionConfig,
   runWithExecutionContext,
+  type SubrequestRecord,
 } from "./execution.js";
 
 describe("getCredentials", () => {
@@ -84,6 +86,26 @@ describe("SuperOpsClient execution instrumentation", () => {
     expect(result).toEqual({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(diagnostics?.subrequests).toMatchObject({ used: 1, budget: 5, safetyMargin: 1 });
+    expect(diagnostics?.requestTrace).toEqual([
+      expect.objectContaining({
+        index: 1,
+        provider: "superops",
+        type: "initialRead",
+        operationType: "query",
+        operationName: "Test",
+        status: 200,
+        retryCount: 0,
+        endpointHost: "api.superops.ai",
+        httpStatus: 200,
+        outcome: "success",
+        responseHadData: true,
+        ok: true,
+      }),
+    ]);
+    const request = (diagnostics?.requestTrace as Array<Record<string, unknown>> | undefined)?.[0];
+    expect(request?.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(request?.completedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(diagnostics?.requestTraceTruncated).toBe(false);
     expect(JSON.stringify(diagnostics)).not.toContain("secret-token");
   });
 
@@ -184,14 +206,14 @@ describe("SuperOpsClient rate-limit handling", () => {
 
     expect(result).toEqual({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(diagnostics?.retries).toMatchObject({ count: 1, delaysMs: [1] });
+    expect(diagnostics?.retries).toMatchObject({ count: 1, delaysMs: [1000] });
     expect((diagnostics?.retries as { details?: unknown[] } | undefined)?.details?.[0]).toMatchObject({
       source: "retry-after",
       retryAfterSupplied: true,
       suppliedDelayMs: 1000,
       parsedDelayMs: 1000,
-      cappedDelayMs: 1,
-      actualDelayMs: 1,
+      cappedDelayMs: 1000,
+      actualDelayMs: 1000,
       endpoint: "https://api.superops.ai/msp",
       operationName: "Test",
     });
@@ -257,6 +279,47 @@ describe("SuperOpsClient rate-limit handling", () => {
 
     expect(result).toEqual({ ok: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("records a GraphQL throttle as a failed rate-limited attempt, not HTTP success", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          errors: [{
+            message: "rate_limit_exceeded",
+            extensions: { code: "rate_limit_exceeded", retryAfter: 0 },
+          }],
+        }),
+        { status: 200 }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new SuperOpsClient({ apiToken: "secret-token", subdomain: "example" });
+    let request: SubrequestRecord | undefined;
+
+    await expect(
+      runWithExecutionConfig(
+        {
+          SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "1",
+          SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED: "false",
+        },
+        () => runWithExecutionContext("superops_custom_query", async () => {
+          await expect(client.query("query Test { ok }")).rejects.toMatchObject({
+            code: "rate_limit_exceeded",
+          });
+          request = getExecutionState()!.requests[0];
+        })
+      )
+    ).resolves.toBeUndefined();
+
+    expect(request).toMatchObject({
+      status: 200,
+      ok: false,
+      outcome: "rate_limited",
+      errorClass: "SuperOpsRateLimit",
+      rateLimited: true,
+      graphqlCode: "rate_limit_exceeded",
+    });
   });
 
   it("retries DataFetchingException GraphQL wrappers that contain rate_limit_exceeded", async () => {
@@ -337,7 +400,7 @@ describe("SuperOpsClient rate-limit handling", () => {
   });
   it("retries reset-header throttling, 5xx, network failure, and timeout with bounded diagnostics", async () => {
     const failureCases: Array<{ name: string; response: Response | Error }> = [
-      { name: "reset header", response: new Response("slow down", { status: 429, headers: { "X-RateLimit-Reset": String(Math.floor(Date.now() / 1000) + 10) } }) },
+      { name: "reset header", response: new Response("slow down", { status: 429, headers: { "X-RateLimit-Reset": String(Math.floor(Date.now() / 1000)) } }) },
       { name: "5xx", response: new Response("unavailable", { status: 503 }) },
       { name: "network", response: new Error("network unavailable") },
       { name: "timeout", response: Object.assign(new Error("request timeout"), { name: "AbortError" }) },
@@ -415,6 +478,40 @@ describe("SuperOpsClient rate-limit handling", () => {
       await rejection;
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect((fetchMock.mock.calls[0][1] as RequestInit).signal).toBeInstanceOf(AbortSignal);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("applies the request timeout while reading a response body", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn((_url: unknown, init?: RequestInit) => {
+        const signal = init?.signal;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: () => new Promise<never>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => {
+              reject(Object.assign(new Error("aborted while reading response"), { name: "AbortError" }));
+            }, { once: true });
+          }),
+        } as unknown as Response);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new SuperOpsClient({ apiToken: "secret-token", subdomain: "example" });
+      const request = runWithExecutionConfig(
+        {
+          SUPEROPS_EXECUTION_REQUEST_TIMEOUT_MS: "5",
+          SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "1",
+        },
+        () => runWithExecutionContext("superops_custom_query", () => client.query("query BodyHang { ok }"))
+      );
+      const rejection = expect(request).rejects.toMatchObject({ name: "SuperOpsTimeoutError" });
+      await vi.advanceTimersByTimeAsync(5);
+      await rejection;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }

@@ -61,7 +61,13 @@ import {
 import { SuperOpsContinuationWorkflow } from "./continuation-workflow.js";
 import { getScriptCatalogueStore, runWithScriptCatalogueStore, SuperOpsScriptCatalogue } from "./script-catalogue-store.js";
 import { syncScriptCatalogue } from "./script-catalogue-sync.js";
-export { SuperOpsOperationLedger, SuperOpsContinuationWorkflow, SuperOpsScriptCatalogue };
+import { createRateLimitProbeAdapter, SuperOpsRateLimitProbe } from "./rate-limit-probe.js";
+export {
+  SuperOpsOperationLedger,
+  SuperOpsContinuationWorkflow,
+  SuperOpsScriptCatalogue,
+  SuperOpsRateLimitProbe,
+};
 
 export interface Env {
   SUPEROPS_API_TOKEN?: string;
@@ -76,6 +82,8 @@ export interface Env {
   OAUTH_PROVIDER?: unknown;
   SUPEROPS_OPERATION_LEDGER?: unknown;
   SUPEROPS_SCRIPT_CATALOGUE?: unknown;
+  SUPEROPS_RATE_LIMIT_PROBE?: unknown;
+  SUPEROPS_RATE_LIMIT_PROBE_ENABLED?: string;
   SUPEROPS_SCRIPT_CATALOGUE_ADMIN_TOKEN?: string;
   SUPEROPS_CONTINUATION_WORKFLOW?: {
     createBatch(options: Array<{ id: string; params: Record<string, unknown> }>): Promise<Array<{ id: string }>>;
@@ -95,6 +103,7 @@ export interface Env {
   CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS?: string;
   CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN?: string;
   CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION?: string;
+  CHATGPT_DIRECT_TARGETED_TRIAGE_ONLY?: string;
   SUPEROPS_EXECUTION_SUBREQUEST_BUDGET?: string;
   SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN?: string;
   SUPEROPS_EXECUTION_MAX_ITEMS_PER_BATCH?: string;
@@ -117,6 +126,7 @@ export interface Env {
   SUPEROPS_OPERATION_RETENTION_SECONDS?: string;
   SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS?: string;
   SUPEROPS_EXECUTION_CONCURRENCY?: string;
+  SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED?: string;
 }
 
 type WorkerExecutionContext = {
@@ -179,9 +189,10 @@ function withCors(res: Response): Response {
  */
 async function handleMcp(
   request: Request,
-  blockedToolNames: ReadonlySet<string>
+  blockedToolNames: ReadonlySet<string>,
+  rateLimitProbe?: ReturnType<typeof createRateLimitProbeAdapter>
 ): Promise<Response> {
-  const server = createMcpServer({ blockedToolNames });
+  const server = createMcpServer({ blockedToolNames, rateLimitProbe });
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -276,6 +287,7 @@ async function blockedToolNamesForWorkerEnv(
         directMutatingToolsAllowed && flagExactlyTrue(env.ENABLE_CUSTOM_MUTATION),
       reviewedTriagePlanAllowed: chatGptDirectReviewedTriagePlanAllowed(env),
       scriptExecutionAllowed: scriptExecutionAllowed(env),
+      targetedTriageOnly: flagExactlyTrue(env.CHATGPT_DIRECT_TARGETED_TRIAGE_ONLY),
     });
   }
 
@@ -915,12 +927,26 @@ async function handleBaseWorkerFetch(
       };
     }
 
+    const rateLimitProbe = !isGatewayMode &&
+      env.SUPEROPS_RATE_LIMIT_PROBE_ENABLED === "true" &&
+      env.SUPEROPS_API_TOKEN &&
+      env.SUPEROPS_SUBDOMAIN
+        ? createRateLimitProbeAdapter({
+            namespace: env.SUPEROPS_RATE_LIMIT_PROBE,
+            tenantKey: await envTenantOwnerHash({
+              subdomain: env.SUPEROPS_SUBDOMAIN ?? "default",
+              region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
+            }),
+            enabled: true,
+          })
+        : undefined;
+
     // Propagate credentials through AsyncLocalStorage so getCredentials()/
     // getClient() resolve them (process.env is unavailable on workerd).
     if (creds) {
-      return runWithCredentials(creds, () => handleMcp(request, mcpBlockedToolNames));
+      return runWithCredentials(creds, () => handleMcp(request, mcpBlockedToolNames, rateLimitProbe));
     }
-    return handleMcp(request, mcpBlockedToolNames);
+    return handleMcp(request, mcpBlockedToolNames, rateLimitProbe);
     };
 
     const runConfiguredMcpRequest = async () => {

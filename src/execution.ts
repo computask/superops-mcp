@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { getAuditContext } from "./audit.js";
 
 export type SubrequestType =
   | "initialRead"
@@ -37,6 +38,7 @@ export interface ExecutionConfigInput {
   SUPEROPS_OPERATION_RETENTION_SECONDS?: string;
   SUPEROPS_OPERATION_MAX_LIFETIME_SECONDS?: string;
   SUPEROPS_EXECUTION_CONCURRENCY?: string;
+  SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED?: string;
 }
 
 export interface ExecutionConfig {
@@ -65,6 +67,28 @@ export interface ExecutionConfig {
   operationRetentionSeconds: number;
   operationMaxLifetimeSeconds: number;
   concurrency: number;
+  /** Emit redacted per-attempt outbound-call telemetry to the Worker log. */
+  callAuditEnabled: boolean;
+}
+
+export type SubrequestOutcome =
+  | "success"
+  | "http_error"
+  | "graphql_error"
+  | "rate_limited"
+  | "network_error"
+  | "request_timeout"
+  | "malformed_response"
+  | "internal_error";
+
+export interface SubrequestFinishDetails {
+  outcome?: SubrequestOutcome;
+  errorClass?: string;
+  httpStatus?: number;
+  rateLimited?: boolean;
+  retryAfterSupplied?: boolean;
+  responseHadData?: boolean;
+  graphqlCode?: string;
 }
 
 export interface SubrequestRecord {
@@ -75,9 +99,20 @@ export interface SubrequestRecord {
   itemKey?: string;
   status?: number | string;
   retryCount: number;
+  startedAt: string;
   durationMs?: number;
   ok?: boolean;
+  /** Host only; never persist a URL that could contain credentials. */
   endpoint?: string;
+  /** Set when the attempt finishes; retained for bounded diagnostic timelines. */
+  completedAt?: string;
+  outcome?: SubrequestOutcome;
+  errorClass?: string;
+  httpStatus?: number;
+  rateLimited?: boolean;
+  retryAfterSupplied?: boolean;
+  responseHadData?: boolean;
+  graphqlCode?: string;
 }
 
 export interface RetryDelayRecord {
@@ -91,6 +126,7 @@ export interface RetryDelayRecord {
   endpoint?: string;
   operationType?: string;
   operationName?: string;
+  retryCause?: "rate_limit" | "server_error" | "network";
   invocationId?: string;
   operationId?: string;
   itemKey?: string;
@@ -156,6 +192,7 @@ const DEFAULT_CONFIG: ExecutionConfig = {
   operationRetentionSeconds: 86_400,
   operationMaxLifetimeSeconds: 21_600,
   concurrency: 1,
+  callAuditEnabled: true,
 };
 
 const EXECUTION_STORE = new AsyncLocalStorage<ExecutionState>();
@@ -380,6 +417,7 @@ export function executionConfigFromEnv(
       1,
       16
     ),
+    callAuditEnabled: merged("SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED")?.trim().toLowerCase() !== "false",
   };
 }
 
@@ -525,13 +563,23 @@ export function recordSubrequestStart(
   endpoint?: string
 ): { index: number; startedMs: number; record?: SubrequestRecord } {
   const classified = classifyGraphQLRequest(query, retryCount);
-  return recordTypedSubrequestStart({
+  const started = recordTypedSubrequestStart({
     type: classified.type,
     operationType: classified.operationType,
     operationName: classified.operationName,
     retryCount,
     endpoint,
   });
+  // Client calls outside an MCP invocation still need outcome metadata. This
+  // detached record does not create an execution budget or change retry policy.
+  if (!started.record) {
+    started.record = {
+      index: started.index, ...classified, retryCount,
+      startedAt: new Date(started.startedMs).toISOString(),
+      endpoint: safeEndpointHost(endpoint),
+    };
+  }
+  return started;
 }
 
 export function recordTypedSubrequestStart(params: {
@@ -570,7 +618,8 @@ export function recordTypedSubrequestStart(params: {
     operationName: params.operationName,
     itemKey: state.itemKey,
     retryCount: params.retryCount ?? 0,
-    endpoint: params.endpoint,
+    startedAt: new Date().toISOString(),
+    endpoint: safeEndpointHost(params.endpoint),
   };
   state.requests.push(record);
   if (state.itemKey) {
@@ -588,12 +637,52 @@ export function recordTypedSubrequestStart(params: {
 export function recordSubrequestFinish(
   started: { startedMs: number; record?: SubrequestRecord },
   status: number | string,
-  ok: boolean
+  ok: boolean,
+  details: SubrequestFinishDetails = {}
 ): void {
   if (!started.record) return;
   started.record.status = status;
   started.record.ok = ok;
+  const completedAt = new Date().toISOString();
+  started.record.completedAt = completedAt;
   started.record.durationMs = Date.now() - started.startedMs;
+  started.record.outcome = details.outcome ?? (ok ? "success" : "internal_error");
+  started.record.errorClass = details.errorClass;
+  started.record.httpStatus = details.httpStatus ?? (typeof status === "number" ? status : undefined);
+  started.record.rateLimited = details.rateLimited;
+  started.record.retryAfterSupplied = details.retryAfterSupplied;
+  started.record.responseHadData = details.responseHadData;
+  started.record.graphqlCode = safeDiagnosticToken(details.graphqlCode);
+
+  const state = getExecutionState();
+  if (state?.config.callAuditEnabled) {
+    console.log(JSON.stringify({
+      event: "superops.api_call",
+      timestamp: new Date().toISOString(),
+      requestId: safeDiagnosticToken(getAuditContext().requestId),
+      invocationId: safeDiagnosticToken(state.invocationId),
+      executionTraceId: safeDiagnosticToken(state.operationId),
+      toolName: safeDiagnosticToken(state.toolName),
+      callIndex: started.record.index,
+      provider: started.record.endpoint ? "superops" : "internal",
+      requestPurpose: started.record.type,
+      operationType: safeDiagnosticToken(started.record.operationType),
+      operationName: safeDiagnosticToken(started.record.operationName),
+      itemKey: safeDiagnosticToken(started.record.itemKey),
+      endpointHost: started.record.endpoint,
+      attempt: started.record.retryCount + 1,
+      status: safeDiagnosticStatus(started.record.status),
+      httpStatus: started.record.httpStatus,
+      ok: started.record.ok,
+      outcome: started.record.outcome,
+      errorClass: safeDiagnosticToken(started.record.errorClass),
+      graphqlCode: started.record.graphqlCode,
+      rateLimited: started.record.rateLimited,
+      retryAfterSupplied: started.record.retryAfterSupplied,
+      responseHadData: started.record.responseHadData,
+      durationMs: started.record.durationMs,
+    }));
+  }
 }
 
 export function markExecutionItem(params: {
@@ -644,12 +733,36 @@ export function recordRetryDelay(
         operationId: state.operationId,
         itemKey: state.itemKey,
       }
-    : {
+      : {
         ...delay,
         invocationId: state.invocationId,
         operationId: state.operationId,
         itemKey: state.itemKey,
       });
+
+  if (state.config.callAuditEnabled) {
+    const details = state.retryDelayDetails.at(-1);
+    console.log(JSON.stringify({
+      event: "superops.api_retry",
+      timestamp: new Date().toISOString(),
+      requestId: safeDiagnosticToken(getAuditContext().requestId),
+      invocationId: safeDiagnosticToken(state.invocationId),
+      executionTraceId: safeDiagnosticToken(state.operationId),
+      toolName: safeDiagnosticToken(state.toolName),
+      itemKey: safeDiagnosticToken(state.itemKey),
+      attempt: details?.attempt,
+      retryCause: details?.retryCause,
+      source: details?.source,
+      retryAfterSupplied: details?.retryAfterSupplied,
+      suppliedDelayMs: details?.suppliedDelayMs,
+      parsedDelayMs: details?.parsedDelayMs,
+      cappedDelayMs: details?.cappedDelayMs,
+      actualDelayMs: details?.actualDelayMs,
+      endpointHost: safeEndpointHost(details?.endpoint),
+      operationType: safeDiagnosticToken(details?.operationType),
+      operationName: safeDiagnosticToken(details?.operationName),
+    }));
+  }
 }
 
 export function finishExecution(reason: string): void {
@@ -662,6 +775,28 @@ export function finishExecution(reason: string): void {
 export function executionDiagnostics(): Record<string, unknown> | undefined {
   const state = getExecutionState();
   if (!state) return undefined;
+  const requestTrace = state.requests.slice(0, 128).map((request) => ({
+    index: request.index,
+    provider: request.endpoint ? "superops" : "internal",
+    type: request.type,
+    operationType: request.operationType,
+    operationName: request.operationName,
+    itemKey: request.itemKey,
+    status: safeDiagnosticStatus(request.status),
+    retryCount: request.retryCount,
+    startedAt: request.startedAt,
+    completedAt: request.completedAt,
+    endpointHost: request.endpoint,
+    httpStatus: request.httpStatus,
+    outcome: request.outcome,
+    errorClass: safeDiagnosticToken(request.errorClass),
+    graphqlCode: request.graphqlCode,
+    rateLimited: request.rateLimited,
+    retryAfterSupplied: request.retryAfterSupplied,
+    responseHadData: request.responseHadData,
+    durationMs: request.durationMs,
+    ok: request.ok,
+  }));
   return {
     invocationId: state.invocationId,
     executionTraceId: state.operationId,
@@ -697,6 +832,8 @@ export function executionDiagnostics(): Record<string, unknown> | undefined {
       delaysMs: state.retryDelaysMs,
       details: state.retryDelayDetails,
     },
+    requestTrace,
+    requestTraceTruncated: state.requests.length > requestTrace.length,
     requestsByType: state.requests.reduce<Record<string, number>>((counts, request) => {
       counts[request.type] = (counts[request.type] ?? 0) + 1;
       return counts;
@@ -713,7 +850,59 @@ export function logExecutionDiagnostics(success: boolean, errorSummary?: string)
       timestamp: new Date().toISOString(),
       success,
       errorSummary,
+      requests: getExecutionConfig().callAuditEnabled ? stateRequestsForLog() : [],
       ...diagnostics,
     })
   );
+}
+
+function stateRequestsForLog(): Record<string, unknown>[] {
+  const state = getExecutionState();
+  if (!state) return [];
+  return state.requests.map((request) => ({
+    index: request.index,
+    startedAt: request.startedAt,
+    completedAt: request.completedAt,
+    provider: request.endpoint ? "superops" : "internal",
+    type: request.type,
+    operationType: safeDiagnosticToken(request.operationType),
+    operationName: safeDiagnosticToken(request.operationName),
+    itemKey: safeDiagnosticToken(request.itemKey),
+    endpointHost: request.endpoint,
+    attempt: request.retryCount + 1,
+    status: safeDiagnosticStatus(request.status),
+    httpStatus: request.httpStatus,
+    ok: request.ok,
+    outcome: request.outcome,
+    errorClass: safeDiagnosticToken(request.errorClass),
+    graphqlCode: request.graphqlCode,
+    rateLimited: request.rateLimited,
+    retryAfterSupplied: request.retryAfterSupplied,
+    responseHadData: request.responseHadData,
+    durationMs: request.durationMs,
+  }));
+}
+
+function safeDiagnosticToken(value: unknown, maxLength = 128): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > maxLength || !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+function safeDiagnosticStatus(value: unknown): number | string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return safeDiagnosticToken(value);
+}
+
+function safeEndpointHost(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return /^[a-z0-9.-]{1,253}$/.test(host) ? host : undefined;
+  } catch {
+    return undefined;
+  }
 }

@@ -7,3 +7,6 @@ dist/
 
 # Cloudflare Workers
 .wrangler/
+
+# Generated runtime declarations for the separate diagnostic collector
+diagnostics/worker-env.d.ts

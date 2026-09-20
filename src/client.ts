@@ -6,6 +6,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { SuperOpsCredentials, GraphQLResponse } from "./types.js";
+import { beginApiAttempt, endApiAttempt } from "./api-attempt-audit.js";
 import {
   classifyGraphQLRequest,
   getExecutionConfig,
@@ -101,6 +102,24 @@ export class SuperOpsClient {
     retryCount: number
   ): Promise<T> {
     const subrequest = recordSubrequestStart(query, retryCount, this.endpoint);
+    // Serialize before recording dispatch: invalid input has made no API call.
+    const body = JSON.stringify({ query, variables });
+    const audit = beginApiAttempt(query, variables, this.subdomain, this.endpoint, retryCount + 1, subrequest.index);
+    try {
+      const result = await this.performRequest<T>(body, subrequest);
+      endApiAttempt(audit, subrequest.record, true, undefined, result);
+      return result;
+    } catch (error) {
+      endApiAttempt(audit, subrequest.record, false,
+        error instanceof SuperOpsError || error instanceof SuperOpsHttpError ? error.retryAfter : undefined);
+      throw error;
+    }
+  }
+
+  private async performRequest<T>(
+    body: string,
+    subrequest: ReturnType<typeof recordSubrequestStart>
+  ): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(
       () => controller.abort(new SuperOpsTimeoutError("SuperOps request timed out.")),
@@ -115,13 +134,21 @@ export class SuperOpsClient {
           Authorization: `Bearer ${this.apiToken}`,
           CustomerSubDomain: this.subdomain,
         },
-        body: JSON.stringify({ query, variables }),
+        body,
         signal: controller.signal,
       });
     } catch (error) {
       const timedOut = controller.signal.aborted ||
         (error instanceof Error && error.name === "AbortError");
-      recordSubrequestFinish(subrequest, timedOut ? "requestTimeout" : "networkError", false);
+      recordSubrequestFinish(
+        subrequest,
+        timedOut ? "requestTimeout" : "networkError",
+        false,
+        {
+          outcome: timedOut ? "request_timeout" : "network_error",
+          errorClass: timedOut ? "SuperOpsRequestTimeout" : "UpstreamNetworkFailure",
+        }
+      );
       throw timedOut
         ? new SuperOpsTimeoutError(
             error instanceof Error ? error.message : "SuperOps request timed out."
@@ -129,32 +156,54 @@ export class SuperOpsClient {
         : new SuperOpsNetworkError(
             error instanceof Error ? error.message : String(error)
           );
-    } finally {
-      clearTimeout(timeout);
     }
 
-    recordSubrequestFinish(subrequest, response.status, response.ok);
-
-    if (!response.ok) {
+    try {
+      if (!response.ok) {
+      const retryAfter = retryAfterFromHeaders(response.headers);
+      const rateLimited = response.status === 429;
+      recordSubrequestFinish(subrequest, response.status, false, {
+        outcome: rateLimited ? "rate_limited" : "http_error",
+        errorClass: rateLimited
+          ? "SuperOpsRateLimit"
+          : response.status >= 500 && response.status < 600
+            ? "SuperOpsInternalError"
+            : "SuperOpsHttpError",
+        httpStatus: response.status,
+        rateLimited,
+        retryAfterSupplied: retryAfter !== undefined,
+      });
       throw new SuperOpsHttpError(
         `HTTP error: ${response.status} ${response.statusText}`,
         response.status,
         response.statusText,
-        retryAfterFromHeaders(response.headers)
+        retryAfter
       );
-    }
+      }
 
-    let result: GraphQLResponse<T>;
-    try {
-      result = (await response.json()) as GraphQLResponse<T>;
-    } catch (error) {
-      throw new SuperOpsMalformedResponseError(
-        error instanceof Error ? error.message : String(error)
-      );
-    }
+      let result: GraphQLResponse<T>;
+      try {
+        result = (await response.json()) as GraphQLResponse<T>;
+      } catch (error) {
+        const timedOut = controller.signal.aborted ||
+          (error instanceof Error && error.name === "AbortError");
+        recordSubrequestFinish(subrequest, response.status, false, {
+          outcome: timedOut ? "request_timeout" : "malformed_response",
+          errorClass: timedOut ? "SuperOpsRequestTimeout" : "MalformedResponse",
+          httpStatus: response.status,
+        });
+        if (timedOut) {
+          throw new SuperOpsTimeoutError(
+            error instanceof Error ? error.message : "SuperOps request timed out."
+          );
+        }
+        throw new SuperOpsMalformedResponseError(
+          error instanceof Error ? error.message : String(error)
+        );
+      }
 
-    if (result.errors && result.errors.length > 0) {
-      const error = result.errors[0];
+      if (result.errors && result.errors.length > 0) {
+        const error = result.errors[0];
 
       const message =
         error.message ||
@@ -169,7 +218,7 @@ export class SuperOpsClient {
           2
         );
 
-      throw new SuperOpsError(
+      const graphQLError = new SuperOpsError(
         message,
         typeof error.extensions?.code === "string" ? error.extensions.code : undefined,
         retryAfterFromGraphQLError(error),
@@ -181,13 +230,38 @@ export class SuperOpsClient {
           mutationPayloadReturned: mutationPayloadReturned(result.data, error.path),
         }
       );
-    }
+      const rateLimited = isGraphQLRateLimit(graphQLError);
+      recordSubrequestFinish(subrequest, response.status, false, {
+        outcome: rateLimited ? "rate_limited" : "graphql_error",
+        errorClass: rateLimited ? "SuperOpsRateLimit" : "SuperOpsGraphQLError",
+        httpStatus: response.status,
+        rateLimited,
+        retryAfterSupplied: graphQLError.retryAfter !== undefined,
+        responseHadData: Object.prototype.hasOwnProperty.call(result, "data"),
+        graphqlCode: graphQLError.code,
+      });
+        throw graphQLError;
+      }
 
-    if (!result.data) {
-      throw new SuperOpsMalformedResponseError("No data returned from GraphQL query");
-    }
+      if (!result.data) {
+        recordSubrequestFinish(subrequest, response.status, false, {
+          outcome: "malformed_response",
+          errorClass: "MalformedResponse",
+          httpStatus: response.status,
+          responseHadData: false,
+        });
+        throw new SuperOpsMalformedResponseError("No data returned from GraphQL query");
+      }
 
-    return result.data;
+      recordSubrequestFinish(subrequest, response.status, true, {
+        outcome: "success",
+        httpStatus: response.status,
+        responseHadData: true,
+      });
+      return result.data;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async mutate<T = unknown>(
@@ -371,6 +445,7 @@ function isRetryableGraphQLServerError(error: SuperOpsError): boolean {
 
 interface RetryDelayInfo {
   source: "retry-after" | "backoff";
+  retryCause: "rate_limit" | "server_error" | "network";
   retryAfterSupplied: boolean;
   suppliedDelayMs?: number;
   parsedDelayMs: number;
@@ -389,14 +464,19 @@ function retryDelayInfo(
       : undefined;
   if (typeof retryAfterSeconds === "number") {
     const suppliedDelayMs = Math.max(0, Math.ceil(retryAfterSeconds * 1000));
-    const cappedDelayMs = Math.min(config.maxSingleDelayMs, suppliedDelayMs);
     return {
       source: "retry-after",
+      retryCause: retryCauseFor(error),
       retryAfterSupplied: true,
       suppliedDelayMs,
       parsedDelayMs: suppliedDelayMs,
-      cappedDelayMs,
-      actualDelayMs: cappedDelayMs,
+      // Retry-After is an upstream scheduling instruction. Do not shorten it
+      // to the inline MCP retry cap: doing so re-hits SuperOps while it is
+      // still asking us to wait. query() will reject a delay that does not fit
+      // the current execution budget, allowing the durable trigger to retry
+      // outside this invocation instead.
+      cappedDelayMs: suppliedDelayMs,
+      actualDelayMs: suppliedDelayMs,
     };
   }
 
@@ -409,11 +489,22 @@ function retryDelayInfo(
   const cappedDelayMs = Math.min(config.maxSingleDelayMs, parsedDelayMs);
   return {
     source: "backoff",
+    retryCause: retryCauseFor(error),
     retryAfterSupplied: false,
     parsedDelayMs,
     cappedDelayMs,
     actualDelayMs: cappedDelayMs,
   };
+}
+
+function retryCauseFor(error: unknown): "rate_limit" | "server_error" | "network" {
+  if (error instanceof SuperOpsHttpError) {
+    return error.status === 429 ? "rate_limit" : "server_error";
+  }
+  if (error instanceof SuperOpsError) {
+    return isGraphQLRateLimit(error) ? "rate_limit" : "server_error";
+  }
+  return "network";
 }
 
 function delay(ms: number): Promise<void> {

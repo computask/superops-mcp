@@ -83,7 +83,17 @@ export class SuperOpsContinuationWorkflow extends WorkflowEntrypoint<
     params: ContinuationWorkflowParams,
     step: WorkflowStep
   ): Promise<{ operationId: string; delivered: boolean }> {
-    await step.sleepUntil("wait-until-next-eligible", new Date(params.nextEligibleTime));
+    const nextEligibleAt = Date.parse(params.nextEligibleTime);
+    if (!Number.isFinite(nextEligibleAt)) {
+      throw new Error("Malformed continuation workflow wake time.");
+    }
+    // A watchdog can recreate a workflow after the durable wake time has
+    // already passed. Cloudflare rejects sleepUntil() for past timestamps;
+    // deliver immediately in that case instead of leaving the operation
+    // stranded behind a repeatedly failing workflow instance.
+    if (nextEligibleAt > Date.now()) {
+      await step.sleepUntil("wait-until-next-eligible", nextEligibleAt);
+    }
     try {
       await step.do(
         "deliver-checked-continuation",
