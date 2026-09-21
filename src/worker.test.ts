@@ -1791,6 +1791,30 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(authServerMetadata.code_challenge_methods_supported).toEqual([
       "S256",
     ]);
+
+    const openIdRes = await worker.fetch(
+      new Request(`${AUTH_SERVER}/.well-known/openid-configuration`),
+      env
+    );
+    expect(openIdRes.status).toBe(200);
+    const openIdMetadata = (await openIdRes.json()) as {
+      issuer?: string;
+      authorization_endpoint?: string;
+      token_endpoint?: string;
+      registration_endpoint?: string;
+      scopes_supported?: string[];
+      code_challenge_methods_supported?: string[];
+    };
+    expect(openIdMetadata.issuer).toBe(AUTH_SERVER);
+    expect(openIdMetadata.authorization_endpoint).toBe(
+      `${AUTH_SERVER}/authorize`
+    );
+    expect(openIdMetadata.token_endpoint).toBe(`${AUTH_SERVER}/token`);
+    expect(openIdMetadata.registration_endpoint).toBe(
+      `${AUTH_SERVER}/register`
+    );
+    expect(openIdMetadata.scopes_supported).toEqual(["superops.read"]);
+    expect(openIdMetadata.code_challenge_methods_supported).toEqual(["S256"]);
   });
 
   it("rejects the ChatGPT direct /mcp route without an OAuth access token", async () => {

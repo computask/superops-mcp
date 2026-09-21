@@ -494,6 +494,34 @@ function getChatGptAuthorizationServer(env: Env): string {
   return `https://${getChatGptMcpHost(env)}`;
 }
 
+function chatGptOpenIdConfiguration(env: Env): Record<string, unknown> {
+  const authorizationServer = getChatGptAuthorizationServer(env);
+  const scopes = getChatGptScopes(env);
+
+  // ChatGPT currently probes the OpenID discovery alias even though this
+  // server implements OAuth authorization-code + PKCE, not OpenID identity.
+  // Keep the metadata values aligned with workers-oauth-provider's RFC 8414
+  // response so both discovery paths describe the same authorization server.
+  return {
+    issuer: authorizationServer,
+    authorization_endpoint: `${authorizationServer}/authorize`,
+    token_endpoint: `${authorizationServer}/token`,
+    registration_endpoint: `${authorizationServer}/register`,
+    scopes_supported: scopes,
+    response_types_supported: ["code"],
+    response_modes_supported: ["query"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    token_endpoint_auth_methods_supported: [
+      "client_secret_basic",
+      "client_secret_post",
+      "none",
+    ],
+    revocation_endpoint: `${authorizationServer}/token`,
+    code_challenge_methods_supported: ["S256"],
+    client_id_metadata_document_supported: false,
+  };
+}
+
 function isChatGptDirectRequest(url: URL, env: Env): boolean {
   return url.hostname.toLowerCase() === getChatGptMcpHost(env);
 }
@@ -1127,6 +1155,12 @@ const chatGptDefaultHandler = {
     ctx?: WorkerExecutionContext
   ): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/.well-known/openid-configuration") {
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: CORS_HEADERS });
+      }
+      return json(chatGptOpenIdConfiguration(env));
+    }
     if (url.pathname === "/authorize") {
       return handleAuthorize(request, env);
     }
