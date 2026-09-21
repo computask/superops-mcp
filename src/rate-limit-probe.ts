@@ -18,7 +18,7 @@ const MAX_EVENTS_PER_RUN = 10_000;
 const MAX_RESULTS_PAGE_SIZE = 200;
 
 export type RateLimitProbeTask = "getClientList" | "getTicketList" | "getTicketListOpenQueue";
-export type RateLimitProbeProfile = "standard" | "oneMinute100";
+export type RateLimitProbeProfile = "standard" | "oneMinute100" | "oneMinute100Staggered";
 
 const DEFAULT_RATE_LIMIT_PROBE_TASK: RateLimitProbeTask = "getClientList";
 const DEFAULT_RATE_LIMIT_PROBE_PROFILE: RateLimitProbeProfile = "standard";
@@ -90,7 +90,7 @@ export const RATE_LIMIT_PROBE_TOOLS: ToolDefinition[] = [
   {
     name: "superops_rate_limit_probe_start",
     description:
-      "Start one read-only SuperOps API rate-limit probe for getClientList, getTicketList, or the filtered getTicketListOpenQueue request. The standard profile runs for 30 minutes; oneMinute100 sends 100 requests over one minute. It bypasses MCP read retries, records safe per-attempt outcomes, and never writes tickets or stores response content. Only one probe may run at a time. Defaults to getClientList and the standard profile.",
+      "Start one read-only SuperOps API rate-limit probe for getClientList, getTicketList, or the filtered getTicketListOpenQueue request. The standard profile runs for 30 minutes; oneMinute100 sends 100 requests in ten-second concurrent batches; oneMinute100Staggered sends 100 requests at 600-millisecond intervals over one minute. It bypasses MCP read retries, records safe per-attempt outcomes, and never writes tickets or stores response content. Only one probe may run at a time. Defaults to getClientList and the standard profile.",
     inputSchema: {
       type: "object",
       properties: {
@@ -101,7 +101,7 @@ export const RATE_LIMIT_PROBE_TOOLS: ToolDefinition[] = [
         },
         profile: {
           type: "string",
-          enum: ["standard", "oneMinute100"],
+          enum: ["standard", "oneMinute100", "oneMinute100Staggered"],
           description: "Probe schedule. Defaults to the standard 30-minute profile.",
         },
       },
@@ -190,20 +190,33 @@ const ONE_MINUTE_BURST_PHASES: readonly ProbePhase[] = [
   { name: "burst_100_per_minute", startSecond: 0, endSecond: 60, requestsPerMinute: 100 },
 ];
 
+const ONE_MINUTE_STAGGERED_PHASES: readonly ProbePhase[] = [
+  { name: "staggered_100_per_minute", startSecond: 0, endSecond: 60, requestsPerMinute: 100 },
+];
+
 const RATE_LIMIT_PROBE_PROFILES: Record<RateLimitProbeProfile, {
   durationMs: number;
   phases: readonly ProbePhase[];
   schedule: string;
+  intervalMs: number;
 }> = {
   standard: {
     durationMs: PROBE_DURATION_MS,
     phases: RATE_LIMIT_PROBE_PHASES,
     schedule: "60/90/100/120/150/30 requests per minute, five minutes per phase, no automatic retries",
+    intervalMs: PROBE_INTERVAL_MS,
   },
   oneMinute100: {
     durationMs: ONE_MINUTE_BURST_DURATION_MS,
     phases: ONE_MINUTE_BURST_PHASES,
     schedule: "100 requests per minute for one minute, no automatic retries",
+    intervalMs: PROBE_INTERVAL_MS,
+  },
+  oneMinute100Staggered: {
+    durationMs: ONE_MINUTE_BURST_DURATION_MS,
+    phases: ONE_MINUTE_STAGGERED_PHASES,
+    schedule: "100 requests at 600-millisecond intervals for one minute, no automatic retries",
+    intervalMs: 600,
   },
 };
 
@@ -266,6 +279,7 @@ interface ProbeRun {
   lastPhase?: string;
   currentPhase?: string;
   currentTargetRequestsPerMinute?: number;
+  nextAlarmAt?: number;
 }
 
 interface ProbeNamespace {
@@ -339,8 +353,8 @@ function parseProbeTask(value: unknown): RateLimitProbeTask {
 
 function parseProbeProfile(value: unknown): RateLimitProbeProfile {
   if (value === undefined || value === null || value === "") return DEFAULT_RATE_LIMIT_PROBE_PROFILE;
-  if (value === "standard" || value === "oneMinute100") return value;
-  throw new Error("profile must be standard or oneMinute100.");
+  if (value === "standard" || value === "oneMinute100" || value === "oneMinute100Staggered") return value;
+  throw new Error("profile must be standard, oneMinute100, or oneMinute100Staggered.");
 }
 
 function graphqlOperationName(task: RateLimitProbeTask): string {
@@ -670,6 +684,7 @@ function resultSummary(run: ProbeRun): Record<string, unknown> {
     firstRateLimitedPhase: run.firstRateLimitedPhase,
     currentPhase: run.currentPhase,
     currentTargetRequestsPerMinute: run.currentTargetRequestsPerMinute,
+    requestIntervalMs: profile.intervalMs,
     lastEventAt: run.lastEventAt,
     lastOutcome: run.lastOutcome,
     lastHttpStatus: run.lastHttpStatus,
@@ -734,6 +749,7 @@ export class SuperOpsRateLimitProbe {
       tenant: safeTenant(tenant),
       nextSequence: 1,
       fractionalBatch: 0,
+      nextAlarmAt: profileName === "oneMinute100Staggered" ? startedAt.getTime() + 100 : undefined,
       totalAttempts: 0,
       successfulAttempts: 0,
       failedAttempts: 0,
@@ -742,7 +758,7 @@ export class SuperOpsRateLimitProbe {
       networkAttempts: 0,
     };
     await this.persistRun(run);
-    if (this.state.storage.setAlarm) await this.state.storage.setAlarm(Date.now() + 100);
+    if (this.state.storage.setAlarm) await this.state.storage.setAlarm(run.nextAlarmAt ?? Date.now() + 100);
     return {
       accepted: true,
       ...resultSummary(run),
@@ -798,11 +814,13 @@ export class SuperOpsRateLimitProbe {
       await this.finishRun(run, "completed");
       return;
     }
-    const phase = phaseFor(Date.parse(run.startedAt), profileFor(run).phases, now);
-    const requestedBatch = phase.requestsPerMinute / (60_000 / PROBE_INTERVAL_MS) + run.fractionalBatch;
+    const profile = profileFor(run);
+    const staggered = run.profile === "oneMinute100Staggered";
+    const phase = phaseFor(Date.parse(run.startedAt), profile.phases, now);
+    const requestedBatch = phase.requestsPerMinute / (60_000 / profile.intervalMs) + run.fractionalBatch;
     const batchSize = Math.max(1, Math.min(25, Math.floor(requestedBatch)));
     const nextFractionalBatch = requestedBatch - batchSize;
-    const scheduledAt = new Date(now).toISOString();
+    const scheduledAt = new Date(staggered ? (run.nextAlarmAt ?? now) : now).toISOString();
     const sequenceStart = run.nextSequence;
     const events = await Promise.all(Array.from({ length: batchSize }, (_, index) =>
       performProbeAttempt({
@@ -817,7 +835,16 @@ export class SuperOpsRateLimitProbe {
       await this.finishRun(run, "failed", "maximum_event_bound_reached");
       return;
     }
-    const next: ProbeRun = { ...run, nextSequence: sequenceStart + events.length, fractionalBatch: nextFractionalBatch };
+    const plannedNextAlarm = (run.nextAlarmAt ?? now) + profile.intervalMs;
+    const nextAlarm = staggered
+      ? (plannedNextAlarm > Date.now() ? plannedNextAlarm : Date.now() + profile.intervalMs)
+      : Date.now() + profile.intervalMs;
+    const next: ProbeRun = {
+      ...run,
+      nextSequence: sequenceStart + events.length,
+      fractionalBatch: nextFractionalBatch,
+      nextAlarmAt: staggered ? nextAlarm : undefined,
+    };
     for (const event of events) {
       await this.state.storage.put(`event:${run.runId}:${String(event.sequence).padStart(8, "0")}`, event);
       next.totalAttempts += 1;
@@ -838,7 +865,6 @@ export class SuperOpsRateLimitProbe {
     next.currentPhase = phase.name;
     next.currentTargetRequestsPerMinute = phase.requestsPerMinute;
     await this.persistRun(next);
-    const nextAlarm = Date.now() + PROBE_INTERVAL_MS;
     if (this.state.storage.setAlarm) {
       if (nextAlarm >= deadline) await this.state.storage.setAlarm(deadline);
       else await this.state.storage.setAlarm(nextAlarm);

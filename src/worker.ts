@@ -256,6 +256,7 @@ function probeOperatorPage(): Response {
     <select name="profile">
       <option value="standard">standard</option>
       <option value="oneMinute100">oneMinute100</option>
+      <option value="oneMinute100Staggered">oneMinute100Staggered</option>
     </select>
   </label>
   <label>Run ID <input name="runId" autocomplete="off"></label>

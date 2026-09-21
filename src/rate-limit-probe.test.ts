@@ -161,6 +161,47 @@ describe("read-only rate-limit probe", () => {
     });
   });
 
+  it("supports the one-minute staggered 100-per-minute profile", async () => {
+    const harness = fakeState();
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      data: { getTicketList: { tickets: [{ ticketId: "private-ticket-id", displayId: "62609" }], listInfo: { page: 1 } } },
+    })));
+    vi.stubGlobal("fetch", fetcher);
+
+    const probe = new SuperOpsRateLimitProbe(harness.state, {
+      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      SUPEROPS_SUBDOMAIN: "computaskltd",
+      SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
+    });
+    const started = await probe.fetch(new Request("https://probe.local/state", {
+      method: "POST",
+      body: JSON.stringify({ action: "start", task: "getTicketList", profile: "oneMinute100Staggered" }),
+    }));
+    const startedBody = await started.json() as { runId: string; profile: string; requestIntervalMs: number };
+    const firstAlarm = Number(harness.getAlarm());
+
+    await probe.alarm();
+
+    expect(startedBody.profile).toBe("oneMinute100Staggered");
+    expect(startedBody.requestIntervalMs).toBe(600);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(Number(harness.getAlarm()) - firstAlarm).toBe(600);
+
+    for (let attempt = 1; attempt < 100; attempt += 1) await probe.alarm();
+    expect(fetcher).toHaveBeenCalledTimes(100);
+
+    const statusResponse = await probe.fetch(new Request("https://probe.local/state", {
+      method: "POST",
+      body: JSON.stringify({ action: "status", runId: startedBody.runId }),
+    }));
+    await expect(statusResponse.json()).resolves.toMatchObject({
+      profile: "oneMinute100Staggered",
+      totalAttempts: 100,
+      currentPhase: "staggered_100_per_minute",
+      currentTargetRequestsPerMinute: 100,
+    });
+  });
+
   it("rejects an unsupported probe task", async () => {
     const harness = fakeState();
     const probe = new SuperOpsRateLimitProbe(harness.state, {
@@ -223,6 +264,6 @@ describe("read-only rate-limit probe", () => {
       body: JSON.stringify({ action: "start", profile: "burst" }),
     }));
     expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: "profile must be standard or oneMinute100." });
+    expect(await response.json()).toEqual({ error: "profile must be standard, oneMinute100, or oneMinute100Staggered." });
   });
 });
