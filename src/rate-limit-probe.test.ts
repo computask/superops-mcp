@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SuperOpsRateLimitProbe } from "./rate-limit-probe.js";
+import { SuperOpsRateLimitProbe, RATE_LIMIT_PROBE_TOOLS } from "./rate-limit-probe.js";
+import { publishToolDefinition } from "./tool-catalogue.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -31,6 +32,19 @@ function fakeState() {
 }
 
 describe("read-only rate-limit probe", () => {
+  it("publishes every probe tool with read-only MCP safety annotations", () => {
+    for (const tool of RATE_LIMIT_PROBE_TOOLS) {
+      const published = publishToolDefinition(tool);
+      expect(published.annotations).toEqual({
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      });
+      expect(published.description).toContain("Read-only. Does not modify SuperOps data.");
+    }
+  });
+
   it("sends one upstream attempt per probe request and records the first 429 without retrying", async () => {
     const harness = fakeState();
     const logs: string[] = [];

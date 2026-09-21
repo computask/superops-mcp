@@ -75,6 +75,13 @@ export const READ_ONLY_TOOL_NAMES = new Set<string>([
   "superops_custom_query",
 ]);
 
+export const RATE_LIMIT_PROBE_TOOL_NAMES = new Set<string>([
+  "superops_rate_limit_probe_start",
+  "superops_rate_limit_probe_status",
+  "superops_rate_limit_probe_results",
+  "superops_rate_limit_probe_stop",
+]);
+
 export const MUTATING_TOOL_NAMES = new Set<string>([
   "superops_triage_emerging_issue_upsert",
   "superops_operations_cancel",
@@ -96,7 +103,7 @@ function annotationsForTool(name: string): ToolAnnotations {
   if (name === "superops_triage_emerging_issue_upsert") {
     return EMERGING_ISSUE_TOOL_ANNOTATIONS;
   }
-  if (READ_ONLY_TOOL_NAMES.has(name)) {
+  if (READ_ONLY_TOOL_NAMES.has(name) || RATE_LIMIT_PROBE_TOOL_NAMES.has(name)) {
     return READ_ONLY_TOOL_ANNOTATIONS;
   }
   if (MUTATING_TOOL_NAMES.has(name)) {
