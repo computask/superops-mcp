@@ -123,8 +123,15 @@ export async function dispatcherFetch(body: string, options: {
     let value: Record<string, unknown>;
     try {
       response = await fetch(url, {method: polling ? "GET" : "POST", headers,
-        body: polling ? undefined : body, redirect: "error",
+        // workerd supports manual/follow, not Node's redirect:"error".
+        // Never follow redirects with producer or Access credentials attached.
+        body: polling ? undefined : body, redirect: "manual",
         signal: options.signal ?? AbortSignal.timeout(Math.max(1, deadline - Date.now()))});
+      if (response.status >= 300 && response.status < 400) {
+        await response.body?.cancel();
+        if (counted) recordSubrequestFinish(counted, response.status, false);
+        throw new DispatcherPendingError(requestId, options.idempotencyKey, "redirect_rejected");
+      }
       if (!polling && response.status !== 202 && response.status !== 504 &&
           !pending.has(response.headers.get("X-Dispatcher-Status") ?? "") &&
           response.headers.get("X-Dispatcher-Uncertain") !== "true" &&
@@ -140,6 +147,7 @@ export async function dispatcherFetch(body: string, options: {
       value = object(await boundedJson(response));
       if (counted) recordSubrequestFinish(counted, response.status, response.ok);
     } catch (error) {
+      if (error instanceof DispatcherPendingError) throw error;
       if (counted) recordSubrequestFinish(counted, "networkError", false);
       throw new DispatcherPendingError(requestId, options.idempotencyKey,
         options.signal?.aborted || (error instanceof Error && error.name === "AbortError") ? "request_timeout" : "submission_or_status_unknown");

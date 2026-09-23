@@ -19,7 +19,14 @@ describe("dispatcher-only transport", () => {
     const init = (fetcher.mock.calls as unknown[][])[0][1] as RequestInit;
     expect(init.headers).toMatchObject({Authorization: "Bearer synthetic-producer", "X-Source": "superops-mcp", "CF-Access-Client-Id": env.CF_ACCESS_CLIENT_ID, "CF-Access-Client-Secret": env.CF_ACCESS_CLIENT_SECRET, "Idempotency-Key": expect.stringMatching(/^superops-mcp:/)});
     expect(JSON.stringify(init)).not.toMatch(/upstream-not-sent|tenant-not-sent|CustomerSubDomain/);
-    expect(init.redirect).toBe("error");
+    expect(init.redirect).toBe("manual");
+  });
+  it.each([undefined, "receipt-1"])("rejects redirects without following or replaying (receipt %s)", async requestId => {
+    const fetcher = vi.fn(async () => new Response(null, {status:302, headers:{Location:"https://untrusted.example/private-location"}}));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(dispatcherFetch("{}", {env, requestId, idempotencyKey:"same", mutation:true})).rejects.toMatchObject({state:"redirect_rejected", requestId});
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.calls[0]).not.toContain("https://untrusted.example/private-location");
   });
   it.each([202, 504])("polls the same receipt after HTTP %s; never re-POSTs", async status => {
     vi.useFakeTimers();

@@ -1,6 +1,6 @@
 # SuperOps MCP Execution Safety Verification
 
-## Dispatcher/pagination migration — local candidate, 23 September 2026
+## Dispatcher/pagination migration — 23 September 2026
 
 The older inventory below describes logical reads/writes, not current physical
 upstream attempts. `src/dispatcher.ts` is now the sole outbound SuperOps transport,
@@ -51,10 +51,18 @@ Arbitrary-tenant legacy
 gateway routing fails closed. The probe measures dispatcher-paced traffic, not
 unthrottled upstream burst capacity; no oversized negative-test profile is enabled.
 
-Local validation: `npm test` passed 636 tests (zero failures); `npm run typecheck`,
+The first Git-connected rollout exposed a Worker-only transport defect: workerd
+rejects `redirect:"error"` before sending the request, although Node accepts it.
+The transport now uses `redirect:"manual"` and rejects every 3xx response without
+following it, logging its Location, or resubmitting. Regression coverage includes
+the actual bundled dispatcher in workerd with outbound traffic mocked, plus POST
+and receipt-poll redirect rejection. This preserves credential isolation and
+ambiguous-mutation protection.
+
+Initial local validation: `npm test` passed 636 tests (zero failures); `npm run typecheck`,
 `npm run lint`, `npm run build`, and `git diff --check` passed. The synthetic test
-report is `diagnostics/dispatcher-local-tests.json`. No live integration test was
-performed. Workers/Durable Objects guidance informed bounded I/O and durable
+report is `diagnostics/dispatcher-local-tests.json`. The live read-only transport
+check above followed that validation. Workers/Durable Objects guidance informed bounded I/O and durable
 receipt checkpointing; passing mocked tests is not evidence of live cutover.
 
 Verification date: 2026-07-18. Final conformance repair cycle 1.
