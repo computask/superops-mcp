@@ -37,13 +37,17 @@ endpoint_host and `/graphql`; these are NOT exact upstream physical-call counts.
 Use the dispatcher's attempt ledger for upstream quota evidence. Neither receipt
 polls nor operation checkpoints consume SuperOps upstream quota.
 
-This candidate is prepared for a local commit, not a completed live cutover.
-The 23 September read-only Worker secret-name preflight found no
+The initial 23 September read-only Worker secret-name preflight found no
 `DISPATCHER_TOKEN`, `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` or
-`SUPEROPS_SUBDOMAIN` secret. Push to the Git-connected deployment branch is held
-until the required bindings are provisioned under separate authorization; live
-credentials have not been changed. Preserve the existing owner identity when
-moving the subdomain from configuration into a secret. Arbitrary-tenant legacy
+`SUPEROPS_SUBDOMAIN` secret, so the first push was held. Subsequent explicit
+authorization covered provisioning: all four bindings are now installed, the
+existing owner value was preserved, and the dedicated MCP producer/Access
+identity authenticates. All four previous dispatcher producers still authenticate.
+A read-only pageSize-1 connection probe through the committed transport succeeded
+at 19:06 UTC in 1.3 seconds with a durable succeeded receipt. This is transport
+proof, not end-to-end mutation or agent proof. Git remains the only code deployment
+path; verify the active Cloudflare version separately from push success.
+Arbitrary-tenant legacy
 gateway routing fails closed. The probe measures dispatcher-paced traffic, not
 unthrottled upstream burst capacity; no oversized negative-test profile is enabled.
 
