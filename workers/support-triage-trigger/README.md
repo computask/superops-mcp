@@ -9,6 +9,10 @@ projects match production. no_bundle preserves that baseline at upload.
 
 Cloudflare Git build uses computask/superops-mcp, main, root /:
 
+The existing Worker was connected to this repository on 23 September 2026,
+reusing the existing superops-mcp build token. No new token or permissions were
+created. The first post-connection push starts the Git-managed restart.
+
 - Build: npm --prefix workers/support-triage-trigger test && npm --prefix workers/support-triage-trigger run build
 - Deploy (CI only): npx wrangler deploy --config workers/support-triage-trigger/wrangler.jsonc
 - Preview builds disabled: no second live mailbox consumer.
