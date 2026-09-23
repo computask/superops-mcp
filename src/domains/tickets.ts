@@ -2999,7 +2999,10 @@ function buildSafeTicketResult(params: {
     ticketNumber: ticket.displayId,
     ticketId: ticket.ticketId,
     subject: ticket.subject,
-    client: readableString(ticket.client, ["name", "accountName"]),
+    // Preserve a verified unassigned client instead of serialising it away as
+    // missing evidence. Unknown/omitted data remains undefined, never null.
+    client: ticket.client === null ? null : readableString(ticket.client, ["name", "accountName"]),
+    clientId: ticketClientAccountId(ticket),
     site: readableString(ticket.site, ["name"]),
     status: ticket.status,
     priority: ticket.priority,

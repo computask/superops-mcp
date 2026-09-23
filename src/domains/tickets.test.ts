@@ -3025,6 +3025,32 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { label: "explicit unassigned", client: null, expected: { client: null } },
+    { label: "assigned identity", client: { accountId: "client-1", name: "Example" }, expected: { client: "Example", clientId: "client-1" } },
+    { label: "unavailable identity", client: undefined, expected: {} },
+  ])("preserves $label client evidence without extra reads", async ({ client, expected }) => {
+    mockClient.query.mockResolvedValue({ getTicket: {
+      ticketId: "identity-test", displayId: "62850", status: "New Calls", client,
+      updatedTime: "2026-09-23T20:07:20.935Z",
+    } });
+    const domain = getTicketsTools();
+    const options = { includeNotes: false, includeConversations: false, includeDescription: false };
+    const single = JSON.parse((await domain.handleCall("superops_tickets_get_safe", {
+      ticketId: "identity-test", ...options,
+    })).content[0].text);
+    const batch = JSON.parse((await domain.handleCall("superops_tickets_triage_evidence_recover", {
+      ticketIds: ["identity-test"], ...options,
+    })).content[0].text);
+    for (const evidence of [single.evidence, batch.results[0].evidence]) {
+      expect(evidence).toMatchObject(expected);
+      if (client === undefined) expect(evidence).not.toHaveProperty("client");
+      if (client == null) expect(evidence).not.toHaveProperty("clientId");
+    }
+    expect(mockClient.query).toHaveBeenCalledTimes(2);
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
   it("recovers bounded sanitised evidence by immutable ticket ID and preserves batch failures", async () => {
     mockClient.query.mockImplementation(async (
       query: string,
