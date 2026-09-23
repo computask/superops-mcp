@@ -1,0 +1,67 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "support-triage-trigger",
+  "account_id": "c6dba133601075b447e306ebb826a33b",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-14",
+  "no_bundle": true,
+  "workers_dev": true,
+  "preview_urls": false,
+  "keep_vars": false,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TRIAGE_COORDINATOR",
+        "class_name": "TriageCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "TriageCoordinator"
+      ]
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  },
+  "vars": {
+    "AUTOMATED_TRIAGE_TRIGGER_ENABLED": "true",
+    "GRAPH_LIFECYCLE_NOTIFICATION_URL": "https://support-triage-trigger.sam-c6d.workers.dev/graph/lifecycle",
+    "GRAPH_NOTIFICATION_URL": "https://support-triage-trigger.sam-c6d.workers.dev/graph/notifications",
+    "GRAPH_SUBSCRIPTION_LIFETIME_MINUTES": "45",
+    "GRAPH_SUBSCRIPTION_RENEWAL_LEAD_MINUTES": "15",
+    "GRAPH_SUPPORT_MAILBOX_UPN": "supportdesk@computask.co.uk",
+    "TRIAGE_ACCEPTED_RUN_MAX_AGE_SECONDS": "300",
+    "TRIAGE_AGENT_TIMING_TELEMETRY_ENABLED": "true",
+    "TRIAGE_CONFIGURATION_RETRY_EXIT_ENABLED": "true",
+    "TRIAGE_FAST_COOLDOWN_SECONDS": "1",
+    "TRIAGE_FAST_DEBOUNCE_SECONDS": "1",
+    "TRIAGE_FAST_INGESTION_GRACE_SECONDS": "15",
+    "TRIAGE_FAST_MAX_DEBOUNCE_SECONDS": "1",
+    "TRIAGE_FAST_NEW_EMAIL_LOOKBACK_SECONDS": "60",
+    "TRIAGE_FAST_TARGETED_MODE_ENABLED": "true",
+    "TRIAGE_GRAPH_SWEEP_ENABLED": "true",
+    "TRIAGE_GRAPH_SWEEP_LOOKBACK_SECONDS": "900",
+    "TRIAGE_GRAPH_SWEEP_MAX_MESSAGES": "100",
+    "TRIAGE_HISTORY_MAX_ROWS": "50000",
+    "TRIAGE_HISTORY_RETENTION_DAYS": "30",
+    "TRIAGE_NEW_EMAIL_LOOKBACK_SECONDS": "300",
+    "TRIAGE_RECONCILIATION_ELIGIBILITY_SEPARATION_ENABLED": "true",
+    "TRIAGE_RESULT_CALLBACK_ENABLED": "true",
+    "TRIAGE_RESULT_MAX_RETRIES": "6",
+    "TRIAGE_RESULT_MAX_RETRY_AFTER_SECONDS": "86400",
+    "TRIAGE_RESULT_POLL_DUE_GATING_ENABLED": "true",
+    "TRIAGE_RESULT_WATCHDOG_SECONDS": "30",
+    "TRIAGE_STALE_RUN_RECOVERY_ENABLED": "true",
+    "TRIAGE_TRIGGER_DEBOUNCE_SECONDS": "45",
+    "TRIAGE_TRIGGER_MAX_DEBOUNCE_SECONDS": "120",
+    "TRIAGE_TRIGGER_SCOPE_MODE": "new-email-tickets",
+    "WORKSPACE_AGENT_TRIGGER_COOLDOWN_SECONDS": "120",
+    "WORKSPACE_AGENT_TRIGGER_URL": "https://api.chatgpt.com/v1/workspace_agents/agtch_6aa8549398188191ab83ec01e16bf474/trigger"
+  }
+}
