@@ -1,3 +1,4 @@
+import { paginatedClient } from "../pagination.js";
 /**
  * SuperOps.ai Clients Domain
  *
@@ -86,7 +87,7 @@ interface GetClientResponse {
 function pageInput(max: number | undefined, defaultPageSize: number, page?: number) {
   return {
     page: page ?? DEFAULT_LIST_PAGE,
-    pageSize: Math.min(max ?? defaultPageSize, 500),
+    pageSize: Math.min(max ?? defaultPageSize, 100),
   };
 }
 
@@ -148,18 +149,19 @@ function readMetadata(params: {
   filterFields: string[];
 }) {
   const complete = params.listInfo.hasMore === false;
-  const truncated = params.listInfo.hasMore === true;
+  const truncated = !complete;
   const nextPage =
     truncated && typeof params.listInfo.page === "number"
-      ? params.listInfo.page + 1
+      ? params.listInfo.nextPage ?? params.listInfo.page + 1
       : undefined;
 
   return {
     complete,
     truncated,
-    truncationReason: truncated ? "upstreamHasMore" : undefined,
+    truncationReason: truncated ? params.listInfo.truncationReason ?? "upstreamHasMoreOrUnknown" : undefined,
+    nextPage, totalCount: params.listInfo.totalCount, recordsReturned: params.returnedCount,
     continuation: truncated
-      ? { nextPage, pageSize: params.listInfo.pageSize }
+      ? params.listInfo.continuation ?? { nextPage, pageSize: params.listInfo.pageSize }
       : undefined,
     returnedCount: params.returnedCount,
     upstreamReturnedCount: params.upstreamReturnedCount,
@@ -187,6 +189,7 @@ function listResult(
   return {
     ...list,
     clients,
+    recordsReturned: clients.length,
     listInfo: filteredListInfo(list.listInfo, clients.length, filterFields),
     readMetadata: readMetadata({
       listInfo: list.listInfo,
@@ -219,12 +222,12 @@ export function getClientsTools(): DomainTools {
             },
             max: {
               type: "number",
-              description: "Maximum number of results (default: 50, max: 500)",
+              description: "Upstream page size (default: 50, maximum: 100), not total results; sequential pagination with explicit continuation",
               default: 50,
             },
             page: {
               type: "number",
-              description: "Page number to fetch (default: 1)",
+              description: "Start or continuation page (default: 1); subsequent pages are fetched sequentially",
               default: 1,
             },
           },
@@ -255,19 +258,21 @@ export function getClientsTools(): DomainTools {
               type: "string",
               description: "Search term to find clients by name or email domain",
             },
+            page: {type: "integer", minimum: 1, default: 1, description: "Continuation start page; preserve max and filters."},
             max: {
               type: "number",
-              description: "Maximum number of results (default: 20)",
+              description: "Upstream page size (default: 20, maximum: 100), not total results; preserve this value on continuation",
               default: 20,
             },
           },
           required: ["query"],
+          // Continuation uses the same filters and page size.
         },
       },
     ],
 
     async handleCall(name, args) {
-      const client = getClient();
+      const client = paginatedClient(getClient());
 
       try {
         switch (name) {
@@ -360,13 +365,13 @@ export function getClientsTools(): DomainTools {
           }
 
           case "superops_clients_search": {
-            const params = args as { query: string; max?: number };
+            const params = args as { query: string; max?: number; page?: number };
 
             const response = await client.query<ListClientsResponse>(SEARCH_CLIENTS_QUERY, {
               // TODO: Replace local search with ListInfoInput.condition after
               // SuperOps documents reliable condition syntax for Client fields.
               input: {
-                page: DEFAULT_LIST_PAGE,
+                page: params.page ?? DEFAULT_LIST_PAGE,
                 pageSize: Math.min(params.max ?? 20, 100),
               },
             });

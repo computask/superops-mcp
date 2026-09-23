@@ -1,3 +1,4 @@
+import { dispatcherFetch, DISPATCHER_ORIGIN } from "./dispatcher.js";
 import type { ToolDefinition } from "./types.js";
 import type { ToolResult } from "./audit.js";
 
@@ -44,7 +45,7 @@ const RATE_LIMIT_PROBE_QUERIES: Record<RateLimitProbeTask, string> = {
     query getTicketList {
       getTicketList(input: {
         page: 1,
-        pageSize: 10000,
+        pageSize: 100,
         condition: {
           attribute: "status",
           operator: "includes",
@@ -97,7 +98,7 @@ export const RATE_LIMIT_PROBE_TOOLS: ToolDefinition[] = [
         task: {
           type: "string",
           enum: ["getClientList", "getTicketList", "getTicketListOpenQueue"],
-          description: "The exact read operation to probe. getTicketListOpenQueue uses the large page-10000 open-status filter. Defaults to getClientList.",
+          description: "Dispatcher-paced read admission probe, not a direct upstream quota test. getTicketListOpenQueue uses a compliant page-100 open-status filter. Defaults to getClientList. No oversized negative test is enabled.",
         },
         profile: {
           type: "string",
@@ -238,7 +239,7 @@ interface ProbeEvent {
   completedAt: string;
   durationMs: number;
   tenant: string;
-  endpointHost: "api.superops.ai" | "euapi.superops.ai";
+  endpointHost: string;
   httpStatus?: number;
   ok: boolean;
   outcome: ProbeOutcome;
@@ -261,7 +262,7 @@ interface ProbeRun {
   deadlineAt: string;
   finishedAt?: string;
   stoppedReason?: string;
-  endpointHost: "api.superops.ai" | "euapi.superops.ai";
+  endpointHost: string;
   tenant: string;
   nextSequence: number;
   fractionalBatch: number;
@@ -293,6 +294,9 @@ export interface RateLimitProbeAdapter {
 }
 
 interface ProbeEnvironment {
+  DISPATCHER_TOKEN?: string;
+  CF_ACCESS_CLIENT_ID?: string;
+  CF_ACCESS_CLIENT_SECRET?: string;
   SUPEROPS_API_TOKEN?: string;
   SUPEROPS_SUBDOMAIN?: string;
   SUPEROPS_REGION?: string;
@@ -365,8 +369,8 @@ function profileFor(run: ProbeRun): (typeof RATE_LIMIT_PROBE_PROFILES)[RateLimit
   return RATE_LIMIT_PROBE_PROFILES[run.profile ?? DEFAULT_RATE_LIMIT_PROBE_PROFILE];
 }
 
-function endpointFor(region: string | undefined): "api.superops.ai" | "euapi.superops.ai" {
-  return region === "eu" ? "euapi.superops.ai" : "api.superops.ai";
+function endpointFor(_region: string | undefined): string {
+  return new URL(DISPATCHER_ORIGIN).hostname;
 }
 
 function parseNonNegativeNumber(value: string | null): number | undefined {
@@ -437,7 +441,7 @@ function emitAttemptStarted(params: {
     callIndex: params.sequence,
     tenant: safeTenant(params.tenant),
     endpointHost: params.endpointHost,
-    endpointPath: "/msp",
+    endpointPath: "/graphql",
     requestPurpose: "initialRead",
     operationType: "query",
     operationName: graphqlOperationName(params.task),
@@ -459,7 +463,7 @@ function emitAttemptFinished(event: ProbeEvent, callId: string): void {
     callIndex: event.sequence,
     tenant: safeTenant(event.tenant),
     endpointHost: event.endpointHost,
-    endpointPath: "/msp",
+    endpointPath: "/graphql",
     requestPurpose: "initialRead",
     operationType: "query",
     operationName: graphqlOperationName(event.task),
@@ -544,10 +548,9 @@ async function performProbeAttempt(params: {
   sequence: number;
   phase: ProbePhase;
   scheduledAt: string;
-  apiToken: string;
+  env: ProbeEnvironment;
 }): Promise<ProbeEvent> {
   const endpointHost = params.run.endpointHost;
-  const endpoint = `https://${endpointHost}/msp`;
   const task = params.run.task ?? DEFAULT_RATE_LIMIT_PROBE_TASK;
   const startedAt = new Date().toISOString();
   const callId = uuid();
@@ -571,16 +574,10 @@ async function performProbeAttempt(params: {
   let headers: ProbeHeaders = {};
   let ok = false;
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${params.apiToken}`,
-        CustomerSubDomain: params.run.tenant,
-      },
-      body: JSON.stringify({ query: RATE_LIMIT_PROBE_QUERIES[task], variables: RATE_LIMIT_PROBE_VARIABLES[task] }),
-      signal: controller.signal,
-    });
+    const response = await dispatcherFetch(
+      JSON.stringify({ query: RATE_LIMIT_PROBE_QUERIES[task], variables: RATE_LIMIT_PROBE_VARIABLES[task] }),
+      {idempotencyKey: `superops-mcp:probe:${params.run.runId}:${params.sequence}`, env: params.env, signal: controller.signal}
+    );
     httpStatus = response.status;
     headers = rateLimitHeaders(response.headers);
     retryAfter = retryAfterSeconds(response.headers);
@@ -726,7 +723,7 @@ export class SuperOpsRateLimitProbe {
     if (this.env.SUPEROPS_RATE_LIMIT_PROBE_ENABLED !== "true") {
       throw new Error("The rate-limit probe is disabled by SUPEROPS_RATE_LIMIT_PROBE_ENABLED.");
     }
-    const token = this.env.SUPEROPS_API_TOKEN?.trim();
+    const token = this.env.DISPATCHER_TOKEN?.trim();
     const tenant = this.env.SUPEROPS_SUBDOMAIN?.trim().toLowerCase();
     if (!token || !tenant) throw new Error("Probe requires the configured SuperOps Worker credentials.");
     const task = parseProbeTask(taskInput);
@@ -806,7 +803,7 @@ export class SuperOpsRateLimitProbe {
 
   async alarm(): Promise<void> {
     const run = await this.activeRun();
-    const token = this.env.SUPEROPS_API_TOKEN?.trim();
+    const token = this.env.DISPATCHER_TOKEN?.trim();
     if (!run || run.status !== "running" || !token) return;
     const now = Date.now();
     const deadline = Date.parse(run.deadlineAt);
@@ -828,7 +825,7 @@ export class SuperOpsRateLimitProbe {
         sequence: sequenceStart + index,
         phase,
         scheduledAt,
-        apiToken: token,
+        env: this.env,
       })
     ));
     if (events.length > 0 && sequenceStart + events.length > MAX_EVENTS_PER_RUN) {

@@ -7,9 +7,11 @@
 import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 
 export interface SuperOpsCredentials {
+  /** Legacy identity fields only; never forwarded to the dispatcher/upstream. */
   apiToken: string;
   subdomain: string;
   region?: "us" | "eu";
+  dispatcher?: import("./dispatcher.js").DispatcherEnvironment;
 }
 
 export interface GraphQLResponse<T = unknown> {
@@ -49,6 +51,12 @@ export interface RuleConditionInput {
 }
 
 export interface ListInfo {
+  complete?: boolean;
+  truncated?: boolean;
+  nextPage?: number | null;
+  recordsReturned?: number;
+  truncationReason?: string;
+  continuation?: unknown;
   page?: number;
   pageSize?: number;
   sort?: Sort[];

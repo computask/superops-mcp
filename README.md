@@ -43,16 +43,38 @@ export SUPEROPS_SUBDOMAIN="yourcompany"
 export SUPEROPS_REGION="us"  # or "eu" for EU region
 ```
 
-Configure the SuperOps API token as a secret in your runtime or Worker platform.
-Never commit token values or put them in examples, logs, headers, or responses.
+Configure `DISPATCHER_TOKEN`, `CF_ACCESS_CLIENT_ID`, and
+`CF_ACCESS_CLIENT_SECRET` through runtime environment secrets/Worker secrets.
+The producer token must be registered for source **superops-mcp**. The MCP sends
+`POST https://superops-api-dispatcher.taskgroup.co.uk/graphql`; it has no direct
+SuperOps transport or fallback. Upstream API credentials belong to the dispatcher.
+`SUPEROPS_SUBDOMAIN` is retained only as the existing operation-owner identity;
+keep its value in environment configuration, not source, and do not change it
+during migration or existing owner-scoped operations will become inaccessible.
+The Access pair is required for the currently protected dispatcher hostname.
+No credentials were created or changed as part of this local migration.
 
-### Getting Your API Token
+### Dispatcher transport and recovery
 
-1. Log in to SuperOps.ai
-2. Click settings icon > "My Profile"
-3. Navigate to "API token" tab
-4. Click "Generate token"
-5. Copy and securely store the token
+Requests carry producer bearer authentication, `X-Source: superops-mcp`,
+`Idempotency-Key`, and `Prefer: respond-async`. Both POST and polling GETs carry
+the Access headers. Redirects and returned external status URLs are never followed.
+202 and timeout receipts are polled at `/v1/requests/{requestId}` within the
+existing execution/time budgets. Polls are Worker subrequests, not new upstream
+SuperOps calls. Retry-After is never shortened to fit an invocation.
+
+Durable triage derives mutation keys from the persisted operation/item and exact
+payload hash. Accepted receipts are checkpointed in the existing owner-scoped
+ledger; fresh continuation polls that receipt before the mutation adapter runs.
+Pending work stays pending; failed/cancelled/uncertain receipts require reconciliation,
+not a new mutation. Existing verification, stale checks and note dedupe remain.
+Other synchronous write tools do not gain a durable ledger: retain their returned
+receipt/key on failure and reconcile rather than repeat with a new key.
+
+Legacy gateway tenant headers cannot select or authorize the dispatcher's account.
+Gateway mode fails closed when a dispatcher producer is configured, pending a
+separately designed tenant-to-producer mapping. Use the authenticated env-mode
+deployment or local stdio. Missing dispatcher secrets never enable direct calls.
 
 ## Usage with Claude Desktop
 
@@ -73,7 +95,7 @@ Add to your `claude_desktop_config.json`:
 }
 ```
 
-Provide the SuperOps API token through your MCP client's secure secret/env
+Provide dispatcher/Access credentials through your MCP client's secure secret/env
 mechanism rather than committing it to this file.
 
 ## Cloudflare Worker Deployment Notes
@@ -81,10 +103,10 @@ mechanism rather than committing it to this file.
 - Worker name: `superops-mcp`
 - MCP endpoint: `https://<your-mcp-host>/mcp`
 - Health endpoint: `https://<your-mcp-host>/health`
-- Required non-secret vars: `AUTH_MODE=env`, `SUPEROPS_SUBDOMAIN=computaskltd`, `SUPEROPS_REGION=us`, `LOG_LEVEL=warn`
+- Required non-secret vars: `AUTH_MODE=env`, `SUPEROPS_REGION=us`, `LOG_LEVEL=warn`; provide the existing `SUPEROPS_SUBDOMAIN` identity through environment secrets.
 - Non-secret safety defaults: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=false`, `ENABLE_CUSTOM_MUTATION=false`, `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=false`, `CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION=false`
 - Execution controls additionally include per-request timeout, CPU guard, continuation/retry/delay/scheduling ceilings, retention, and maximum operation lifetime. The exact committed values are in `wrangler.json` and are described in the continuation runbook.
-- Required secrets: the SuperOps API token Worker secret, plus any OAuth/session secrets required by the deployed auth provider. SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY is also required when durable approved private-note recovery is enabled; store it as a Cloudflare secret and keep it distinct from SUPEROPS_INTERNAL_CONTINUATION_TOKEN.
+- Required secrets: `DISPATCHER_TOKEN`, `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`, the existing `SUPEROPS_SUBDOMAIN` identity, plus existing OAuth/session secrets. SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY remains required for approved private-note recovery and must stay distinct from SUPEROPS_INTERNAL_CONTINUATION_TOKEN.
 - Never commit: API token values, OAuth access/refresh tokens, bearer tokens, Cloudflare service token values, client secrets, private keys, or full request headers
 - Durable operation status uses `SUPEROPS_OPERATION_LEDGER`. Long rate-limit waits use the `SUPEROPS_CONTINUATION_WORKFLOW` binding; immediate delivery and Workflow wake delivery use the internal service binding/token. Both continuation flags default false. Durable Object alarms are cleanup-only: they enforce maximum operation lifetime and retention without performing SuperOps mutations. Do not reuse `OAUTH_KV` for operation state.
 
@@ -181,10 +203,40 @@ Operation status is fail-closed and owner-scoped. Direct OAuth uses the authenti
 `superops_tickets_list` supports configured status display names such as
 `New Calls`. Status filters are sent to SuperOps as a ticket-list condition so
 queue listing is not limited to the first unfiltered page. `max` controls the
-requested page size up to 500, with `page` selecting the page number. If extra
+requested page size up to **100**, with `page` selecting the starting page. If extra
 client, priority, or assignee filters are applied locally after the SuperOps
 query, `totalCount` and `hasMore` are omitted rather than reporting unrelated
-unfiltered counts.
+unfiltered counts. Normal ticket/client/asset/technician/alert lists now fetch
+sequential pages automatically (including software and patches). The per-page cap
+does not cap the total: 350 records use four requests returning 100/100/100/50.
+Fields, filters, sorting and other variables are preserved on every page.
+
+Pagination is bounded by execution budget, configured pagination depth, 5,000
+records and a conservative 600,000-byte record payload allowance below the 1 MiB
+MCP response cap. Partial results expose `complete:false`, `truncated:true`,
+`recordsReturned`, `totalCount` when known, `truncationReason`, `nextPage` and
+`continuation`. Inspect top-level/listInfo/readMetadata (historical tools use
+`pagination`). Missing metadata, inconsistent counts, duplicate/stalled pages and
+invalid page numbers never mean success. Stable IDs deduplicate overlapping pages.
+
+To continue, invoke the same MCP tool with the same filters, sorting and `max`
+(or alert `pageSize`) and set `page` to `nextPage`; the returned continuation also
+retains exact GraphQL variables. Do not change the page size mid-scan. Historical
+queries/reports retain fixed pageSize 100 and expose `nextPageOffset`: pass it as
+`pageOffset` alongside `page`. This preserves unread records when a bound falls
+inside a page. Merge query segments by stable ID before computing a full report;
+partial aggregate reports describe only their returned segment. Live offset
+pagination is not a transactional snapshot: changes to the upstream list can
+require restarting the scan.
+
+Intentionally bounded contracts remain: recent-N tickets, frozen triage snapshot
+pages, saved-script/activity pages, exact-ID reconciliation and the one-record
+connection probe. They do not widen into whole-queue reads. Script/activity pages
+expose page/pageSize/hasMore/totalCount/nextPage and partial metadata. Custom GraphQL
+preserves the caller's document; oversized page requests are rejected before I/O,
+not rewritten. The stress probe also uses the dispatcher and compliant pages; it
+measures dispatcher-paced admission/completion, not raw upstream burst capacity.
+No oversized negative-test profile is enabled.
 
 Ticket urgency and impact are writable. Priority can still be supplied manually
 and will be validated against live SuperOps options. Prefer impact plus urgency
@@ -720,9 +772,10 @@ The priority override has been validated and applied.
 
 ## Rate Limits
 
-SuperOps.ai API has a published rate limit of 800 requests per minute per API token.
+SuperOps.ai documents an upstream ceiling of **100 requests per minute**.
+The existing shared dispatcher applies its own conservative limiter across producers.
 The MCP distinguishes SuperOps upstream throttling from Cloudflare invocation-budget
-exhaustion. Read calls retry only with bounded attempts and capped Retry-After or
+exhaustion. Read calls retry only with bounded attempts and respected Retry-After or
 exponential backoff delays. Write calls are not blindly retried by the central client;
 a write path must prove idempotency or verify current state before adding safe retries.
 The New Calls snapshot does not convert a failed list-page read or exhausted list-page

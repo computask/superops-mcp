@@ -60,7 +60,7 @@ describe("read-only rate-limit probe", () => {
     vi.stubGlobal("fetch", fetcher);
 
     const probe = new SuperOpsRateLimitProbe(harness.state, {
-      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      DISPATCHER_TOKEN: "secret-token-never-log",
       SUPEROPS_SUBDOMAIN: "computaskltd",
       SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
     });
@@ -108,7 +108,7 @@ describe("read-only rate-limit probe", () => {
     vi.stubGlobal("fetch", fetcher);
 
     const probe = new SuperOpsRateLimitProbe(harness.state, {
-      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      DISPATCHER_TOKEN: "secret-token-never-log",
       SUPEROPS_SUBDOMAIN: "computaskltd",
       SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
     });
@@ -149,7 +149,7 @@ describe("read-only rate-limit probe", () => {
     vi.stubGlobal("fetch", fetcher);
 
     const probe = new SuperOpsRateLimitProbe(harness.state, {
-      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      DISPATCHER_TOKEN: "secret-token-never-log",
       SUPEROPS_SUBDOMAIN: "computaskltd",
       SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
     });
@@ -183,7 +183,7 @@ describe("read-only rate-limit probe", () => {
     vi.stubGlobal("fetch", fetcher);
 
     const probe = new SuperOpsRateLimitProbe(harness.state, {
-      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      DISPATCHER_TOKEN: "secret-token-never-log",
       SUPEROPS_SUBDOMAIN: "computaskltd",
       SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
     });
@@ -219,7 +219,7 @@ describe("read-only rate-limit probe", () => {
   it("rejects an unsupported probe task", async () => {
     const harness = fakeState();
     const probe = new SuperOpsRateLimitProbe(harness.state, {
-      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      DISPATCHER_TOKEN: "secret-token-never-log",
       SUPEROPS_SUBDOMAIN: "computaskltd",
       SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
     });
@@ -244,7 +244,7 @@ describe("read-only rate-limit probe", () => {
     vi.stubGlobal("fetch", fetcher);
 
     const probe = new SuperOpsRateLimitProbe(harness.state, {
-      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      DISPATCHER_TOKEN: "secret-token-never-log",
       SUPEROPS_SUBDOMAIN: "computaskltd",
       SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
     });
@@ -257,7 +257,7 @@ describe("read-only rate-limit probe", () => {
 
     expect(startedBody.task).toBe("getTicketListOpenQueue");
     expect(requests).toHaveLength(10);
-    expect(requests[0]?.query).toContain("pageSize: 10000");
+    expect(requests[0]?.query).toContain("pageSize: 100");
     expect(requests[0]?.query).toContain('attribute: "status"');
     expect(requests[0]?.query).toContain('"Waiting on third party"');
     expect(requests[0]?.query).toContain("updatedTime");
@@ -268,7 +268,7 @@ describe("read-only rate-limit probe", () => {
   it("rejects an unsupported probe profile", async () => {
     const harness = fakeState();
     const probe = new SuperOpsRateLimitProbe(harness.state, {
-      SUPEROPS_API_TOKEN: "secret-token-never-log",
+      DISPATCHER_TOKEN: "secret-token-never-log",
       SUPEROPS_SUBDOMAIN: "computaskltd",
       SUPEROPS_RATE_LIMIT_PROBE_ENABLED: "true",
     });

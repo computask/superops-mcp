@@ -10,7 +10,7 @@ import type { Asset, DomainTools, ListInfo, SuperOpsJson } from "../types.js";
 
 const DEFAULT_LIST_PAGE = 1;
 const DEFAULT_PAGE_SIZE = 100;
-const MAX_PAGE_SIZE = 500;
+const MAX_PAGE_SIZE = 100;
 const DEFAULT_FIND_MAX_PAGES = 20;
 const SCRIPT_PLATFORM_TYPES = ["WINDOWS", "MAC", "LINUX"] as const;
 const SCRIPT_CATALOGUE_MAX_RECORDS = 500;
@@ -245,17 +245,20 @@ function normalizeId(value: unknown): string | undefined {
 
 function listInfoWithReadMetadata(listInfo: ListInfo, returnedCount: number) {
   const complete = listInfo.hasMore === false;
-  const truncated = listInfo.hasMore === true;
+  const truncated = !complete;
   return {
     page: listInfo.page,
     pageSize: listInfo.pageSize,
     hasMore: listInfo.hasMore,
     totalCount: listInfo.totalCount,
+    complete, truncated, recordsReturned: returnedCount,
+    nextPage: truncated && typeof listInfo.page === "number" ? listInfo.page + 1 : null,
     readMetadata: {
       complete,
       truncated,
       truncationReason: truncated ? "upstreamHasMore" : undefined,
       returnedCount,
+      recordsReturned: returnedCount,
       upstreamTotalCount: listInfo.totalCount,
       completeness: complete ? "known" : truncated ? "partial" : "unknown",
       continuation: truncated && typeof listInfo.page === "number"
@@ -889,7 +892,7 @@ export function getScriptsTools(): DomainTools {
     tools: [
       {
         name: "superops_scripts_list",
-        description: "List saved SuperOps RMM scripts by metadata. Does not return script source.",
+        description: "Return one bounded page (maximum 100) of saved SuperOps RMM script metadata. Does not return script source. Inspect hasMore/truncated and request nextPage with the same filters for remaining pages.",
         inputSchema: {
           type: "object",
           properties: {

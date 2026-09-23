@@ -1,3 +1,4 @@
+import { paginatedClient } from "../pagination.js";
 /**
  * SuperOps.ai Alerts Domain
  *
@@ -17,7 +18,7 @@ import type {
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_PAGE_SIZE = 25;
-const MAX_PAGE_SIZE = 500;
+const MAX_PAGE_SIZE = 100;
 const ALERT_ID_LOOKUP_PAGE_LIMIT = 10;
 const ALERT_ID_LOOKUP_PAGE_SIZE = 100;
 const MAX_SYNCHRONOUS_ALERT_RESOLVE_IDS = 4;
@@ -416,7 +417,7 @@ function readMetadata(params: {
   filterFields: string[];
 }) {
   const complete = params.listInfo.hasMore === false;
-  const truncated = params.listInfo.hasMore === true;
+  const truncated = !complete;
   const completionState = complete
     ? "complete"
     : truncated
@@ -424,15 +425,16 @@ function readMetadata(params: {
       : "upstream_pagination_ambiguous";
   const nextPage =
     truncated && typeof params.listInfo.page === "number"
-      ? params.listInfo.page + 1
+      ? params.listInfo.nextPage ?? params.listInfo.page + 1
       : undefined;
 
   return {
     complete,
     truncated,
-    truncationReason: truncated ? "upstreamHasMore" : undefined,
+    truncationReason: truncated ? params.listInfo.truncationReason ?? "upstreamHasMoreOrUnknown" : undefined,
+    nextPage, totalCount: params.listInfo.totalCount, recordsReturned: params.returnedCount,
     continuation: truncated
-      ? { nextPage, pageSize: params.listInfo.pageSize }
+      ? params.listInfo.continuation ?? { nextPage, pageSize: params.listInfo.pageSize }
       : undefined,
     returnedCount: params.returnedCount,
     upstreamReturnedCount: params.upstreamReturnedCount,
@@ -468,7 +470,7 @@ async function queryAlertList(
     throw new AlertValidationError(built.error ?? "Invalid alert list input.");
   }
 
-  const response = await client.query<AlertListResponse>(GET_ALERT_LIST_QUERY, {
+  const response = await paginatedClient(client).query<AlertListResponse>(GET_ALERT_LIST_QUERY, {
     input: built.input,
   });
   const normalized = normalizeAlerts(response.getAlertList.alerts ?? []);
@@ -498,7 +500,7 @@ async function queryAlertsForAsset(
   }
 
   try {
-    const response = await client.query<AlertsForAssetResponse>(
+    const response = await paginatedClient(client).query<AlertsForAssetResponse>(
       GET_ALERTS_FOR_ASSET_QUERY,
       { input: built.input }
     );
@@ -525,7 +527,7 @@ async function queryAlertsForAsset(
         condition: undefined,
       },
     };
-    const response = await client.query<AlertsForAssetResponse>(
+    const response = await paginatedClient(client).query<AlertsForAssetResponse>(
       GET_ALERTS_FOR_ASSET_QUERY,
       { input: fallbackInput }
     );
@@ -841,6 +843,7 @@ export function getAlertsTools(): DomainTools {
           type: "object",
           properties: {
             status: { type: "string", default: "Open" },
+            page: {type: "integer", minimum: 1, default: 1},
             pageSize: { type: "number", default: 100 },
           },
         },
@@ -1034,11 +1037,11 @@ export function getAlertsTools(): DomainTools {
           }
 
           case "superops_alerts_summary": {
-            const params = args as { status?: string; pageSize?: number };
+            const params = args as { status?: string; pageSize?: number; page?: number };
             const result = await queryAlertList(client, {
               status: stringValue(params.status) ?? "Open",
               pageSize: pageSize(params.pageSize, 100),
-              page: 1,
+              page: params.page ?? 1,
             });
             const byCreated = [...result.alerts].sort((a, b) =>
               (a.createdTime ?? "").localeCompare(b.createdTime ?? "")

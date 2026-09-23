@@ -739,7 +739,7 @@ describe("Tickets Domain", () => {
     expect(parsed.tickets).toEqual([
       expect.objectContaining({ ticketId: "1", status: "New Calls" }),
     ]);
-    expect(parsed.listInfo).toEqual({
+    expect(parsed.listInfo).toMatchObject({
       page: 1,
       pageSize: 50,
       hasMore: true,
@@ -813,7 +813,7 @@ describe("Tickets Domain", () => {
     expect(parsed.tickets).toEqual([
       expect.objectContaining({ ticketId: "1", priority: "High" }),
     ]);
-    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 50 });
+    expect(parsed.listInfo).toMatchObject({ page: 1, pageSize: 50 });
     expect(parsed.listInfo.totalCount).toBeUndefined();
     expect(parsed.listInfo.hasMore).toBeUndefined();
   });
@@ -992,7 +992,7 @@ describe("Tickets Domain", () => {
     mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "1", displayId: "1", subject: "Loop", createdTime: "2026-07-01T10:00:00Z" }], listInfo: { page: 1, pageSize: 100, hasMore: true, totalCount: 10 } } });
     let result = await domain.handleCall("superops_tickets_query", { createdFrom: "2026-07-01T00:00:00Z", createdTo: "2026-07-02T00:00:00Z", maxPages: 3 });
     let parsed = JSON.parse(result.content[0].text);
-    expect(parsed.pagination).toMatchObject({ complete: false, truncated: true, stopReason: "repeatedPageLoop" });
+    expect(parsed.pagination).toMatchObject({ complete: false, truncated: true, stopReason: "invalidPage" });
 
     mockClient.query.mockReset();
     mockClient.query.mockResolvedValue({ getTicketList: { tickets: [{ ticketId: "1", displayId: "1", subject: "Page", createdTime: "2026-07-01T10:00:00Z" }], listInfo: { page: 1, pageSize: 100, hasMore: true, totalCount: 10 } } });
@@ -3911,7 +3911,7 @@ describe("Tickets Domain", () => {
       .mockResolvedValueOnce({
         getClientList: {
           clients: [{ accountId: "2993553194649526272", name: "TaskGroup" }],
-          listInfo: { page: 1, pageSize: 200, hasMore: false, totalCount: 1 },
+          listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 1 },
         },
       })
       .mockResolvedValueOnce({

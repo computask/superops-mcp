@@ -60,7 +60,7 @@ describe("Technicians Domain", () => {
             team: { teamId: "team-456", name: "Projects" },
           },
         ],
-        listInfo: { page: 1, pageSize: 50, hasMore: false, totalCount: 2 },
+        listInfo: { page: 2, pageSize: 25, hasMore: false, totalCount: 27 },
       },
     });
 
@@ -79,14 +79,14 @@ describe("Technicians Domain", () => {
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.userList.map((tech: { userId: string }) => tech.userId)).toEqual(["tech-1"]);
-    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 50, hasMore: false, totalCount: 1 });
+    expect(parsed.listInfo).toMatchObject({ page: 2, pageSize: 25, hasMore: false, totalCount: 1 });
     expect(parsed.readMetadata).toMatchObject({
       complete: true,
       truncated: false,
       completeness: "known",
       returnedCount: 1,
       upstreamReturnedCount: 2,
-      upstreamTotalCount: 2,
+      upstreamTotalCount: 27,
       upstreamHasMore: false,
       filtering: {
         applied: true,
@@ -128,7 +128,7 @@ describe("Technicians Domain", () => {
             email: "jane@example.com",
           },
         ],
-        listInfo: { page: 1, pageSize: 500, hasMore: false, totalCount: 1 },
+        listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 1 },
       },
     });
 
@@ -139,7 +139,7 @@ describe("Technicians Domain", () => {
 
     expect(mockClient.query).toHaveBeenCalledWith(
       expect.stringContaining("getTechnicianList"),
-      { input: { page: 1, pageSize: 500 } }
+      { input: { page: 1, pageSize: 100 } }
     );
     expect(mockClient.query.mock.calls[0][0]).not.toContain("query getTechnician(");
     expect(result.content[0].text).toContain("Jane Smith");
@@ -149,7 +149,7 @@ describe("Technicians Domain", () => {
     mockClient.query.mockResolvedValue({
       getTechnicianList: {
         userList: [],
-        listInfo: { page: 1, pageSize: 500, hasMore: false, totalCount: 0 },
+        listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 0 },
       },
     });
 

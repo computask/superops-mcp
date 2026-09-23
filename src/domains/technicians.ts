@@ -1,3 +1,4 @@
+import { paginatedClient } from "../pagination.js";
 /**
  * SuperOps.ai Technicians Domain
  *
@@ -100,7 +101,7 @@ interface ListTechGroupsResponse {
 function pageInput(max: number | undefined, page?: number) {
   return {
     page: page ?? DEFAULT_LIST_PAGE,
-    pageSize: Math.min(max ?? 50, 500),
+    pageSize: Math.min(max ?? 50, 100),
   };
 }
 
@@ -146,18 +147,19 @@ function readMetadata(params: {
   filterFields: string[];
 }) {
   const complete = params.listInfo.hasMore === false;
-  const truncated = params.listInfo.hasMore === true;
+  const truncated = !complete;
   const nextPage =
     truncated && typeof params.listInfo.page === "number"
-      ? params.listInfo.page + 1
+      ? params.listInfo.nextPage ?? params.listInfo.page + 1
       : undefined;
 
   return {
     complete,
     truncated,
-    truncationReason: truncated ? "upstreamHasMore" : undefined,
+    truncationReason: truncated ? params.listInfo.truncationReason ?? "upstreamHasMoreOrUnknown" : undefined,
+    nextPage, totalCount: params.listInfo.totalCount, recordsReturned: params.returnedCount,
     continuation: truncated
-      ? { nextPage, pageSize: params.listInfo.pageSize }
+      ? params.listInfo.continuation ?? { nextPage, pageSize: params.listInfo.pageSize }
       : undefined,
     returnedCount: params.returnedCount,
     upstreamReturnedCount: params.upstreamReturnedCount,
@@ -185,6 +187,7 @@ function listResult(
   return {
     ...list,
     userList,
+    recordsReturned: userList.length,
     listInfo: filteredListInfo(list.listInfo, userList.length, filterFields),
     readMetadata: readMetadata({
       listInfo: list.listInfo,
@@ -203,6 +206,8 @@ function groupReadMetadata(totalAvailable: number, returnedCount: number, reques
     truncationReason: truncated ? "recordLimit" : undefined,
     continuation: undefined,
     returnedCount,
+    recordsReturned: returnedCount,
+    totalCount: totalAvailable,
     upstreamReturnedCount: totalAvailable,
     upstreamTotalCount: totalAvailable,
     completeness: truncated ? "partial" : "known",
@@ -232,12 +237,12 @@ export function getTechniciansTools(): DomainTools {
             },
             max: {
               type: "number",
-              description: "Maximum number of results (default: 50, max: 500)",
+              description: "Upstream page size (default: 50, maximum: 100), not total results; sequential pagination with explicit continuation",
               default: 50,
             },
             page: {
               type: "number",
-              description: "Page number to fetch (default: 1)",
+              description: "Start or continuation page (default: 1); subsequent pages are fetched sequentially",
               default: 1,
             },
           },
@@ -274,7 +279,7 @@ export function getTechniciansTools(): DomainTools {
     ],
 
     async handleCall(name, args) {
-      const client = getClient();
+      const client = paginatedClient(getClient());
 
       try {
         switch (name) {
@@ -322,7 +327,7 @@ export function getTechniciansTools(): DomainTools {
             const { technicianId } = args as { technicianId: string };
 
             const response = await client.query<GetTechnicianResponse>(GET_TECHNICIAN_QUERY, {
-              input: pageInput(500),
+              input: pageInput(100),
             });
             const technician = response.getTechnicianList.userList.find(
               (item) => item.userId === technicianId
@@ -333,7 +338,7 @@ export function getTechniciansTools(): DomainTools {
                 content: [
                   {
                     type: "text",
-                    text: `Error: Technician not found in first returned page: ${technicianId}`,
+                    text: `Error: Technician not found in fetched pages: ${technicianId}; complete=${response.getTechnicianList.listInfo.complete ?? false}; nextPage=${response.getTechnicianList.listInfo.nextPage ?? "none"}`,
                   },
                 ],
                 isError: true,

@@ -48,7 +48,7 @@ describe("Clients Domain", () => {
           { accountId: "1", name: "Active Client", status: "Active" },
           { accountId: "2", name: "Inactive Client", status: "Inactive" },
         ],
-        listInfo: { page: 1, pageSize: 50, hasMore: false, totalCount: 2 },
+        listInfo: { page: 2, pageSize: 100, hasMore: false, totalCount: 102 },
       },
     });
 
@@ -67,14 +67,14 @@ describe("Clients Domain", () => {
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.clients.map((client: { accountId: string }) => client.accountId)).toEqual(["1"]);
-    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 50, hasMore: false, totalCount: 1 });
+    expect(parsed.listInfo).toMatchObject({ page: 2, pageSize: 100, hasMore: false, totalCount: 1 });
     expect(parsed.readMetadata).toMatchObject({
       complete: true,
       truncated: false,
       completeness: "known",
       returnedCount: 1,
       upstreamReturnedCount: 2,
-      upstreamTotalCount: 2,
+      upstreamTotalCount: 102,
       upstreamHasMore: false,
       filtering: {
         applied: true,
@@ -85,11 +85,11 @@ describe("Clients Domain", () => {
     });
   });
 
-  it("caps list pageSize at 500", async () => {
+  it("caps list pageSize at 100", async () => {
     mockClient.query.mockResolvedValue({
       getClientList: {
         clients: [],
-        listInfo: { page: 1, pageSize: 500, hasMore: false, totalCount: 0 },
+        listInfo: { page: 3, pageSize: 100, hasMore: false, totalCount: 0 },
       },
     });
 
@@ -107,7 +107,7 @@ describe("Clients Domain", () => {
     });
     expect(mockClient.query).toHaveBeenCalledWith(
       expect.any(String),
-      { input: { page: 3, pageSize: 500 } }
+      { input: { page: 3, pageSize: 100 } }
     );
   });
 

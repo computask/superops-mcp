@@ -129,6 +129,8 @@ export type ReconciliationDisposition =
   | "AmbiguousUnresolved";
 
 export interface OperationItemState {
+  /** Content-free, owner-scoped recovery receipt; never the request payload. */
+  dispatcherReceipt?: import("./dispatcher.js").DispatcherReceipt;
   itemKey: string;
   stage: OperationItemStage;
   outcome?: string;
@@ -1040,6 +1042,16 @@ function assertStringArray(value: unknown, field: string): asserts value is stri
   }
 }
 
+function validDispatcherReceipt(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecordObject(value)) return false;
+  return Object.keys(value).every(key => ["requestId", "idempotencyKey", "state", "retryAfter"].includes(key)) &&
+    typeof value.requestId === "string" && /^[A-Za-z0-9_-]{1,160}$/.test(value.requestId) &&
+    typeof value.idempotencyKey === "string" && /^superops-mcp:[A-Za-z0-9:_-]{1,160}$/.test(value.idempotencyKey) &&
+    typeof value.state === "string" && /^[a-z_]{1,64}$/.test(value.state) &&
+    (value.retryAfter === undefined || (typeof value.retryAfter === "number" && Number.isFinite(value.retryAfter) && value.retryAfter >= 0));
+}
+
 function validOptionalRecoveryMetadata(item: Record<string, unknown>): boolean {
   for (const field of [
     "updatedTimeExpectation",
@@ -1233,6 +1245,7 @@ function assertOperationRecord(value: unknown): asserts value is OperationLedger
       typeof item.writeMayHaveSucceeded !== "boolean" ||
       typeof item.partialWrite !== "boolean" ||
       !isFiniteNonnegativeInteger(item.retryCount) ||
+      !validDispatcherReceipt(item.dispatcherReceipt) ||
       (item.recoveryRetryCount !== undefined && !isFiniteNonnegativeInteger(item.recoveryRetryCount)) ||
       (item.reconciliationPass !== undefined && !isFiniteNonnegativeInteger(item.reconciliationPass)) ||
       (item.reconciliationPassReadAttempts !== undefined && !isFiniteNonnegativeInteger(item.reconciliationPassReadAttempts)) ||
@@ -2054,6 +2067,13 @@ function applyItemPatch(
   delete item.lease;
   if (TERMINAL_STAGES.has(item.stage)) {
     delete item.nextEligibleTime;
+  }
+  // Receipt recovery is unnecessary only after verified terminal success.
+  // Terminal checkpoints still prevent replay, and receipt IDs remain in the
+  // dispatcher/audit trail. Never prune pending/ambiguous/partial evidence.
+  if (isTerminalSuccessfulItem(item) && item.verificationState === "Verified" &&
+      !item.partialWrite && item.dispatcherReceipt?.state === "succeeded") {
+    delete item.dispatcherReceipt;
   }
   if (isTerminalSuccessfulItem(item) && item.ambiguityEncountered !== true) {
     delete item.expectedTicketId;

@@ -103,7 +103,7 @@ describe("Alerts Domain", () => {
       ownerName: "Owner User",
       ownerEmail: "owner@example.test",
     });
-    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 25, totalCount: 1 });
+    expect(parsed.listInfo).toMatchObject({ page: 1, pageSize: 25, totalCount: 1 });
     expect(parsed.evidence).toMatchObject({
       evidenceType: "current_rmm_alert",
       live: true,
@@ -118,7 +118,7 @@ describe("Alerts Domain", () => {
     mockClient.query.mockResolvedValue({
       getAlertList: {
         alerts: [],
-        listInfo: { page: 2, pageSize: 500, totalCount: 0 },
+        listInfo: { page: 2, pageSize: 100, totalCount: 0 },
       },
     });
 
@@ -134,7 +134,7 @@ describe("Alerts Domain", () => {
     expect(mockClient.query.mock.calls[0][1]).toEqual({
       input: {
         page: 2,
-        pageSize: 500,
+        pageSize: 100,
         sort: [{ attribute: "severity", order: "ASC" }],
         condition: { attribute: "status", operator: "is", value: "Resolved" },
       },
@@ -174,7 +174,7 @@ describe("Alerts Domain", () => {
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.alerts.map((alert: { id: string }) => alert.id)).toEqual(["alert-1"]);
-    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 25 });
+    expect(parsed.listInfo).toMatchObject({ page: 1, pageSize: 25 });
   });
 
   it("gets an alert by exact ID using ID condition lookup", async () => {
@@ -315,7 +315,7 @@ describe("Alerts Domain", () => {
     expect(parsed.alerts.map((alert: { id: string }) => alert.id)).toEqual([
       "open-alert",
     ]);
-    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 25 });
+    expect(parsed.listInfo).toMatchObject({ page: 1, pageSize: 25 });
   });
 
   it("validates alert resolution input and de-duplicates dry runs", async () => {
@@ -569,7 +569,7 @@ describe("Alerts Domain", () => {
       evidenceType: "current_rmm_alert",
       live: true,
       causalInference: "not_proven",
-      readCompleteness: "ambiguous",
+      readCompleteness: "complete",
     });
     expect(mockClient.mutate).not.toHaveBeenCalled();
   });

@@ -17,7 +17,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import type { Domain, DomainTools, ToolDefinition } from "./types.js";
-import { getCredentials } from "./client.js";
+import { getCredentials, getClient } from "./client.js";
 import { setServerRef } from "./utils/server-ref.js";
 import {
   auditToolCall,
@@ -412,14 +412,8 @@ async function executeToolCall(
     }
 
     try {
-      const clientsTools = await loadDomain("clients");
-      const result = await clientsTools.handleCall("superops_clients_list", {
-        max: 1,
-      });
-
-      if (result.isError) {
-        return result;
-      }
+      // Deliberately bounded health probe, not a complete-list tool.
+      await getClient().query("query ConnectionProbe($input: ListInfoInput!) { getClientList(input: $input) { clients { accountId } listInfo { page pageSize hasMore totalCount } } }", {input: {page: 1, pageSize: 1}});
 
       return {
         content: [

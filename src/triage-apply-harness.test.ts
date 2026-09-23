@@ -1731,7 +1731,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
       recoveryRetryAttempted: true,
       recoveryRetryOutcome: "Accepted",
       acceptedPhysicalWrites: [expect.objectContaining({ outcome: "Accepted", recovery: true })],
-      initialFailure: expect.objectContaining({ errorClass: "TransportError" }),
+      initialFailure: expect.objectContaining({ errorClass: "DispatcherPendingError" }),
       recoveryHistory: expect.arrayContaining([
         expect.objectContaining({ event: "OriginalMutationAttempt" }),
         expect.objectContaining({ event: "RecoveryWriteStarted" }),

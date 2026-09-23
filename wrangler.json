@@ -29,7 +29,6 @@
   ],
   "vars": {
     "AUTH_MODE": "env",
-    "SUPEROPS_SUBDOMAIN": "computaskltd",
     "SUPEROPS_REGION": "us",
     "LOG_LEVEL": "warn",
     "MCP_ENABLED": "true",

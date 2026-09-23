@@ -1,5 +1,58 @@
 # SuperOps MCP Execution Safety Verification
 
+## Dispatcher/pagination migration — local candidate, 23 September 2026
+
+The older inventory below describes logical reads/writes, not current physical
+upstream attempts. `src/dispatcher.ts` is now the sole outbound SuperOps transport,
+including the probe: POST `/graphql`, producer authentication, paired Access
+headers where required, `X-Source: superops-mcp`, and idempotency. No client or
+probe direct-call fallback exists. Polling GETs count as `dispatcherPoll` Worker
+subrequests; the dispatcher owns upstream retry and account-rate limiting.
+SuperOps' documented upstream ceiling is 100 requests/minute.
+
+Accepted/timeout receipts are polled without re-POSTing. Durable triage checkpoints
+content-free receipts in its owner-scoped ledger and derives mutation keys from
+the persisted operation/item and exact payload. Fresh continuation polls pending
+receipts before invoking the mutation adapter. Failed/cancelled/uncertain receipts
+retain possible-write truth and require reconciliation. No credentials, request
+payloads, note bodies or customer content are added to ledger metadata.
+After verified terminal success only, the item can discard its no-longer-needed
+recovery receipt; terminal checkpoints still prevent replay and receipt IDs stay
+in dispatcher/audit diagnostics. Pending, ambiguous, partial or unverified items
+retain their receipts. This keeps large operations within the unchanged 512-KiB
+ledger ceiling. The 250-item harness includes dispatcher receipt headers.
+
+Normal lists use sequential pages <=100, stable-ID dedupe, and page/signature/count
+validation. Default bounds are 5,000 records and 600,000 record-payload bytes,
+plus existing execution and pagination-depth limits. Partial results include
+complete:false, truncated:true, recordsReturned, totalCount when known, a reason,
+nextPage, and continuation variables. Frozen snapshots, recent-N, script/activity
+one-page tools, exact-ID reconciliation and the connection probe remain bounded.
+Historical scans retain fixed pageSize 100 and now accept page/pageOffset for
+lossless mid-page continuation. Missing hasMore or an empty page is not proof of
+completion. Partial aggregate reports cover only their returned segment.
+
+The existing `superops_api_calls` table distinguishes dispatcher submissions by
+endpoint_host and `/graphql`; these are NOT exact upstream physical-call counts.
+Use the dispatcher's attempt ledger for upstream quota evidence. Neither receipt
+polls nor operation checkpoints consume SuperOps upstream quota.
+
+This candidate is prepared for a local commit, not a completed live cutover.
+The 23 September read-only Worker secret-name preflight found no
+`DISPATCHER_TOKEN`, `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` or
+`SUPEROPS_SUBDOMAIN` secret. Push to the Git-connected deployment branch is held
+until the required bindings are provisioned under separate authorization; live
+credentials have not been changed. Preserve the existing owner identity when
+moving the subdomain from configuration into a secret. Arbitrary-tenant legacy
+gateway routing fails closed. The probe measures dispatcher-paced traffic, not
+unthrottled upstream burst capacity; no oversized negative-test profile is enabled.
+
+Local validation: `npm test` passed 636 tests (zero failures); `npm run typecheck`,
+`npm run lint`, `npm run build`, and `git diff --check` passed. The synthetic test
+report is `diagnostics/dispatcher-local-tests.json`. No live integration test was
+performed. Workers/Durable Objects guidance informed bounded I/O and durable
+receipt checkpointing; passing mocked tests is not evidence of live cutover.
+
 Verification date: 2026-07-18. Final conformance repair cycle 1.
 
 ## Root cause and repaired boundary
@@ -26,28 +79,28 @@ The repaired production path makes the complete fixed-candidate operation durabl
 
 ## Outbound call inventory
 
-All standard SuperOps traffic is one GraphQL POST per client attempt to the US or EU `/msp` endpoint. A “read retries” worst case is the configured read-attempt ceiling, which defaults to three total attempts. Writes are one outbound attempt unless the durable adapter has conclusive evidence that the previous write was rejected.
+All MCP SuperOps traffic is submitted to the dispatcher `/graphql` endpoint, never directly to either regional SuperOps endpoint. A logical read may need a POST and bounded receipt polls. Pre-acceptance read failures retain the configured retry ceiling (three by default); accepted receipts are recovered, not re-enqueued. Upstream attempt counts come from the dispatcher's ledger. Writes are submitted once with idempotency and durable receipt recovery where supported.
 
 | Tool or runtime operation | Normal calls | Worst-case bound / rule | Resumable |
 | --- | ---: | --- | --- |
 | Status/navigation | 0 | 0 | N/A |
 | `superops_test_connection` | 1 read | 3 attempts | No |
 | Operation get/list | 1 DO fetch | 1 per call | N/A |
-| Client list/get/search | 1 read | 3 attempts | No |
-| Asset list/get/software/patches | 1 read | 3 attempts | No |
-| Technician list/get/groups | 1 read | 3 attempts | No |
-| Alert list/for-asset | 1 read | for-asset fallback: 2 reads, each within retry bound | No |
+| Client list/search; asset list/software/patches; technician list | sequential reads | pages <=100; execution/page/record/byte bounds | Caller page continuation |
+| Client/asset/technician get; technician groups | 1 read | existing retrieval/response bounds | No |
+| Alert list/for-asset/summary | sequential reads | pages <=100; for-asset schema fallback remains bounded | Caller page continuation |
 | Alert get | 1 read | exact lookup plus at most 11 fallback pages; each read within retry bound | No |
 | Alert create | 1 write + optional verification | one write; verification lookup bounded as alert get | No |
 | Alert resolve | 1 write + optional per-alert verification | one batch write; each requested verification bounded as alert get | No |
 | Custom query | 1 read | query document 64 KiB, variables 128 KiB, response 1 MiB, read retry bound; caller query shape is otherwise opaque | No |
 | Custom mutation | 1 write | one attempt; same request/response size bounds; ambiguous response is non-resumable | No |
-| Ticket list/get/conversation/notes/fields | 1 read | read retry bound | No |
+| Ticket list | sequential reads | pages <=100; execution/page/record/byte bounds | Caller page continuation |
+| Ticket get/conversation/notes/fields | 1 read | existing retrieval/response bounds | No |
 | Ticket get by number | 2 reads | 6 total attempts | No |
 | Ticket safe get | 2 base reads | at most 4 logical reads, each within retry bound | No |
 | Ticket recent | 1 list | plus at most 2 content reads for each of at most 10 tickets | No |
 | Triage snapshot | 1 list | plus at most 2 safe-content reads per bounded candidate | No |
-| Historical query/created-between/report | sequential pages | `maxPages` and `maxRecords`; each page within retry bound; never concurrent | No |
+| Historical query/created-between/report | sequential pages | `maxPages`, `maxRecords`, byte/execution bounds; never concurrent | Caller page/pageOffset continuation |
 | Direct ticket create/note/log-time | 1 write | one attempt | No |
 | Direct ticket update | validation read + write | at most 2 logical calls; one write | No |
 | Direct resolve-full | lookup/read/metadata/note/update/verify | bounded synchronous path; a note followed by failed update reports partial write and is never blindly repeated | No |
@@ -149,29 +202,29 @@ Exact approved staging/production resource-changing commands and pending-Workflo
 
 ### Exact per-tool call and response matrix
 
-Counts below are logical SuperOps GraphQL POSTs before read retry multiplication. A read marked `R` can consume up to 3 total attempts under committed defaults; a synchronous write marked `W` is one attempt and is not retried by the shared client. Durable apply-triage is the only resumable write path.
+Counts below are logical operations. `P` means the number of fetched pages. The legacy numeric retry column is a client-side pre-acceptance estimate, NOT a current physical upstream quota bound: dispatcher receipt polls and upstream retries are separate. A write marked `W` is one idempotent submission, never blind replay. Durable apply-triage is the only resumable write path.
 
 | Tool | Calls before read retries | Pagination/fallback | Verification | Worst-case committed SuperOps attempts | Output bound |
 | --- | --- | --- | --- | --- | --- |
-| `superops_clients_list` | 1R | one requested page, page size max 500 | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_clients_list` | P logical reads (one per fetched page) | sequential pages <=100; explicit bounded continuation | none | bounded dispatcher submissions/polls, plus upstream retries owned by dispatcher | MCP serialized response cap 1 MiB |
 | `superops_clients_get` | 1R | none | same read is retrieval | 3 | MCP serialized response cap 1 MiB |
-| `superops_clients_search` | 1R | one requested page, max 20 unless supplied | none | 3 | MCP serialized response cap 1 MiB |
-| `superops_assets_list` | 1R | one requested page, page size max 500 | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_clients_search` | P logical reads (one per fetched page) | sequential pages <=100; explicit bounded continuation | none | bounded dispatcher submissions/polls, plus upstream retries owned by dispatcher | MCP serialized response cap 1 MiB |
+| `superops_assets_list` | P logical reads (one per fetched page) | sequential pages <=100; explicit bounded continuation | none | bounded dispatcher submissions/polls, plus upstream retries owned by dispatcher | MCP serialized response cap 1 MiB |
 | `superops_assets_get` | 1R | none | same read is retrieval | 3 | MCP serialized response cap 1 MiB |
-| `superops_assets_software` | 1R | one requested page | none | 3 | MCP serialized response cap 1 MiB |
-| `superops_assets_patches` | 1R | one requested page | none | 3 | MCP serialized response cap 1 MiB |
-| `superops_technicians_list` | 1R | one requested page, page size max 500 | none | 3 | MCP serialized response cap 1 MiB |
-| `superops_technicians_get` | 1R | none | same read is retrieval | 3 | MCP serialized response cap 1 MiB |
+| `superops_assets_software` | P logical reads (one per fetched page) | sequential pages <=100; explicit bounded continuation | none | bounded dispatcher submissions/polls, plus upstream retries owned by dispatcher | MCP serialized response cap 1 MiB |
+| `superops_assets_patches` | P logical reads (one per fetched page) | sequential pages <=100; explicit bounded continuation | none | bounded dispatcher submissions/polls, plus upstream retries owned by dispatcher | MCP serialized response cap 1 MiB |
+| `superops_technicians_list` | P logical reads (one per fetched page) | sequential pages <=100; explicit bounded continuation | none | bounded dispatcher submissions/polls, plus upstream retries owned by dispatcher | MCP serialized response cap 1 MiB |
+| `superops_technicians_get` | P reads | sequential pages <=100; missing match reports whether scan was incomplete | same read is retrieval | dispatcher/execution bounds | MCP serialized response cap 1 MiB |
 | `superops_technicians_groups` | 1R | one requested page | none | 3 | MCP serialized response cap 1 MiB |
-| `superops_alerts_list` | 1R | one requested page, page size max 500 | none | 3 | MCP serialized response cap 1 MiB |
-| `superops_alerts_for_asset` | 1R, fallback 1R if status condition is rejected | one requested page | none | 6 | MCP serialized response cap 1 MiB |
+| `superops_alerts_list` | P logical reads (one per fetched page) | sequential pages <=100; explicit bounded continuation | none | bounded dispatcher submissions/polls, plus upstream retries owned by dispatcher | MCP serialized response cap 1 MiB |
+| `superops_alerts_for_asset` | P logical reads (one per fetched page) | sequential pages <=100; explicit bounded continuation | none | bounded dispatcher submissions/polls, plus upstream retries owned by dispatcher | MCP serialized response cap 1 MiB |
 | `superops_alerts_get` | 1R exact-condition lookup plus up to 10 fallback pages | fallback stops when found or `hasMore=false` | same read is retrieval | 33 | MCP serialized response cap 1 MiB |
-| `superops_alerts_summary` | 1R | one requested page, default 100 | aggregate only | 3 | aggregate counts plus 10 compact samples, MCP cap |
+| `superops_alerts_summary` | P logical reads (one per fetched page) | sequential pages <=100; explicit bounded continuation | aggregate only | bounded dispatcher submissions/polls, plus upstream retries owned by dispatcher | aggregate counts plus 10 compact samples, MCP cap |
 | `superops_alerts_create` | 1W plus optional alert lookup | lookup uses alert-get path when `verify` is not false | returns verification or accepted-followup failure | 34 | one alert plus compact verification, MCP cap |
 | `superops_alerts_resolve` | 1W plus optional lookup per requested alert ID | each lookup uses alert-get path | per-alert verification or skipped reason | `1 + 33 * ids` | compact per-ID verification, MCP cap |
 | `superops_custom_query` | 1R | caller-defined query, bounded only by input/response bytes | none | 3 | custom response cap 1 MiB plus MCP cap |
 | `superops_custom_mutation` | 1W | none | explicitly not possible for opaque mutation | 1 | custom response cap 1 MiB plus MCP cap |
-| `superops_tickets_list` | 1R | one requested page, page size max 500 | none | 3 | MCP serialized response cap 1 MiB |
+| `superops_tickets_list` | P logical reads (one per fetched page) | sequential pages <=100; explicit bounded continuation | none | bounded dispatcher submissions/polls, plus upstream retries owned by dispatcher | MCP serialized response cap 1 MiB |
 | `superops_tickets_recent` | 1R plus up to 2R per included content ticket | recent page is capped; content tickets capped at 10 | content retrieval only | 63 | per-content char/item caps plus MCP cap |
 | `superops_tickets_query`, `superops_tickets_created_between`, `superops_tickets_report` | sequential R pages | bounded by `maxPages`, `maxRecords`, and execution budget | aggregate/report only | `3 * fetchedPages` | max records/pages plus MCP cap |
 | `superops_tickets_get` | 1R | none | same read is retrieval | 3 | MCP serialized response cap 1 MiB |

@@ -856,7 +856,7 @@ describe("Cloudflare Worker entrypoint", () => {
         }),
       }),
       {
-        SUPEROPS_API_TOKEN: "test-token",
+        DISPATCHER_TOKEN: "test-token",
         SUPEROPS_SUBDOMAIN: "computaskltd",
       } as Env
     );
@@ -874,7 +874,7 @@ describe("Cloudflare Worker entrypoint", () => {
         }),
       }),
       {
-        SUPEROPS_API_TOKEN: "test-token",
+        DISPATCHER_TOKEN: "test-token",
         SUPEROPS_SUBDOMAIN: "computaskltd",
         SUPEROPS_CONTINUATION_ENABLED: "true",
         SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
@@ -898,7 +898,7 @@ describe("Cloudflare Worker entrypoint", () => {
         }),
       }),
       {
-        SUPEROPS_API_TOKEN: "test-token",
+        DISPATCHER_TOKEN: "test-token",
         SUPEROPS_SUBDOMAIN: "computaskltd",
         SUPEROPS_CONTINUATION_ENABLED: "true",
         SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
@@ -952,7 +952,7 @@ describe("Cloudflare Worker entrypoint", () => {
         }),
       }),
       {
-        SUPEROPS_API_TOKEN: "test-token",
+        DISPATCHER_TOKEN: "test-token",
         SUPEROPS_SUBDOMAIN: "computaskltd",
         SUPEROPS_CONTINUATION_ENABLED: "true",
         SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "secret-token",
@@ -1006,7 +1006,7 @@ describe("Cloudflare Worker entrypoint", () => {
         }),
       }),
       {
-        SUPEROPS_API_TOKEN: "test-token",
+        DISPATCHER_TOKEN: "test-token",
         SUPEROPS_SUBDOMAIN: "computaskltd",
         SUPEROPS_CONTINUATION_ENABLED: "true",
         SUPEROPS_DURABLE_RETRY_ENABLED: "true",
@@ -1062,7 +1062,7 @@ describe("Cloudflare Worker entrypoint", () => {
         }),
       }),
       {
-        SUPEROPS_API_TOKEN: "test-token",
+        DISPATCHER_TOKEN: "test-token",
         SUPEROPS_SUBDOMAIN: "computaskltd",
         SUPEROPS_CONTINUATION_ENABLED: "true",
         SUPEROPS_DURABLE_RETRY_ENABLED: "true",
@@ -1145,7 +1145,7 @@ describe("Cloudflare Worker entrypoint", () => {
         }),
       }),
       {
-        SUPEROPS_API_TOKEN: "test-token",
+        DISPATCHER_TOKEN: "test-token",
         SUPEROPS_SUBDOMAIN: "computaskltd",
         SUPEROPS_CONTINUATION_ENABLED: "true",
         SUPEROPS_DURABLE_RETRY_ENABLED: "true",
@@ -1218,7 +1218,7 @@ describe("Cloudflare Worker entrypoint", () => {
             : input instanceof URL
               ? input.href
               : input.url;
-        if (url.startsWith("https://api.superops.ai/")) {
+        if (url.startsWith("https://superops-api-dispatcher.taskgroup.co.uk/")) {
           superOpsCalls.push(url);
           return new Response("unexpected SuperOps request", { status: 500 });
         }
@@ -1238,7 +1238,7 @@ describe("Cloudflare Worker entrypoint", () => {
           },
         },
         {
-          SUPEROPS_API_TOKEN: "test-token",
+          DISPATCHER_TOKEN: "test-token",
           SUPEROPS_SUBDOMAIN: "computaskltd",
           ENABLE_WRITE_TOOLS: "false",
         }
@@ -1266,7 +1266,7 @@ describe("Cloudflare Worker entrypoint", () => {
           params: { name: "superops_status", arguments: {} },
         },
         {
-          SUPEROPS_API_TOKEN: "test-token",
+          DISPATCHER_TOKEN: "test-token",
           SUPEROPS_SUBDOMAIN: "computaskltd",
           SUPEROPS_REGION: "us",
         },
@@ -1316,7 +1316,7 @@ describe("Cloudflare Worker entrypoint", () => {
       // backwards-compatible telemetry item: some MCP clients expose only
       // the first text item to the model.
       expect(body.result?.content?.[0]?.text).toContain("mcpExecution");
-      expect(body.result?.content?.[0]?.text).not.toContain("SUPEROPS_API_TOKEN");
+      expect(body.result?.content?.[0]?.text).not.toContain("DISPATCHER_TOKEN");
       expect(body.result?.content?.[0]?.text).not.toContain(" at ");
 
       const telemetry = body.result?.content
@@ -1342,7 +1342,7 @@ describe("Cloudflare Worker entrypoint", () => {
         success: false,
       });
       expect(String(records[0].errorSummary)).toContain("credentials");
-      expect(JSON.stringify(records[0])).not.toContain("SUPEROPS_API_TOKEN");
+      expect(JSON.stringify(records[0])).not.toContain("DISPATCHER_TOKEN");
     } finally {
       logSpy.mockRestore();
     }
@@ -2043,7 +2043,7 @@ describe("Cloudflare Worker entrypoint", () => {
 
   it("exposes only apply_triage_plan on ChatGPT direct when the dedicated triage gates are true", async () => {
     const env = chatGptEnv({
-      SUPEROPS_API_TOKEN: "test-token",
+      DISPATCHER_TOKEN: "test-token",
       SUPEROPS_SUBDOMAIN: "acme",
       CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
       SUPEROPS_CONTINUATION_ENABLED: "true",
@@ -2109,7 +2109,7 @@ describe("Cloudflare Worker entrypoint", () => {
 
   it("hides standalone field-option discovery from the targeted direct triage route", async () => {
     const env = chatGptEnv({
-      SUPEROPS_API_TOKEN: "test-token",
+      DISPATCHER_TOKEN: "test-token",
       SUPEROPS_SUBDOMAIN: "acme",
       CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
       CHATGPT_DIRECT_TARGETED_TRIAGE_ONLY: "true",
@@ -2153,7 +2153,7 @@ describe("Cloudflare Worker entrypoint", () => {
   it("propagates continuation scheduler bindings through the ChatGPT direct MCP route", async () => {
     const serviceRequests: Request[] = [];
     const env = chatGptEnv({
-      SUPEROPS_API_TOKEN: "test-token",
+      DISPATCHER_TOKEN: "test-token",
       SUPEROPS_SUBDOMAIN: "acme",
       CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
       SUPEROPS_CONTINUATION_ENABLED: "true",
@@ -2214,7 +2214,7 @@ describe("Cloudflare Worker entrypoint", () => {
   it("does not schedule continuation for a completed single-ticket direct triage operation", async () => {
     const serviceRequests: Request[] = [];
     const env = chatGptEnv({
-      SUPEROPS_API_TOKEN: "test-token",
+      DISPATCHER_TOKEN: "test-token",
       SUPEROPS_SUBDOMAIN: "acme",
       CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
       SUPEROPS_CONTINUATION_ENABLED: "true",
@@ -2266,7 +2266,7 @@ describe("Cloudflare Worker entrypoint", () => {
 
   it("publishes the bounded emerging issue signal on the authenticated direct tools list", async () => {
     const env = chatGptEnv({
-      SUPEROPS_API_TOKEN: "test-token",
+      DISPATCHER_TOKEN: "test-token",
       SUPEROPS_SUBDOMAIN: "acme",
       CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
       SUPEROPS_CONTINUATION_ENABLED: "true",
@@ -2304,7 +2304,7 @@ describe("Cloudflare Worker entrypoint", () => {
 
   it("keeps all other direct mutation and custom tools blocked when triage is allowed", async () => {
     const env = chatGptEnv({
-      SUPEROPS_API_TOKEN: "test-token",
+      DISPATCHER_TOKEN: "test-token",
       SUPEROPS_SUBDOMAIN: "acme",
       CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "true",
       SUPEROPS_CONTINUATION_ENABLED: "true",
@@ -2408,7 +2408,7 @@ describe("Cloudflare Worker entrypoint", () => {
 
   it("hides script execution by default while publishing read-only script tools on ChatGPT direct", async () => {
     const env = chatGptEnv({
-      SUPEROPS_API_TOKEN: "test-token",
+      DISPATCHER_TOKEN: "test-token",
       SUPEROPS_SUBDOMAIN: "acme",
     });
     const token = await getOAuthAccessToken(env);
@@ -2447,7 +2447,7 @@ describe("Cloudflare Worker entrypoint", () => {
 
   it("exposes script execution only with the dedicated script flag", async () => {
     const env = chatGptEnv({
-      SUPEROPS_API_TOKEN: "test-token",
+      DISPATCHER_TOKEN: "test-token",
       SUPEROPS_SUBDOMAIN: "acme",
       CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION: "true",
     });
@@ -2488,7 +2488,7 @@ describe("Cloudflare Worker entrypoint", () => {
   });
   it("does not execute blocked direct-route tools when credentials are present", async () => {
     const env = chatGptEnv({
-      SUPEROPS_API_TOKEN: "test-token",
+      DISPATCHER_TOKEN: "test-token",
       SUPEROPS_SUBDOMAIN: "acme",
       CHATGPT_DIRECT_ALLOW_TRIAGE_PLAN: "false",
       SUPEROPS_CONTINUATION_ENABLED: "true",
@@ -2504,7 +2504,7 @@ describe("Cloudflare Worker entrypoint", () => {
             : input instanceof URL
               ? input.href
               : input.url;
-        if (url.startsWith("https://api.superops.ai/")) {
+        if (url.startsWith("https://superops-api-dispatcher.taskgroup.co.uk/")) {
           superOpsCalls.push(url);
           return new Response("blocked test request", { status: 500 });
         }

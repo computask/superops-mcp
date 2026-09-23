@@ -70,6 +70,9 @@ export {
 };
 
 export interface Env {
+  DISPATCHER_TOKEN?: string;
+  CF_ACCESS_CLIENT_ID?: string;
+  CF_ACCESS_CLIENT_SECRET?: string;
   SUPEROPS_API_TOKEN?: string;
   SUPEROPS_SUBDOMAIN?: string;
   SUPEROPS_REGION?: string;
@@ -214,7 +217,7 @@ async function rateLimitProbeAdapterForEnv(
   if (
     (env.AUTH_MODE ?? "env") === "gateway" ||
     env.SUPEROPS_RATE_LIMIT_PROBE_ENABLED !== "true" ||
-    !env.SUPEROPS_API_TOKEN ||
+    !env.DISPATCHER_TOKEN ||
     !env.SUPEROPS_SUBDOMAIN
   ) {
     return undefined;
@@ -374,7 +377,7 @@ async function workerOwnerHash(request: Request, env: Env): Promise<string | und
     );
     return resolved.creds ? gatewayOwnerHash(resolved.creds) : undefined;
   }
-  if (!env.SUPEROPS_API_TOKEN || !env.SUPEROPS_SUBDOMAIN) return undefined;
+  if (!env.DISPATCHER_TOKEN || !env.SUPEROPS_SUBDOMAIN) return undefined;
   return envTenantOwnerHash({
     subdomain: env.SUPEROPS_SUBDOMAIN,
     region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
@@ -823,7 +826,7 @@ async function handleInternalContinuation(
   if (!expectedToken || request.headers.get("X-SuperOps-Internal-Continuation") !== expectedToken) {
     return json({ error: "Forbidden" }, 403);
   }
-  if (!env.SUPEROPS_API_TOKEN || !env.SUPEROPS_SUBDOMAIN) {
+  if (!env.DISPATCHER_TOKEN || !env.SUPEROPS_SUBDOMAIN) {
     return json({ error: "Continuation requires env-mode SuperOps credentials" }, 503);
   }
 
@@ -842,7 +845,8 @@ async function handleInternalContinuation(
   }
 
   const creds: SuperOpsCredentials = {
-    apiToken: env.SUPEROPS_API_TOKEN,
+    apiToken: env.DISPATCHER_TOKEN,
+    dispatcher: env,
     subdomain: env.SUPEROPS_SUBDOMAIN,
     region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
   };
@@ -1072,6 +1076,9 @@ async function handleBaseWorkerFetch(
 
     let creds: SuperOpsCredentials | undefined;
     if (isGatewayMode) {
+      // A producer credential owns one dispatcher account. Arbitrary gateway
+      // tenant headers cannot authorize that account or select another one.
+      if (env.DISPATCHER_TOKEN) return json({error: "Dispatcher gateway tenant mapping is not configured; use the authenticated env-mode deployment."}, 503);
       const resolved = resolveGatewayCredentials(
         (name) => request.headers.get(name) ?? undefined
       );
@@ -1086,10 +1093,12 @@ async function handleBaseWorkerFetch(
         );
       }
       creds = resolved.creds;
-    } else if (env.SUPEROPS_API_TOKEN && env.SUPEROPS_SUBDOMAIN) {
+      if (creds) creds.dispatcher = env;
+    } else if (env.DISPATCHER_TOKEN && env.SUPEROPS_SUBDOMAIN) {
       // Env mode may still omit creds for initialize and tools/list.
       creds = {
-        apiToken: env.SUPEROPS_API_TOKEN,
+        apiToken: env.DISPATCHER_TOKEN,
+        dispatcher: env,
         subdomain: env.SUPEROPS_SUBDOMAIN,
         region: env.SUPEROPS_REGION === "eu" ? "eu" : ("us" as "us" | "eu"),
       };
@@ -1233,9 +1242,10 @@ export default {
     env: Env,
     ctx: ScheduledExecutionContext
   ): void {
-    if (!env.SUPEROPS_API_TOKEN || !env.SUPEROPS_SUBDOMAIN) return;
+    if (!env.DISPATCHER_TOKEN || !env.SUPEROPS_SUBDOMAIN) return;
     const credentials: SuperOpsCredentials = {
-      apiToken: env.SUPEROPS_API_TOKEN,
+      apiToken: env.DISPATCHER_TOKEN,
+      dispatcher: env,
       subdomain: env.SUPEROPS_SUBDOMAIN,
       region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
     };

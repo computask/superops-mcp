@@ -41,7 +41,7 @@ function listResponse(scripts = [savedScript], hasMore = false) {
   return {
     getScriptList: {
       scripts,
-      listInfo: { page: 1, pageSize: 500, hasMore, totalCount: scripts.length },
+      listInfo: { page: 1, pageSize: 100, hasMore, totalCount: scripts.length },
     },
   };
 }
@@ -50,7 +50,7 @@ function typedListResponse(scripts = [savedScript], hasMore = false) {
   return {
     getScriptListByType: {
       scripts,
-      listInfo: { page: 1, pageSize: 500, hasMore, totalCount: scripts.length },
+      listInfo: { page: 1, pageSize: 100, hasMore, totalCount: scripts.length },
     },
   };
 }
@@ -97,7 +97,7 @@ describe("Scripts Domain", () => {
     });
 
     expect(mockClient.query).toHaveBeenCalledWith(expect.stringContaining("getScriptListByType"), {
-      input: { type: "WINDOWS", listInfo: { page: 2, pageSize: 200 } },
+      input: { type: "WINDOWS", listInfo: { page: 2, pageSize: 100 } },
     });
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.scripts).toHaveLength(1);
@@ -236,7 +236,7 @@ describe("Scripts Domain", () => {
     mockClient.query.mockResolvedValueOnce({
       getScriptList: {
         scripts: [{ ...savedScript, tags: ["REVIEWED", "WINDOWS"] }],
-        listInfo: { page: 1, pageSize: 500, hasMore: undefined, totalCount: 1 },
+        listInfo: { page: 1, pageSize: 100, hasMore: undefined, totalCount: 1 },
       },
     });
     const ambiguousCatalogue = await getScriptsTools().handleCall("superops_script_catalog_recommend", {
@@ -437,7 +437,7 @@ describe("Scripts Domain", () => {
             },
           },
         ],
-        listInfo: { page: 1, pageSize: 500, hasMore: false, totalCount: 1 },
+        listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 1 },
       },
     });
 
@@ -448,7 +448,7 @@ describe("Scripts Domain", () => {
 
     expect(result.isError).not.toBe(true);
     expect(mockClient.query).toHaveBeenCalledWith(expect.stringContaining("getAssetActivity"), {
-      input: { assetId: "asset-1", listInfo: { page: 1, pageSize: 500 } },
+      input: { assetId: "asset-1", listInfo: { page: 1, pageSize: 100 } },
     });
     expect(mockClient.mutate).not.toHaveBeenCalled();
     const parsed = JSON.parse(result.content[0].text);

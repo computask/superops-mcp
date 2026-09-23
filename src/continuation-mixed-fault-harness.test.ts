@@ -22,7 +22,7 @@ const HARNESS_CREDS = { apiToken: "harness-token", subdomain: "harness" };
 function graphQlData(data: unknown): Response {
   return new Response(JSON.stringify({ data }), {
     status: 200,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Dispatcher-Status": "succeeded", "X-Dispatcher-Request-Id": crypto.randomUUID() },
   });
 }
 
@@ -62,7 +62,7 @@ async function deliverInternalContinuation(operationId: string, ownerHash: strin
       SUPEROPS_CONTINUATION_ENABLED: "true",
       SUPEROPS_DURABLE_RETRY_ENABLED: "true",
       SUPEROPS_INTERNAL_CONTINUATION_TOKEN: "harness-internal-token",
-      SUPEROPS_API_TOKEN: HARNESS_CREDS.apiToken,
+      DISPATCHER_TOKEN: HARNESS_CREDS.apiToken,
       SUPEROPS_SUBDOMAIN: HARNESS_CREDS.subdomain,
       SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "14",
       SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "2",

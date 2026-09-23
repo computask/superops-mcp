@@ -1,5 +1,7 @@
 import { SuperOpsError, SuperOpsHttpError } from "../client.js";
 import { getExecutionConfig, hasExecutionBudgetFor } from "../execution.js";
+import { pageNumber } from "../pagination.js";
+import { DispatcherPendingError } from "../dispatcher.js";
 import type { ListInfo, ListInfoInput, SuperOpsJson, Ticket } from "../types.js";
 
 export const CREATED_TIME_REPORT_PAGE_SIZE = 100;
@@ -24,6 +26,7 @@ type GroupByField = (typeof GROUP_BY_FIELDS)[number];
 type QueryableClient = { query<T = unknown>(query: string, variables?: Record<string, unknown>): Promise<T> };
 interface TicketListResponse { getTicketList: { tickets: Ticket[]; listInfo: ListInfo } }
 export interface HistoricalTicketQueryParams {
+  page?: number; pageOffset?: number;
   createdFrom?: string; createdTo?: string; updatedFrom?: string; updatedTo?: string; resolvedFrom?: string; resolvedTo?: string;
   status?: string[]; priorities?: string[]; clientIds?: string[]; clientNames?: string[]; technicianIds?: string[]; technicianNames?: string[];
   sources?: string[]; requestTypes?: string[]; categories?: string[]; subcategories?: string[]; techGroups?: string[];
@@ -37,7 +40,7 @@ interface NormalizedIdentity { id?: string; name?: string; email?: string }
 export interface NormalizedReportingTicket { ticketId: string; displayId?: string | null; subject?: string | null; createdTime: string; updatedTime?: string | null; resolutionTime?: string | null; client?: NormalizedIdentity | null; requester?: NormalizedIdentity | null; technician?: NormalizedIdentity | null; techGroup?: NormalizedIdentity | null; status?: string | null; source?: string | null; category?: string | null; subcategory?: string | null; priority?: string | null; impact?: string | null; urgency?: string | null; requestType?: string | null; [key: string]: unknown }
 interface FetchErrorDiagnostic { stage: "fetchPage"; page: number; errorType: "rateLimit" | "server" | "graphql" | "network" | "budget"; message: string; retryable: boolean; attempts: number }
 interface RetryDiagnostics { retries: number; retryDelaysMs: number[] }
-export interface TicketPaginationDiagnostics { pagesFetched: number; pageSize: number; apiTotalCount?: number; recordsExamined: number; recordsMatched: number; recordsReturned: number; duplicateRecordsRemoved: number; complete: boolean; truncated: boolean; nextPage: number | null; stopReason: "crossedCreatedFromBoundary" | "hasMoreFalse" | "emptyPage" | "maxPagesReached" | "maxRecordsReached" | "repeatedPageLoop" | "fetchError" | "executionBudgetExhausted" }
+export interface TicketPaginationDiagnostics { pagesFetched: number; pageSize: number; apiTotalCount?: number; recordsExamined: number; recordsMatched: number; recordsReturned: number; duplicateRecordsRemoved: number; complete: boolean; truncated: boolean; nextPage: number | null; nextPageOffset?: number; stopReason: "totalCountMismatch" | "invalidPage" | "missingHasMore" | "responseSizeLimit" | "crossedCreatedFromBoundary" | "hasMoreFalse" | "emptyPage" | "maxPagesReached" | "maxRecordsReached" | "repeatedPageLoop" | "fetchError" | "executionBudgetExhausted" }
 export interface TicketQueryResult { responseVersion: 1; queryWindow: { createdFrom: string; createdTo: string; boundarySemantics: "createdFromInclusiveCreatedToExclusive"; timeField: "createdTime" }; sort: { attribute: "createdTime"; order: "DESC"; effectiveReturnOrder: "ASC" | "DESC" }[]; fieldProfile: FieldProfile; fields: string[]; records: NormalizedReportingTicket[]; pagination: TicketPaginationDiagnostics; filterExecution: Record<string, "server" | "local">; warnings: string[]; errors: FetchErrorDiagnostic[]; retryDiagnostics: RetryDiagnostics }
 export interface TicketReportResult { responseVersion: 1; queryWindow: { createdFrom: string; createdTo: string; timezone: string; timeField: "createdTime"; boundarySemantics: "createdFromInclusiveCreatedToExclusive" }; totals: { tickets: number }; series: { bucketStart: string; bucketEnd: string; count: number }[]; breakdowns: Record<string, { key: string; count: number; percentage: number }[]>; rows?: Record<string, unknown>[]; samples?: Record<string, { key: string; tickets: { displayId?: string | null; subject?: string | null; createdTime: string; client?: string; source?: string | null; technician?: string }[] }[]>; pagination: TicketPaginationDiagnostics & { recordsAnalysed: number }; filterExecution: Record<string, "server" | "local">; technicianSemantics: "currentAssigneeAtQueryTime"; warnings: string[]; errors: FetchErrorDiagnostic[]; retryDiagnostics: RetryDiagnostics }
 
@@ -84,34 +87,62 @@ export async function fetchTicketsPaginated(client: QueryableClient, params: His
   const recordsById = new Map<string, NormalizedReportingTicket>(); const rangeMatched: NormalizedReportingTicket[] = []; const seenPages = new Set<string>();
   const condition = buildTicketConditions(params);
   const pagination: TicketPaginationDiagnostics = { pagesFetched: 0, pageSize: CREATED_TIME_REPORT_PAGE_SIZE, recordsExamined: 0, recordsMatched: 0, recordsReturned: 0, duplicateRecordsRemoved: 0, complete: false, truncated: false, nextPage: null, stopReason: "fetchError" };
-  let page = 1; let done = false;
+  let page = pageNumber(params.page); let done = false;
+  const startPage = page;
+  const upstreamIds = new Set<string>();
+  let responseBytes = 0;
+  const startOffset = params.pageOffset ?? 0;
+  if (!Number.isSafeInteger(startOffset) || startOffset < 0 || startOffset >= CREATED_TIME_REPORT_PAGE_SIZE) throw new Error("Invalid pageOffset.");
   while (!done) {
-    if (page > maxPageLimit) { pagination.complete = false; pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "maxPagesReached"; warnings.push("Configured pagination depth reached; results are partial."); break; }
+    if (pagination.pagesFetched >= maxPageLimit) { pagination.complete = false; pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "maxPagesReached"; warnings.push("Configured pagination depth reached; results are partial."); break; }
     if (!hasExecutionBudgetFor(1)) { errors.push({ stage: "fetchPage", page, errorType: "budget", message: "Execution subrequest budget exhausted before fetching the next page.", retryable: true, attempts: 0 }); pagination.complete = false; pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "executionBudgetExhausted"; warnings.push("Execution budget reached before all pages were fetched; results are partial."); break; }
     const input: ListInfoInput = { page, pageSize: CREATED_TIME_REPORT_PAGE_SIZE, sort: buildTicketSort(), condition };
     if (!condition) delete input.condition;
     const pageResult = await fetchTicketPage(client, input, effective.fetchFields, page);
     if (pageResult.error) { errors.push(pageResult.error); pagination.complete = false; pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "fetchError"; break; }
     const ticketList = pageResult.response?.getTicketList; const tickets = ticketList?.tickets ?? [];
+    if (ticketList?.listInfo?.totalCount !== undefined && (!Number.isSafeInteger(ticketList.listInfo.totalCount) || ticketList.listInfo.totalCount < 0 || (pagination.apiTotalCount !== undefined && ticketList.listInfo.totalCount !== pagination.apiTotalCount))) {
+      pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "totalCountMismatch"; break;
+    }
     pagination.pagesFetched += 1; pagination.apiTotalCount ??= ticketList?.listInfo?.totalCount; pagination.pageSize = Math.min(ticketList?.listInfo?.pageSize ?? CREATED_TIME_REPORT_PAGE_SIZE, CREATED_TIME_REPORT_PAGE_SIZE);
-    if (tickets.length === 0) { pagination.complete = true; pagination.stopReason = "emptyPage"; break; }
+    if ((ticketList?.listInfo?.page !== undefined && ticketList.listInfo.page !== page) || (ticketList?.listInfo?.pageSize !== undefined && ticketList.listInfo.pageSize !== 100) || tickets.length > 100 || (page === startPage && startOffset > tickets.length)) { pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "invalidPage"; break; }
+    if (tickets.length === 0) { pagination.complete = ticketList?.listInfo?.hasMore === false && (pagination.apiTotalCount === undefined || upstreamIds.size === Math.max(0, pagination.apiTotalCount - (startPage-1)*100)); pagination.truncated = !pagination.complete; pagination.nextPage = pagination.complete ? null : page; pagination.stopReason = "emptyPage"; break; }
     const signature = tickets.map((ticket) => ticket.ticketId || ticket.displayId || "").join("|");
     if (seenPages.has(signature)) { pagination.complete = false; pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "repeatedPageLoop"; warnings.push("Repeated ticket page detected; results are partial."); break; }
     seenPages.add(signature);
+    if (tickets.some(ticket => !ticket.ticketId)) { pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "invalidPage"; break; }
+    if (tickets.every(ticket => upstreamIds.has(ticket.ticketId))) { pagination.truncated = true; pagination.nextPage = page; pagination.stopReason = "repeatedPageLoop"; break; }
+    for (const ticket of tickets) upstreamIds.add(ticket.ticketId);
     let crossedLowerBoundary = false;
-    for (const ticket of tickets) {
+    for (let index = page === startPage ? startOffset : 0; index < tickets.length; index++) {
+      const ticket = tickets[index];
+      if (rangeMatched.length >= effective.maxRecords || responseBytes >= 600_000) {
+        pagination.truncated = true; pagination.nextPage = page; pagination.nextPageOffset = index;
+        pagination.stopReason = responseBytes >= 600_000 ? "responseSizeLimit" : "maxRecordsReached"; done = true; break;
+      }
       pagination.recordsExamined += 1;
       const createdMs = parseTicketCreatedMs(ticket.createdTime); if (createdMs === undefined) continue;
       if (createdMs >= effective.createdToMs) continue;
       if (createdMs < effective.createdFromMs) { crossedLowerBoundary = true; continue; }
       if (recordsById.has(ticket.ticketId)) { pagination.duplicateRecordsRemoved += 1; continue; }
-      const normalized = normaliseReportingTicket(ticket, effective.fetchFields); recordsById.set(ticket.ticketId, normalized); rangeMatched.push(normalized); pagination.recordsMatched += 1;
-      if (rangeMatched.length >= effective.maxRecords) { pagination.complete = false; pagination.truncated = true; pagination.nextPage = page + 1; pagination.stopReason = "maxRecordsReached"; done = true; break; }
+      const normalized = normaliseReportingTicket(ticket, effective.fetchFields);
+      const bytes = new TextEncoder().encode(JSON.stringify(normalized, null, 2)).length;
+      if (responseBytes + bytes > 600_000) { pagination.truncated = true; pagination.nextPage = page; pagination.nextPageOffset = index; pagination.stopReason = "responseSizeLimit"; done = true; break; }
+      recordsById.set(ticket.ticketId, normalized); rangeMatched.push(normalized); pagination.recordsMatched += 1;
+      responseBytes += bytes;
     }
     if (done) break;
     if (crossedLowerBoundary) { pagination.complete = true; pagination.stopReason = "crossedCreatedFromBoundary"; break; }
-    if (!ticketList?.listInfo?.hasMore) { pagination.complete = true; pagination.stopReason = "hasMoreFalse"; break; }
-    if (page >= maxPageLimit) { pagination.complete = false; pagination.truncated = true; pagination.nextPage = page + 1; pagination.stopReason = "maxPagesReached"; break; }
+    if (ticketList?.listInfo?.hasMore === false) {
+      pagination.complete = pagination.apiTotalCount === undefined || upstreamIds.size === Math.max(0, pagination.apiTotalCount - (startPage-1)*100);
+      pagination.truncated = !pagination.complete; pagination.nextPage = pagination.complete ? null : page;
+      pagination.stopReason = pagination.complete ? "hasMoreFalse" : "totalCountMismatch"; break;
+    }
+    if (ticketList?.listInfo?.hasMore !== true) {
+      pagination.complete = pagination.apiTotalCount !== undefined && upstreamIds.size === Math.max(0, pagination.apiTotalCount - (startPage-1)*100);
+      pagination.truncated = !pagination.complete; pagination.nextPage = pagination.complete ? null : page + 1; pagination.stopReason = "missingHasMore"; break;
+    }
+    if (pagination.pagesFetched >= maxPageLimit) { pagination.complete = false; pagination.truncated = true; pagination.nextPage = page + 1; pagination.stopReason = "maxPagesReached"; break; }
     page += 1;
   }
   const filtered = applyLocalFilters(rangeMatched, params);
@@ -191,7 +222,7 @@ function isRetryable(error: unknown): boolean {
   if (error instanceof SuperOpsError) { const code = error.code?.toLowerCase() ?? ""; return code.includes("rate") || code.includes("timeout") || code.includes("internal"); }
   const status = typeof error === "object" && error !== null ? (error as { status?: unknown }).status : undefined; return status === 429 || (typeof status === "number" && status >= 500 && status <= 599);
 }
-function errorType(error: unknown): FetchErrorDiagnostic["errorType"] { if (error instanceof SuperOpsHttpError) { if (error.status === 429) return "rateLimit"; if (error.status >= 500) return "server"; } if (error instanceof SuperOpsError) return "graphql"; const status = typeof error === "object" && error !== null ? (error as { status?: unknown }).status : undefined; if (status === 429) return "rateLimit"; if (typeof status === "number" && status >= 500) return "server"; return "network"; }
+function errorType(error: unknown): FetchErrorDiagnostic["errorType"] { if (error instanceof DispatcherPendingError && error.rateLimited) return "rateLimit"; if (error instanceof SuperOpsHttpError) { if (error.status === 429) return "rateLimit"; if (error.status >= 500) return "server"; } if (error instanceof SuperOpsError) return "graphql"; const status = typeof error === "object" && error !== null ? (error as { status?: unknown }).status : undefined; if (status === 429) return "rateLimit"; if (typeof status === "number" && status >= 500) return "server"; return "network"; }
 function safeErrorMessage(error: unknown): string { return error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300); }
 
 function validateTimezone(timezone: string): void { try { new Intl.DateTimeFormat("en-GB", { timeZone: timezone }).format(new Date()); } catch { throw new Error(`Unsupported IANA timezone: ${timezone}`); } }

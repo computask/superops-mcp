@@ -18,8 +18,8 @@ describe("getCredentials", () => {
     resetClient();
   });
 
-  it("returns null when SUPEROPS_API_TOKEN is not set", () => {
-    vi.stubEnv("SUPEROPS_API_TOKEN", "");
+  it("returns null when DISPATCHER_TOKEN is not set", () => {
+    vi.stubEnv("DISPATCHER_TOKEN", "");
     vi.stubEnv("SUPEROPS_SUBDOMAIN", "testcompany");
 
     const creds = getCredentials();
@@ -27,7 +27,7 @@ describe("getCredentials", () => {
   });
 
   it("returns null when SUPEROPS_SUBDOMAIN is not set", () => {
-    vi.stubEnv("SUPEROPS_API_TOKEN", "test-token");
+    vi.stubEnv("DISPATCHER_TOKEN", "test-token");
     vi.stubEnv("SUPEROPS_SUBDOMAIN", "");
 
     const creds = getCredentials();
@@ -35,11 +35,11 @@ describe("getCredentials", () => {
   });
 
   it("returns credentials when both are set", () => {
-    vi.stubEnv("SUPEROPS_API_TOKEN", "test-token");
+    vi.stubEnv("DISPATCHER_TOKEN", "test-token");
     vi.stubEnv("SUPEROPS_SUBDOMAIN", "testcompany");
 
     const creds = getCredentials();
-    expect(creds).toEqual({
+    expect(creds).toMatchObject({
       apiToken: "test-token",
       subdomain: "testcompany",
       region: undefined,
@@ -47,12 +47,12 @@ describe("getCredentials", () => {
   });
 
   it("includes region when SUPEROPS_REGION is set", () => {
-    vi.stubEnv("SUPEROPS_API_TOKEN", "test-token");
+    vi.stubEnv("DISPATCHER_TOKEN", "test-token");
     vi.stubEnv("SUPEROPS_SUBDOMAIN", "testcompany");
     vi.stubEnv("SUPEROPS_REGION", "eu");
 
     const creds = getCredentials();
-    expect(creds).toEqual({
+    expect(creds).toMatchObject({
       apiToken: "test-token",
       subdomain: "testcompany",
       region: "eu",
@@ -89,13 +89,13 @@ describe("SuperOpsClient execution instrumentation", () => {
     expect(diagnostics?.requestTrace).toEqual([
       expect.objectContaining({
         index: 1,
-        provider: "superops",
+        provider: "dispatcher",
         type: "initialRead",
         operationType: "query",
         operationName: "Test",
         status: 200,
         retryCount: 0,
-        endpointHost: "api.superops.ai",
+        endpointHost: "superops-api-dispatcher.taskgroup.co.uk",
         httpStatus: 200,
         outcome: "success",
         responseHadData: true,
@@ -214,7 +214,7 @@ describe("SuperOpsClient rate-limit handling", () => {
       parsedDelayMs: 1000,
       cappedDelayMs: 1000,
       actualDelayMs: 1000,
-      endpoint: "https://api.superops.ai/msp",
+      endpoint: "https://superops-api-dispatcher.taskgroup.co.uk/graphql",
       operationName: "Test",
     });
     expect(diagnostics?.subrequests).toMatchObject({ used: 2 });
@@ -473,7 +473,7 @@ describe("SuperOpsClient rate-limit handling", () => {
         },
         () => runWithExecutionContext("superops_custom_query", () => client.query("query Hung { ok }"))
       );
-      const rejection = expect(request).rejects.toMatchObject({ name: "SuperOpsTimeoutError" });
+      const rejection = expect(request).rejects.toMatchObject({ name: "DispatcherPendingError", state: "request_timeout" });
       await vi.advanceTimersByTimeAsync(5);
       await rejection;
       expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -488,16 +488,13 @@ describe("SuperOpsClient rate-limit handling", () => {
     try {
       const fetchMock = vi.fn((_url: unknown, init?: RequestInit) => {
         const signal = init?.signal;
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          statusText: "OK",
-          json: () => new Promise<never>((_resolve, reject) => {
+        return Promise.resolve(new Response(new ReadableStream({
+          start(controller) {
             signal?.addEventListener("abort", () => {
-              reject(Object.assign(new Error("aborted while reading response"), { name: "AbortError" }));
+              controller.error(Object.assign(new Error("aborted while reading response"), { name: "AbortError" }));
             }, { once: true });
-          }),
-        } as unknown as Response);
+          },
+        })));
       });
       vi.stubGlobal("fetch", fetchMock);
       const client = new SuperOpsClient({ apiToken: "secret-token", subdomain: "example" });

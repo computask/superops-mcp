@@ -10,6 +10,8 @@ export default defineConfig({
     },
   },
   test: {
+    // Synthetic producer credentials only. Every transport test mocks fetch.
+    env: { DISPATCHER_TOKEN: "test-dispatcher-producer" },
     deps: {
       inline: ["@cloudflare/workers-oauth-provider"],
     },

@@ -46,7 +46,7 @@ export function rowsFromTail(events: readonly AuditTrace[]): SafeRow[] {
         if (!finished && e.event !== "superops.api_attempt_started") continue;
         if (typeof e.callId !== "string" || !/^[0-9a-f-]{36}$/.test(e.callId)) continue;
         const startedAt = timestamp(e.startedAt);
-        if (!startedAt || !["api.superops.ai", "euapi.superops.ai"].includes(String(e.endpointHost))) continue;
+        if (!startedAt || !["api.superops.ai", "euapi.superops.ai", "superops-api-dispatcher.taskgroup.co.uk"].includes(String(e.endpointHost))) continue;
         if (rows.get(e.callId)?.completed_at) continue;
         const completedAt = finished ? timestamp(e.completedAt) : null;
         const outcome = completedAt && OUTCOMES.has(String(e.outcome)) ? String(e.outcome) : "incomplete";
@@ -54,7 +54,7 @@ export function rowsFromTail(events: readonly AuditTrace[]): SafeRow[] {
           call_id: e.callId, started_at: startedAt, completed_at: completedAt,
           duration_ms: completedAt ? number(e.durationMs) : null,
           tenant: typeof e.tenant === "string" && /^[a-z0-9-]{1,63}$/.test(e.tenant) ? e.tenant : null,
-          endpoint_host: String(e.endpointHost), endpoint_path: "/msp",
+          endpoint_host: String(e.endpointHost), endpoint_path: e.endpointHost === "superops-api-dispatcher.taskgroup.co.uk" ? "/graphql" : "/msp",
           ticket_number: id(e.ticketNumber, 12),
           ticket_id: id(e.ticketId, 30) ?? (typeof e.ticketId === "string" && /^[a-f0-9-]{36}$/i.test(e.ticketId) ? e.ticketId : null),
           item_key: token(e.itemKey), request_id: token(e.requestId), invocation_id: token(e.invocationId),

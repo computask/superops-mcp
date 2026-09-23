@@ -7,6 +7,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { SuperOpsCredentials, GraphQLResponse } from "./types.js";
 import { beginApiAttempt, endApiAttempt } from "./api-attempt-audit.js";
+import { assertPageBounds } from "./pagination.js";
+import { dispatcherIdempotencyKey } from "./dispatcher.js";
+import { DISPATCHER_ORIGIN, DispatcherPendingError, dispatcherFetch, runWithDispatcher, dispatcherEnvironment, boundedJson } from "./dispatcher.js";
 import {
   classifyGraphQLRequest,
   getExecutionConfig,
@@ -16,10 +19,6 @@ import {
   recordSubrequestStart,
 } from "./execution.js";
 
-const API_ENDPOINTS = {
-  us: "https://api.superops.ai/msp",
-  eu: "https://euapi.superops.ai/msp",
-} as const;
 
 /**
  * AsyncLocalStorage for per-request credential isolation in HTTP transport.
@@ -32,18 +31,18 @@ const credentialStore = new AsyncLocalStorage<SuperOpsCredentials>();
  * Run a function with per-request credentials available via getCredentials()/getClient().
  */
 export function runWithCredentials<T>(creds: SuperOpsCredentials, fn: () => T): T {
-  return credentialStore.run(creds, fn);
+  return credentialStore.run(creds, () => runWithDispatcher(creds.dispatcher ?? dispatcherEnvironment(), fn));
 }
 
 export class SuperOpsClient {
-  private readonly apiToken: string;
   private readonly subdomain: string;
   private readonly endpoint: string;
+  private readonly dispatcher;
 
   constructor(credentials: SuperOpsCredentials) {
-    this.apiToken = credentials.apiToken;
     this.subdomain = credentials.subdomain;
-    this.endpoint = API_ENDPOINTS[credentials.region ?? "us"];
+    this.endpoint = `${DISPATCHER_ORIGIN}/graphql`;
+    this.dispatcher = credentials.dispatcher;
   }
 
   async query<T = unknown>(
@@ -52,6 +51,7 @@ export class SuperOpsClient {
   ): Promise<T> {
     const operation = classifyGraphQLRequest(query);
     const isWrite = operation.operationType === "mutation";
+    if (!isWrite) assertPageBounds(query, variables);
     const config = getExecutionConfig();
     const maxAttempts = isWrite
       ? config.maxWriteRetryAttempts
@@ -59,11 +59,12 @@ export class SuperOpsClient {
     const startedMs = Date.now();
     let attempt = 0;
     let lastError: unknown;
+    const idempotencyKey = await dispatcherIdempotencyKey(JSON.stringify({query, variables}), isWrite);
 
     while (attempt < maxAttempts) {
       attempt += 1;
       try {
-        return await this.requestOnce<T>(query, variables, attempt - 1);
+        return await this.requestOnce<T>(query, variables, attempt - 1, idempotencyKey);
       } catch (error) {
         lastError = error;
         const retryable = shouldRetrySuperOpsRequest(error, isWrite);
@@ -99,26 +100,29 @@ export class SuperOpsClient {
   private async requestOnce<T = unknown>(
     query: string,
     variables: Record<string, unknown> | undefined,
-    retryCount: number
+    retryCount: number,
+    idempotencyKey: string
   ): Promise<T> {
     const subrequest = recordSubrequestStart(query, retryCount, this.endpoint);
     // Serialize before recording dispatch: invalid input has made no API call.
     const body = JSON.stringify({ query, variables });
     const audit = beginApiAttempt(query, variables, this.subdomain, this.endpoint, retryCount + 1, subrequest.index);
     try {
-      const result = await this.performRequest<T>(body, subrequest);
+      const result = await this.performRequest<T>(body, subrequest, idempotencyKey, classifyGraphQLRequest(query).operationType === "mutation");
       endApiAttempt(audit, subrequest.record, true, undefined, result);
       return result;
     } catch (error) {
       endApiAttempt(audit, subrequest.record, false,
-        error instanceof SuperOpsError || error instanceof SuperOpsHttpError ? error.retryAfter : undefined);
+        error instanceof SuperOpsError || error instanceof SuperOpsHttpError || error instanceof DispatcherPendingError ? error.retryAfter : undefined);
       throw error;
     }
   }
 
   private async performRequest<T>(
     body: string,
-    subrequest: ReturnType<typeof recordSubrequestStart>
+    subrequest: ReturnType<typeof recordSubrequestStart>,
+    idempotencyKey: string,
+    mutation: boolean
   ): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(
@@ -127,18 +131,26 @@ export class SuperOpsClient {
     );
     let response: Response;
     try {
-      response = await fetch(this.endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiToken}`,
-          CustomerSubDomain: this.subdomain,
-        },
-        body,
-        signal: controller.signal,
+      response = await dispatcherFetch(body, { idempotencyKey, signal: controller.signal, env: this.dispatcher, mutation,
+        onReceipt: receipt => { if (subrequest.record) {
+          subrequest.record.dispatcherRequestId = receipt.requestId;
+          subrequest.record.dispatcherState = receipt.state;
+        } },
       });
     } catch (error) {
+      clearTimeout(timeout);
+      if (error instanceof DispatcherPendingError && error.httpStatus !== undefined) {
+        recordSubrequestFinish(subrequest, error.httpStatus, false, {
+          outcome: error.rateLimited ? "rate_limited" : "http_error",
+          errorClass: error.errorClassification ?? "DispatcherTerminalFailure",
+          graphqlCode: error.errorClassification,
+          httpStatus: error.httpStatus, rateLimited: error.rateLimited,
+          retryAfterSupplied: error.retryAfter !== undefined,
+        });
+        throw error;
+      }
       const timedOut = controller.signal.aborted ||
+        (error instanceof DispatcherPendingError && error.state === "request_timeout") ||
         (error instanceof Error && error.name === "AbortError");
       recordSubrequestFinish(
         subrequest,
@@ -146,9 +158,10 @@ export class SuperOpsClient {
         false,
         {
           outcome: timedOut ? "request_timeout" : "network_error",
-          errorClass: timedOut ? "SuperOpsRequestTimeout" : "UpstreamNetworkFailure",
+          errorClass: timedOut ? "SuperOpsRequestTimeout" : error instanceof DispatcherPendingError ? "DispatcherPending" : "UpstreamNetworkFailure",
         }
       );
+      if (error instanceof DispatcherPendingError) throw error;
       throw timedOut
         ? new SuperOpsTimeoutError(
             error instanceof Error ? error.message : "SuperOps request timed out."
@@ -183,7 +196,7 @@ export class SuperOpsClient {
 
       let result: GraphQLResponse<T>;
       try {
-        result = (await response.json()) as GraphQLResponse<T>;
+        result = (await boundedJson(response)) as GraphQLResponse<T>;
       } catch (error) {
         const timedOut = controller.signal.aborted ||
           (error instanceof Error && error.name === "AbortError");
@@ -399,6 +412,7 @@ function parseRateLimitResetValue(value: unknown): number | undefined {
 }
 function shouldRetrySuperOpsRequest(error: unknown, isWrite: boolean): boolean {
   if (isWrite) return false;
+  if (error instanceof DispatcherPendingError) return !error.requestId && ["submission_or_status_unknown", "request_timeout"].includes(error.state);
   if (error instanceof SuperOpsHttpError) {
     return error.status === 429 || (error.status >= 500 && error.status < 600);
   }
@@ -553,7 +567,7 @@ export function getCredentials(): SuperOpsCredentials | null {
   }
 
   // Fall back to environment variables (stdio mode)
-  const apiToken = process.env.SUPEROPS_API_TOKEN;
+  const apiToken = process.env.DISPATCHER_TOKEN;
   const subdomain = process.env.SUPEROPS_SUBDOMAIN;
   const region = process.env.SUPEROPS_REGION as "us" | "eu" | undefined;
 
@@ -561,7 +575,7 @@ export function getCredentials(): SuperOpsCredentials | null {
     return null;
   }
 
-  return { apiToken, subdomain, region };
+  return { apiToken, subdomain, region, dispatcher: dispatcherEnvironment() };
 }
 
 export function getClient(): SuperOpsClient {
@@ -576,7 +590,7 @@ export function getClient(): SuperOpsClient {
     const creds = getCredentials();
     if (!creds) {
       throw new Error(
-        "SuperOps credentials not configured. Set the required SuperOps API token and subdomain configuration."
+        "Dispatcher producer credentials and operation-owner identity are not configured. Direct SuperOps access is disabled."
       );
     }
     _client = new SuperOpsClient(creds);

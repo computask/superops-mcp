@@ -61,7 +61,7 @@ describe("Assets Domain", () => {
             client: { accountId: "other", name: "Other" },
           },
         ],
-        listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 2 },
+        listInfo: { page: 2, pageSize: 100, hasMore: false, totalCount: 102 },
       },
     });
 
@@ -76,20 +76,20 @@ describe("Assets Domain", () => {
 
     expect(mockClient.query).toHaveBeenCalledWith(
       expect.stringContaining("getAssetList"),
-      { input: { page: 2, pageSize: 200 } }
+      { input: { page: 2, pageSize: 100 } }
     );
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("first");
     expect(mockClient.query.mock.calls[0][1].input).not.toHaveProperty("filter");
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.assets.map((asset: { assetId: string }) => asset.assetId)).toEqual(["1"]);
-    expect(parsed.listInfo).toEqual({ page: 1, pageSize: 100, hasMore: false, totalCount: 1 });
+    expect(parsed.listInfo).toMatchObject({ page: 2, pageSize: 100, hasMore: false, totalCount: 1 });
     expect(parsed.readMetadata).toMatchObject({
       complete: true,
       truncated: false,
       completeness: "known",
       returnedCount: 1,
       upstreamReturnedCount: 2,
-      upstreamTotalCount: 2,
+      upstreamTotalCount: 102,
       upstreamHasMore: false,
       filtering: {
         applied: true,
@@ -217,11 +217,11 @@ describe("Assets Domain", () => {
     expect(result.content[0].text).not.toContain("Optional Update");
   });
 
-  it("caps asset list pageSize at 500", async () => {
+  it("caps asset list pageSize at 100", async () => {
     mockClient.query.mockResolvedValue({
       getAssetList: {
         assets: [],
-        listInfo: { page: 1, pageSize: 500, hasMore: false, totalCount: 0 },
+        listInfo: { page: 1, pageSize: 100, hasMore: false, totalCount: 0 },
       },
     });
 
@@ -230,7 +230,7 @@ describe("Assets Domain", () => {
 
     expect(mockClient.query).toHaveBeenCalledWith(
       expect.any(String),
-      { input: { page: 1, pageSize: 500 } }
+      { input: { page: 1, pageSize: 100 } }
     );
   });
 

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { getAuditContext } from "./audit.js";
 
 export type SubrequestType =
+  | "dispatcherPoll"
   | "initialRead"
   | "paginationRead"
   | "metadataValidation"
@@ -92,6 +93,8 @@ export interface SubrequestFinishDetails {
 }
 
 export interface SubrequestRecord {
+  dispatcherRequestId?: string;
+  dispatcherState?: string;
   index: number;
   type: SubrequestType;
   operationType?: string;
@@ -664,7 +667,7 @@ export function recordSubrequestFinish(
       executionTraceId: safeDiagnosticToken(state.operationId),
       toolName: safeDiagnosticToken(state.toolName),
       callIndex: started.record.index,
-      provider: started.record.endpoint ? "superops" : "internal",
+      provider: started.record.endpoint?.includes("superops-api-dispatcher") ? "dispatcher" : started.record.endpoint ? "superops" : "internal",
       requestPurpose: started.record.type,
       operationType: safeDiagnosticToken(started.record.operationType),
       operationName: safeDiagnosticToken(started.record.operationName),
@@ -777,7 +780,7 @@ export function executionDiagnostics(): Record<string, unknown> | undefined {
   if (!state) return undefined;
   const requestTrace = state.requests.slice(0, 128).map((request) => ({
     index: request.index,
-    provider: request.endpoint ? "superops" : "internal",
+    provider: request.endpoint?.includes("superops-api-dispatcher") ? "dispatcher" : request.endpoint ? "superops" : "internal",
     type: request.type,
     operationType: request.operationType,
     operationName: request.operationName,
@@ -791,6 +794,8 @@ export function executionDiagnostics(): Record<string, unknown> | undefined {
     outcome: request.outcome,
     errorClass: safeDiagnosticToken(request.errorClass),
     graphqlCode: request.graphqlCode,
+    dispatcherRequestId: safeDiagnosticToken(request.dispatcherRequestId, 160),
+    dispatcherState: safeDiagnosticToken(request.dispatcherState, 64),
     rateLimited: request.rateLimited,
     retryAfterSupplied: request.retryAfterSupplied,
     responseHadData: request.responseHadData,
@@ -863,7 +868,7 @@ function stateRequestsForLog(): Record<string, unknown>[] {
     index: request.index,
     startedAt: request.startedAt,
     completedAt: request.completedAt,
-    provider: request.endpoint ? "superops" : "internal",
+    provider: request.endpoint?.includes("superops-api-dispatcher") ? "dispatcher" : request.endpoint ? "superops" : "internal",
     type: request.type,
     operationType: safeDiagnosticToken(request.operationType),
     operationName: safeDiagnosticToken(request.operationName),

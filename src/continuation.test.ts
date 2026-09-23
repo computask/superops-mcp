@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { SuperOpsClient } from "./client.js";
 import {
   ExecutionBudgetExceededError,
   getExecutionState,
@@ -100,6 +101,47 @@ function completingAdapter(processed: Map<string, number>): OperationContinuatio
 }
 
 describe("durable continuation runner", () => {
+  it.each(["succeeded", "failed", "uncertain"])("persists an accepted dispatcher mutation and recovers %s without a second POST", async status => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-18T00:00:00.000Z"));
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({requestId:"receipt-1", status:"queued", source:"superops-mcp"}, {status:202, headers:{"Retry-After":"60"}}))
+      .mockResolvedValueOnce(Response.json({requestId:"receipt-1", status, source:"superops-mcp", httpStatus:status === "succeeded" ? 200 : 429,
+        errorClassification:status === "failed" ? "RATE_LIMIT_EXHAUSTED" : undefined,
+        response:status === "succeeded" ? {data:{updateTicket:{ticketId:"1"}}} : null}));
+    vi.stubGlobal("fetch", fetcher);
+    try {
+      await runWithOperationStore({}, async () => {
+        const ownerHash=stableHash("dispatcher-owner");
+        const record=ledgerRecord({operationId:"dispatcher-durable",ownerHash,itemKeys:["ticket-1"]});
+        await getOperationStore().put(record);
+        let adapterCalls = 0;
+        const adapter: OperationContinuationAdapter = {
+          toolName:"test_batch_tool", estimateItemSubrequests:()=>2,
+          async processItem({claim,checkpoint}) {
+            adapterCalls++;
+            if(claim.item.dispatcherReceipt) return {stage:"Completed",outcome:"Updated",writeAttempted:true,writeMayHaveSucceeded:true,partialWrite:false,verified:true};
+            await checkpoint({stage:"WriteNotStarted"});
+            await checkpoint({stage:"WriteStarted",writeAttempted:true,writeMayHaveSucceeded:true});
+            try { await new SuperOpsClient({apiToken:"unused",subdomain:"test"}).mutate("mutation Update {updateTicket {ticketId}}"); } catch { /* persisted receipt controls recovery */ }
+            return {stage:"AmbiguousWriteUnresolved",outcome:"pending",writeAttempted:true,writeMayHaveSucceeded:true,partialWrite:false};
+          },
+        };
+        const run=()=>runWithExecutionContext("test_batch_tool",()=>runOperationContinuation({operationId:record.operationId,ownerHash,adapter,leaseOwner:"test",now:new Date().toISOString()}));
+        expect((await run()).continuationRequired).toBe(true);
+        const saved=await getOperationStore().get(record.operationId);
+        expect(saved?.itemStates["ticket-1"].dispatcherReceipt).toMatchObject({requestId:"receipt-1",state:"queued",retryAfter:60});
+        expect(saved?.itemStates["ticket-1"].stage).toBe("RateLimitedRescheduled");
+        vi.setSystemTime(new Date("2026-07-18T00:01:01.000Z"));
+        expect((await run()).state).toBe(status === "succeeded" ? "Completed" : "CompletedWithFailures");
+        expect(adapterCalls).toBe(status === "succeeded" ? 2 : 1);
+        const terminalItem=(await getOperationStore().get(record.operationId))?.itemStates["ticket-1"];
+        if (status === "succeeded") expect(terminalItem?.dispatcherReceipt).toBeUndefined();
+        else expect(terminalItem?.dispatcherReceipt?.state).toBe(status);
+        expect(fetcher.mock.calls.map(call=>call[1].method)).toEqual(["POST","GET"]);
+      });
+    } finally {vi.unstubAllGlobals();vi.useRealTimers();}
+  });
   it("continues a 250-item operation across fresh invocation budgets without duplicate writes", async () => {
     const ownerHash = stableHash("owner@example.com");
     const processed = new Map<string, number>();

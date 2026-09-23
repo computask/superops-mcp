@@ -1,3 +1,4 @@
+import { paginatedClient } from "../pagination.js";
 /**
  * SuperOps.ai Assets Domain
  *
@@ -178,7 +179,7 @@ interface GetPatchesResponse {
 function pageInput(max: number | undefined, defaultPageSize: number, page?: number) {
   return {
     page: page ?? DEFAULT_LIST_PAGE,
-    pageSize: Math.min(max ?? defaultPageSize, 500),
+    pageSize: Math.min(max ?? defaultPageSize, 100),
   };
 }
 
@@ -262,18 +263,19 @@ function readMetadata(params: {
   filterFields: string[];
 }) {
   const complete = params.listInfo.hasMore === false;
-  const truncated = params.listInfo.hasMore === true;
+  const truncated = !complete;
   const nextPage =
     truncated && typeof params.listInfo.page === "number"
-      ? params.listInfo.page + 1
+      ? params.listInfo.nextPage ?? params.listInfo.page + 1
       : undefined;
 
   return {
     complete,
     truncated,
-    truncationReason: truncated ? "upstreamHasMore" : undefined,
+    truncationReason: truncated ? params.listInfo.truncationReason ?? "upstreamHasMoreOrUnknown" : undefined,
+    nextPage, totalCount: params.listInfo.totalCount, recordsReturned: params.returnedCount,
     continuation: truncated
-      ? { nextPage, pageSize: params.listInfo.pageSize }
+      ? params.listInfo.continuation ?? { nextPage, pageSize: params.listInfo.pageSize }
       : undefined,
     returnedCount: params.returnedCount,
     upstreamReturnedCount: params.upstreamReturnedCount,
@@ -311,6 +313,7 @@ function listResult<T extends Record<string, unknown>, K extends keyof T & strin
   return {
     ...list,
     [key]: items,
+    recordsReturned: (items as unknown[]).length,
     listInfo: filteredListInfo(list.listInfo, (items as unknown[]).length, filterFields),
     readMetadata: readMetadata({
       listInfo: list.listInfo,
@@ -347,12 +350,12 @@ export function getAssetsTools(): DomainTools {
             },
             max: {
               type: "number",
-              description: "Maximum number of results (default: 100, max: 500)",
+              description: "Upstream page size (default: 100, maximum: 100), not total results; sequential pagination with explicit continuation",
               default: 100,
             },
             page: {
               type: "number",
-              description: "Page number to fetch (default: 1)",
+              description: "Start or continuation page (default: 1); subsequent pages are fetched sequentially",
               default: 1,
             },
           },
@@ -387,9 +390,10 @@ export function getAssetsTools(): DomainTools {
               type: "string",
               description: "Search term to filter software by name",
             },
+            page: {type: "integer", minimum: 1, default: 1},
             max: {
               type: "number",
-              description: "Maximum number of results (default: 100)",
+              description: "Upstream page size (default: 100, maximum: 100), not total results; preserve this value on continuation",
               default: 100,
             },
           },
@@ -416,6 +420,7 @@ export function getAssetsTools(): DomainTools {
               items: { type: "string" },
               description: "Filter by severity levels: Critical, Important, Moderate, Low",
             },
+            page: {type: "integer", minimum: 1, default: 1},
           },
           required: ["assetId"],
         },
@@ -423,7 +428,7 @@ export function getAssetsTools(): DomainTools {
     ],
 
     async handleCall(name, args) {
-      const client = getClient();
+      const client = paginatedClient(getClient());
 
       try {
         switch (name) {
@@ -487,6 +492,7 @@ export function getAssetsTools(): DomainTools {
 
           case "superops_assets_software": {
             const params = args as {
+              page?: number;
               assetId: string;
               search?: string;
               max?: number;
@@ -495,7 +501,7 @@ export function getAssetsTools(): DomainTools {
             const response = await client.query<GetSoftwareResponse>(GET_ASSET_SOFTWARE_QUERY, {
               input: {
                 assetId: params.assetId,
-                listInfo: pageInput(params.max, 100),
+                listInfo: pageInput(params.max, 100, params.page),
               },
             });
             const assetSoftwares = applySoftwareSearch(
@@ -525,6 +531,7 @@ export function getAssetsTools(): DomainTools {
 
           case "superops_assets_patches": {
             const params = args as {
+              page?: number;
               assetId: string;
               status?: string;
               severity?: string[];
@@ -535,7 +542,7 @@ export function getAssetsTools(): DomainTools {
                 assetId: params.assetId,
                 // TODO: Replace local filtering with ListInfoInput.condition after
                 // SuperOps documents condition syntax for patch fields.
-                listInfo: pageInput(undefined, 100),
+                listInfo: pageInput(undefined, 100, params.page),
               },
             });
             const filters = { status: params.status, severity: params.severity };

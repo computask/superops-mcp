@@ -1,3 +1,5 @@
+import { paginatedClient } from "../pagination.js";
+import { DispatcherPendingError } from "../dispatcher.js";
 /**
  * SuperOps.ai Tickets Domain
  *
@@ -95,7 +97,7 @@ const MIN_RECENT_TICKETS_COUNT = 1;
 const MAX_RECENT_TICKETS_COUNT = 50;
 const MAX_RECENT_TICKETS_WITH_CONTENT = 10;
 const DEFAULT_TRIAGE_SNAPSHOT_MAX = 50;
-const MAX_TRIAGE_SNAPSHOT_MAX = 500;
+const MAX_TRIAGE_SNAPSHOT_MAX = 100;
 const TRIAGE_SNAPSHOT_SUBREQUEST_HEADROOM = 4;
 const DEFAULT_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET = 3000;
 const MAX_TRIAGE_MAX_CONTENT_CHARS_PER_TICKET = 10000;
@@ -1292,7 +1294,7 @@ interface StructuredValidationFailure {
 function pageInput(max: number | undefined, page?: number) {
   return {
     page: page ?? DEFAULT_LIST_PAGE,
-    pageSize: Math.min(max ?? 50, 500),
+    pageSize: Math.min(max ?? 50, 100),
   };
 }
 
@@ -4308,6 +4310,7 @@ async function createTicketNote(
 }
 
 function isRateLimitError(error: unknown): boolean {
+  if (error instanceof DispatcherPendingError) return error.rateLimited;
   if (error instanceof SuperOpsHttpError) return error.status === 429;
   if (error instanceof SuperOpsError) {
     const extensions = JSON.stringify(error.extensions ?? {});
@@ -4326,7 +4329,7 @@ function rateLimitRetryMetadata(error: unknown): {
   delaySource: "retry-after" | "backoff";
   conclusiveRejection: boolean;
 } {
-  const retryAfterSeconds = error instanceof SuperOpsHttpError || error instanceof SuperOpsError
+  const retryAfterSeconds = error instanceof SuperOpsHttpError || error instanceof SuperOpsError || error instanceof DispatcherPendingError
     ? error.retryAfter
     : undefined;
   const configured = getExecutionConfig();
@@ -10134,7 +10137,7 @@ export function getTicketsTools(): DomainTools {
             },
             max: {
               type: "number",
-              description: "Maximum number of results (default: 50, max: 500)",
+              description: "Upstream page size (default: 50, maximum: 100), not total results. Pages are fetched sequentially until complete or an explicit continuation boundary.",
               default: 50,
             },
             page: {
@@ -10169,17 +10172,17 @@ export function getTicketsTools(): DomainTools {
       {
         name: "superops_tickets_query",
         description: "Read-only historical ticket query over createdTime ranges. Uses confirmed createdTime DESC sorting, sequential pagination, local date filtering, dedupe, and completeness diagnostics. Does not fetch conversations, notes, descriptions, or ticket content.",
-        inputSchema: { type: "object", properties: { createdFrom: { type: "string", description: "Inclusive ISO 8601 createdTime lower boundary." }, createdTo: { type: "string", description: "Exclusive ISO 8601 createdTime upper boundary." }, status: { type: "array", items: { type: "string", enum: [...VALID_TICKET_STATUSES] }, description: "Server-side status filter using confirmed is/in conditions." }, priorities: { type: "array", items: { type: "string" } }, clientIds: { type: "array", items: { type: "string" } }, clientNames: { type: "array", items: { type: "string" } }, technicianIds: { type: "array", items: { type: "string" } }, technicianNames: { type: "array", items: { type: "string" } }, sources: { type: "array", items: { type: "string" } }, requestTypes: { type: "array", items: { type: "string" } }, categories: { type: "array", items: { type: "string" } }, subcategories: { type: "array", items: { type: "string" } }, techGroups: { type: "array", items: { type: "string" } }, fieldProfile: { type: "string", enum: ["minimal", "reporting"], default: "reporting" }, fields: { type: "array", items: { type: "string" }, description: "Optional strict allowlisted metadata fields. ticketId, displayId, and createdTime are always included." }, sortOrder: { type: "string", enum: ["ASC", "DESC"], default: "DESC", description: "Return ordering. Fetching always uses createdTime DESC for early stopping." }, maxRecords: { type: "number", default: 5000 }, maxPages: { type: "number", default: 100 } }, required: ["createdFrom", "createdTo"] },
+        inputSchema: { type: "object", properties: { page: {type: "integer", minimum: 1}, pageOffset: {type: "integer", minimum: 0, maximum: 99}, createdFrom: { type: "string", description: "Inclusive ISO 8601 createdTime lower boundary." }, createdTo: { type: "string", description: "Exclusive ISO 8601 createdTime upper boundary." }, status: { type: "array", items: { type: "string", enum: [...VALID_TICKET_STATUSES] }, description: "Server-side status filter using confirmed is/in conditions." }, priorities: { type: "array", items: { type: "string" } }, clientIds: { type: "array", items: { type: "string" } }, clientNames: { type: "array", items: { type: "string" } }, technicianIds: { type: "array", items: { type: "string" } }, technicianNames: { type: "array", items: { type: "string" } }, sources: { type: "array", items: { type: "string" } }, requestTypes: { type: "array", items: { type: "string" } }, categories: { type: "array", items: { type: "string" } }, subcategories: { type: "array", items: { type: "string" } }, techGroups: { type: "array", items: { type: "string" } }, fieldProfile: { type: "string", enum: ["minimal", "reporting"], default: "reporting" }, fields: { type: "array", items: { type: "string" }, description: "Optional strict allowlisted metadata fields. ticketId, displayId, and createdTime are always included." }, sortOrder: { type: "string", enum: ["ASC", "DESC"], default: "DESC", description: "Return ordering. Fetching always uses createdTime DESC for early stopping." }, maxRecords: { type: "number", default: 5000 }, maxPages: { type: "number", default: 100 } }, required: ["createdFrom", "createdTo"] },
       },
       {
         name: "superops_tickets_created_between",
         description: "Read-only convenience wrapper for tickets created in a half-open createdTime range. Uses the shared historical query service and returns completeness diagnostics.",
-        inputSchema: { type: "object", properties: { createdFrom: { type: "string", description: "Inclusive ISO 8601 createdTime lower boundary." }, createdTo: { type: "string", description: "Exclusive ISO 8601 createdTime upper boundary." }, status: { type: "array", items: { type: "string", enum: [...VALID_TICKET_STATUSES] }, description: "Server-side status filter using confirmed is/in conditions." }, sortOrder: { type: "string", enum: ["ASC", "DESC"], default: "ASC" }, fieldProfile: { type: "string", enum: ["minimal", "reporting"], default: "reporting" }, maxRecords: { type: "number", default: 5000 }, maxPages: { type: "number", default: 100 } }, required: ["createdFrom", "createdTo"] },
+        inputSchema: { type: "object", properties: { page: {type: "integer", minimum: 1}, pageOffset: {type: "integer", minimum: 0, maximum: 99}, createdFrom: { type: "string", description: "Inclusive ISO 8601 createdTime lower boundary." }, createdTo: { type: "string", description: "Exclusive ISO 8601 createdTime upper boundary." }, status: { type: "array", items: { type: "string", enum: [...VALID_TICKET_STATUSES] }, description: "Server-side status filter using confirmed is/in conditions." }, sortOrder: { type: "string", enum: ["ASC", "DESC"], default: "ASC" }, fieldProfile: { type: "string", enum: ["minimal", "reporting"], default: "reporting" }, maxRecords: { type: "number", default: 5000 }, maxPages: { type: "number", default: 100 } }, required: ["createdFrom", "createdTo"] },
       },
       {
         name: "superops_tickets_report",
         description: "Read-only compact historical workload report for tickets created in a date range. Aggregates metadata inside the MCP worker and does not return raw ticket records by default.",
-        inputSchema: { type: "object", properties: { createdFrom: { type: "string", description: "Inclusive ISO 8601 createdTime lower boundary." }, createdTo: { type: "string", description: "Exclusive ISO 8601 createdTime upper boundary." }, timezone: { type: "string", default: "Europe/London", description: "IANA timezone for report buckets." }, interval: { type: "string", enum: ["hour", "day", "week", "month", "none"], default: "day" }, groupBy: { type: "array", items: { type: "string", enum: ["client", "technician", "techGroup", "source", "status", "category", "subcategory", "priority", "requestType"] }, description: "One or two grouping dimensions." }, includeZeroBuckets: { type: "boolean", default: false }, topN: { type: "number", default: 20 }, includeSampleTickets: { type: "boolean", default: false }, sampleSizePerGroup: { type: "number", default: 1, description: "Maximum 3." }, status: { type: "array", items: { type: "string", enum: [...VALID_TICKET_STATUSES] }, description: "Server-side status filter using confirmed is/in conditions." }, priorities: { type: "array", items: { type: "string" } }, clientIds: { type: "array", items: { type: "string" } }, clientNames: { type: "array", items: { type: "string" } }, technicianIds: { type: "array", items: { type: "string" } }, technicianNames: { type: "array", items: { type: "string" } }, sources: { type: "array", items: { type: "string" } }, requestTypes: { type: "array", items: { type: "string" } }, categories: { type: "array", items: { type: "string" } }, subcategories: { type: "array", items: { type: "string" } }, techGroups: { type: "array", items: { type: "string" } }, timeField: { type: "string", enum: ["createdTime"], default: "createdTime", description: "Only createdTime is supported in this first version." }, maxRecords: { type: "number", default: 10000 }, maxPages: { type: "number", default: 200 } }, required: ["createdFrom", "createdTo", "timezone"] },
+        inputSchema: { type: "object", properties: { page: {type: "integer", minimum: 1}, pageOffset: {type: "integer", minimum: 0, maximum: 99}, createdFrom: { type: "string", description: "Inclusive ISO 8601 createdTime lower boundary." }, createdTo: { type: "string", description: "Exclusive ISO 8601 createdTime upper boundary." }, timezone: { type: "string", default: "Europe/London", description: "IANA timezone for report buckets." }, interval: { type: "string", enum: ["hour", "day", "week", "month", "none"], default: "day" }, groupBy: { type: "array", items: { type: "string", enum: ["client", "technician", "techGroup", "source", "status", "category", "subcategory", "priority", "requestType"] }, description: "One or two grouping dimensions." }, includeZeroBuckets: { type: "boolean", default: false }, topN: { type: "number", default: 20 }, includeSampleTickets: { type: "boolean", default: false }, sampleSizePerGroup: { type: "number", default: 1, description: "Maximum 3." }, status: { type: "array", items: { type: "string", enum: [...VALID_TICKET_STATUSES] }, description: "Server-side status filter using confirmed is/in conditions." }, priorities: { type: "array", items: { type: "string" } }, clientIds: { type: "array", items: { type: "string" } }, clientNames: { type: "array", items: { type: "string" } }, technicianIds: { type: "array", items: { type: "string" } }, technicianNames: { type: "array", items: { type: "string" } }, sources: { type: "array", items: { type: "string" } }, requestTypes: { type: "array", items: { type: "string" } }, categories: { type: "array", items: { type: "string" } }, subcategories: { type: "array", items: { type: "string" } }, techGroups: { type: "array", items: { type: "string" } }, timeField: { type: "string", enum: ["createdTime"], default: "createdTime", description: "Only createdTime is supported in this first version." }, maxRecords: { type: "number", default: 10000 }, maxPages: { type: "number", default: 200 } }, required: ["createdFrom", "createdTo", "timezone"] },
       },      {
         name: "superops_tickets_get",
         description: "Get detailed information for a specific ticket by its ID.",
@@ -10359,7 +10362,7 @@ export function getTicketsTools(): DomainTools {
             max: {
               type: "number",
               default: DEFAULT_TRIAGE_SNAPSHOT_MAX,
-              description: "Requested candidates per page (default: 50, max: 500). The tool automatically uses a smaller stable page size when required to preserve safe metadata and content reads. The returned pagination.completeness, not the requested max, determines whether the page is complete.",
+              description: "Requested candidates per page (default: 50, max: 100). The tool automatically uses a smaller stable page size when required to preserve safe metadata and content reads. The returned pagination.completeness, not the requested max, determines whether the page is complete.",
             },
             page: {
               type: "number",
@@ -10849,7 +10852,7 @@ export function getTicketsTools(): DomainTools {
               }
             }
 
-            const response = await client.query<ListTicketsResponse>(LIST_TICKETS_QUERY, {
+            const response = await paginatedClient(client).query<ListTicketsResponse>(LIST_TICKETS_QUERY, {
               input: buildTicketListInput(params),
             });
             const tickets = applyTicketFilters(
@@ -10867,7 +10870,7 @@ export function getTicketsTools(): DomainTools {
                   page: response.getTicketList.listInfo.page ?? params.page ?? DEFAULT_LIST_PAGE,
                   pageSize:
                     response.getTicketList.listInfo.pageSize ??
-                    Math.min(params.max ?? 50, 500),
+                    Math.min(params.max ?? 50, 100),
                   totalCount: undefined,
                   hasMore: undefined,
                 }
@@ -10877,7 +10880,15 @@ export function getTicketsTools(): DomainTools {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify({ tickets, listInfo }, null, 2),
+                  text: JSON.stringify({ tickets, listInfo,
+                    complete: response.getTicketList.listInfo.complete ?? false,
+                    truncated: response.getTicketList.listInfo.truncated ?? true,
+                    nextPage: response.getTicketList.listInfo.nextPage,
+                    totalCount: response.getTicketList.listInfo.totalCount,
+                    recordsReturned: tickets.length,
+                    truncationReason: response.getTicketList.listInfo.truncationReason,
+                    continuation: response.getTicketList.listInfo.continuation,
+                  }, null, 2),
                 },
               ],
             };

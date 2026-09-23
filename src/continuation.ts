@@ -6,7 +6,6 @@ import {
   getExecutionConfig,
   hasExecutionBudgetFor,
   markExecutionItem,
-  withExecutionItem,
 } from "./execution.js";
 import {
   getOperationStore,
@@ -17,6 +16,7 @@ import {
   type OperationItemState,
   type OperationLedgerRecord,
 } from "./operation-store.js";
+import { withDispatcherOperation, dispatcherFetch, DispatcherPendingError, type DispatcherReceipt } from "./dispatcher.js";
 
 export interface ContinuationItemContext {
   record: OperationLedgerRecord;
@@ -315,8 +315,43 @@ export async function runOperationContinuation(
     try {
       const currentRecord = record;
       let latestDurableItem = claim.item;
-      const outcome = await withExecutionItem(claim.itemKey, () =>
-        params.adapter.processItem({
+      const saveReceipt = async (receipt: DispatcherReceipt) => {
+        if (JSON.stringify(latestDurableItem.dispatcherReceipt) === JSON.stringify(receipt)) return;
+        const saved = await store.checkpointItem({operationId: params.operationId, ownerHash: params.ownerHash,
+          itemKey: claim.itemKey, leaseId: claim.lease.leaseId,
+          patch: {stage: latestDurableItem.stage, dispatcherReceipt: receipt}});
+        latestDurableItem = saved.itemStates[claim.itemKey];
+      };
+      const receiptOutcome = (): ContinuationItemOutcome | undefined => {
+        const receipt = latestDurableItem.dispatcherReceipt;
+        if (!receipt || receipt.state === "succeeded") return undefined;
+        const terminal = ["failed", "cancelled", "uncertain"].includes(receipt.state);
+        return {
+          stage: terminal ? "AmbiguousWriteUnresolved" : "RateLimitedRescheduled",
+          outcome: terminal ? "DispatcherRequiresReconciliation" : "DispatcherPending",
+          writeAttempted: true, writeMayHaveSucceeded: true, partialWrite: latestDurableItem.partialWrite,
+          failureReason: `Dispatcher ${receipt.state}; receipt ${receipt.requestId}. No new mutation submitted.`,
+          nextEligibleTime: terminal ? undefined : new Date(Date.now() + Math.max(1, receipt.retryAfter ?? 5) * 1000).toISOString(),
+          result: {ticketNumber: claim.itemKey, dispatcherRequestId: receipt.requestId,
+            dispatcherState: receipt.state, complete: false, humanReconciliationRequired: terminal},
+        };
+      };
+      const outcome = await withDispatcherOperation(`${params.ownerHash}:${params.operationId}`, claim.itemKey, async () => {
+        const prior = latestDurableItem.dispatcherReceipt;
+        if (prior && !["succeeded", "failed", "cancelled", "uncertain"].includes(prior.state)) {
+          try {
+            const response = await dispatcherFetch("", {requestId: prior.requestId, idempotencyKey: prior.idempotencyKey});
+            await response.body?.cancel();
+            await saveReceipt({...prior, state: response.headers.get("X-Dispatcher-Status") ?? "uncertain"});
+          } catch (error) {
+            if (!(error instanceof DispatcherPendingError)) throw error;
+            await saveReceipt({...prior, state: ["failed", "cancelled", "uncertain"].includes(error.state) ? error.state : prior.state,
+              retryAfter: error.retryAfter ?? prior.retryAfter});
+          }
+        }
+        const waiting = receiptOutcome();
+        if (waiting) return waiting;
+        const processed = await params.adapter.processItem({
           record: currentRecord,
           claim,
           checkpoint: async (patch) => {
@@ -330,8 +365,9 @@ export async function runOperationContinuation(
             latestDurableItem = checkpointed.itemStates[claim.itemKey] ?? latestDurableItem;
             return checkpointed;
           },
-        })
-      );
+        });
+        return receiptOutcome() ?? processed;
+      }, saveReceipt);
       const config = getExecutionConfig();
       const priorRate = claim.item.rateLimit;
       const rateAttempts = outcome.rateLimited ? (priorRate?.attempts ?? 0) + 1 : 0;

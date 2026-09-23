@@ -83,6 +83,9 @@ async function startHttpTransport(): Promise<void> {
   const port = parseInt(process.env.MCP_HTTP_PORT || "8080", 10);
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
   const isGatewayMode = process.env.AUTH_MODE === "gateway";
+  if (isGatewayMode && process.env.DISPATCHER_TOKEN) {
+    throw new Error("Dispatcher gateway tenant mapping is not configured; use authenticated env mode or stdio.");
+  }
   const requestId = (req: IncomingMessage): string => {
     const value = req.headers["x-request-id"];
     if (Array.isArray(value)) {
