@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { build } from "esbuild";
-import { Miniflare } from "miniflare";
+import { createRequire } from "node:module";
+
+// Resolve Wrangler's own dependencies explicitly: pnpm does not hoist these
+// packages to the project root as the local npm installation does.
+const require = createRequire(import.meta.url);
+const wranglerRequire = createRequire(require.resolve("wrangler/package.json"));
+const { build } = wranglerRequire("esbuild");
+const { Miniflare } = wranglerRequire("miniflare");
 
 // Exercise the real workerd Request/fetch implementation, not Node's fetch.
 // Both dependencies are supplied by the pinned Wrangler development toolchain.
