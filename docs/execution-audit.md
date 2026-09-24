@@ -44,6 +44,27 @@ a rate limit. Later attempts reported pending/timeout conditions, which require
 their own receipt-level diagnostics. These instrumentation changes do not
 retrospectively establish the Agent's unrecorded reason for skipping apply.
 
+Subsequent read-only inspection of the first Agent conversation established the
+missing reason: it initially planned `leave`, queried classification options,
+then considered `resolve` without having requested `cause` and `resolutionCode`.
+It refused to guess these values and returned `apply_not_attempted`. The trigger
+input now requires selecting the evidence-supported disposition before spending
+the one options lookup, including missing closure fields when resolve is under
+consideration. Leave actions do not need closure-only fields. Required option
+validation, the one-lookup bound, and no-write-on-missing-evidence remain intact.
+This fixes a prompt planning defect; future automated success still needs live
+verification and cannot be inferred from the successful read-only smoke test.
+
+The fourth attempt's retained callback receipt
+`46a9cc55-3014-47e4-9b59-055e3522999c` provided a second confirmed cause:
+the dispatcher made five getFields attempts from 07:43:05.237Z to
+07:43:45.871Z, each HTTP 200 with GraphQL classification RATE_LIMITED. The
+old MCP discarded that classification while the receipt was `retry_wait` and
+reported generic DispatcherPending/network_error. Pending/deadline exits now
+preserve the last observed upstream classification, status and retry delay.
+This lets the existing rate-limit path distinguish throttling from a transport
+failure without changing dispatcher retries or re-POSTing the accepted request.
+
 ## Dispatcher/pagination migration — 23 September 2026
 
 The older inventory below describes logical reads/writes, not current physical

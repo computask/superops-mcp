@@ -82,6 +82,13 @@ describe("persistent API attempt metadata", () => {
     await runWithExecutionConfig({ SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED: "false" }, () => client().query("query Test { ok }"));
     expect(rowsFromTail(trace(lines))).toEqual([]);
   });
+  it("does not mislabel a pending GraphQL rate limit as network failure",async()=>{
+    const lines=capture();
+    vi.stubGlobal("fetch",vi.fn(async()=>Response.json({requestId:"receipt-throttle",status:"retry_wait",httpStatus:200,errorClassification:"RATE_LIMITED"},{status:202,headers:{"Retry-After":"60"}})));
+    await expect(runWithExecutionContext("superops_tickets_field_options",()=>client().query("query Fields { getFields { fieldId } }"))).rejects.toMatchObject({rateLimited:true});
+    expect(rowsFromTail(trace(lines))[0]).toMatchObject({dispatcher_state:"retry_wait",dispatcher_error_code:"RATE_LIMITED",http_status:200,outcome:"rate_limited",rate_limited:1,retry_after_seconds:60});
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
 
   it("ignores unrelated and raw logs and accepts only allowlisted columns", async () => {
     const lines = capture(); vi.stubGlobal("fetch", vi.fn(async () => response()));

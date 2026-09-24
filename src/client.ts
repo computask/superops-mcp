@@ -143,8 +143,8 @@ export class SuperOpsClient {
         subrequest.record.dispatcherRequestId = error.requestId ?? subrequest.record.dispatcherRequestId;
         subrequest.record.dispatcherErrorCode = error.errorClassification ?? error.state;
       }
-      if (error instanceof DispatcherPendingError && error.httpStatus !== undefined) {
-        recordSubrequestFinish(subrequest, error.httpStatus, false, {
+      if (error instanceof DispatcherPendingError && (error.httpStatus !== undefined || error.rateLimited)) {
+        recordSubrequestFinish(subrequest, error.httpStatus ?? "networkError", false, {
           outcome: error.rateLimited ? "rate_limited" : "http_error",
           errorClass: error.errorClassification ?? "DispatcherTerminalFailure",
           graphqlCode: error.errorClassification,

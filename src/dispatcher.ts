@@ -110,11 +110,14 @@ export async function dispatcherFetch(body: string, options: {
     headers["CF-Access-Client-Secret"] = env.CF_ACCESS_CLIENT_SECRET;
   }
   let requestId = options.requestId;
+  let observedHttpStatus: number | undefined;
+  let observedErrorClassification: string | undefined;
+  let observedRetryAfter: number | undefined;
   const deadline = Date.now() + getExecutionConfig().requestTimeoutMs;
   for (let poll = 0; poll < 20; poll++) {
     if (requestId && !/^[A-Za-z0-9_-]{1,160}$/.test(requestId)) throw new DispatcherPendingError(undefined, options.idempotencyKey, "invalid_receipt");
     if (options.signal?.aborted || Date.now() >= deadline || !hasExecutionBudgetFor(requestId ? 1 : 0)) {
-      throw new DispatcherPendingError(requestId, options.idempotencyKey, "pending");
+      throw new DispatcherPendingError(requestId, options.idempotencyKey, "pending", observedRetryAfter, observedHttpStatus, observedErrorClassification);
     }
     const polling = Boolean(requestId);
     const url = `${DISPATCHER_ORIGIN}${polling ? `/v1/requests/${requestId}` : "/graphql"}`;
@@ -159,7 +162,8 @@ export async function dispatcherFetch(body: string, options: {
       if (error instanceof DispatcherPendingError) throw error;
       if (counted) recordSubrequestFinish(counted, "networkError", false);
       throw new DispatcherPendingError(requestId, options.idempotencyKey,
-        options.signal?.aborted || (error instanceof Error && error.name === "AbortError") ? "request_timeout" : "submission_or_status_unknown");
+        options.signal?.aborted || (error instanceof Error && error.name === "AbortError") ? "request_timeout" : "submission_or_status_unknown",
+        observedRetryAfter, observedHttpStatus, observedErrorClassification);
     }
     const receipt = value.requestId ?? response.headers.get("X-Dispatcher-Request-Id");
     if (receipt !== undefined && receipt !== null) {
@@ -175,6 +179,11 @@ export async function dispatcherFetch(body: string, options: {
       ? "uncertain" : String(response.headers.get("X-Dispatcher-Status") ?? value.status ?? "");
     const retryAt = typeof value.nextRetryAt === "string" ? Date.parse(value.nextRetryAt) : NaN;
     const seconds = Math.max(retrySeconds(response.headers), Number.isFinite(retryAt) ? Math.max(0, Math.ceil((retryAt - Date.now()) / 1000)) : 0);
+    // Status HTTP 200 acknowledges a poll, not upstream success. Preserve the
+    // receipt's last upstream classification when the caller must stop waiting.
+    observedHttpStatus = typeof value.httpStatus === "number" && Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599 ? value.httpStatus : undefined;
+    observedErrorClassification = typeof value.errorClassification === "string" && /^[A-Z0-9_]{1,100}$/.test(value.errorClassification) ? value.errorClassification : undefined;
+    observedRetryAfter = pending.has(state) ? seconds : undefined;
     if (requestId) options.onReceipt?.({requestId, idempotencyKey: options.idempotencyKey, state: state || "queued"});
     if (requestId && options.mutation) await operation.getStore()?.checkpoint?.({requestId, idempotencyKey: options.idempotencyKey, state: state || "queued", retryAfter: seconds});
     if (state === "uncertain" || response.headers.get("X-Dispatcher-Uncertain") === "true" || value.uncertain === true) {
@@ -205,8 +214,8 @@ export async function dispatcherFetch(body: string, options: {
     }
     if (!requestId) throw new DispatcherPendingError(undefined, options.idempotencyKey, "missing_receipt");
     if (polling && response.ok && !pending.has(state)) throw new DispatcherPendingError(requestId, options.idempotencyKey, "invalid_status");
-    if (Date.now() + seconds * 1000 >= deadline) throw new DispatcherPendingError(requestId, options.idempotencyKey, "pending", seconds);
+    if (Date.now() + seconds * 1000 >= deadline) throw new DispatcherPendingError(requestId, options.idempotencyKey, "pending", seconds, observedHttpStatus, observedErrorClassification);
     await new Promise(resolve => setTimeout(resolve, seconds * 1000));
   }
-  throw new DispatcherPendingError(requestId, options.idempotencyKey, "poll_limit");
+  throw new DispatcherPendingError(requestId, options.idempotencyKey, "poll_limit", observedRetryAfter, observedHttpStatus, observedErrorClassification);
 }

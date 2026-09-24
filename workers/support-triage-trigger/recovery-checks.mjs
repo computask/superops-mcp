@@ -17,6 +17,13 @@ test('dispatch input requires an actual no-apply cause and preserves receipt dia
   assert(source.includes('Keep any observed denial terminal; do not retry or bypass it'));
 });
 
+test('the single metadata lookup covers closure fields before a resolve plan',()=>{
+  assert(source.includes('Plan the single field-options lookup after establishing'));
+  assert(source.includes('include any missing cause and resolutionCode in that same lookup'));
+  assert(source.includes('missing closure-only cause/resolutionCode is not a reason to stop'));
+  assert(source.includes('Never invent option values, resolve an actionable ticket'));
+});
+
 function fixture(status, age = 120000) {
   let now = Date.parse('2026-09-24T06:00:00Z');
   const scope = {mode:'new-email-tickets', source:'EMAIL', createdFrom:new Date(now-60000).toISOString(), createdTo:new Date(now).toISOString()};

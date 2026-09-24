@@ -13,7 +13,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-177a869603c6a8d5f980bc06b15436a4c672f6cf3823356e4526657873b0e3cd.
+237c62ad383a68539ca7a603058846262061caf51eb742f020d722f36a3648bc.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -22,6 +22,9 @@ Failure diagnostics guidance now distinguishes an observed reason for not
 attempting apply from the generic `apply_not_attempted` outcome. Failed-tool
 telemetry must be reported instead of the last successful call; unknown reasons
 remain explicitly unknown. This does not authorize any safety-gate override.
+The one options lookup must cover required closure fields when an evidence-
+supported resolve is under consideration, before spending that lookup on other
+missing classifications. Leave actions do not require closure-only fields.
 
 The five-email test exposed a second defect: the one-second maximum debounce
 gave later coalesced notifications less than their configured ingestion grace.

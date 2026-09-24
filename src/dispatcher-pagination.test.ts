@@ -59,6 +59,16 @@ describe("dispatcher-only transport", () => {
     await expect(runWithDispatcher(env, () => new SuperOpsClient({apiToken: "unused", subdomain: "test"}).mutate("mutation Update { updateTicket { ticketId } }"))).rejects.toBeInstanceOf(DispatcherPendingError);
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
+  it.each([200, null])("preserves GraphQL throttling from pending receipts without replay (upstream HTTP %s)", async httpStatus => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValueOnce(Response.json(receipt("queued"), {status:202}))
+      .mockResolvedValueOnce(Response.json(receipt("retry_wait", {httpStatus,errorClassification:"RATE_LIMITED",nextRetryAt:new Date(Date.now()+61000).toISOString()})));
+    vi.stubGlobal("fetch", fetcher);
+    const result=runWithDispatcher(env,()=>new SuperOpsClient({apiToken:"unused",subdomain:"test"}).query("query Test {ok}")).catch(e=>e);
+    await vi.runAllTimersAsync();
+    expect(await result).toMatchObject({state:"pending",rateLimited:true,errorClassification:"RATE_LIMITED",httpStatus:httpStatus??undefined,requestId:"receipt-1"});
+    expect(fetcher.mock.calls.map(c=>c[1].method)).toEqual(["POST","GET"]);
+  });
   it("rejects receipt identity confusion and never follows a supplied URL", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({...receipt("succeeded"), source: "other", statusUrl: "https://evil.example/", httpStatus: 200, response: {data: {ok: true}}})));
     await expect(dispatcherFetch("", {env, requestId: "receipt-1", idempotencyKey: "same"})).rejects.toMatchObject({state: "invalid_status_identity"});
