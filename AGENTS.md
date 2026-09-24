@@ -168,6 +168,14 @@ Notes:
 
 - Documentation/code agents should not deploy unless explicitly asked.
 - Do not create production Cloudflare resources automatically.
+- For this `superops-mcp` repository, Git is the only deployment path. When the
+  Worker or its production configuration is updated, commit and push the
+  reviewed changes and let the repository's Git-connected deployment pipeline
+  publish them. Do not use `wrangler deploy`, `wrangler versions deploy`, or any
+  equivalent Wrangler upload/publish command for this Worker.
+- Wrangler remains permitted for non-deployment work such as read-only
+  inspection, logs/tails, and separately authorised secret or resource
+  operations; it must not be used to publish `superops-mcp`.
 - `wrangler.json` contains the Worker configuration and non-secret vars; secrets must be managed outside Git.
 - The Durable Object binding is declared, but account-level provisioning/deployment still requires normal Cloudflare authorization.
 - Before any staging/production deployment, run at least `npm test`, `npm run build`, and `git diff --check`.

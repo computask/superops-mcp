@@ -80,14 +80,18 @@ Generate the collector's separate types with
 then check them with `tsc -p diagnostics/tsconfig.json`. The generated runtime
 declarations are deliberately outside the main MCP compiler scope.
 
-Deploy collector using `wrangler.api-call-log.jsonc`; apply its D1 migrations
-before enabling the producer's `tail_consumers` binding. The collector has no
-SuperOps credentials or HTTP endpoint. Keep the existing producer runtime vars
-and routes when deploying. After deploying the MCP source, refresh the isolated
-trigger project's result-callback schema and published Agent instructions so
-they accept and copy the expanded safe request trace. Until that refresh is
-published, the private D1 table still captures the exact SuperOps attempts, but
-callback history may retain only the older aggregate telemetry.
+Publish the collector through the repository's Git-connected deployment
+pipeline using `wrangler.api-call-log.jsonc`; apply its D1 migrations before
+enabling the producer's `tail_consumers` binding. Do not use `wrangler deploy`
+for the collector or the main MCP Worker. Wrangler remains available for type
+generation, validation, tails, and separately authorised resource operations.
+The collector has no SuperOps credentials or HTTP endpoint. Keep the existing
+producer runtime vars and routes when publishing. After publishing the MCP
+source, refresh the isolated trigger project's result-callback schema and
+published Agent instructions so they accept and copy the expanded safe request
+trace. Until that refresh is published, the private D1 table still captures the
+exact SuperOps attempts, but callback history may retain only the older
+aggregate telemetry.
 
 To stop capture immediately set collector `AUDIT_ENABLED=false`, or detach the
 producer's `tail_consumers`. The existing producer flag

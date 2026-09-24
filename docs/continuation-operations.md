@@ -81,7 +81,7 @@ Expected pinned Wrangler version: `4.111.0`. Wrangler 4.111.0 requires Node.js 2
 
 Durable approved private-note recovery requires SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY as a Cloudflare secret. Generate and manage it independently from SUPEROPS_INTERNAL_CONTINUATION_TOKEN; neither value belongs in Wrangler configuration or source control.
 
-Every command in this section changes external Cloudflare resources and requires explicit human approval. Use an independently reviewed `wrangler.staging.json` with distinct staging Worker, Workflow, Durable Object migration/binding, routes, vars, and service binding; never point staging at the production ledger.
+Every command in this section changes external Cloudflare resources and requires explicit human approval. Use an independently reviewed `wrangler.staging.json` with distinct staging Worker, Workflow, Durable Object migration/binding, routes, vars, and service binding; never point staging at the production ledger. Wrangler may manage the separately authorised secrets below, but it must not publish this Worker. Commit and push reviewed code/configuration and use the repository's Git-connected Cloudflare deployment pipeline for publication.
 
 ```powershell
 # RESOURCE-CHANGING: stores/rotates the staging internal continuation secret.
@@ -90,17 +90,17 @@ npx wrangler secret put SUPEROPS_INTERNAL_CONTINUATION_TOKEN --config wrangler.s
 # RESOURCE-CHANGING: stores/rotates the distinct staging private-note encryption secret.
 npx wrangler secret put SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY --config wrangler.staging.json
 
-# RESOURCE-CHANGING: deploys the staging Worker, Workflow, bindings, and migrations.
-npx wrangler deploy --config wrangler.staging.json
+# Do not run a Wrangler deployment here. Commit and push the reviewed
+# revision; the repository's Git-connected Cloudflare pipeline publishes it.
 ```
 
-Deploy initially with both continuation flags false. Smoke-test `/health`, `superops_status`, operation-status tools, and read-only lists. Run the fixed-seed harness outside the restricted sandbox. Then exercise an approved staging-safe low-budget stop, conclusive HTTP 429, GraphQL throttle, wait longer than one request lifetime, stale change during wait, duplicate Workflow delivery, and lost-response update/resolution/note. Confirm all expected items are accounted, no invocation exceeds its configured effective budget, and duplicate successful updates/resolutions/private notes are zero.
+Publish the initial staging revision with both continuation flags false. Smoke-test `/health`, `superops_status`, operation-status tools, and read-only lists. Run the fixed-seed harness outside the restricted sandbox. Then exercise an approved staging-safe low-budget stop, conclusive HTTP 429, GraphQL throttle, wait longer than one request lifetime, stale change during wait, duplicate Workflow delivery, and lost-response update/resolution/note. Confirm all expected items are accounted, no invocation exceeds its configured effective budget, and duplicate successful updates/resolutions/private notes are zero.
 
-Only after retaining that evidence may an approved operator set staging `SUPEROPS_CONTINUATION_ENABLED=true` and `SUPEROPS_DURABLE_RETRY_ENABLED=true` and redeploy. Changing vars and redeploying are resource-changing actions.
+Only after retaining that evidence may an approved operator set staging `SUPEROPS_CONTINUATION_ENABLED=true` and `SUPEROPS_DURABLE_RETRY_ENABLED=true` and publish another reviewed Git revision through the same pipeline. Changing vars and publishing are resource-changing actions.
 
 ## Production rollout
 
-The following commands change production resources and require a separate explicit approval:
+The following secret operations change production resources and require a separate explicit approval. They do not publish code:
 
 ```powershell
 # RESOURCE-CHANGING: stores/rotates the production internal continuation secret.
@@ -109,20 +109,20 @@ npx wrangler secret put SUPEROPS_INTERNAL_CONTINUATION_TOKEN --config wrangler.j
 # RESOURCE-CHANGING: stores/rotates the distinct production private-note encryption secret.
 npx wrangler secret put SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY --config wrangler.json
 
-# RESOURCE-CHANGING: deploys the production Worker, Workflow, bindings, and migrations.
-npx wrangler deploy --config wrangler.json
+# Do not run a Wrangler deployment here. Commit and push the reviewed
+# revision; the repository's Git-connected Cloudflare pipeline publishes it.
 ```
 
-First deploy with both continuation flags false. Smoke-test only read and status tools. Review staging evidence and pending operation inventory. Enabling continuation requires an approved config change plus another approved deploy. Keep synchronous write and custom mutation flags false; use approved fixed-candidate apply-triage for production writes.
+Publish the first production revision through the Git-connected pipeline with both continuation flags false. Smoke-test only read and status tools. Review staging evidence and pending operation inventory. Enabling continuation requires an approved config change plus another reviewed Git revision published through the same pipeline. Keep synchronous write and custom mutation flags false; use approved fixed-candidate apply-triage for production writes.
 
 ## Rollback with pending Workflows and alarms
 
-1. RESOURCE-CHANGING: set both continuation flags false and deploy the configuration.
+1. RESOURCE-CHANGING: set both continuation flags false, commit and push the configuration, and publish it through the Git-connected deployment pipeline.
 2. Do not remove the internal route, token, self service binding, Workflow class/binding, or Durable Object while Workflow instances may still deliver.
 3. Inventory every non-terminal operation ID and retain status/results. A pending Workflow delivery may still arrive, but it must pass token, owner, lease, stale, checkpoint, verification, and dedupe guards.
 4. Allow pending operations to reach a reviewed terminal result or investigate them manually. Do not fabricate completion and do not delete ambiguity evidence.
 5. Keep cleanup-only Durable Object alarms and the ledger binding until retained terminal records expire.
-6. Only after no pending operation depends on the old code may an approved operator deploy a previous Worker version. Git reversion and Cloudflare deployment are separate actions.
+6. Only after no pending operation depends on the old code may an approved operator revert Git to a previous Worker version and publish that revision through the Git-connected deployment pipeline.
 
 ## External validation still required
 

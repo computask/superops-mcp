@@ -10,3 +10,7 @@ dist/
 
 # Generated runtime declarations for the separate diagnostic collector
 diagnostics/worker-env.d.ts
+
+# Local attachments and verbose test-run output are not deployment sources.
+.codex-remote-attachments/
+diagnostics/*-tests.json

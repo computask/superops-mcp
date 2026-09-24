@@ -3659,29 +3659,12 @@ var CoordinatorEngine = class {
         ...statusPollDurationMs === void 0 ? {} : { agentStatusPollDurationMs: statusPollDurationMs }
       }, state.pendingTriggerScope);
       const acceptedRunAge = acceptedRunAgeMs(state, now);
-      if (separationEnabled(this.deps.config) && (diagnostics.status === "completed" || diagnostics.status === "failed") && state.pendingTriggerScope?.mode === "new-email-tickets") {
-        recordDispatchHistory(state, now, {
-          event: "orphan_recovered",
-          failureKind: "ambiguous",
-          attempt: state.dispatchAttempt > 0 ? state.dispatchAttempt : void 0,
-          retryCount: state.retryCount,
-          agentRunIdPresent: true,
-          agentRunStatus: diagnostics.status,
-          failureDiagnostics: missingCallbackDiagnostics("result_callback_missing"),
-          waitReason: "result_watchdog"
-        }, state.pendingTriggerScope);
-        const terminalScope = state.pendingTriggerScope;
-        recordReconciliationNeedsAttention(state, terminalScope, now, state.retryCount);
-        refreshQueuedAttentionBlock(state, this.deps.config);
-        const nextAt = this.finishCurrent(state, now);
-        await this.deps.store.save(state);
-        if (nextAt !== void 0) await this.deps.store.setAlarm(nextAt);
-        return {
-          status: nextAt === void 0 ? "permanent_failure" : "retry_scheduled",
-          nextAt
-        };
-      }
-      if (!exhaustedZeroWorkConfiguration(state, this.deps.config) && recoverStaleAcceptedRun(state, this.deps.config, now, diagnostics)) {
+      // This branch is entered only for a correlated, recorded retry callback.
+      // Once its run is terminal, continue the already-approved same-window
+      // retry; it is neither a missing callback nor a stale ambiguous run.
+      // Active/unknown runs must still drain before any new dispatch.
+      const retryRunTerminal = diagnostics.status === "completed" || diagnostics.status === "failed";
+      if (!retryRunTerminal && !exhaustedZeroWorkConfiguration(state, this.deps.config) && recoverStaleAcceptedRun(state, this.deps.config, now, diagnostics)) {
         const nextAt = state.pending ? Math.max(state.dueAt ?? now, state.cooldownUntil) : void 0;
         await this.deps.store.save(state);
         if (nextAt !== void 0) await this.deps.store.setAlarm(nextAt);
