@@ -41,6 +41,14 @@ Private notes start with <strong>TRIAGE SUMMARY</strong><br><br>. Use <strong>
 for each relevant section title and <br><br> between lines/sections. Omit irrelevant
 or unknown history/emerging sections; preserve positive-evidence enum rules.
 
+The required base section labels, including their colons, are exactly
+<strong>Ticket goal:</strong>, <strong>What needs to be known:</strong>,
+<strong>Next step:</strong>, and <strong>When:</strong>. Each must have useful
+non-empty text. Do not substitute labels such as Issue summary or Recommendation.
+Insert only relevant, evidence-backed optional history sections between the
+second and third base sections, using the existing exact labels and enum rules.
+This is the existing MCP v2 note contract, not an additional note requirement.
+
 ## Evidence and rollout status
 
 Batch 2321 considered four tickets (62856-62859) and reported apply_rejected

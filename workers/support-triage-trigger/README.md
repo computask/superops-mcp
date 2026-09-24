@@ -13,7 +13,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-7f884b20977f89c094174331ab64e4308ad045de83710b5a6a093cff334f8ed7.
+9a01ed54365302326c5300c2ccc5b6215d0c153a0c6359cf63187de0c99d2b1d.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -35,6 +35,15 @@ URLs, and malformed values remain rejected. Dispatcher polls are transport
 coordination, not additional SuperOps calls; receipt-level upstream accounting
 remains authoritative. Refresh Triage Result Reporter v2 in ChatGPT after this
 Git deployment so its cached schema includes the additive fields.
+
+Safety/access denials (risk_gate, unacceptable_risk, apply_rejected,
+permission_denied, access_denied) are terminal even when read-only telemetry
+exists. Their exact scope is retained for human reconciliation; it is not
+automatically replayed or widened. Persisted retries from an older version are
+fenced after their accepted run drains. Disjoint new email windows can proceed.
+Regression tests cover each denial, active-run draining, stored retry migration,
+attention persistence and a subsequent unrelated email. No risk gate or mutation
+safeguard is weakened.
 
 Cloudflare Git build uses computask/superops-mcp, main, root /:
 

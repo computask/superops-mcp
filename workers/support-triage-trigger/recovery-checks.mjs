@@ -12,7 +12,7 @@ const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url
 
 function fixture(status, age = 120000) {
   let now = Date.parse('2026-09-24T06:00:00Z');
-  const scope = {mode:'new-email-tickets', createdFrom:new Date(now-60000).toISOString(), createdTo:new Date(now).toISOString()};
+  const scope = {mode:'new-email-tickets', source:'EMAIL', createdFrom:new Date(now-60000).toISOString(), createdTo:new Date(now).toISOString()};
   let state = {...createInitialState(), pending:true, pendingReason:'new_message',
     pendingTriggerId:'email-triage:9001', pendingTriggerScope:scope,
     pendingNotificationWindowStartedAt:now-60000, pendingNotificationWindowEndedAt:now,
@@ -24,7 +24,7 @@ function fixture(status, age = 120000) {
   const engine = new CoordinatorEngine({config:loadConfig(vars), now:()=>now,
     store:{load:async()=>structuredClone(state),save:async s=>{state=structuredClone(s);},setAlarm:async at=>alarms.push(at)},
     agent:{getRunDiagnostics:async()=>({status,httpStatus:200}),trigger:async(...args)=>{calls.push(args);return {kind:'accepted',runId:'apirun_retry'};}}});
-  return {engine,calls,alarms,scope,get state(){return state;},advance:()=>{now=state.dueAt ?? now+40000;},expire:()=>{now+=40000;}};
+  return {engine,calls,alarms,scope,get state(){return state;},seed:patch=>{state={...state,...patch};},advance:()=>{now=state.dueAt ?? now+40000;},expire:()=>{now+=40000;}};
 }
 const metadata = {failureStage:'evidence_recovery',ticketsConsidered:1,ticketsCompleted:0,ticketsDeferred:1,
   failureDiagnostics:[{stage:'evidence_recovery',errorCode:'read_failed',message:'Synthetic no-write failure'}]};
@@ -78,6 +78,45 @@ test('unclassified possible-write failure is not retried',async()=>{
   const f=fixture('completed');
   await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',metadata:{...metadata,failureStage:'triage_apply'}});
   f.advance(); await f.engine.processAlarm(); assert.equal(f.calls.length,0);
+});
+for(const errorCode of ['unacceptable_risk','apply_rejected','permission_denied','access_denied']) {
+  test(`a ${errorCode} denial is never retried despite valid no-write telemetry`,async()=>{
+    const f=fixture('completed');
+    const report={...metadata,failureStage:'triage_apply',
+      ticketOutcomes:[{ticketNumber:'90001',outcome:'failed',stage:'triage_apply',reasonCode:'validation'}],
+      failureDiagnostics:[{stage:'triage_apply',errorType:'agent_action',errorCode}],
+      mcpExecution:{toolName:'superops_tickets_field_options',subrequestsUsed:2,requestsByType:{metadataValidation:1,dispatcherPoll:1}}};
+    const outcome=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',metadata:report});
+    assert.equal(outcome.status,'terminal_failure',JSON.stringify(outcome));
+    assert.equal(f.state.needsAttentionScopes.length,1,JSON.stringify(f.state));
+    f.advance(); await f.engine.processAlarm();
+    assert.equal(f.calls.length,0);
+    assert.equal(f.state.needsAttentionScopes.length,1);
+  });
+}
+for(const status of ['completed','in_progress']) {
+  test(`persisted denied retry is ${status==='completed'?'fenced':'held until terminal'} without redispatch`,async()=>{
+    const f=fixture(status);
+    f.seed({executionPhase:'retry_wait',retryCount:1,dueAt:Date.parse('2026-09-24T06:00:00Z'),
+      lastResultReport:{triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',
+        metadata:{failureStage:'triage_apply',failureDiagnostics:[{stage:'triage_apply',errorType:'risk_gate',errorCode:'unacceptable_risk'}]}}});
+    await f.engine.processAlarm();
+    assert.equal(f.calls.length,0);
+    assert.equal(f.state.needsAttentionScopes.length,status==='completed'?1:0);
+    assert.equal(f.state.pending,status!=='completed');
+  });
+}
+test('a held denied window does not block a disjoint new email',async()=>{
+  const f=fixture('completed');
+  await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',
+    metadata:{failureStage:'triage_apply',failureDiagnostics:[{stage:'triage_apply',errorType:'risk_gate',errorCode:'unacceptable_risk'}]}});
+  const next=structuredClone(f.state);
+  registerCreatedNotification(next,loadConfig(vars),Date.parse('2026-09-24T06:02:00Z'),60000);
+  f.seed(next);f.advance();
+  assert.equal((await f.engine.processAlarm()).status,'accepted');
+  assert.equal(f.calls.length,1);
+  assert(Date.parse(f.calls[0][1].createdFrom)>=Date.parse(f.scope.createdTo));
+  assert.equal(f.state.needsAttentionScopes.length,1);
 });
 test('five notification burst gives the final arrival its full ingestion grace',()=>{
   const config=loadConfig(vars), state=createInitialState();

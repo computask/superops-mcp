@@ -2573,6 +2573,11 @@ function isProvenAlreadyHandledCompletion(report) {
 }
 __name(isProvenAlreadyHandledCompletion, "isProvenAlreadyHandledCompletion");
 function terminalApplyFailureNeedsHumanReconciliation(report) {
+  // No-write telemetry proves only that an action has not executed. It is not
+  // permission to retry a policy/security denial as a transient validation error.
+  const diagnostics = [...report.metadata?.failureDiagnostics ?? [], ...report.metadata?.mcpExecution?.failureDiagnostics ?? []];
+  if (diagnostics.some((entry) => entry.errorType === "risk_gate" ||
+    ["unacceptable_risk", "apply_rejected", "permission_denied", "access_denied"].includes(entry.errorCode))) return true;
   if (report.status !== "terminal_failure" || report.metadata?.failureStage !== "triage_apply") {
     return false;
   }
@@ -3705,6 +3710,21 @@ var CoordinatorEngine = class {
       // retry; it is neither a missing callback nor a stale ambiguous run.
       // Active/unknown runs must still drain before any new dispatch.
       const retryRunTerminal = diagnostics.status === "completed" || diagnostics.status === "failed";
+      // Migrate a retry persisted by an older version only after its accepted
+      // run has drained. A denial is never permission for another dispatch.
+      if (retryRunTerminal && terminalApplyFailureNeedsHumanReconciliation(state.lastResultReport)) {
+        const triggerId = state.pendingTriggerId;
+        recordDispatchHistory(state, now, {
+          event: "batch_failed",
+          ...resultHistoryDetails(state.lastResultReport),
+          failureKind: "ambiguous"
+        }, state.pendingTriggerScope);
+        recordReconciliationNeedsAttention(state, state.pendingTriggerScope, now, state.retryCount);
+        const nextAt = this.finishCurrent(state, now);
+        await this.deps.store.save(state);
+        if (nextAt !== void 0) await this.deps.store.setAlarm(nextAt);
+        return { status: "terminal_failure", triggerId, nextAt };
+      }
       if (!retryRunTerminal && !exhaustedZeroWorkConfiguration(state, this.deps.config) && recoverStaleAcceptedRun(state, this.deps.config, now, diagnostics)) {
         const nextAt = state.pending ? Math.max(state.dueAt ?? now, state.cooldownUntil) : void 0;
         await this.deps.store.save(state);
@@ -3976,12 +3996,15 @@ var CoordinatorEngine = class {
       if (nextAt2 !== void 0) await this.deps.store.setAlarm(nextAt2);
       return { status: "complete", triggerId: report.triggerId, nextAt: nextAt2 };
     }
-    if (terminalApplyFailureNeedsHumanReconciliation(report)) {
+    if (terminalApplyFailureNeedsHumanReconciliation(effectiveReport)) {
       recordDispatchHistory(state, now, {
         event: "batch_failed",
         ...resultHistoryDetails(effectiveReport),
         failureKind: "ambiguous"
       }, state.pendingTriggerScope);
+      if (state.pendingTriggerScope !== null) {
+        recordReconciliationNeedsAttention(state, state.pendingTriggerScope, now, state.retryCount);
+      }
       markFailure(state, "ambiguous", now);
       const nextAt2 = this.finishCurrent(state, now);
       await this.deps.store.save(state);
