@@ -13,7 +13,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-5b31a4923dc5dead9b1936f58bba36f3f328e230682c26b7c41ad24909b1ef9f.
+5b71debcb7b2e57a34d0e257578bf16fecbc7fa560af3e839f563f466a455577.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

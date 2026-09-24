@@ -13,7 +13,16 @@ prompt and asserts that it includes the email policy, excludes the scheduled
 policy, and retains the leave/New Calls rule. This source-only correction does
 not change Agent allowlists, MCP policy constraints, or any safety gate.
 
-Reviewed module SHA-256: `5b31a4923dc5dead9b1936f58bba36f3f328e230682c26b7c41ad24909b1ef9f`.
+The live Agent's published instructions also explicitly pause all Ticket
+History/Supabase searches during first-pass stabilization, requiring
+`historyAssessment` values `unknown/degraded`. The trigger's previous prompt
+conflicted by demanding the history checks before apply. It now follows the
+published first-pass mode: no history calls, unknown/degraded metadata, and no
+history sections in the initial note. This does not represent unavailable
+history as a negative finding. Regression coverage asserts the policy and
+routing instructions together.
+
+Reviewed module SHA-256: `5b71debcb7b2e57a34d0e257578bf16fecbc7fa560af3e839f563f466a455577`.
 This is not evidence of a production Git build or live Agent success; verify
 those separately after pushing.
 

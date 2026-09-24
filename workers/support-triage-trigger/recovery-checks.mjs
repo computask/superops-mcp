@@ -31,6 +31,9 @@ test('email trigger directs the Agent to the email policy, never the scheduled p
   assert(prompt.includes('policyMode "email-new-calls-v2"'));
   assert(prompt.includes('in email-new-calls-v2'));
   assert(!prompt.includes('scheduled-new-calls-v2'));
+  assert(prompt.includes('do not call Ticket History MCP, Supabase'));
+  assert(prompt.includes('resultState to degraded'));
+  assert(prompt.includes('omit all history/emerging note sections'));
   assert(prompt.includes('always use action leave and omit target.status'));
 });
 
