@@ -100,6 +100,26 @@ mechanism rather than committing it to this file.
 
 ## Cloudflare Worker Deployment Notes
 
+### Direct ChatGPT sign-in: registration lifetime and recovery
+
+ChatGPT reuses its dynamically registered OAuth client ID across reconnects.
+Client registration metadata therefore has no automatic expiry; access tokens
+and refresh-token grants retain the provider's normal expiry. Cloudflare Access,
+the staff allowlist, exact registered callback matching and S256 PKCE are unchanged.
+Existing KV registrations retain their old TTL until separately migrated: changing
+the code does not resurrect a missing registration or remove existing KV expiry.
+
+`oauth.authorize_rejected` records only a fixed reason and diagnostic ID, never
+the authorization URL, identity, state, tokens, or provider error text.
+`client_registration_missing` means the connection must obtain a fresh registration
+or an administrator must restore its independently verified original registration.
+Do not auto-register a supplied client ID, infer a missing client's authentication
+method, or broaden its redirect allowlist. Verify the original client metadata or
+the connector's current configuration before any repair. Keep private backups of
+changed existing records outside Git. Never remove user grants as routine cleanup.
+
+### Runtime configuration
+
 - Worker name: `superops-mcp`
 - MCP endpoint: `https://<your-mcp-host>/mcp`
 - Health endpoint: `https://<your-mcp-host>/health`

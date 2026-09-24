@@ -783,10 +783,30 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
   let authRequest: AuthRequest;
   try {
     authRequest = await oauthApi.parseAuthRequest(request);
-  } catch {
+  } catch (error) {
+    // Never log the request URL, provider error text, state, PKCE challenge or
+    // identity. Provider errors can contain attacker-controlled input.
+    const providerMessage = error instanceof Error ? error.message : "";
+    const reason = providerMessage === "Invalid client. The clientId provided does not match to this client."
+      ? "client_registration_missing"
+      : providerMessage === "Invalid redirect URI. The redirect URI provided does not match any registered URI for this client."
+        ? "redirect_uri_mismatch"
+        : providerMessage === "The plain PKCE method is not allowed. Use S256 instead."
+          ? "pkce_method_rejected"
+          : "authorization_request_rejected";
+    const diagnosticId = crypto.randomUUID();
+    console.warn(JSON.stringify({ event: "oauth.authorize_rejected", reason, diagnosticId }));
     return json(
-      { error: "invalid_request", message: "Invalid authorization request." },
-      400
+      {
+        error: "invalid_request",
+        message: reason === "client_registration_missing"
+          ? "This ChatGPT connection's OAuth client registration is missing or expired. Reconnect SO MCP v6 with a fresh client registration, or ask the workspace administrator to repair its existing registration."
+          : "Invalid authorization request.",
+        reason,
+        diagnosticId,
+      },
+      400,
+      { "Cache-Control": "no-store" }
     );
   }
 
@@ -1190,6 +1210,11 @@ function getChatGptOAuthOptions(env: Env): OAuthProviderOptions<Env> {
     authorizeEndpoint: `${authServer}/authorize`,
     tokenEndpoint: `${authServer}/token`,
     clientRegistrationEndpoint: `${authServer}/register`,
+    // ChatGPT retains its DCR client ID across user reconnects. The provider's
+    // 90-day default silently deletes that metadata and strands valid grants.
+    // Registration metadata is not an access credential: Access identity,
+    // exact redirects, PKCE, and normal token/grant expiry remain unchanged.
+    clientRegistrationTTL: undefined,
     scopesSupported: scopes,
     allowPlainPKCE: false,
     resourceMetadata: {

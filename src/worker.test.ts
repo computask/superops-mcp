@@ -1860,6 +1860,67 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(res.status).toBe(403);
   });
 
+  it("retains DCR client metadata past 90 days without extending access tokens or grants", async () => {
+    const kv = createMemoryKv();
+    const env = chatGptEnv({ OAUTH_KV: kv });
+    const clientId = await registerChatGptClient(env);
+    await getOAuthAccessToken(env, { clientId });
+    const tokenKeys = (await kv.list({ prefix: "token:" })).keys;
+    const grantKeys = (await kv.list({ prefix: "grant:" })).keys;
+    expect(tokenKeys.length).toBeGreaterThan(0);
+    expect(grantKeys.length).toBeGreaterThan(0);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 91 * 24 * 60 * 60 * 1000);
+    try {
+      expect(await kv.get(`client:${clientId}`, { type: "json" })).toMatchObject({
+        clientId, redirectUris: [CHATGPT_REDIRECT_URI], tokenEndpointAuthMethod: "none",
+      });
+      for (const key of [...tokenKeys, ...grantKeys]) expect(await kv.get(key.name)).toBeNull();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each([
+    ["missing client", "client_registration_missing"],
+    ["different redirect", "redirect_uri_mismatch"],
+    ["plain PKCE", "pkce_method_rejected"],
+  ])("diagnoses %s without accepting it or leaking OAuth inputs", async (scenario, reason) => {
+    const kv = createMemoryKv();
+    const env = chatGptEnv({ OAUTH_KV: kv });
+    const clientId = await registerChatGptClient(env);
+    if (scenario === "missing client") await kv.delete(`client:${clientId}`);
+    const url = new URL(`${AUTH_SERVER}/authorize`);
+    url.search = new URLSearchParams({
+      response_type: "code", client_id: clientId,
+      redirect_uri: scenario === "different redirect" ? `${CHATGPT_REDIRECT_URI}-other` : CHATGPT_REDIRECT_URI,
+      code_challenge: "private-challenge-sentinel", state: "private-state-sentinel",
+      code_challenge_method: scenario === "plain PKCE" ? "plain" : "S256",
+      scope: "superops.read", resource: MCP_RESOURCE,
+    }).toString();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const res = await worker.fetch(new Request(url, {
+        headers: { "CF-Access-Jwt-Assertion": await cloudflareAccessJwt(ALLOWED_EMAIL) },
+      }), env);
+      expect(res.status).toBe(400);
+      expect(res.headers.get("Location")).toBeNull();
+      expect(res.headers.get("Cache-Control")).toBe("no-store");
+      const body = await res.json() as { reason: string; diagnosticId: string };
+      expect(body.reason).toBe(reason);
+      expect(body.diagnosticId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: "oauth.authorize_rejected", reason, diagnosticId: body.diagnosticId }));
+      const output = JSON.stringify([body, warn.mock.calls]);
+      for (const secret of [clientId, ALLOWED_EMAIL, CHATGPT_REDIRECT_URI, "private-state-sentinel", "private-challenge-sentinel"]) {
+        expect(output).not.toContain(secret);
+      }
+      expect((await kv.list({ prefix: "grant:" })).keys).toHaveLength(0);
+      expect((await kv.list({ prefix: "token:" })).keys).toHaveLength(0);
+      if (scenario === "missing client") expect(await kv.get(`client:${clientId}`)).toBeNull();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("rejects /authorize for a non-allowed Access user", async () => {
     const env = chatGptEnv();
     const clientId = await registerChatGptClient(env);
