@@ -124,5 +124,61 @@ Workspace billing was inspected read-only after both failed Agent runs: it
 showed 1,215 credits / GBP 48.59 available. An exhausted balance is therefore
 not established as the cause; the Agent API supplied only run_failed.
 
+Post-push verification for d7e9050: all three Git builds succeeded and all three
+actual deployments were at 100%: MCP 0624063c-9e35-429f-a939-81c79fae2855,
+trigger 485bad49-2fb9-468a-9995-b2cd21967704 and collector
+dc5c94d8-8d65-43f7-98f1-9e277db7e3c0. A fresh read-only ticket 62868 check
+persisted two dispatcher submissions in D1 at 07:12:43.327 and 07:12:44.485,
+getTicket and getTicketNoteList, both HTTP 200/success with Worker outcome ok.
+Three receipt polls in that invocation were not counted as SuperOps calls.
+Logging is restored going forward; the gap has not been backfilled.
+
+## Logged final diagnostic: 62869 — passed
+
+One distinct controlled email LOGGED-20260924-01 was sent after logging was
+restored, at 07:14:23.160. This was not a replay of a held failed scope.
+Ticket createdTime: 07:14:23.000. Notification: 07:14:30.565. Dispatch:
+07:14:46.565. One Agent dispatch, with the exact frozen window retained.
+Private note created: 07:17:58.314 (215.314 seconds after ticket creation).
+Durable operation terminal Completed: 07:18:03.656. Callback: 07:18:38.413.
+Fresh independent safe read and operation-status read verified one private
+TRIAGE SUMMARY, classification updated, New Calls retained, no failures,
+pending items, partial writes or ambiguity. The ledger confirms exactly two
+physical writes: updateTicket and createTicketNote. No manual triage was used.
+The callback's coarse no_action reason must not be read as ticket resolution:
+the authoritative operation explicitly records requestedAction leave and Left.
+
+The private collector captured these 13 successful MCP-to-dispatcher submissions
+for this run (all HTTP 200, no rate_limited outcome). Receipt polling is not
+additional upstream SuperOps traffic. Dispatcher-owned retry totals require its
+own attempt ledger; this table alone is not proof of 13 physical upstream calls.
+
+| Start UTC | Operation | End UTC |
+|---|---|---|
+| 07:15:31.360 | getTicketList | 07:15:33.613 |
+| 07:15:45.704 | getTicket | 07:15:47.739 |
+| 07:15:47.739 | getTicketConversationList | 07:15:50.367 |
+| 07:15:47.739 | getTicketNoteList | 07:15:49.146 |
+| 07:17:01.857 | getTicket | 07:17:05.785 |
+| 07:17:21.821 | getFields | 07:17:23.255 |
+| 07:17:49.324 | getTicket | 07:17:51.393 |
+| 07:17:51.625 | getTicketNoteList | 07:17:53.029 |
+| 07:17:53.607 | updateTicket | 07:17:55.436 |
+| 07:17:55.632 | getTicket | 07:17:57.076 |
+| 07:17:58.049 | createTicketNote | 07:17:59.868 |
+| 07:18:00.071 | getTicketNoteList | 07:18:01.500 |
+| 07:18:01.500 | getTicket | 07:18:02.902 |
+
+The first MCP request began 44.795 seconds after dispatch. The final apply took
+16.936 seconds; most elapsed time was outside that final apply. That gap cannot
+be attributed exclusively to model reasoning because history/tool transport
+also occurs there. No specific cause was exposed for the earlier Agent crashes.
+62867 and 62868 remain held/untriaged; earlier failed test/backlog scopes remain
+unreconciled. No blanket claim that every ticket is now triaged is warranted.
+
+Relevant Agent conversations for troubleshooting:
+- 62867: https://chatgpt.com/c/6ab4c9ae-a5fc-83ed-9af9-77da76e58ebd
+- 62868: https://chatgpt.com/c/6ab4cb0c-4370-83eb-8e47-88c495d53588
+
 The five-ticket proof exceeded the desired two-minute latency. Reliability and
 latency must be reported separately; no 100-percent future guarantee is made.
