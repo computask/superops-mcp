@@ -1,5 +1,30 @@
 # Private SuperOps API attempt table
 
+## Dispatcher migration and collector Git rollout — 24 September 2026
+
+Current rows describe MCP-to-dispatcher submissions to `/graphql`, not physical
+SuperOps upstream calls. Receipt polling is separate transport coordination;
+use the dispatcher's own attempt ledger for exact upstream quota accounting.
+The older direct-SuperOps interpretation below applies only to pre-migration
+rows whose endpoint_host is api.superops.ai or euapi.superops.ai.
+
+The collector was found still running its 18 September version despite the
+MCP's Git deployment. Its last persisted row was 23 September 13:46:36.391 UTC;
+the old allowlist did not admit dispatcher endpoints. Current committed source
+already permits that endpoint. The existing collector is now connected to
+computask/superops-mcp main, root `/`, using the existing MCP build token:
+
+- Build: `npm run build && npx tsc -p diagnostics/tsconfig.json && node --test diagnostics/sql.test.mjs`
+- Deploy (Git CI only): `npx wrangler deploy --config wrangler.api-call-log.jsonc`
+- Preview builds disabled. No database, secret or permission changes.
+
+Verify the actual collector deployment and a new persisted read-only call after
+the push. The logging gap is not automatically backfilled and must not be
+interpreted as zero traffic. A real-SQLite regression covers dispatcher success
+and pending/failure rows in addition to the original direct-endpoint fixtures.
+
+## Collector contract
+
 Every network attempt dispatched through the deployed `SuperOpsClient` emits
 allowlisted start and finish events. `superops-api-call-log` is a private Tail
 Worker that combines them into one immutable D1 row per call ID. Each retry has

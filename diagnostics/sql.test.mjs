@@ -36,6 +36,20 @@ test('timeline resolves canonical ticket IDs without confusing tenants', () => {
   assert.equal(db.prepare('SELECT resolved_ticket_number FROM superops_api_call_timeline WHERE call_id=?').get(record(1).call_id).resolved_ticket_number, '62521');
   db.close();
 });
+test('dispatcher submissions persist as transport attempts, not direct upstream calls', () => {
+  const db = database();
+  insert(db, record(4, { endpointHost: 'superops-api-dispatcher.taskgroup.co.uk' }));
+  insert(db, record(5, { endpointHost: 'superops-api-dispatcher.taskgroup.co.uk',
+    ok: false, outcome: 'network_error', errorClass: 'DispatcherPending' }));
+  const rows = db.prepare('SELECT endpoint_host,endpoint_path,outcome,error_class FROM superops_api_calls ORDER BY call_id').all();
+  assert.equal(rows.length, 2);
+  for (const row of rows) {
+    assert.equal(row.endpoint_host, 'superops-api-dispatcher.taskgroup.co.uk');
+    assert.equal(row.endpoint_path, '/graphql');
+  }
+  assert.equal(rows[1].error_class, 'DispatcherPending');
+  db.close();
+});
 test('bounded retention removes expired diagnostics and leaves recent attempts', () => {
   const db = database(); insert(db, record(1, { startedAt: '2026-08-01T10:00:00.000Z' })); insert(db, record(2));
   db.prepare('DELETE FROM superops_api_calls WHERE call_id IN (SELECT call_id FROM superops_api_calls WHERE started_at < ? ORDER BY started_at LIMIT 10000)').run('2026-08-19T00:00:00.000Z');
