@@ -564,6 +564,7 @@ var MCP_REQUEST_TYPES = /* @__PURE__ */ new Set([
   "fallbackWrite",
   "verificationRead",
   "retry",
+  "dispatcherPoll",
   "custom"
 ]);
 var MCP_OPERATION_TYPES = /* @__PURE__ */ new Set([
@@ -755,7 +756,9 @@ function parseMcpRequestTrace(value) {
     "status",
     "retryCount",
     "durationMs",
-    "ok"
+    "ok", "provider", "startedAt", "completedAt", "endpointHost", "httpStatus",
+    "outcome", "errorClass", "graphqlCode", "rateLimited", "retryAfterSupplied",
+    "responseHadData", "dispatcherRequestId", "dispatcherState"
   ])) return null;
   const index = boundedInteger(value.index, 1, 1e3);
   if (index === void 0 || index === null) return null;
@@ -771,8 +774,40 @@ function parseMcpRequestTrace(value) {
   const durationMs = boundedInteger(value.durationMs, 0, 864e5);
   if (retryCount === null || durationMs === null) return null;
   if (value.ok !== void 0 && typeof value.ok !== "boolean") return null;
+  const telemetry = {};
+  for (const key of ["rateLimited", "retryAfterSupplied", "responseHadData"]) {
+    if (value[key] === void 0) continue;
+    if (typeof value[key] !== "boolean") return null;
+    telemetry[key] = value[key];
+  }
+  for (const key of ["errorClass", "graphqlCode", "dispatcherRequestId", "dispatcherState"]) {
+    const token = safeReference(value[key]);
+    if (token === null) return null;
+    if (token !== void 0) telemetry[key] = token;
+  }
+  for (const key of ["startedAt", "completedAt"]) {
+    if (value[key] === void 0) continue;
+    if (typeof value[key] !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value[key]) || !Number.isFinite(Date.parse(value[key]))) return null;
+    telemetry[key] = value[key];
+  }
+  if (value.provider !== void 0) {
+    if (!["superops", "internal", "dispatcher"].includes(value.provider)) return null;
+    telemetry.provider = value.provider;
+  }
+  if (value.endpointHost !== void 0) {
+    if (typeof value.endpointHost !== "string" || !/^[A-Za-z0-9.-]{1,253}$/.test(value.endpointHost)) return null;
+    telemetry.endpointHost = value.endpointHost;
+  }
+  if (value.outcome !== void 0) {
+    if (!["success", "http_error", "graphql_error", "rate_limited", "network_error", "request_timeout", "malformed_response", "internal_error"].includes(value.outcome)) return null;
+    telemetry.outcome = value.outcome;
+  }
+  const httpStatus = boundedInteger(value.httpStatus, 100, 599);
+  if (httpStatus === null) return null;
+  if (httpStatus !== void 0) telemetry.httpStatus = httpStatus;
   return {
     index,
+    ...telemetry,
     type: value.type,
     ...operationType === void 0 ? {} : { operationType },
     ...operationName === void 0 ? {} : { operationName },
@@ -4687,6 +4722,7 @@ function toolDefinition() {
                     fallbackWrite: { type: "integer", minimum: 0, maximum: 1e3 },
                     verificationRead: { type: "integer", minimum: 0, maximum: 1e3 },
                     retry: { type: "integer", minimum: 0, maximum: 1e3 },
+                    dispatcherPoll: { type: "integer", minimum: 0, maximum: 1e3 },
                     custom: { type: "integer", minimum: 0, maximum: 1e3 }
                   }
                 },
@@ -4710,6 +4746,7 @@ function toolDefinition() {
                           "fallbackWrite",
                           "verificationRead",
                           "retry",
+                          "dispatcherPoll",
                           "custom"
                         ]
                       },
@@ -4727,7 +4764,20 @@ function toolDefinition() {
                       },
                       retryCount: { type: "integer", minimum: 0, maximum: 100 },
                       durationMs: { type: "integer", minimum: 0, maximum: 864e5 },
-                      ok: { type: "boolean" }
+                      ok: { type: "boolean" },
+                      provider: { type: "string", enum: ["superops", "internal", "dispatcher"] },
+                      startedAt: { type: "string", format: "date-time", maxLength: 24 },
+                      completedAt: { type: "string", format: "date-time", maxLength: 24 },
+                      endpointHost: { type: "string", pattern: "^[A-Za-z0-9.-]{1,253}$" },
+                      httpStatus: { type: "integer", minimum: 100, maximum: 599 },
+                      outcome: { type: "string", enum: ["success", "http_error", "graphql_error", "rate_limited", "network_error", "request_timeout", "malformed_response", "internal_error"] },
+                      errorClass: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$" },
+                      graphqlCode: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$" },
+                      dispatcherRequestId: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$" },
+                      dispatcherState: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$" },
+                      rateLimited: { type: "boolean" },
+                      retryAfterSupplied: { type: "boolean" },
+                      responseHadData: { type: "boolean" }
                     }
                   }
                 },

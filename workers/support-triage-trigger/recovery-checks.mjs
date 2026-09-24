@@ -5,8 +5,8 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 // Exercise the actual preserved production module, exposing internals only in
 // this in-memory test module. No test route or export is shipped to production.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
-const {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope} = await import(
-  `data:text/javascript;base64,${Buffer.from(source + '\nexport {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope};').toString('base64')}`
+const {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition} = await import(
+  `data:text/javascript;base64,${Buffer.from(source + '\nexport {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
@@ -108,4 +108,31 @@ test('notifications during a frozen run preserve its exact scope',()=>{
   registerCreatedNotification(state,config,start+20000,60000);
   assert.deepEqual(state.pendingTriggerScope,scope);
   assert.equal(state.queuedPending,true);
+});
+const dispatcherTrace={index:1,provider:'dispatcher',type:'paginationRead',operationType:'query',
+  operationName:'getTicketList',status:200,retryCount:0,startedAt:'2026-09-24T06:00:00.000Z',
+  completedAt:'2026-09-24T06:00:01.000Z',endpointHost:'superops-api-dispatcher.taskgroup.co.uk',
+  httpStatus:200,outcome:'success',dispatcherRequestId:'synthetic-request-1',dispatcherState:'succeeded',
+  responseHadData:true,rateLimited:false,retryAfterSupplied:false,durationMs:1000,ok:true};
+test('dispatcher transport and poll telemetry survive the callback parser exactly',()=>{
+  const execution={toolName:'superops_tickets_query',subrequestsUsed:2,
+    requestsByType:{paginationRead:1,dispatcherPoll:1},requestTrace:[dispatcherTrace,
+      {...dispatcherTrace,index:2,type:'dispatcherPoll',operationName:'dispatcherStatus'}]};
+  assert.deepEqual(parseSafeMcpExecution(execution),execution);
+  const schema=toolDefinition().inputSchema.properties.metadata.properties.mcpExecution;
+  assert.equal(schema.additionalProperties,false);
+  assert(schema.properties.requestsByType.properties.dispatcherPoll);
+  const traceSchema=schema.properties.requestTrace.items;
+  assert.equal(traceSchema.additionalProperties,false);
+  assert(traceSchema.properties.type.enum.includes('dispatcherPoll'));
+  for(const key of Object.keys(dispatcherTrace)) assert(traceSchema.properties[key],key);
+});
+test('legacy traces remain valid and unsafe or malformed telemetry is rejected',()=>{
+  const legacy={requestTrace:[{index:1,type:'initialRead',status:200,ok:true}]};
+  assert.deepEqual(parseSafeMcpExecution(legacy),legacy);
+  for(const invalid of [{headers:{Authorization:'synthetic'}},{endpointHost:'https://host/path?token=synthetic'},
+    {provider:'unknown'},{startedAt:'invalid'},{rateLimited:'false'},{httpStatus:999},
+    {dispatcherRequestId:'Bearer synthetic'},{errorClass:'customer text'}]) {
+    assert.equal(parseSafeMcpExecution({requestTrace:[{...dispatcherTrace,...invalid}]}),null);
+  }
 });

@@ -13,7 +13,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-a64f214bcd6d574bdf7d34364b0f3a57ea0c3be472487b9411203f3af5e531e0.
+7f884b20977f89c094174331ab64e4308ad045de83710b5a6a093cff334f8ed7.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -27,6 +27,14 @@ cannot indefinitely postpone the first batch or widen a frozen run. This is a
 bounded ingestion allowance, not a guarantee against arbitrary upstream delays.
 Regression tests include the exact final-arrival timing, sustained arrivals,
 and notifications received during a frozen run.
+
+The callback parser and published tool schema now accept the MCP's bounded
+dispatcher telemetry: dispatcherPoll, provider, timing, host-only endpoint,
+receipt ID/state, and structured outcome flags. Unknown keys, headers, bodies,
+URLs, and malformed values remain rejected. Dispatcher polls are transport
+coordination, not additional SuperOps calls; receipt-level upstream accounting
+remains authoritative. Refresh Triage Result Reporter v2 in ChatGPT after this
+Git deployment so its cached schema includes the additive fields.
 
 Cloudflare Git build uses computask/superops-mcp, main, root /:
 
