@@ -3,6 +3,20 @@
 All timestamps below are UTC. Controlled emails were explicitly authorized.
 Only ticket numbers, timing and safe outcome metadata are retained here.
 
+## Follow-up source correction
+
+The production trigger prompt for `new-email-tickets` incorrectly instructed
+the Agent to use `scheduled-new-calls-v2`, even though the supported email
+policy is `email-new-calls-v2`. The prompt now names the email policy and its
+New Calls routing rule explicitly. A regression test builds the actual email
+prompt and asserts that it includes the email policy, excludes the scheduled
+policy, and retains the leave/New Calls rule. This source-only correction does
+not change Agent allowlists, MCP policy constraints, or any safety gate.
+
+Reviewed module SHA-256: `5b31a4923dc5dead9b1936f58bba36f3f328e230682c26b7c41ad24909b1ef9f`.
+This is not evidence of a production Git build or live Agent success; verify
+those separately after pushing.
+
 ## Git-only rollout
 
 Repository: computask/superops-mcp, branch main. Both superops-mcp and

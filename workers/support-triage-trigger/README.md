@@ -13,7 +13,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-619133e5a45fe85cae9633d2258c953b7f6844335e5a361b370f4d29dc54a057.
+5b31a4923dc5dead9b1936f58bba36f3f328e230682c26b7c41ad24909b1ef9f.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -87,7 +87,8 @@ reusing the existing superops-mcp build token. No new token or permissions were
 created. The first post-connection push starts the Git-managed restart.
 
 - Build: npm --prefix workers/support-triage-trigger test && npm --prefix workers/support-triage-trigger run build
-- Deploy (CI only): npx wrangler deploy --config workers/support-triage-trigger/wrangler.jsonc
+- Deployment: commit and push to main; the existing Cloudflare Git-connected
+  production build publishes the change. Do not deploy this Worker with Wrangler.
 - Preview builds disabled: no second live mailbox consumer.
 - Only change this folder for trigger-only updates. The root MCP configuration
   still targets superops-mcp and never this Worker.

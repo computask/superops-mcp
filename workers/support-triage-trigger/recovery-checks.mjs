@@ -5,8 +5,8 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 // Exercise the actual preserved production module, exposing internals only in
 // this in-memory test module. No test route or export is shipped to production.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
-const {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState} = await import(
-  `data:text/javascript;base64,${Buffer.from(source + '\nexport {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState};').toString('base64')}`
+const {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState} = await import(
+  `data:text/javascript;base64,${Buffer.from(source + '\nexport {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
@@ -22,6 +22,16 @@ test('the single metadata lookup covers closure fields before a resolve plan',()
   assert(source.includes('include any missing cause and resolutionCode in that same lookup'));
   assert(source.includes('missing closure-only cause/resolutionCode is not a reason to stop'));
   assert(source.includes('Never invent option values, resolve an actionable ticket'));
+});
+
+test('email trigger directs the Agent to the email policy, never the scheduled policy',()=>{
+  const prompt=buildAgentInput('email-triage:regression',{
+    mode:'new-email-tickets',source:'EMAIL',createdFrom:'2026-09-24T06:00:00.000Z',createdTo:'2026-09-24T06:01:00.000Z'
+  });
+  assert(prompt.includes('policyMode "email-new-calls-v2"'));
+  assert(prompt.includes('in email-new-calls-v2'));
+  assert(!prompt.includes('scheduled-new-calls-v2'));
+  assert(prompt.includes('always use action leave and omit target.status'));
 });
 
 function fixture(status, age = 120000) {

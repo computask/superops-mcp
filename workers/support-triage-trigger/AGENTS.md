@@ -7,7 +7,7 @@ Git-connected build. Never upload/deploy manually.
 
 The initial src/index.js is the exact deployed module, preserved to avoid
 replacing production with a stale local TypeScript copy. Its baseline hash is
-checked in verify.mjs. Any future source reconciliation needs a reviewed diff,
+checked in verify.mjs and README.md. Every source change needs a reviewed diff,
 runtime regression tests and an explicit updated provenance record.
 
 Preserve TriageCoordinator, TRIAGE_COORDINATOR, namespace
