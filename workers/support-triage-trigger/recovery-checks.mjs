@@ -5,8 +5,8 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 // Exercise the actual preserved production module, exposing internals only in
 // this in-memory test module. No test route or export is shipped to production.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
-const {CoordinatorEngine, createInitialState, loadConfig} = await import(
-  `data:text/javascript;base64,${Buffer.from(source + '\nexport {CoordinatorEngine, createInitialState, loadConfig};').toString('base64')}`
+const {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope} = await import(
+  `data:text/javascript;base64,${Buffer.from(source + '\nexport {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
@@ -78,4 +78,34 @@ test('unclassified possible-write failure is not retried',async()=>{
   const f=fixture('completed');
   await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',metadata:{...metadata,failureStage:'triage_apply'}});
   f.advance(); await f.engine.processAlarm(); assert.equal(f.calls.length,0);
+});
+test('five notification burst gives the final arrival its full ingestion grace',()=>{
+  const config=loadConfig(vars), state=createInitialState();
+  const start=Date.parse('2026-09-24T06:17:39.852Z');
+  for(const offset of [0,1798,2433,2895,12438]) registerCreatedNotification(state,config,start+offset,60000);
+  assert.equal(state.dueAt,start+12438+16000);
+  assert.equal(state.queuedPending,false);
+  const scope=createPendingTriggerScope(state,config,state.dueAt);
+  assert(Date.parse(scope.createdTo)>Date.parse('2026-09-24T06:17:58.517Z'));
+});
+test('sustained arrivals spill into next window without starving or widening the first',()=>{
+  const config=loadConfig(vars), state=createInitialState(), start=Date.parse('2026-09-24T06:00:00Z');
+  registerCreatedNotification(state,config,start,60000);
+  registerCreatedNotification(state,config,start+29000,60000);
+  const firstDue=state.dueAt, firstEnd=state.pendingNotificationWindowEndedAt;
+  registerCreatedNotification(state,config,start+30000,60000);
+  assert.equal(state.dueAt,firstDue);
+  assert.equal(state.pendingNotificationWindowEndedAt,firstEnd);
+  assert.equal(state.queuedPending,true);
+  assert.equal(state.queuedLastNotificationAt,start+30000);
+  assert(state.queuedDueAt>=start+30000+16000);
+});
+test('notifications during a frozen run preserve its exact scope',()=>{
+  const config=loadConfig(vars), state=createInitialState(), start=Date.parse('2026-09-24T06:00:00Z');
+  registerCreatedNotification(state,config,start,60000);
+  const scope=createPendingTriggerScope(state,config,state.dueAt);
+  state.pendingTriggerScope=scope;
+  registerCreatedNotification(state,config,start+20000,60000);
+  assert.deepEqual(state.pendingTriggerScope,scope);
+  assert.equal(state.queuedPending,true);
 });

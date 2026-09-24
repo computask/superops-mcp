@@ -13,10 +13,20 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-fc42cb06a15a6c7721023f43bde4f0b3d90b9b130100424c6536bcde39e696fb.
+a64f214bcd6d574bdf7d34364b0f3a57ea0c3be472487b9411203f3af5e531e0.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
+
+The five-email test exposed a second defect: the one-second maximum debounce
+gave later coalesced notifications less than their configured ingestion grace.
+Fast mode now coalesces for at most 30 seconds, plus 15 seconds ingestion grace.
+An isolated notification still dispatches after 16 seconds. Notifications too
+late for that bounded deadline go into the existing next-window queue; they
+cannot indefinitely postpone the first batch or widen a frozen run. This is a
+bounded ingestion allowance, not a guarantee against arbitrary upstream delays.
+Regression tests include the exact final-arrival timing, sustained arrivals,
+and notifications received during a frozen run.
 
 Cloudflare Git build uses computask/superops-mcp, main, root /:
 

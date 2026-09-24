@@ -1481,7 +1481,13 @@ function registerLifecycleEvent(state, event, config, now) {
 }
 __name(registerLifecycleEvent, "registerLifecycleEvent");
 function registerCreatedNotification(state, config, now, lookbackMs) {
-  if (currentBatchIsFrozen(state) || state.queuedPending && state.queuedUnavailableRetryCount > 0) {
+  // Never consume a late notification in a window that cannot give its ticket
+  // the configured ingestion grace. Preserve the first batch's bounded deadline
+  // and retain overflow in the existing next-window queue instead.
+  const exceedsIngestionDeadline = config.fastTargetedModeEnabled && state.pending &&
+    state.debounceWindowStartedAt !== null &&
+    now + dispatchDelayMs(config) > state.debounceWindowStartedAt + maxDispatchDelayMs(config);
+  if (currentBatchIsFrozen(state) || exceedsIngestionDeadline || state.queuedPending && state.queuedUnavailableRetryCount > 0) {
     state.queuedPending = true;
     if (config.scopeMode === "new-email-tickets" || state.queuedReason !== "lifecycle") {
       state.queuedReason = "new_message";
