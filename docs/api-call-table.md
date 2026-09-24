@@ -14,7 +14,8 @@ the old allowlist did not admit dispatcher endpoints. Current committed source
 already permits that endpoint. The existing collector is now connected to
 computask/superops-mcp main, root `/`, using the existing MCP build token:
 
-- Build: `npm run build && npx tsc -p diagnostics/tsconfig.json && node --test diagnostics/sql.test.mjs`
+- Build: `npm run build:api-call-log` (generates ignored Worker runtime types
+  before the separate collector typecheck and real-SQLite tests).
 - Deploy (Git CI only): `npx wrangler deploy --config wrangler.api-call-log.jsonc`
 - Preview builds disabled. No database, secret or permission changes.
 

@@ -16,6 +16,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "build:api-call-log": "npm run build && wrangler types diagnostics/worker-env.d.ts --config wrangler.api-call-log.jsonc && tsc -p diagnostics/tsconfig.json && node --test diagnostics/sql.test.mjs",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "lint": "eslint src --ext .ts",

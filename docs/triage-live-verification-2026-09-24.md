@@ -114,5 +114,15 @@ No permission expansion, migration or retention change. Four real-SQLite tests
 and its separate TypeScript check pass. Live synchronization and a fresh
 persisted read-only submission must be verified after this commit is pushed.
 
+The first Git collector build failed safely before deployment because its
+ignored generated Worker type definitions were present locally but absent in
+CI. The committed build:api-call-log script now generates those definitions
+before typechecking, then runs the four SQLite tests. No runtime code or
+permissions changed for this build correction.
+
+Workspace billing was inspected read-only after both failed Agent runs: it
+showed 1,215 credits / GBP 48.59 available. An exhausted balance is therefore
+not established as the cause; the Agent API supplied only run_failed.
+
 The five-ticket proof exceeded the desired two-minute latency. Reliability and
 latency must be reported separately; no 100-percent future guarantee is made.
