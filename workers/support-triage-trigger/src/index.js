@@ -2219,25 +2219,52 @@ function attentionFenceIsActive(state, config) {
   return separationEnabled(config) || state.candidateAttentionFenceActive || state.attentionBlockedWindow !== null;
 }
 __name(attentionFenceIsActive, "attentionFenceIsActive");
+function opaqueAttentionCutoff(state, now) {
+  const acceptedAt = Date.parse(state.lastAcceptedTrigger?.acceptedAt ?? "");
+  const timestamps = [state.needsAttentionAt, state.attentionBlockedWindow?.notificationWindowEndedAt, acceptedAt]
+    .filter((value) => Number.isFinite(value));
+  return timestamps.length === 0 ? now : Math.max(...timestamps);
+}
+__name(opaqueAttentionCutoff, "opaqueAttentionCutoff");
 function scopeOverlapsAttention(state, config, candidate) {
   if (!attentionFenceIsActive(state, config)) return false;
-  if (attentionScopes(state).some((scope) => targetedScopesOverlap(scope, candidate))) return true;
   const blockedScope = attentionBlockedWindowScope(state, config);
-  return blockedScope !== null && targetedScopesOverlap(blockedScope, candidate);
+  const fences = [...attentionScopes(state), blockedScope].filter(Boolean);
+  if (fences.length === 0 && !state.candidateAttentionFenceActive) return false;
+  if (candidate?.mode === "new-email-tickets") {
+    // A legacy/full-queue fence cannot describe which future email timestamps
+    // overlap its uncertain writes. Keep the original bounded attention window
+    // as the quarantine boundary, but do not let an opaque fence stop later
+    // email windows. Use the incident time as a fallback cutoff; if it was not
+    // persisted, the current processing time is the conservative cutoff.
+    const temporalFences = fences.filter((scope) =>
+      scope.mode === "new-email-tickets" && finiteScopeBounds(scope) !== null
+    );
+    const bounds = finiteScopeBounds(candidate);
+    if (bounds === null) return true;
+    if (temporalFences.some((scope) => targetedScopesOverlap(scope, candidate))) return true;
+    const opaqueFenceExists = temporalFences.length !== fences.length || temporalFences.length === 0;
+    return opaqueFenceExists && bounds.from < opaqueAttentionCutoff(state, Date.now());
+  }
+  return fences.some((scope) => targetedScopesOverlap(scope, candidate));
 }
 __name(scopeOverlapsAttention, "scopeOverlapsAttention");
-// Release only an undispatched suffix beyond EVERY overlapping fence. Keep
-// legacy aggregated holds conservative: they are not proof of safe gaps.
-// This never changes an accepted run, clears a hold, or replays its mutation.
-function attentionSafeTail(state, config, candidate) {
+// Release only an undispatched suffix beyond EVERY comparable time-bounded
+// fence. Opaque legacy fences do not describe future email timestamps; the
+// exact durable notification window remains the quarantine boundary. This
+// never changes an accepted run, clears a hold, or replays its mutation.
+function attentionSafeTail(state, config, candidate, now) {
   if (!config.attentionTailIsolationEnabled || candidate?.mode !== "new-email-tickets") return null;
   const bounds = finiteScopeBounds(candidate);
   if (bounds === null) return null;
   let from = bounds.from;
-  const fences = [...attentionScopes(state), attentionBlockedWindowScope(state, config)].filter(Boolean);
+  const allFences = [...attentionScopes(state), attentionBlockedWindowScope(state, config)].filter(Boolean);
+  const fences = allFences
+    .filter((fence) => fence?.mode === "new-email-tickets" && finiteScopeBounds(fence) !== null);
+  const opaqueFenceExists = fences.length !== allFences.length || fences.length === 0;
+  if (opaqueFenceExists) from = Math.max(from, opaqueAttentionCutoff(state, now));
   for (const fence of fences) {
     const held = finiteScopeBounds(fence);
-    if (fence.mode !== "new-email-tickets" || held === null) return null;
     if (held.from < bounds.to && bounds.from < held.to) from = Math.max(from, held.to);
   }
   if (from <= bounds.from || from >= bounds.to) return null;
@@ -2248,7 +2275,7 @@ function isolateAttentionTail(state, config, now, queued) {
   // A frozen retry must retain its exact scope and accepted-write truth.
   if (!queued && (state.pendingTriggerScope !== null || state.dispatchAttempt > 0)) return false;
   const candidate = queued ? queuedEmailScope(state, config) : pendingEmailScopeForComparison(state, config);
-  const tail = attentionSafeTail(state, config, candidate);
+  const tail = attentionSafeTail(state, config, candidate, now);
   const original = queued ? attentionBlockedWindowFromQueued(state) : attentionBlockedWindowFromPending(state);
   if (tail === null || original === null) return false;
   const boundary = Date.parse(tail.createdFrom);

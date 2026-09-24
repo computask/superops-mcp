@@ -74,7 +74,7 @@ test('exact overlapping-lookback regression releases later ticket after ambiguou
   assert.deepEqual(restored.pendingTriggerScope,dispatched);
   assert.deepEqual(restored.needsAttentionScopes,[failedScope]);
 });
-test('tail release respects every fence and never releases a legacy aggregate gap',()=>{
+test('tail release respects every comparable fence and never releases a legacy aggregate gap',()=>{
   const s=overlappingQueue(), config=loadConfig(vars);
   s.needsAttentionScopes.push(emailScope('2026-09-24T09:30:20Z','2026-09-24T09:30:40Z'));
   s.attentionBlockedWindow={reason:'new_message',notificationWindowStartedAt:Date.parse('2026-09-15T13:00:00Z'),
@@ -85,12 +85,10 @@ test('tail release respects every fence and never releases a legacy aggregate ga
   assert.equal(s.queuedNotificationLookbackMs,0);
   assert.equal(s.attentionBlockedWindow.notificationWindowEndedAt,Date.parse('2026-09-24T09:31:00Z'));
 });
-for(const variant of ['fully-overlapping','invalid-fence','full-queue-fence','rollback']) {
+for(const variant of ['fully-overlapping','rollback']) {
   test(`${variant} retains the entire blocked window`,()=>{
     const s=overlappingQueue(), config=loadConfig(vars);
     if(variant==='fully-overlapping') s.queuedNotificationWindowEndedAt=Date.parse('2026-09-24T09:29:40Z');
-    if(variant==='invalid-fence') s.needsAttentionScopes.push({...failedScope,createdTo:'invalid'});
-    if(variant==='full-queue-fence') s.needsAttentionScopes.push({mode:'full-new-calls',reason:'configured'});
     if(variant==='rollback') config.attentionTailIsolationEnabled=false;
     refreshQueuedAttentionBlock(s,config);
     assert.equal(s.queuedNotificationWindowStartedAt,null);
@@ -98,6 +96,61 @@ for(const variant of ['fully-overlapping','invalid-fence','full-queue-fence','ro
     assert(!s.dispatchHistory.some(e=>e.event==='attention_tail_released'));
   });
 }
+test('opaque full-queue fence cannot block a time-bounded safe email tail',()=>{
+  const s=overlappingQueue(),config=loadConfig(vars);
+  s.needsAttentionAt=Date.parse(failedScope.createdTo);
+  s.needsAttentionScopes.push({mode:'full-new-calls',reason:'legacy-aggregate'});
+  s.needsAttentionScopes.push({...failedScope,createdTo:'invalid'});
+  refreshQueuedAttentionBlock(s,config,Date.parse('2026-09-24T09:32:16Z'));
+  assert.equal(s.queuedNotificationWindowStartedAt,Date.parse('2026-09-24T09:30:12.964Z'));
+  assert.equal(s.queuedNotificationLookbackMs,
+    Date.parse('2026-09-24T09:30:12.964Z')-Date.parse(failedScope.createdTo));
+  assert(!scopeOverlapsAttention(s,config,{mode:'new-email-tickets',source:'EMAIL',
+    createdFrom:failedScope.createdTo,createdTo:'2026-09-24T09:32:34.626Z'}));
+  assert.equal(s.needsAttentionScopes.at(-2).mode,'full-new-calls');
+  assert.equal(s.needsAttentionScopes.at(-1).createdTo,'invalid');
+  assert(s.attentionBlockedWindow,'the uncertain prefix remains durably held');
+});
+test('opaque fences release later email from the persisted incident-time boundary',()=>{
+  const s=createInitialState(),config=loadConfig(vars);
+  s.needsAttentionScopes=[{mode:'full-new-calls',reason:'legacy-aggregate'}];
+  s.needsAttentionScope=s.needsAttentionScopes[0];s.candidateAttentionFenceActive=true;
+  s.needsAttentionAt=Date.parse('2026-09-24T09:31:00Z');
+  const candidate=emailScope('2026-09-24T09:31:00Z','2026-09-24T09:32:00Z');
+  assert(!scopeOverlapsAttention(s,config,candidate),'events at or after the incident boundary are independent');
+  Object.assign(s,{queuedPending:true,queuedReason:'new_message',
+    queuedNotificationWindowStartedAt:Date.parse('2026-09-24T09:30:00Z'),
+    queuedNotificationWindowEndedAt:Date.parse(candidate.createdTo),queuedNotificationLookbackMs:60000,
+    queuedLastNotificationAt:Date.parse(candidate.createdTo),queuedDueAt:Date.parse(candidate.createdTo)});
+  refreshQueuedAttentionBlock(s,config,Date.parse(candidate.createdTo));
+  assert.equal(s.queuedNotificationWindowStartedAt,Date.parse(candidate.createdFrom));
+  assert.equal(s.queuedNotificationLookbackMs,0);
+  assert(s.attentionBlockedWindow,'the uncertain prefix remains durably held');
+});
+test('missing incident time uses the current queue evaluation time rather than starving future tickets',()=>{
+  const s=createInitialState(),config=loadConfig(vars);
+  s.needsAttentionScopes=[{mode:'full-new-calls',reason:'legacy-aggregate'}];
+  s.needsAttentionScope=s.needsAttentionScopes[0];s.candidateAttentionFenceActive=true;
+  const candidate=emailScope('2026-09-24T09:30:00Z','2026-09-24T09:32:00Z');
+  Object.assign(s,{queuedPending:true,queuedReason:'new_message',
+    queuedNotificationWindowStartedAt:Date.parse(candidate.createdFrom),
+    queuedNotificationWindowEndedAt:Date.parse(candidate.createdTo),queuedNotificationLookbackMs:0,
+    queuedLastNotificationAt:Date.parse(candidate.createdTo),queuedDueAt:Date.parse(candidate.createdTo)});
+  refreshQueuedAttentionBlock(s,config,Date.parse('2026-09-24T09:31:00Z'));
+  assert.equal(s.queuedNotificationWindowStartedAt,Date.parse('2026-09-24T09:31:00Z'));
+  assert(s.attentionBlockedWindow,'the pre-cutoff candidate prefix remains quarantined');
+});
+test('reconciliation mode without any attention record does not invent a blocker',()=>{
+  const s=createInitialState(),config=loadConfig(vars),candidate=emailScope('2026-09-24T09:30:00Z','2026-09-24T09:32:00Z');
+  Object.assign(s,{queuedPending:true,queuedReason:'new_message',
+    queuedNotificationWindowStartedAt:Date.parse(candidate.createdFrom),
+    queuedNotificationWindowEndedAt:Date.parse(candidate.createdTo),queuedNotificationLookbackMs:0,
+    queuedLastNotificationAt:Date.parse(candidate.createdTo),queuedDueAt:Date.parse(candidate.createdTo)});
+  assert.equal(scopeOverlapsAttention(s,config,candidate),false);
+  refreshQueuedAttentionBlock(s,config,Date.parse('2026-09-24T09:31:00Z'));
+  assert.equal(s.queuedNotificationWindowStartedAt,Date.parse(candidate.createdFrom));
+  assert.equal(s.queuedBlockedByAttention,false);
+});
 test('pending unaccepted tail is released without changing its delay or admitting the protected ticket',()=>{
   const s=createInitialState(),config=loadConfig(vars),at=Date.parse('2026-09-24T09:30:12.964Z');
   s.needsAttentionScope=failedScope;s.needsAttentionScopes=[failedScope];

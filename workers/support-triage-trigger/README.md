@@ -13,7 +13,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-9c0196e17d1ceac67879bd967698dfe94ab30b3cab10f3664e8d001b3ba0f2e7.
+619133e5a45fe85cae9633d2258c953b7f6844335e5a361b370f4d29dc54a057.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -32,9 +32,14 @@ cannot widen a released suffix back into a hold.
 and push through Git to restore whole-window parking. No state migration or
 hold clearing is needed. Old aggregated parked windows remain conservative
 fences: their gaps and already-parked tickets are NOT automatically released.
-Fully covered windows, unknown/full-queue fences and malformed bounds still
-fail closed. Prefixes before the final fence remain held for reconciliation.
-This fixes later-window starvation, not every possible missed-ticket case.
+For a new time-bounded email window, opaque legacy/full-queue fences no longer
+block every later ticket: the Worker uses the durable original notification
+window as the quarantine boundary and releases only a strictly later suffix.
+If no exact time-bounded fence exists, the incident timestamp is the fallback
+cutoff; if that timestamp is missing, the current queue-evaluation time is used.
+Fully covered windows remain parked, and prefixes before the final known fence
+remain held for reconciliation. This prevents one ambiguous ticket from
+starving unrelated later email while never replaying its frozen scope.
 History records `attention_prefix_parked` and `attention_tail_released` with
 their exact half-open scopes. Original arrival events remain in history; when
 a fence ends after the original arrival, the released window starts at that
