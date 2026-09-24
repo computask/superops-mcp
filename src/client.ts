@@ -139,6 +139,10 @@ export class SuperOpsClient {
       });
     } catch (error) {
       clearTimeout(timeout);
+      if (error instanceof DispatcherPendingError && subrequest.record) {
+        subrequest.record.dispatcherRequestId = error.requestId ?? subrequest.record.dispatcherRequestId;
+        subrequest.record.dispatcherErrorCode = error.errorClassification ?? error.state;
+      }
       if (error instanceof DispatcherPendingError && error.httpStatus !== undefined) {
         recordSubrequestFinish(subrequest, error.httpStatus, false, {
           outcome: error.rateLimited ? "rate_limited" : "http_error",
@@ -158,7 +162,7 @@ export class SuperOpsClient {
         false,
         {
           outcome: timedOut ? "request_timeout" : "network_error",
-          errorClass: timedOut ? "SuperOpsRequestTimeout" : error instanceof DispatcherPendingError ? "DispatcherPending" : "UpstreamNetworkFailure",
+          errorClass: error instanceof DispatcherPendingError ? error.errorClassification ?? `Dispatcher_${error.state}` : timedOut ? "SuperOpsRequestTimeout" : "UpstreamNetworkFailure",
         }
       );
       if (error instanceof DispatcherPendingError) throw error;

@@ -10,6 +10,13 @@ const {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotific
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
+test('dispatch input requires an actual no-apply cause and preserves receipt diagnostics',()=>{
+  assert(source.includes('apply_not_attempted describes an outcome, not a cause'));
+  assert(source.includes('reason_unavailable if the cause genuinely cannot be established'));
+  assert(source.includes('never invent HTTP 400/429/502'));
+  assert(source.includes('Keep any observed denial terminal; do not retry or bypass it'));
+});
+
 function fixture(status, age = 120000) {
   let now = Date.parse('2026-09-24T06:00:00Z');
   const scope = {mode:'new-email-tickets', source:'EMAIL', createdFrom:new Date(now-60000).toISOString(), createdTo:new Date(now).toISOString()};

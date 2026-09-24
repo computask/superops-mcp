@@ -34,6 +34,7 @@ import {
 } from "./audit.js";
 import {
   executionDiagnostics,
+  getExecutionConfig,
   finishExecution,
   logExecutionDiagnostics,
   runWithExecutionContext,
@@ -754,9 +755,13 @@ function triageFailureDiagnostics(
   if (result.isError) {
     const diagnostic: Record<string, unknown> = {
       stage: "mcp_tool",
+      errorType: "McpToolError",
+      errorCode: "tool_error_without_failed_request",
       message: safeFailureDiagnosticMessage(errorSummaryFromResult(result)),
     };
     if (failedRequest) {
+      diagnostic.errorType = safeFailureDiagnosticToken(failedRequest.errorClass);
+      diagnostic.errorCode = safeFailureDiagnosticToken(failedRequest.graphqlCode ?? failedRequest.errorClass);
       if (typeof failedRequest.status === "number") diagnostic.httpStatus = failedRequest.status;
       if (typeof failedRequest.index === "number") diagnostic.requestIndex = failedRequest.index;
       if (typeof failedRequest.operationName === "string" && SAFE_FAILURE_DIAGNOSTIC_OPERATION.test(failedRequest.operationName)) {
@@ -766,7 +771,7 @@ function triageFailureDiagnostics(
         diagnostic.itemKey = failedRequest.itemKey;
       }
     }
-    if (diagnostic.message !== undefined || diagnostic.httpStatus !== undefined) {
+    if (diagnostic.message !== undefined || diagnostic.httpStatus !== undefined || diagnostic.errorCode !== undefined) {
       entries.push(diagnostic);
     }
   }
@@ -847,6 +852,20 @@ function appendTriageExecutionTelemetry(
     retryTrace: safeRetryTrace(retries?.details),
     failureDiagnostics: triageFailureDiagnostics(toolName, result, diagnostics),
   };
+  if (getExecutionConfig().callAuditEnabled) {
+    // A compact allowlisted event survives even when no upstream call was
+    // made (validation/policy failure). No raw result, message or input values.
+    const requests = Array.isArray(trace.requestTrace) ? trace.requestTrace as Record<string, unknown>[] : [];
+    console.log(JSON.stringify({
+      event: "mcp.triage_execution_finished", timestamp: new Date().toISOString(),
+      invocationId: trace.invocationId, executionTraceId: trace.executionTraceId,
+      toolName, success: !result.isError, durationMs: trace.durationMs,
+      subrequestsUsed: trace.subrequestsUsed,
+      dispatcherSubmissions: requests.filter(r => r.provider === "dispatcher" && r.type !== "dispatcherPoll").length,
+      mutationSubmissions: requests.filter(r => r.provider === "dispatcher" && r.operationType === "mutation").length,
+      failureCodes: trace.failureDiagnostics?.map(d => ({stage:d.stage,errorType:d.errorType,errorCode:d.errorCode,requestIndex:d.requestIndex})),
+    }));
+  }
 
   // Some MCP clients expose only the first text content item to the model even
   // though the protocol permits multiple content items. Keep the original

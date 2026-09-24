@@ -60,6 +60,7 @@ export function endApiAttempt(
     ok,
     dispatcherRequestId: token(record?.dispatcherRequestId),
     dispatcherState: token(record?.dispatcherState),
+    dispatcherErrorCode: token(record?.dispatcherErrorCode),
     httpStatus: record?.httpStatus,
     outcome: record?.outcome ?? (ok ? "success" : "internal_error"),
     errorClass: token(record?.errorClass),

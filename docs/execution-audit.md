@@ -1,5 +1,49 @@
 # SuperOps MCP Execution Safety Verification
 
+## Failure correlation — 24 September 2026
+
+The private tail collector previously discarded `dispatcherRequestId` and
+`dispatcherState`, although MCP attempt events emitted them. Migration
+`0002_dispatcher_correlation.sql` retains those fields plus the safe dispatcher
+error code in `superops_api_calls`. Existing rows are preserved; missing old
+receipt IDs cannot be reconstructed from this table alone.
+
+`triage_mcp_invocations` independently records triage tool completion, safe error
+codes, invocation/trace IDs, duration, and submission counts, including failures
+before any dispatcher submission. Its `success` means the MCP result is not
+`isError`; it does not prove that every ticket was triaged. Inspect per-item
+failure codes, the operation ledger, and final verified state as well. An Agent
+that never calls the MCP cannot generate an MCP invocation row.
+
+Join API rows by `invocation_id`, then use `dispatcher_request_id` with the
+existing authenticated dispatcher `/v1/requests/{id}/diagnostics` endpoint.
+The dispatcher owns exact upstream attempt times, responses and retry history.
+MCP submissions and status polls are NOT physical upstream attempt counts.
+Only extract safe status/classification/timing fields from dispatcher diagnostics;
+never copy its raw response bodies or headers into reports or this database.
+
+Transport diagnostics preserve accepted header receipts even if body reading
+fails. They distinguish `pending`, caller `request_timeout`, and the dispatcher's
+terminal error classification. Missing upstream HTTP status stays null; it is
+not fabricated as HTTP 502. Accepted/ambiguous mutations are never resubmitted.
+
+Trigger input now requires a specific observed reason for `apply_not_attempted`,
+or `reason_unavailable` when unknown. It requires telemetry from the failed tool,
+not an unrelated last successful tool. This is reporting guidance, not permission
+to bypass validation, missing evidence, risk gates or tool denials.
+
+Both audit tables use bounded, existing 30-day/250,000-row retention. Apply the
+additive D1 migration before the Git-connected collector deployment. Revert code
+through Git for rollback; leave additive columns/table in place. No dispatcher
+runtime or credentials change is required for this correlation repair.
+
+Observed evidence: for ticket 62870's first attempt, getFields receipt
+`7b1f5a16-d26b-443a-a488-815fb64c2c49` succeeded upstream in 154 ms, on one
+HTTP-200 attempt. Its subsequent `apply_not_attempted` callback does not prove
+a rate limit. Later attempts reported pending/timeout conditions, which require
+their own receipt-level diagnostics. These instrumentation changes do not
+retrospectively establish the Agent's unrecorded reason for skipping apply.
+
 ## Dispatcher/pagination migration — 23 September 2026
 
 The older inventory below describes logical reads/writes, not current physical

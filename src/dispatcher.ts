@@ -132,6 +132,15 @@ export async function dispatcherFetch(body: string, options: {
         if (counted) recordSubrequestFinish(counted, response.status, false);
         throw new DispatcherPendingError(requestId, options.idempotencyKey, "redirect_rejected");
       }
+      // Preserve an acknowledged receipt even if parsing its body subsequently
+      // times out. It is evidence of accepted work, never replay permission.
+      const headerReceipt = response.headers.get("X-Dispatcher-Request-Id");
+      if (!polling && (response.status === 202 || response.status === 504) && headerReceipt && /^[A-Za-z0-9_-]{1,160}$/.test(headerReceipt)) {
+        requestId = headerReceipt;
+        const receipt = {requestId, idempotencyKey: options.idempotencyKey, state: "queued"};
+        options.onReceipt?.(receipt);
+        if (options.mutation) await operation.getStore()?.checkpoint?.(receipt);
+      }
       if (!polling && response.status !== 202 && response.status !== 504 &&
           !pending.has(response.headers.get("X-Dispatcher-Status") ?? "") &&
           response.headers.get("X-Dispatcher-Uncertain") !== "true" &&
@@ -172,11 +181,11 @@ export async function dispatcherFetch(body: string, options: {
       throw new DispatcherPendingError(requestId, options.idempotencyKey, "uncertain");
     }
     if (polling && terminal.has(state)) {
-      const status = typeof value.httpStatus === "number" ? value.httpStatus : 502;
-      if (state === "succeeded" && (status < 200 || status >= 300 || value.errorClassification)) {
+      const status = typeof value.httpStatus === "number" && Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599 ? value.httpStatus : undefined;
+      if (state === "succeeded" && (status === undefined || status < 200 || status >= 300 || value.errorClassification)) {
         throw new DispatcherPendingError(requestId, options.idempotencyKey, "invalid_success");
       }
-      if (!value.response || state === "cancelled") {
+      if (!value.response || status === undefined || state === "cancelled") {
         // The status contract intentionally omits failed response bodies. Keep
         // safe classification, never lastError/customer data, and do not POST
         // again: dispatcher retries have already finished for this receipt.

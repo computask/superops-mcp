@@ -4,6 +4,7 @@ const COLUMNS = [
   "ticket_number", "ticket_id", "item_key", "request_id", "invocation_id", "execution_trace_id",
   "tool_name", "call_index", "request_purpose", "operation_type", "operation_name", "attempt",
   "http_status", "ok", "outcome", "error_class", "graphql_code", "rate_limited", "retry_after_seconds", "worker_outcome",
+  "dispatcher_request_id", "dispatcher_state", "dispatcher_error_code",
 ] as const;
 export const INSERT_API_CALL = `INSERT OR IGNORE INTO superops_api_calls (${COLUMNS.join(",")}) VALUES (${COLUMNS.map(() => "?").join(",")})`;
 type Cell = string | number | null;
@@ -66,6 +67,9 @@ export function rowsFromTail(events: readonly AuditTrace[]): SafeRow[] {
           outcome, error_class: token(e.errorClass), graphql_code: token(e.graphqlCode),
           rate_limited: e.rateLimited === true ? 1 : 0, retry_after_seconds: number(e.retryAfterSeconds),
           worker_outcome: WORKER_OUTCOMES.has(trace.outcome) ? trace.outcome : "unknown",
+          dispatcher_request_id: token(e.dispatcherRequestId),
+          dispatcher_state: token(e.dispatcherState),
+          dispatcher_error_code: token(e.dispatcherErrorCode),
         });
       }
     }
@@ -74,13 +78,41 @@ export function rowsFromTail(events: readonly AuditTrace[]): SafeRow[] {
 }
 
 export async function persistRows<Statement>(db: AuditDatabase<Statement>, rows: SafeRow[]): Promise<void> {
+  return persistCells(db, INSERT_API_CALL, rows.map(row => COLUMNS.map(key => row[key])));
+}
+
+export const INSERT_TRIAGE_INVOCATION = "INSERT OR IGNORE INTO triage_mcp_invocations (invocation_id,completed_at,execution_trace_id,tool_name,success,duration_ms,subrequests_used,dispatcher_submissions,mutation_submissions,failure_codes_json) VALUES (?,?,?,?,?,?,?,?,?,?)";
+export function invocationRowsFromTail(events: readonly AuditTrace[]): Cell[][] {
+  const rows = new Map<string, Cell[]>();
+  for (const trace of events) {
+    if (trace.scriptName !== "superops-mcp") continue;
+    for (const log of trace.logs) for (const message of log.message) {
+      if (typeof message !== "string" || message.length > 16384 || !message.startsWith('{"event":"mcp.triage_execution_finished"')) continue;
+      let e: Record<string, unknown>;
+      try { e = JSON.parse(message) as Record<string, unknown>; } catch { continue; }
+      const invocation = token(e.invocationId), at = timestamp(e.timestamp), tool = token(e.toolName);
+      if (!invocation || !at || !tool || typeof e.success !== "boolean") continue;
+      const codes = Array.isArray(e.failureCodes) ? e.failureCodes.slice(0,32).map(value => {
+        const d = value && typeof value === "object" ? value as Record<string, unknown> : {};
+        return {stage:token(d.stage),errorType:token(d.errorType),errorCode:token(d.errorCode),requestIndex:number(d.requestIndex,1000)};
+      }) : [];
+      rows.set(invocation, [invocation,at,token(e.executionTraceId),tool,Number(e.success),number(e.durationMs),
+        number(e.subrequestsUsed,1000),number(e.dispatcherSubmissions,1000),number(e.mutationSubmissions,1000),JSON.stringify(codes)]);
+    }
+  }
+  return [...rows.values()];
+}
+export async function persistInvocations<Statement>(db: AuditDatabase<Statement>, rows: Cell[][]): Promise<void> {
+  return persistCells(db, INSERT_TRIAGE_INVOCATION, rows);
+}
+async function persistCells<Statement>(db: AuditDatabase<Statement>, sql: string, rows: Cell[][]): Promise<void> {
   // Bound each write batch; idempotent call IDs make uncertain D1 retries safe.
   for (let offset = 0; offset < rows.length; offset += 50) {
     const batch = rows.slice(offset, offset + 50);
     let persisted = false;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const result = await db.batch(batch.map(row => db.prepare(INSERT_API_CALL).bind(...COLUMNS.map(key => row[key]))));
+        const result = await db.batch(batch.map(row => db.prepare(sql).bind(...row)));
         if (result.some(r => !r.success)) throw new Error("D1 batch not successful");
         persisted = true;
         break;

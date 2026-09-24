@@ -84,6 +84,21 @@ describe("dispatcher-only transport", () => {
     vi.stubGlobal("fetch", vi.fn(async()=>Response.json(receipt("retry_wait", {nextRetryAt:new Date(Date.now()+120000).toISOString()}))));
     await expect(dispatcherFetch("",{env,requestId:"receipt-1",idempotencyKey:"same"})).rejects.toMatchObject({requestId:"receipt-1",retryAfter:120});
   });
+  it.each([null, {errors:[{message:"private"}]}])("does not invent upstream HTTP 502 or success for a terminal transport timeout (%j)", async response => {
+    vi.stubGlobal("fetch", vi.fn(async()=>Response.json(receipt("failed", {httpStatus:null,response,errorClassification:"TIMEOUT"}))));
+    await expect(dispatcherFetch("",{env,requestId:"receipt-1",idempotencyKey:"same"})).rejects.toMatchObject({
+      requestId:"receipt-1",state:"failed",httpStatus:undefined,errorClassification:"TIMEOUT",
+    });
+  });
+  it("retains an accepted header receipt if the response body fails", async () => {
+    const onReceipt=vi.fn();
+    vi.stubGlobal("fetch",vi.fn(async()=>new Response(new ReadableStream({start(controller){controller.error(new DOMException("private","AbortError"));}}),{
+      status:202,headers:{"X-Dispatcher-Request-Id":"receipt-1"},
+    })));
+    await expect(dispatcherFetch("{}",{env,idempotencyKey:"same",onReceipt,mutation:true})).rejects.toMatchObject({requestId:"receipt-1",state:"request_timeout"});
+    expect(onReceipt).toHaveBeenCalledWith(expect.objectContaining({requestId:"receipt-1",state:"queued"}));
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
   it("uses a stable mutation key across invocations, isolated by owner, item and payload", async () => {
     const key = (scope:string,item:string,body="mutation body") => withDispatcherOperation(scope,item,()=>dispatcherIdempotencyKey(body,true));
     const first=await key("owner:operation","1");

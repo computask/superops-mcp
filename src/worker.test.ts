@@ -1331,6 +1331,7 @@ describe("Cloudflare Worker entrypoint", () => {
       expect(telemetry?.failureDiagnostics).toEqual([
         expect.objectContaining({
           stage: "mcp_tool",
+          errorCode: "tool_error_without_failed_request",
           message: expect.stringContaining("credentials"),
         }),
       ]);
@@ -1343,6 +1344,15 @@ describe("Cloudflare Worker entrypoint", () => {
       });
       expect(String(records[0].errorSummary)).toContain("credentials");
       expect(JSON.stringify(records[0])).not.toContain("DISPATCHER_TOKEN");
+      const invocationEvents = logSpy.mock.calls.map(call => {
+        try { return JSON.parse(String(call[0])) as Record<string, unknown>; } catch { return {}; }
+      }).filter(event => event.event === "mcp.triage_execution_finished");
+      expect(invocationEvents).toEqual([expect.objectContaining({
+        toolName: "superops_tickets_triage_snapshot", success: false,
+        dispatcherSubmissions: 0, mutationSubmissions: 0,
+        failureCodes: [expect.objectContaining({errorCode: "tool_error_without_failed_request"})],
+      })]);
+      expect(JSON.stringify(invocationEvents)).not.toContain("credentials");
     } finally {
       logSpy.mockRestore();
     }

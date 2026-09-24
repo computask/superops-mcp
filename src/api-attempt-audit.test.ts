@@ -69,6 +69,13 @@ describe("persistent API attempt metadata", () => {
     await expect(runWithExecutionConfig({ SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "1", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "1" }, () => runWithExecutionContext("superops_tickets_get", () => client().query("query getTicket { getTicket { ticketId } }")))).rejects.toThrow();
     expect(fetcher).not.toHaveBeenCalled(); expect(rowsFromTail(trace(lines))).toEqual([]);
   });
+  it("persists receipt identity and pending state when the caller stops waiting", async () => {
+    const lines=capture();
+    vi.stubGlobal("fetch",vi.fn(async()=>Response.json({requestId:"receipt-a",status:"retry_wait"},{status:202,headers:{"Retry-After":"60"}})));
+    await expect(runWithExecutionContext("superops_tickets_field_options",()=>client().query("query Fields { getFields { fieldId } }"))).rejects.toThrow();
+    expect(rowsFromTail(trace(lines))[0]).toMatchObject({dispatcher_request_id:"receipt-a",dispatcher_state:"retry_wait",dispatcher_error_code:"pending",http_status:null,error_class:"Dispatcher_pending"});
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
 
   it("honours the existing audit switch", async () => {
     const lines = capture(); vi.stubGlobal("fetch", vi.fn(async () => response()));

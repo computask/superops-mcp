@@ -95,6 +95,8 @@ export interface SubrequestFinishDetails {
 export interface SubrequestRecord {
   dispatcherRequestId?: string;
   dispatcherState?: string;
+  /** Transport-local reason; never confused with upstream HTTP status. */
+  dispatcherErrorCode?: string;
   index: number;
   type: SubrequestType;
   operationType?: string;
