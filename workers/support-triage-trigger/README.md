@@ -13,10 +13,32 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-237c62ad383a68539ca7a603058846262061caf51eb742f020d722f36a3648bc.
+9c0196e17d1ceac67879bd967698dfe94ab30b3cab10f3664e8d001b3ba0f2e7.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
+
+Overlapping attention windows, 24 September 2026: an undispatched email window
+can now retain its protected prefix and release only the suffix after every
+overlapping attention fence. This addresses the 62890/62891 failure sequence:
+an uncertain update for the earlier ticket must not swallow the later ticket's
+window just because its lookback overlaps. The original upper bound and due time
+are retained (normal dispatch-time end clamping still applies). The existing
+single-run gate, rate-limit gate, stale checks and mutation safeguards remain.
+Accepted/frozen scopes are never clipped or replayed. Empty-result recovery
+cannot widen a released suffix back into a hold.
+
+`TRIAGE_ATTENTION_TAIL_ISOLATION_ENABLED=true` enables this behavior; set it false
+and push through Git to restore whole-window parking. No state migration or
+hold clearing is needed. Old aggregated parked windows remain conservative
+fences: their gaps and already-parked tickets are NOT automatically released.
+Fully covered windows, unknown/full-queue fences and malformed bounds still
+fail closed. Prefixes before the final fence remain held for reconciliation.
+This fixes later-window starvation, not every possible missed-ticket case.
+History records `attention_prefix_parked` and `attention_tail_released` with
+their exact half-open scopes. Original arrival events remain in history; when
+a fence ends after the original arrival, the released window starts at that
+fence boundary, not at a newly received email.
 
 Failure diagnostics guidance now distinguishes an observed reason for not
 attempting apply from the generic `apply_not_attempted` outcome. Failed-tool

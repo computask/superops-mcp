@@ -1,5 +1,26 @@
 # SuperOps MCP Execution Safety Verification
 
+## Overlapping email windows — 24 September 2026
+
+Ticket 62890's updateTicket receipt `2f62fd34-3b2c-42f8-b4d3-f822e28710cd`,
+upstream attempt 6375, completed at 09:31:24.389Z with HTTP 200 and GraphQL
+error `Internal Server Error(s) while executing query`. No path or extensions
+were provided. This is not a rate-limit classification and does not prove
+whether the mutation partially applied. Its uncertain receipt remains held;
+no automatic mutation replay is authorized by the queue repair.
+
+62891 was created at 09:30:06Z, after the failed scope ended at 09:29:45.946Z.
+Its queued lookback nevertheless began at 09:29:12.964Z, so whole-window parking
+discarded its chance to dispatch. The trigger now splits an undispatched safe
+suffix from the held prefix and records both boundaries. Legacy parked backlog
+remains held. Tests reproduce those exact times and preserve the active-run
+gate, frozen scopes, persistence, recovery fencing and flag-based rollback.
+At live inspection 09:54:45Z, 62891 was already Awaiting Customer Reply, with an
+engineer reply at 09:43:26.602Z; it was therefore not modified by this repair.
+
+This is trigger-only queue handling. SuperOps transport, mutation classification,
+operation checkpoints, write verification and the dispatcher are unchanged.
+
 ## Failure correlation — 24 September 2026
 
 The private tail collector previously discarded `dispatcherRequestId` and

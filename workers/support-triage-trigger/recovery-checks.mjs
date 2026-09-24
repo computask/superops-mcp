@@ -5,8 +5,8 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 // Exercise the actual preserved production module, exposing internals only in
 // this in-memory test module. No test route or export is shipped to production.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
-const {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition} = await import(
-  `data:text/javascript;base64,${Buffer.from(source + '\nexport {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition};').toString('base64')}`
+const {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState} = await import(
+  `data:text/javascript;base64,${Buffer.from(source + '\nexport {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
@@ -38,8 +38,99 @@ function fixture(status, age = 120000) {
   const engine = new CoordinatorEngine({config:loadConfig(vars), now:()=>now,
     store:{load:async()=>structuredClone(state),save:async s=>{state=structuredClone(s);},setAlarm:async at=>alarms.push(at)},
     agent:{getRunDiagnostics:async()=>({status,httpStatus:200}),trigger:async(...args)=>{calls.push(args);return {kind:'accepted',runId:'apirun_retry'};}}});
-  return {engine,calls,alarms,scope,get state(){return state;},seed:patch=>{state={...state,...patch};},advance:()=>{now=state.dueAt ?? now+40000;},expire:()=>{now+=40000;}};
+  return {engine,calls,alarms,scope,get state(){return state;},seed:patch=>{state={...state,...patch};},setNow:value=>{now=Date.parse(value);},advance:()=>{now=state.dueAt ?? now+40000;},expire:()=>{now+=40000;}};
 }
+
+const emailScope=(from,to)=>({mode:'new-email-tickets',source:'EMAIL',createdFrom:from,createdTo:to});
+const failedScope=emailScope('2026-09-24T09:28:12.295Z','2026-09-24T09:29:45.946Z');
+function overlappingQueue() {
+  return {...createInitialState(),needsAttentionScope:failedScope,needsAttentionScopes:[failedScope],candidateAttentionFenceActive:true,
+    queuedPending:true,queuedReason:'new_message',queuedNotificationWindowStartedAt:Date.parse('2026-09-24T09:30:12.964Z'),
+    queuedNotificationWindowEndedAt:Date.parse('2026-09-24T09:32:34.626Z'),queuedNotificationLookbackMs:60000,
+    queuedLastNotificationAt:Date.parse('2026-09-24T09:31:47.626Z'),queuedDueAt:Date.parse('2026-09-24T09:32:03.626Z')};
+}
+test('exact overlapping-lookback regression releases later ticket after ambiguous callback',async()=>{
+  const f=fixture('completed');
+  f.setNow('2026-09-24T09:32:16.410Z');
+  f.seed({...overlappingQueue(),pending:true,pendingReason:'new_message',pendingTriggerId:'email-triage:9001',
+    pendingTriggerScope:failedScope,pendingNotificationWindowStartedAt:Date.parse('2026-09-24T09:29:12.295Z'),
+    pendingNotificationWindowEndedAt:Date.parse(failedScope.createdTo),pendingNotificationLookbackMs:60000,
+    executionPhase:'awaiting_result',dispatchAttempt:1,
+    lastAcceptedTrigger:{triggerId:'email-triage:9001',attempt:1,runId:'apirun_synthetic',acceptedAt:'2026-09-24T09:29:45.946Z'}});
+  await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',metadata:{failureStage:'triage_apply'}});
+  f.advance();
+  assert.equal((await f.engine.processAlarm()).status,'accepted');
+  assert.equal(f.calls.length,1);
+  const dispatched=f.calls[0][1];
+  assert.equal(dispatched.createdFrom,failedScope.createdTo);
+  assert.equal(dispatched.createdTo,'2026-09-24T09:32:16.410Z');
+  assert(Date.parse(dispatched.createdFrom)<=Date.parse('2026-09-24T09:30:06Z'));
+  assert.deepEqual(f.state.needsAttentionScopes,[failedScope]);
+  assert.equal(f.state.attentionBlockedWindow.notificationWindowEndedAt,Date.parse(failedScope.createdTo));
+  assert(!scopeOverlapsAttention(f.state,loadConfig(vars),dispatched));
+  assert(f.state.dispatchHistory.some(e=>e.event==='attention_tail_released'));
+  // Persisted state/restart retains both the exact hold and released run.
+  const restored=normalizeState(JSON.parse(JSON.stringify(f.state)));
+  assert.deepEqual(restored.pendingTriggerScope,dispatched);
+  assert.deepEqual(restored.needsAttentionScopes,[failedScope]);
+});
+test('tail release respects every fence and never releases a legacy aggregate gap',()=>{
+  const s=overlappingQueue(), config=loadConfig(vars);
+  s.needsAttentionScopes.push(emailScope('2026-09-24T09:30:20Z','2026-09-24T09:30:40Z'));
+  s.attentionBlockedWindow={reason:'new_message',notificationWindowStartedAt:Date.parse('2026-09-15T13:00:00Z'),
+    notificationWindowEndedAt:Date.parse('2026-09-24T09:31:00Z'),notificationLookbackMs:60000,
+    lastNotificationAt:null,debounceWindowStartedAt:null,unavailableRetryCount:0,lifecycleRecoveryRequested:false,lastLifecycleEvent:null};
+  refreshQueuedAttentionBlock(s,config,Date.parse('2026-09-24T09:32:16Z'));
+  assert.equal(s.queuedNotificationWindowStartedAt,Date.parse('2026-09-24T09:31:00Z'));
+  assert.equal(s.queuedNotificationLookbackMs,0);
+  assert.equal(s.attentionBlockedWindow.notificationWindowEndedAt,Date.parse('2026-09-24T09:31:00Z'));
+});
+for(const variant of ['fully-overlapping','invalid-fence','full-queue-fence','rollback']) {
+  test(`${variant} retains the entire blocked window`,()=>{
+    const s=overlappingQueue(), config=loadConfig(vars);
+    if(variant==='fully-overlapping') s.queuedNotificationWindowEndedAt=Date.parse('2026-09-24T09:29:40Z');
+    if(variant==='invalid-fence') s.needsAttentionScopes.push({...failedScope,createdTo:'invalid'});
+    if(variant==='full-queue-fence') s.needsAttentionScopes.push({mode:'full-new-calls',reason:'configured'});
+    if(variant==='rollback') config.attentionTailIsolationEnabled=false;
+    refreshQueuedAttentionBlock(s,config);
+    assert.equal(s.queuedNotificationWindowStartedAt,null);
+    assert(s.attentionBlockedWindow);
+    assert(!s.dispatchHistory.some(e=>e.event==='attention_tail_released'));
+  });
+}
+test('pending unaccepted tail is released without changing its delay or admitting the protected ticket',()=>{
+  const s=createInitialState(),config=loadConfig(vars),at=Date.parse('2026-09-24T09:30:12.964Z');
+  s.needsAttentionScope=failedScope;s.needsAttentionScopes=[failedScope];
+  registerCreatedNotification(s,config,at,60000);
+  const due=s.dueAt;
+  blockPendingIfAttentionOverlaps(s,config,at);
+  assert.equal(s.dueAt,due);
+  assert.equal(s.pendingNotificationWindowStartedAt,at,'retain original notification timing');
+  assert.equal(s.pendingNotificationWindowStartedAt-s.pendingNotificationLookbackMs,Date.parse(failedScope.createdTo));
+  s.pendingTriggerScope=createPendingTriggerScope(s,config,due);
+  assert.equal(s.pendingTriggerScope.createdFrom,failedScope.createdTo);
+  widenTargetedEmailScopeForRecovery(s,config);
+  assert.equal(s.pendingTriggerScope.createdFrom,failedScope.createdTo,'empty recovery must not undo the fence');
+});
+test('a frozen scope is never clipped into a new replayable scope',()=>{
+  const s=createInitialState(), config=loadConfig(vars),at=Date.parse('2026-09-24T09:30:12.964Z');
+  s.needsAttentionScope=failedScope;s.needsAttentionScopes=[failedScope];
+  registerCreatedNotification(s,config,at,60000);
+  s.pendingTriggerScope=createPendingTriggerScope(s,config,s.dueAt);s.dispatchAttempt=1;
+  blockPendingIfAttentionOverlaps(s,config,at);
+  assert.equal(s.pending,false);
+  assert(!s.dispatchHistory.some(e=>e.event==='attention_tail_released'));
+});
+test('queued tail cannot dispatch while an accepted run remains active',async()=>{
+  const f=fixture('in_progress');
+  f.seed({...overlappingQueue(),pending:true,pendingReason:'new_message',pendingTriggerId:'email-triage:9001',
+    pendingTriggerScope:failedScope,executionPhase:'awaiting_result',dispatchAttempt:1,
+    lastAcceptedTrigger:{triggerId:'email-triage:9001',attempt:1,runId:'apirun_synthetic',acceptedAt:'2026-09-24T05:59:00Z'},
+    resultDeadlineAt:Date.parse('2026-09-24T06:00:30Z')});
+  f.expire();await f.engine.processAlarm();
+  assert.equal(f.calls.length,0);
+  assert.deepEqual(f.state.pendingTriggerScope,failedScope);
+});
 const metadata = {failureStage:'evidence_recovery',ticketsConsidered:1,ticketsCompleted:0,ticketsDeferred:1,
   failureDiagnostics:[{stage:'evidence_recovery',errorCode:'read_failed',message:'Synthetic no-write failure'}]};
 

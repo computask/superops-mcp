@@ -140,6 +140,7 @@ function loadConfig(env) {
       get(env, "TRIAGE_RECONCILIATION_ELIGIBILITY_SEPARATION_ENABLED"),
       DEFAULT_RECONCILIATION_ELIGIBILITY_SEPARATION_ENABLED
     ),
+    attentionTailIsolationEnabled: parseBoolean(get(env, "TRIAGE_ATTENTION_TAIL_ISOLATION_ENABLED"), false),
     acceptedRunMaxAgeMs: parsePositiveSeconds(
       get(env, "TRIAGE_ACCEPTED_RUN_MAX_AGE_SECONDS"),
       DEFAULT_ACCEPTED_RUN_MAX_AGE_SECONDS
@@ -966,6 +967,8 @@ var DISPATCH_HISTORY_EVENTS = /* @__PURE__ */ new Set([
   "orphan_recovered",
   "reconciliation_parked",
   "reconciliation_released",
+  "attention_prefix_parked",
+  "attention_tail_released",
   "subscription_maintenance_completed",
   "subscription_maintenance_failed",
   "graph_sweep_completed",
@@ -2223,6 +2226,54 @@ function scopeOverlapsAttention(state, config, candidate) {
   return blockedScope !== null && targetedScopesOverlap(blockedScope, candidate);
 }
 __name(scopeOverlapsAttention, "scopeOverlapsAttention");
+// Release only an undispatched suffix beyond EVERY overlapping fence. Keep
+// legacy aggregated holds conservative: they are not proof of safe gaps.
+// This never changes an accepted run, clears a hold, or replays its mutation.
+function attentionSafeTail(state, config, candidate) {
+  if (!config.attentionTailIsolationEnabled || candidate?.mode !== "new-email-tickets") return null;
+  const bounds = finiteScopeBounds(candidate);
+  if (bounds === null) return null;
+  let from = bounds.from;
+  const fences = [...attentionScopes(state), attentionBlockedWindowScope(state, config)].filter(Boolean);
+  for (const fence of fences) {
+    const held = finiteScopeBounds(fence);
+    if (fence.mode !== "new-email-tickets" || held === null) return null;
+    if (held.from < bounds.to && bounds.from < held.to) from = Math.max(from, held.to);
+  }
+  if (from <= bounds.from || from >= bounds.to) return null;
+  return { ...candidate, createdFrom: new Date(from).toISOString() };
+}
+__name(attentionSafeTail, "attentionSafeTail");
+function isolateAttentionTail(state, config, now, queued) {
+  // A frozen retry must retain its exact scope and accepted-write truth.
+  if (!queued && (state.pendingTriggerScope !== null || state.dispatchAttempt > 0)) return false;
+  const candidate = queued ? queuedEmailScope(state, config) : pendingEmailScopeForComparison(state, config);
+  const tail = attentionSafeTail(state, config, candidate);
+  const original = queued ? attentionBlockedWindowFromQueued(state) : attentionBlockedWindowFromPending(state);
+  if (tail === null || original === null) return false;
+  const boundary = Date.parse(tail.createdFrom);
+  mergeAttentionBlockedWindow(state, {
+    ...original,
+    notificationWindowStartedAt: Date.parse(candidate.createdFrom),
+    notificationLookbackMs: 0,
+    notificationWindowEndedAt: boundary
+  });
+  if (queued) {
+    state.queuedNotificationWindowStartedAt = Math.max(original.notificationWindowStartedAt, boundary);
+    state.queuedNotificationLookbackMs = state.queuedNotificationWindowStartedAt - boundary;
+  } else {
+    state.pendingNotificationWindowStartedAt = Math.max(original.notificationWindowStartedAt, boundary);
+    state.pendingNotificationLookbackMs = state.pendingNotificationWindowStartedAt - boundary;
+  }
+  recordDispatchHistory(state, now, {
+    event: "attention_prefix_parked", waitReason: "reconciliation_hold"
+  }, { ...candidate, createdTo: tail.createdFrom });
+  recordDispatchHistory(state, now, {
+    event: "attention_tail_released", waitReason: "bounded_recovery"
+  }, tail);
+  return true;
+}
+__name(isolateAttentionTail, "isolateAttentionTail");
 function pendingEmailScopeForComparison(state, config) {
   if (state.pendingTriggerScope?.mode === "new-email-tickets") return state.pendingTriggerScope;
   return windowScope(
@@ -2343,9 +2394,10 @@ function queuedOverlapsReconciliationHold(state, config) {
   return queuedScope === null || targetedScopesOverlap(state.reconciliationHold.scope, queuedScope);
 }
 __name(queuedOverlapsReconciliationHold, "queuedOverlapsReconciliationHold");
-function refreshQueuedAttentionBlock(state, config) {
+function refreshQueuedAttentionBlock(state, config, now = Date.now()) {
   if (!attentionFenceIsActive(state, config) || !state.queuedPending) return;
   if (queuedOverlapsAttention(state, config)) {
+    if (isolateAttentionTail(state, config, now, true)) return;
     parkQueuedAttentionWindow(state);
   }
 }
@@ -2354,6 +2406,7 @@ function blockPendingIfAttentionOverlaps(state, config, now) {
   if (!attentionFenceIsActive(state, config) || !state.pending || state.needsAttentionScope === null) return;
   const pendingScope = pendingEmailScopeForComparison(state, config);
   if (pendingScope === null || scopeOverlapsAttention(state, config, pendingScope)) {
+    if (isolateAttentionTail(state, config, now, false)) return;
     if (!parkPendingAttentionWindow(state)) {
       queueCurrentEmailWindow(state, now);
       state.queuedBlockedByAttention = true;
@@ -2790,6 +2843,9 @@ function widenTargetedEmailScopeForRecovery(state, config) {
   )).toISOString();
   const currentCreatedFrom = Date.parse(state.pendingTriggerScope.createdFrom);
   const widenedTime = Date.parse(widenedCreatedFrom);
+  const widenedScope = { ...state.pendingTriggerScope, createdFrom: widenedCreatedFrom };
+  // An empty-result recovery must not grow a released tail back into a hold.
+  if (config.attentionTailIsolationEnabled && scopeOverlapsAttention(state, config, widenedScope)) return;
   if (!Number.isFinite(currentCreatedFrom) || widenedTime < currentCreatedFrom) {
     state.pendingTriggerScope.createdFrom = widenedCreatedFrom;
   }
@@ -2897,8 +2953,10 @@ function canPromoteQueuedDispatch(state, now, config) {
   if (!state.queuedPending || state.queuedBlockedByAttention && state.attentionBlockedWindow === null) return false;
   if (sharedRateLimitActive(state, now)) return false;
   if (queuedOverlapsAttention(state, config)) {
-    parkQueuedAttentionWindow(state);
-    return false;
+    if (!isolateAttentionTail(state, config, now, true)) {
+      parkQueuedAttentionWindow(state);
+      return false;
+    }
   }
   if (queuedOverlapsReconciliationHold(state, config)) return false;
   return true;
@@ -6308,6 +6366,7 @@ var index_default = {
         triageStaleRunRecoveryEnabled: config.staleRunRecoveryEnabled,
         triageAcceptedRunMaxAgeMs: config.acceptedRunMaxAgeMs,
         triageConfigurationRetryExitEnabled: config.configurationRetryExitEnabled,
+        triageAttentionTailIsolationEnabled: config.attentionTailIsolationEnabled,
         triageGraphSweepEnabled: config.graphSweepEnabled,
         triageGraphSweepLookbackMs: config.graphSweepLookbackMs,
         triageGraphSweepMaxMessages: config.graphSweepMaxMessages,
