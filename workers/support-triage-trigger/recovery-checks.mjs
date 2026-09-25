@@ -37,12 +37,27 @@ test('email trigger directs the Agent to the email policy, never the scheduled p
   assert(prompt.includes('always use action leave and omit target.status'));
 });
 
-function replayCoordinator(seed) {
+function historyRow(entry) {
+  const row={event_id:entry.eventId,occurred_at:entry.at,batch_sequence:entry.batchSequence??null,event_name:entry.event,
+    scope_mode:entry.scopeMode??null,scope_created_from:entry.scopeCreatedFrom??null,scope_created_to:entry.scopeCreatedTo??null,
+    failure_kind:entry.failureKind??null,error_type:entry.errorType??null,error_code:entry.errorCode??null,
+    agent_run_status:entry.agentRunStatus??null,agent_run_id_present:entry.agentRunIdPresent?1:0,
+    failure_diagnostics_json:entry.failureDiagnostics?JSON.stringify(entry.failureDiagnostics):null,
+    replay_of_event_id:entry.replayOfEventId??null,ticket_number:entry.ticketNumber??null,
+    operator_confirmed_no_mcp_calls:entry.operatorConfirmedNoMcpCalls?1:0};
+  return new Proxy(row,{get(target,key){return key in target?target[key]:null;}});
+}
+function replayCoordinator(seed, archivedEvents=seed.dispatchHistory??[]) {
   const storage={value:structuredClone(seed),alarm:null,
     async get(){return structuredClone(this.value);},
     async put(_key,value){this.value=structuredClone(value);},
     async setAlarm(value){this.alarm=value;},
-    sql:{exec(){return {toArray(){return [];},one(){return {event_id:0};}};}}
+    sql:{exec(query,...args){
+      let rows=[];
+      if(query.includes('SELECT * FROM triage_dispatch_history WHERE event_id = ?')) rows=archivedEvents.filter(event=>event.eventId===args[0]).map(historyRow);
+      else if(query.includes("event_name = 'manual_replay_requested'")) rows=archivedEvents.filter(event=>event.event==='manual_replay_requested'&&event.replayOfEventId===args[0]&&event.ticketNumber===args[1]).map(()=>({found:1}));
+      return {toArray(){return rows;},one(){return {event_id:0};}};
+    }}
   };
   return {storage,coordinator:new TriageCoordinator({storage},vars)};
 }
@@ -50,7 +65,7 @@ const replaySourceScope={mode:'new-email-tickets',source:'EMAIL',createdFrom:'20
 const replayFailureEvent={eventId:41,at:'2026-09-25T10:18:47.407Z',event:'orphan_recovered',batchSequence:24,
   scopeMode:'new-email-tickets',scopeCreatedFrom:replaySourceScope.createdFrom,scopeCreatedTo:replaySourceScope.createdTo,
   failureKind:'ambiguous',attempt:1,agentRunIdPresent:true,agentRunStatus:'failed',
-  failureDiagnostics:[{stage:'agent_callback',errorType:'callback_contract',errorCode:'result_callback_missing',message:'Agent run reached a terminal state without calling triage_result_report.'}]};
+  failureDiagnostics:[{stage:'agent_callback',errorType:'callback_contract',errorCode:'result_callback_missing',httpStatus:500,requestIndex:1,message:'Agent run reached a terminal state without calling triage_result_report.'}]};
 test('manual replay schedules only one named ticket and preserves the attention fence',async()=>{
   const seed={...createInitialState(),dispatchHistorySequence:41,dispatchHistory:[replayFailureEvent],
     needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true};
@@ -73,6 +88,19 @@ test('manual replay schedules only one named ticket and preserves the attention 
   assert(prompt.includes('only process ticket #62966'));
   assert(prompt.includes('Never widen this scope'));
   assert(prompt.includes('"targetTicketNumbers":["62966"]'));
+});
+test('manual replay resolves an older source event from durable history beyond the live-state ring',async()=>{
+  const recent=Array.from({length:96},(_,index)=>({eventId:100+index,at:'2026-09-25T12:00:00.000Z',event:'maintenance_started'}));
+  const seed={...createInitialState(),dispatchHistorySequence:195,dispatchHistory:recent,
+    needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true};
+  const {storage,coordinator}=replayCoordinator(seed,[replayFailureEvent]);
+  const response=await coordinator.fetch(new Request('https://coordinator.internal/internal/admin/replay',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({sourceEventId:41,ticketNumber:'62966',confirmNoMcpCalls:true})}));
+  const result=await response.json();
+  assert.equal(response.status,202,JSON.stringify(result));
+  assert.equal(result.status,'replay_scheduled');
+  assert.equal(storage.value.dispatchHistory.at(-1).replayOfEventId,41);
+  assert.deepEqual(storage.value.pendingTriggerScope.targetTicketNumbers,['62966']);
 });
 test('manual replay rejects an unconfirmed call log or non-failed run and preserves other overlapping holds',async()=>{
   const request=body=>new Request('https://coordinator.internal/internal/admin/replay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -111,6 +139,17 @@ test('manual replay is one-shot per failed history event and ticket',async()=>{
   const state={...createInitialState(),dispatchHistorySequence:42,dispatchHistory:[replayFailureEvent,requested],
     needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true};
   const {coordinator}=replayCoordinator(state);
+  const response=await coordinator.fetch(new Request('https://coordinator.internal/internal/admin/replay',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({sourceEventId:41,ticketNumber:'62966',confirmNoMcpCalls:true})}));
+  assert.equal(response.status,409);
+  assert.equal((await response.json()).error,'replay_already_requested');
+});
+test('manual replay one-shot guard also sees requests archived beyond the live-state ring',async()=>{
+  const seed={...createInitialState(),dispatchHistorySequence:195,dispatchHistory:[],
+    needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true};
+  const archivedRequest={eventId:42,at:'2026-09-25T10:20:00.000Z',event:'manual_replay_requested',
+    replayOfEventId:41,ticketNumber:'62966'};
+  const {coordinator}=replayCoordinator(seed,[replayFailureEvent,archivedRequest]);
   const response=await coordinator.fetch(new Request('https://coordinator.internal/internal/admin/replay',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({sourceEventId:41,ticketNumber:'62966',confirmNoMcpCalls:true})}));
   assert.equal(response.status,409);

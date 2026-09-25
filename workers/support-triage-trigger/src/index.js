@@ -5550,6 +5550,28 @@ function listDispatchHistory(storage, limit = 96, beforeEventId) {
   };
 }
 __name(listDispatchHistory, "listDispatchHistory");
+function getDispatchHistoryEvent(storage, eventId) {
+  ensureDispatchHistoryTable(storage);
+  const row = storage.sql.exec(
+    `SELECT * FROM ${DISPATCH_HISTORY_TABLE} WHERE event_id = ? LIMIT 1`,
+    eventId
+  ).toArray()[0];
+  return row ? rowToEntry(row) : null;
+}
+__name(getDispatchHistoryEvent, "getDispatchHistoryEvent");
+function hasDispatchHistoryReplay(storage, sourceEventId, ticketNumber) {
+  ensureDispatchHistoryTable(storage);
+  return storage.sql.exec(
+    `SELECT 1 AS found FROM ${DISPATCH_HISTORY_TABLE}
+       WHERE event_name = 'manual_replay_requested'
+         AND replay_of_event_id = ?
+         AND ticket_number = ?
+       LIMIT 1`,
+    sourceEventId,
+    ticketNumber
+  ).toArray().length > 0;
+}
+__name(hasDispatchHistoryReplay, "hasDispatchHistoryReplay");
 function listRelevantDispatchHistory(storage, afterEventId, limit = MAX_RELEVANT_HISTORY_PAGE_SIZE, throughEventId) {
   ensureDispatchHistoryTable(storage);
   const safeAfterEventId = Math.max(0, Math.floor(afterEventId));
@@ -5874,6 +5896,12 @@ var DurableObjectStore = class {
   listDispatchHistory(limit, beforeEventId) {
     return listDispatchHistory(this.storage, limit, beforeEventId);
   }
+  getDispatchHistoryEvent(eventId) {
+    return getDispatchHistoryEvent(this.storage, eventId);
+  }
+  hasDispatchHistoryReplay(sourceEventId, ticketNumber) {
+    return hasDispatchHistoryReplay(this.storage, sourceEventId, ticketNumber);
+  }
   listRelevantDispatchHistory(afterEventId, limit, throughEventId) {
     return listRelevantDispatchHistory(this.storage, afterEventId, limit, throughEventId);
   }
@@ -5984,7 +6012,7 @@ var TriageCoordinator = class {
         return json({ error: "coordinator_not_idle" }, 409);
       }
       const sourceEventId = body.sourceEventId;
-      const sourceEvent = state.dispatchHistory.find((entry) => entry.eventId === sourceEventId);
+      const sourceEvent = store.getDispatchHistoryEvent(sourceEventId);
       if (!sourceEvent || sourceEvent.event !== "orphan_recovered" || sourceEvent.agentRunStatus !== "failed" ||
           sourceEvent.failureKind !== "ambiguous" || sourceEvent.scopeMode !== "new-email-tickets" ||
           !sourceEvent.failureDiagnostics?.some((item) => item.stage === "agent_callback" && item.errorCode === "result_callback_missing") ||
@@ -5994,7 +6022,7 @@ var TriageCoordinator = class {
       const originalScope = state.needsAttentionScopes.find((scope) => scope.mode === "new-email-tickets" &&
         scope.createdFrom === sourceEvent.scopeCreatedFrom && scope.createdTo === sourceEvent.scopeCreatedTo && scope.source === "EMAIL");
       if (!originalScope) return json({ error: "matching_attention_fence_not_found" }, 409);
-      if (state.dispatchHistory.some((entry) => entry.event === "manual_replay_requested" && entry.replayOfEventId === sourceEventId && entry.ticketNumber === body.ticketNumber)) {
+      if (store.hasDispatchHistoryReplay(sourceEventId, body.ticketNumber)) {
         return json({ error: "replay_already_requested" }, 409);
       }
       const scope = {
