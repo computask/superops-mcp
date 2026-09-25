@@ -50,6 +50,7 @@ import {
   currentOwnerHash,
   getOperationStore,
   operationResultView,
+  type OperationLedgerRecord,
 } from "./operation-store.js";
 import { type RateLimitProbeAdapter } from "./rate-limit-probe.js";
 
@@ -332,7 +333,7 @@ const operationTools: ToolDefinition[] = [
   {
     name: "superops_operations_dispatcher_diagnostics",
     description:
-      "Read redacted upstream attempt status and error codes for dispatcher receipts already attached to one owner-visible durable operation. Never returns request/response bodies, headers, tokens, or idempotency keys; does not resubmit work.",
+      "Read redacted upstream attempt status and error codes for receipts attached to one owner-visible durable operation, or for up to 20 exact dispatcher receipt IDs. Never returns request/response bodies, headers, tokens, or idempotency keys; does not resubmit work.",
     inputSchema: {
       type: "object",
       properties: {
@@ -340,8 +341,14 @@ const operationTools: ToolDefinition[] = [
           type: "string",
           description: "Exact durable operation ID from superops_operations_get or superops_operations_results.",
         },
+        requestIds: {
+          type: "array",
+          items: {type: "string", pattern: "^[0-9a-fA-F-]{36}$"},
+          minItems: 1,
+          maxItems: 20,
+          description: "Exact dispatcher receipt UUIDs from safe MCP diagnostics. Use instead of operationId when inspecting read-call receipts not stored on a durable operation.",
+        },
       },
-      required: ["operationId"],
     },
   },
   {
@@ -540,30 +547,38 @@ async function executeToolCall(
   }
   if (name === "superops_operations_dispatcher_diagnostics") {
     const operationId = typeof args.operationId === "string" ? args.operationId.trim() : "";
-    if (!operationId) return errorResult("operationId is required.");
-    const ownerHash = currentOwnerHash();
-    const record = await getOperationStore().get(operationId, ownerHash);
-    if (!record || record.ownerHash !== ownerHash) {
-      return errorResult("Operation was not found or is not visible to this caller.");
+    const suppliedIds = args.requestIds;
+    if (operationId && suppliedIds !== undefined) return errorResult("Provide operationId or requestIds, not both.");
+    let receipts: Array<{itemId?: string; requestId: string; state?: string}>;
+    let operation: OperationLedgerRecord | undefined;
+    if (operationId) {
+      const ownerHash = currentOwnerHash();
+      const record = await getOperationStore().get(operationId, ownerHash);
+      if (!record || record.ownerHash !== ownerHash) return errorResult("Operation was not found or is not visible to this caller.");
+      operation = record;
+      receipts = record.expectedItems.flatMap((itemId) => {
+        const receipt = record.itemStates[itemId]?.dispatcherReceipt;
+        if (!receipt || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(receipt.requestId)) return [];
+        return [{itemId, requestId: receipt.requestId, state: receipt.state}];
+      }).slice(0, 20);
+    } else if (Array.isArray(suppliedIds) && suppliedIds.length > 0 && suppliedIds.length <= 20 && suppliedIds.every((id) => typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))) {
+      receipts = [...new Set(suppliedIds as string[])].map((requestId) => ({requestId}));
+    } else {
+      return errorResult("Provide an owner-visible operationId or 1–20 valid dispatcher requestIds.");
     }
-    const receipts = record.expectedItems.flatMap((itemId) => {
-      const receipt = record.itemStates[itemId]?.dispatcherReceipt;
-      if (!receipt || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(receipt.requestId)) return [];
-      return [{itemId, requestId: receipt.requestId, state: receipt.state}];
-    }).slice(0, 20);
     const credentials = getCredentials();
     const diagnostics = await Promise.all(receipts.map(async (receipt) => {
       try {
-        return {itemId: receipt.itemId, receiptState: receipt.state,
+        return {...(receipt.itemId ? {itemId: receipt.itemId} : {}), receiptState: receipt.state,
           ...(await dispatcherDiagnostics(receipt.requestId, credentials?.dispatcher ?? dispatcherEnvironment()) as Record<string, unknown>)};
       } catch (error) {
-        return {itemId: receipt.itemId, receiptState: receipt.state,
+        return {...(receipt.itemId ? {itemId: receipt.itemId} : {}), receiptState: receipt.state,
           error: sanitizeText(error instanceof Error ? error.message : "Dispatcher diagnostics failed.")};
       }
     }));
     return {
-      content: [{type: "text", text: JSON.stringify({operationId, receiptCount: receipts.length,
-        truncated: record.expectedItems.filter((itemId) => Boolean(record.itemStates[itemId]?.dispatcherReceipt?.requestId)).length > receipts.length,
+      content: [{type: "text", text: JSON.stringify({...(operationId ? {operationId} : {}), receiptCount: receipts.length,
+        truncated: operation ? operation.expectedItems.filter((itemId) => Boolean(operation?.itemStates[itemId]?.dispatcherReceipt?.requestId)).length > receipts.length : false,
         receipts: diagnostics}, null, 2)}],
     };
   }
