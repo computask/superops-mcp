@@ -186,7 +186,8 @@ function loadConfig(env) {
     graphApiBaseUrl: get(env, "GRAPH_API_BASE_URL") ?? "https://graph.microsoft.com/v1.0",
     workspaceAgentTriggerUrl: get(env, "WORKSPACE_AGENT_TRIGGER_URL"),
     workspaceAgentAccessToken: get(env, "WORKSPACE_AGENT_ACCESS_TOKEN"),
-    historyResetToken: get(env, "TRIAGE_HISTORY_RESET_TOKEN")
+    historyResetToken: get(env, "TRIAGE_HISTORY_RESET_TOKEN"),
+    replayAdminToken: get(env, "TRIAGE_REPLAY_ADMIN_TOKEN")
   };
 }
 __name(loadConfig, "loadConfig");
@@ -978,7 +979,8 @@ var DISPATCH_HISTORY_EVENTS = /* @__PURE__ */ new Set([
   "alarm_failed",
   "maintenance_started",
   "maintenance_completed",
-  "maintenance_failed"
+  "maintenance_failed",
+  "manual_replay_requested"
 ]);
 var DISPATCH_HISTORY_WAIT_REASONS = /* @__PURE__ */ new Set([
   "active_agent_run",
@@ -1140,7 +1142,18 @@ function normalizedTriageRunScope(value) {
     if (createdFrom === void 0 || createdTo === void 0 || Date.parse(createdFrom) >= Date.parse(createdTo)) {
       return null;
     }
-    return { mode: "new-email-tickets", createdFrom, createdTo, source: "EMAIL" };
+    const targetTicketNumbers = value.targetTicketNumbers;
+    const replayOfEventId = boundedInteger2(value.replayOfEventId, 1);
+    if (targetTicketNumbers !== void 0 && (!Array.isArray(targetTicketNumbers) || targetTicketNumbers.length !== 1 || typeof targetTicketNumbers[0] !== "string" || !SAFE_TICKET_NUMBER_PATTERN.test(targetTicketNumbers[0]))) return null;
+    if (replayOfEventId === null || replayOfEventId !== void 0 && targetTicketNumbers === void 0) return null;
+    return {
+      mode: "new-email-tickets",
+      createdFrom,
+      createdTo,
+      source: "EMAIL",
+      ...targetTicketNumbers === void 0 ? {} : { targetTicketNumbers },
+      ...replayOfEventId === void 0 ? {} : { replayOfEventId }
+    };
   }
   if (value.mode === "full-new-calls" && (value.reason === "configured" || value.reason === "lifecycle-recovery")) {
     return { mode: "full-new-calls", reason: value.reason };
@@ -1222,6 +1235,9 @@ function normalizedHistoryEntry(value) {
   const ticketOutcomes = parseSafeTicketOutcomes(value.ticketOutcomes);
   const failureDiagnostics = parseSafeFailureDiagnostics(value.failureDiagnostics);
   const mcpExecution = parseSafeMcpExecution(value.mcpExecution);
+  const replayOfEventId = boundedInteger2(value.replayOfEventId, 1);
+  const ticketNumber = typeof value.ticketNumber === "string" && SAFE_TICKET_NUMBER_PATTERN.test(value.ticketNumber) ? value.ticketNumber : void 0;
+  const operatorConfirmedNoMcpCalls = value.operatorConfirmedNoMcpCalls === true ? true : void 0;
   Object.assign(entry, {
     ...attempt === void 0 ? {} : { attempt },
     ...retryCount === void 0 ? {} : { retryCount },
@@ -1266,7 +1282,10 @@ function normalizedHistoryEntry(value) {
     ...scopeCreatedTo === void 0 ? {} : { scopeCreatedTo },
     ...ticketOutcomes === void 0 || ticketOutcomes === null ? {} : { ticketOutcomes },
     ...failureDiagnostics === void 0 || failureDiagnostics === null ? {} : { failureDiagnostics },
-    ...mcpExecution === void 0 || mcpExecution === null ? {} : { mcpExecution }
+    ...mcpExecution === void 0 || mcpExecution === null ? {} : { mcpExecution },
+    ...replayOfEventId === void 0 || replayOfEventId === null ? {} : { replayOfEventId },
+    ...ticketNumber === void 0 ? {} : { ticketNumber },
+    ...operatorConfirmedNoMcpCalls === void 0 ? {} : { operatorConfirmedNoMcpCalls }
   });
   return entry;
 }
@@ -1876,6 +1895,10 @@ function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = 
     "Plan the single field-options lookup after establishing each candidate's evidence-supported disposition and required action fields. If resolve_no_action is warranted or still under consideration, include any missing cause and resolutionCode in that same lookup, alongside the other missing required fields. Do not consume the one lookup on leave-only fields and then switch to resolve with unqueried closure fields. For customer_request, manual_intake or engineer_review with action leave, missing closure-only cause/resolutionCode is not a reason to stop; preserve New Calls and use the existing apply contract. Never invent option values, resolve an actionable ticket to avoid this check, or bypass required validation. If a required option remains unavailable, report missing_field_options with the exact missing field names in the Agent conversation and no write.",
       "",
       "Scope mode: new-email-tickets",
+      ...(scope.targetTicketNumbers?.length === 1 ? [
+        `MANUAL SINGLE-TICKET REPLAY: only process ticket #${scope.targetTicketNumbers[0]}. Do not process or apply any other ticket returned by the time-window query. If that exact ticket is absent from the complete bounded New Calls candidate set, do not apply anything; report terminal_failure with failureStage=bounded_query, safe errorCode=replay_target_not_found, and exactly one not_attempted ticketOutcome for this number. Never widen this scope or run automatic empty-window recovery.`,
+        "Re-read this exact ticket's current state and content using the normal bounded evidence flow. If status, identity, content, or updatedTime safety checks fail, do not write; report the ticket as skipped or deferred with the precise safe reason. Preserve all existing stale checks, note dedupe, private-note, verification, and mutation safeguards."
+      ] : []),
       `Created from (inclusive): ${scope.createdFrom}`,
       `Created to (exclusive): ${scope.createdTo}`,
       `Source: ${scope.source}`,
@@ -1885,6 +1908,8 @@ function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = 
         createdFrom: scope.createdFrom,
         createdTo: scope.createdTo,
         source: scope.source,
+        ...(scope.targetTicketNumbers === void 0 ? {} : { targetTicketNumbers: scope.targetTicketNumbers }),
+        ...(scope.replayOfEventId === void 0 ? {} : { manualReplayOfEventId: scope.replayOfEventId }),
         triggerId,
         dispatchAttempt: attempt,
         resultCallbackRequired: resultCallbackEnabled
@@ -2230,6 +2255,17 @@ function scopeOverlapsAttention(state, config, candidate) {
   if (!attentionFenceIsActive(state, config)) return false;
   const blockedScope = attentionBlockedWindowScope(state, config);
   const fences = [...attentionScopes(state), blockedScope].filter(Boolean);
+  if (candidate?.mode === "new-email-tickets" && candidate.replayOfEventId !== void 0 && candidate.targetTicketNumbers?.length === 1) {
+    const matchingFences = fences.filter((scope) =>
+      scope.mode === "new-email-tickets" && finiteScopeBounds(scope) !== null &&
+      scope.createdFrom === candidate.createdFrom && scope.createdTo === candidate.createdTo && scope.source === candidate.source
+    );
+    // The replay endpoint separately requires this exact failed run, a current
+    // matching fence, no active Agent, and one named ticket. Window-based
+    // fences for neighbouring notifications must not make that exact ticket
+    // unrecoverable; they remain intact and continue to block all broad work.
+    if (matchingFences.length > 0) return false;
+  }
   if (fences.length === 0 && !state.candidateAttentionFenceActive) return false;
   if (candidate?.mode === "new-email-tickets") {
     // A legacy/full-queue fence cannot describe which future email timestamps
@@ -4006,7 +4042,7 @@ var CoordinatorEngine = class {
       ...agentResultTiming
     }, state.pendingTriggerScope);
     const staleBroadScope = this.deps.config.scopeMode === "new-email-tickets" && state.pendingTriggerScope?.mode === "full-new-calls";
-    const firstEmptyTargetedQuery = !state.emptyTargetedRecoveryPending && this.deps.config.fastTargetedModeEnabled && state.pendingTriggerScope?.mode === "new-email-tickets" && isEmptyTargetedQueryCompletion(report);
+    const firstEmptyTargetedQuery = !state.emptyTargetedRecoveryPending && this.deps.config.fastTargetedModeEnabled && state.pendingTriggerScope?.mode === "new-email-tickets" && state.pendingTriggerScope.targetTicketNumbers === void 0 && isEmptyTargetedQueryCompletion(report);
     const settledEmptyTargetedRetry = !firstEmptyTargetedQuery && state.retryCount > 0 && this.deps.config.scopeMode === "new-email-tickets" && state.pendingTriggerScope?.mode === "new-email-tickets" && isEmptyTargetedQueryCompletion(report);
     const continuationDisposition = operationContinuationDisposition(effectiveReport);
     if (report.status === "complete" && continuationDisposition === "human_reconciliation") {
@@ -5147,7 +5183,7 @@ __name(parseRelevantHistoryQuery, "parseRelevantHistoryQuery");
 
 // src/dispatch-history.ts
 var DISPATCH_HISTORY_TABLE = "triage_dispatch_history";
-var DISPATCH_HISTORY_PLACEHOLDERS = Array.from({ length: 49 }, () => "?").join(", ");
+var DISPATCH_HISTORY_PLACEHOLDERS = Array.from({ length: 52 }, () => "?").join(", ");
 var MAX_DISPATCH_HISTORY_PAGE_SIZE = 100;
 var ROUTINE_RELEVANT_HISTORY_EXCLUSION = `
   NOT COALESCE((
@@ -5255,7 +5291,10 @@ function ensureDispatchHistoryTable(storage) {
       ticket_outcomes_json TEXT,
       failure_diagnostics_json TEXT,
       mcp_execution_json TEXT,
-      operation_status_json TEXT
+      operation_status_json TEXT,
+      replay_of_event_id INTEGER,
+      ticket_number TEXT,
+      operator_confirmed_no_mcp_calls INTEGER
     )
   `);
   const columns = new Set(
@@ -5284,7 +5323,10 @@ function ensureDispatchHistoryTable(storage) {
     ["scope_created_to", "TEXT"],
     ["agent_status_poll_count", "INTEGER"],
     ["agent_status_poll_duration_ms", "INTEGER"],
-    ["agent_accepted_to_callback_ms", "INTEGER"]
+    ["agent_accepted_to_callback_ms", "INTEGER"],
+    ["replay_of_event_id", "INTEGER"],
+    ["ticket_number", "TEXT"],
+    ["operator_confirmed_no_mcp_calls", "INTEGER"]
   ];
   for (const [name, definition] of additions) {
     if (!columns.has(name)) {
@@ -5337,7 +5379,8 @@ function persistDispatchHistory(storage, entries) {
         run_duration_ms, notification_count, discovered_count, accepted_count,
         duplicate_count, rejected_count, partial, scheduled_at, alarm_lateness_ms,
         duration_ms, source, phase_status, subscription_expiration_at, operation_id, result_reference, ticket_outcomes_json,
-        failure_diagnostics_json, mcp_execution_json, operation_status_json
+        failure_diagnostics_json, mcp_execution_json, operation_status_json,
+        replay_of_event_id, ticket_number, operator_confirmed_no_mcp_calls
       ) VALUES (${DISPATCH_HISTORY_PLACEHOLDERS})
       `,
       entry.eventId,
@@ -5388,7 +5431,10 @@ function persistDispatchHistory(storage, entries) {
       optionalJson(entry.ticketOutcomes),
       optionalJson(entry.failureDiagnostics),
       optionalJson(entry.mcpExecution),
-      optionalJson(entry.operationStatus)
+      optionalJson(entry.operationStatus),
+      optionalNumber(entry.replayOfEventId),
+      optionalString(entry.ticketNumber),
+      optionalBoolean(entry.operatorConfirmedNoMcpCalls)
     );
   }
 }
@@ -5477,7 +5523,10 @@ function rowToEntry(row) {
     ...(() => {
       const operationStatus = parseSafeOperationStatus(asOptionalJson(row.operation_status_json));
       return operationStatus === void 0 || operationStatus === null ? {} : { operationStatus };
-    })()
+    })(),
+    ...asOptionalNumber(row.replay_of_event_id) === void 0 ? {} : { replayOfEventId: row.replay_of_event_id },
+    ...row.ticket_number === null ? {} : { ticketNumber: row.ticket_number },
+    ...row.operator_confirmed_no_mcp_calls === null ? {} : { operatorConfirmedNoMcpCalls: row.operator_confirmed_no_mcp_calls === 1 }
   };
 }
 __name(rowToEntry, "rowToEntry");
@@ -5916,6 +5965,83 @@ var TriageCoordinator = class {
       agent: new WorkspaceAgentTriggerClient(config, boundWorkerFetch, logger()),
       logger: logger()
     });
+    if (request.method === "POST" && path === "/internal/admin/replay") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ error: "invalid_payload" }, 400);
+      }
+      if (!isRecord3(body) || !keysAreBounded(body, ["sourceEventId", "ticketNumber", "confirmNoMcpCalls"]) ||
+          boundedInteger2(body.sourceEventId, 1) === null || typeof body.ticketNumber !== "string" ||
+          !SAFE_TICKET_NUMBER_PATTERN.test(body.ticketNumber) || body.confirmNoMcpCalls !== true) {
+        return json({ error: "invalid_replay_request" }, 400);
+      }
+      if (!config.enabled || config.scopeMode !== "new-email-tickets") return json({ error: "targeted_triage_not_enabled" }, 409);
+      const state = await store.load();
+      const queuedWorkIsExplicitlyHeld = state.queuedPending && state.queuedBlockedByAttention && state.attentionBlockedWindow !== null;
+      if (state.pending || state.queuedPending && !queuedWorkIsExplicitlyHeld || state.unavailableRetryWindow !== null || state.reconciliationHold !== null || state.sharedRateLimitUntil !== null && state.sharedRateLimitUntil > Date.now()) {
+        return json({ error: "coordinator_not_idle" }, 409);
+      }
+      const sourceEventId = body.sourceEventId;
+      const sourceEvent = state.dispatchHistory.find((entry) => entry.eventId === sourceEventId);
+      if (!sourceEvent || sourceEvent.event !== "orphan_recovered" || sourceEvent.agentRunStatus !== "failed" ||
+          sourceEvent.failureKind !== "ambiguous" || sourceEvent.scopeMode !== "new-email-tickets" ||
+          !sourceEvent.failureDiagnostics?.some((item) => item.stage === "agent_callback" && item.errorCode === "result_callback_missing") ||
+          !sourceEvent.scopeCreatedFrom || !sourceEvent.scopeCreatedTo) {
+        return json({ error: "eligible_failed_run_not_found" }, 409);
+      }
+      const originalScope = state.needsAttentionScopes.find((scope) => scope.mode === "new-email-tickets" &&
+        scope.createdFrom === sourceEvent.scopeCreatedFrom && scope.createdTo === sourceEvent.scopeCreatedTo && scope.source === "EMAIL");
+      if (!originalScope) return json({ error: "matching_attention_fence_not_found" }, 409);
+      if (state.dispatchHistory.some((entry) => entry.event === "manual_replay_requested" && entry.replayOfEventId === sourceEventId && entry.ticketNumber === body.ticketNumber)) {
+        return json({ error: "replay_already_requested" }, 409);
+      }
+      const scope = {
+        ...originalScope,
+        targetTicketNumbers: [body.ticketNumber],
+        replayOfEventId: sourceEventId
+      };
+      if (scopeOverlapsAttention(state, config, scope)) return json({ error: "additional_overlapping_attention_fence" }, 409);
+      const now = Date.now();
+      state.triggerSequence += 1;
+      state.pending = true;
+      state.pendingReason = "new_message";
+      state.pendingTriggerId = `triage-${state.triggerSequence}-${crypto.randomUUID()}`;
+      state.pendingNotificationWindowStartedAt = Date.parse(scope.createdFrom);
+      state.pendingNotificationWindowEndedAt = Date.parse(scope.createdTo);
+      state.pendingNotificationLookbackMs = 0;
+      state.pendingTriggerScope = scope;
+      state.pendingDispatchWasQueued = false;
+      state.pendingDispatchWaitReason = null;
+      state.executionPhase = "pending_dispatch";
+      state.dispatchAttempt = 0;
+      state.resultDeadlineAt = null;
+      state.dueAt = now;
+      state.retryCount = 0;
+      state.emptyTargetedRecoveryPending = false;
+      state.pendingTicketOutcomes = null;
+      state.acceptedRunLeaseUnknown = false;
+      state.lastNotificationAt = now;
+      recordDispatchHistory(state, now, {
+        event: "manual_replay_requested",
+        replayOfEventId: sourceEventId,
+        ticketNumber: body.ticketNumber,
+        operatorConfirmedNoMcpCalls: true,
+        waitReason: "bounded_recovery"
+      }, scope);
+      await store.save(state);
+      await store.setAlarm(now);
+      logger().warn("triage_manual_ticket_replay_requested", {
+        sourceEventId,
+        ticketNumber: body.ticketNumber,
+        triggerId: state.pendingTriggerId,
+        createdFrom: scope.createdFrom,
+        createdTo: scope.createdTo,
+        operatorConfirmedNoMcpCalls: true
+      });
+      return json({ status: "replay_scheduled", triggerId: state.pendingTriggerId, ticketNumber: body.ticketNumber, sourceEventId }, 202);
+    }
     if (request.method === "POST" && path === "/internal/history/reset") {
       const state = normalizeState(await store.load());
       let resetRunStatus = null;
@@ -6430,6 +6556,24 @@ var index_default = {
       return coordinator(env).fetch(
         new Request("https://coordinator.internal/internal/history/reset", { method: "POST" })
       );
+    }
+    if (url.pathname === "/admin/replay" && request.method === "POST") {
+      const authorization = request.headers.get("Authorization");
+      const actualToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+      if (!config.replayAdminToken || !constantTimeEqual(config.replayAdminToken, actualToken)) {
+        return json2({ error: "unauthorized" }, 401);
+      }
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json2({ error: "invalid_payload" }, 400);
+      }
+      return coordinator(env).fetch(new Request("https://coordinator.internal/internal/admin/replay", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }));
     }
     if (url.pathname === "/mcp" && request.method === "POST") {
       return handleTriageResultMcp(request, {

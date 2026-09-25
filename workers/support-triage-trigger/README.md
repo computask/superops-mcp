@@ -13,7 +13,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-5b71debcb7b2e57a34d0e257578bf16fecbc7fa560af3e839f563f466a455577.
+51b868cd9d0da013c4c61818c3257020eebe77a61a198f9fdd647f3e4a6cae26.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -25,8 +25,29 @@ an uncertain update for the earlier ticket must not swallow the later ticket's
 window just because its lookback overlaps. The original upper bound and due time
 are retained (normal dispatch-time end clamping still applies). The existing
 single-run gate, rate-limit gate, stale checks and mutation safeguards remain.
-Accepted/frozen scopes are never clipped or replayed. Empty-result recovery
-cannot widen a released suffix back into a hold.
+Accepted/frozen scopes are never automatically clipped or replayed. Empty-result
+recovery cannot widen a released suffix back into a hold.
+
+Operator-controlled single-ticket replay, 25 September 2026: `POST /admin/replay`
+is a separate, bearer-token-protected recovery path for one ticket from a
+recorded `orphan_recovered` event whose Agent run is confirmed `failed` and
+whose result callback is missing. The caller must provide the exact
+`sourceEventId`, one display `ticketNumber`, and `confirmNoMcpCalls: true` after
+checking MCP/dispatcher logs. The Worker requires no active Agent, no
+rate-limit or reconciliation hold, the exact matching attention fence, and
+either no queued work or a queue explicitly blocked by attention. An explicitly
+blocked queue is preserved untouched while the one-ticket replay runs. The
+Worker records the replay request, preserves every attention fence, rejects a
+duplicate request for that event/ticket, and constrains the Agent prompt and
+candidate application to that ticket only. A later failure remains fenced; it
+is not automatically replayed. Replays never widen the original time window,
+clear history, or bypass stale checks, deduplication, verification, or write
+safeguards.
+
+Configure the distinct `TRIAGE_REPLAY_ADMIN_TOKEN` as a Worker secret outside
+Git before using this endpoint. Do not reuse `TRIAGE_HISTORY_RESET_TOKEN` or
+commit the replay token. The history reset credential remains limited to its
+existing reset route.
 
 `TRIAGE_ATTENTION_TAIL_ISOLATION_ENABLED=true` enables this behavior; set it false
 and push through Git to restore whole-window parking. No state migration or

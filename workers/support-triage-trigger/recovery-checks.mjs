@@ -5,7 +5,7 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 // Exercise the actual preserved production module, exposing internals only in
 // this in-memory test module. No test route or export is shipped to production.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
-const {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState} = await import(
+const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState} = await import(
   `data:text/javascript;base64,${Buffer.from(source + '\nexport {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
@@ -35,6 +35,98 @@ test('email trigger directs the Agent to the email policy, never the scheduled p
   assert(prompt.includes('resultState to degraded'));
   assert(prompt.includes('omit all history/emerging note sections'));
   assert(prompt.includes('always use action leave and omit target.status'));
+});
+
+function replayCoordinator(seed) {
+  const storage={value:structuredClone(seed),alarm:null,
+    async get(){return structuredClone(this.value);},
+    async put(_key,value){this.value=structuredClone(value);},
+    async setAlarm(value){this.alarm=value;},
+    sql:{exec(){return {toArray(){return [];},one(){return {event_id:0};}};}}
+  };
+  return {storage,coordinator:new TriageCoordinator({storage},vars)};
+}
+const replaySourceScope={mode:'new-email-tickets',source:'EMAIL',createdFrom:'2026-09-25T10:17:01.406Z',createdTo:'2026-09-25T10:18:17.407Z'};
+const replayFailureEvent={eventId:41,at:'2026-09-25T10:18:47.407Z',event:'orphan_recovered',batchSequence:24,
+  scopeMode:'new-email-tickets',scopeCreatedFrom:replaySourceScope.createdFrom,scopeCreatedTo:replaySourceScope.createdTo,
+  failureKind:'ambiguous',attempt:1,agentRunIdPresent:true,agentRunStatus:'failed',
+  failureDiagnostics:[{stage:'agent_callback',errorType:'callback_contract',errorCode:'result_callback_missing',message:'Agent run reached a terminal state without calling triage_result_report.'}]};
+test('manual replay schedules only one named ticket and preserves the attention fence',async()=>{
+  const seed={...createInitialState(),dispatchHistorySequence:41,dispatchHistory:[replayFailureEvent],
+    needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true};
+  const {storage,coordinator}=replayCoordinator(seed);
+  const response=await coordinator.fetch(new Request('https://coordinator.internal/internal/admin/replay',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({sourceEventId:41,ticketNumber:'62966',confirmNoMcpCalls:true})}));
+  const result=await response.json();
+  assert.equal(response.status,202,JSON.stringify(result));
+  assert.equal(result.status,'replay_scheduled');
+  assert.equal(result.ticketNumber,'62966');
+  assert.equal(storage.value.pending,true);
+  assert.equal(storage.value.pendingTriggerScope.replayOfEventId,41);
+  assert.deepEqual(storage.value.pendingTriggerScope.targetTicketNumbers,['62966']);
+  assert.deepEqual(storage.value.pendingTriggerScope,{...replaySourceScope,targetTicketNumbers:['62966'],replayOfEventId:41});
+  assert.deepEqual(storage.value.needsAttentionScopes,[replaySourceScope]);
+  assert.equal(storage.value.dispatchHistory.at(-1).event,'manual_replay_requested');
+  assert.equal(storage.value.dispatchHistory.at(-1).operatorConfirmedNoMcpCalls,true);
+  assert.equal(storage.alarm,Date.parse(storage.value.dispatchHistory.at(-1).at));
+  const prompt=buildAgentInput(result.triggerId,storage.value.pendingTriggerScope,1,true);
+  assert(prompt.includes('only process ticket #62966'));
+  assert(prompt.includes('Never widen this scope'));
+  assert(prompt.includes('"targetTicketNumbers":["62966"]'));
+});
+test('manual replay rejects an unconfirmed call log or non-failed run and preserves other overlapping holds',async()=>{
+  const request=body=>new Request('https://coordinator.internal/internal/admin/replay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const seed={...createInitialState(),dispatchHistorySequence:41,dispatchHistory:[replayFailureEvent],
+    needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true};
+  const a=replayCoordinator(seed);
+  assert.equal((await a.coordinator.fetch(request({sourceEventId:41,ticketNumber:'62966',confirmNoMcpCalls:false}))).status,400);
+  const failed={...replayFailureEvent,agentRunStatus:'completed'};
+  const b=replayCoordinator({...seed,dispatchHistory:[failed]});
+  assert.equal((await b.coordinator.fetch(request({sourceEventId:41,ticketNumber:'62966',confirmNoMcpCalls:true}))).status,409);
+  const overlapping={mode:'new-email-tickets',source:'EMAIL',createdFrom:'2026-09-25T10:18:00.000Z',createdTo:'2026-09-25T10:18:30.000Z'};
+  const c=replayCoordinator({...seed,needsAttentionScopes:[replaySourceScope,overlapping]});
+  const overlapResponse=await c.coordinator.fetch(request({sourceEventId:41,ticketNumber:'62966',confirmNoMcpCalls:true}));
+  assert.equal(overlapResponse.status,202);
+  assert.deepEqual(c.storage.value.needsAttentionScopes,[replaySourceScope,overlapping]);
+  assert.deepEqual(c.storage.value.pendingTriggerScope.targetTicketNumbers,['62966']);
+});
+test('manual replay can run through an attention-blocked queue without consuming it',async()=>{
+  const heldQueue={mode:'new-email-tickets',source:'EMAIL',createdFrom:'2026-09-25T10:35:55.935Z',createdTo:'2026-09-25T10:37:11.936Z'};
+  const blockedWindow={reason:'new_message',notificationWindowStartedAt:Date.parse('2026-09-25T10:35:55.935Z'),notificationWindowEndedAt:Date.parse('2026-09-25T10:37:11.936Z'),notificationLookbackMs:0,lastNotificationAt:Date.parse('2026-09-25T10:37:11.936Z'),debounceWindowStartedAt:Date.parse('2026-09-25T10:35:55.935Z'),unavailableRetryCount:0,lifecycleRecoveryRequested:false,lastLifecycleEvent:null};
+  const queued={queuedPending:true,queuedBlockedByAttention:true,queuedReason:'new_message',queuedNotificationWindowStartedAt:Date.parse(heldQueue.createdFrom),queuedNotificationWindowEndedAt:Date.parse(heldQueue.createdTo),queuedNotificationLookbackMs:0,queuedLastNotificationAt:Date.parse(heldQueue.createdTo),queuedDebounceWindowStartedAt:Date.parse(heldQueue.createdFrom)};
+  const seed={...createInitialState(),dispatchHistorySequence:41,dispatchHistory:[replayFailureEvent],needsAttentionScope:heldQueue,needsAttentionScopes:[replaySourceScope,heldQueue],attentionBlockedWindow:blockedWindow,candidateAttentionFenceActive:true,...queued};
+  const {storage,coordinator}=replayCoordinator(seed);
+  const response=await coordinator.fetch(new Request('https://coordinator.internal/internal/admin/replay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sourceEventId:41,ticketNumber:'62966',confirmNoMcpCalls:true})}));
+  assert.equal(response.status,202);
+  assert.equal(storage.value.pending,true);
+  assert.equal(storage.value.queuedPending,true);
+  assert.equal(storage.value.queuedBlockedByAttention,true);
+  assert.deepEqual(storage.value.needsAttentionScopes,[replaySourceScope,heldQueue]);
+  assert.equal(storage.value.queuedNotificationWindowStartedAt,Date.parse(heldQueue.createdFrom));
+});
+test('manual replay is one-shot per failed history event and ticket',async()=>{
+  const requested={eventId:42,at:'2026-09-25T10:20:00.000Z',event:'manual_replay_requested',batchSequence:25,
+    scopeMode:'new-email-tickets',scopeCreatedFrom:replaySourceScope.createdFrom,scopeCreatedTo:replaySourceScope.createdTo,
+    replayOfEventId:41,ticketNumber:'62966',operatorConfirmedNoMcpCalls:true};
+  const state={...createInitialState(),dispatchHistorySequence:42,dispatchHistory:[replayFailureEvent,requested],
+    needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true};
+  const {coordinator}=replayCoordinator(state);
+  const response=await coordinator.fetch(new Request('https://coordinator.internal/internal/admin/replay',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({sourceEventId:41,ticketNumber:'62966',confirmNoMcpCalls:true})}));
+  assert.equal(response.status,409);
+  assert.equal((await response.json()).error,'replay_already_requested');
+});
+test('an empty manual replay completes without widening the source window',async()=>{
+  const f=fixture('completed');
+  const targetScope={...f.scope,targetTicketNumbers:['62966'],replayOfEventId:41};
+  f.seed({...f.state,pendingTriggerScope:targetScope,needsAttentionScope:f.scope,needsAttentionScopes:[f.scope],candidateAttentionFenceActive:true});
+  const result=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'complete',
+    metadata:{ticketsConsidered:0,ticketsCompleted:0,ticketsDeferred:0,ticketOutcomes:[]}});
+  assert.equal(result.status,'complete');
+  assert.deepEqual(f.state.needsAttentionScopes,[f.scope]);
+  assert.equal(f.state.queuedPending,false);
+  assert.equal(f.state.pendingTriggerScope,null);
+  assert(!f.state.dispatchHistory.some(event=>event.event==='retry_scheduled'));
 });
 
 function fixture(status, age = 120000) {
