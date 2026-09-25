@@ -18,6 +18,7 @@ import {
 
 import type { Domain, DomainTools, ToolDefinition } from "./types.js";
 import { getCredentials, getClient } from "./client.js";
+import { dispatcherDiagnostics, dispatcherEnvironment } from "./dispatcher.js";
 import { setServerRef } from "./utils/server-ref.js";
 import {
   auditToolCall,
@@ -209,6 +210,7 @@ const CHATGPT_DIRECT_TARGETED_TRIAGE_BLOCKED_TOOL_NAMES = [
   "superops_tickets_report",
   "superops_tickets_triage_snapshot",
   "superops_tickets_field_options",
+  "superops_operations_dispatcher_diagnostics",
 ] as const;
 
 export type ChatGptDirectToolPolicy = {
@@ -325,6 +327,21 @@ const operationTools: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {},
+    },
+  },
+  {
+    name: "superops_operations_dispatcher_diagnostics",
+    description:
+      "Read redacted upstream attempt status and error codes for dispatcher receipts already attached to one owner-visible durable operation. Never returns request/response bodies, headers, tokens, or idempotency keys; does not resubmit work.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        operationId: {
+          type: "string",
+          description: "Exact durable operation ID from superops_operations_get or superops_operations_results.",
+        },
+      },
+      required: ["operationId"],
     },
   },
   {
@@ -519,6 +536,35 @@ async function executeToolCall(
           text: JSON.stringify(records, null, 2),
         },
       ],
+    };
+  }
+  if (name === "superops_operations_dispatcher_diagnostics") {
+    const operationId = typeof args.operationId === "string" ? args.operationId.trim() : "";
+    if (!operationId) return errorResult("operationId is required.");
+    const ownerHash = currentOwnerHash();
+    const record = await getOperationStore().get(operationId, ownerHash);
+    if (!record || record.ownerHash !== ownerHash) {
+      return errorResult("Operation was not found or is not visible to this caller.");
+    }
+    const receipts = record.expectedItems.flatMap((itemId) => {
+      const receipt = record.itemStates[itemId]?.dispatcherReceipt;
+      if (!receipt || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(receipt.requestId)) return [];
+      return [{itemId, requestId: receipt.requestId, state: receipt.state}];
+    }).slice(0, 20);
+    const credentials = getCredentials();
+    const diagnostics = await Promise.all(receipts.map(async (receipt) => {
+      try {
+        return {itemId: receipt.itemId, receiptState: receipt.state,
+          ...(await dispatcherDiagnostics(receipt.requestId, credentials?.dispatcher ?? dispatcherEnvironment()) as Record<string, unknown>)};
+      } catch (error) {
+        return {itemId: receipt.itemId, receiptState: receipt.state,
+          error: sanitizeText(error instanceof Error ? error.message : "Dispatcher diagnostics failed.")};
+      }
+    }));
+    return {
+      content: [{type: "text", text: JSON.stringify({operationId, receiptCount: receipts.length,
+        truncated: record.expectedItems.filter((itemId) => Boolean(record.itemStates[itemId]?.dispatcherReceipt?.requestId)).length > receipts.length,
+        receipts: diagnostics}, null, 2)}],
     };
   }
   if (name === "superops_operations_cancel") {

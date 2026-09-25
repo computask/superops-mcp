@@ -83,6 +83,105 @@ export async function boundedJson(response: Response): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
+const DIAGNOSTIC_SAFE_KEYS = new Set([
+  "requestId", "source", "status", "state", "attempts", "upstreamAttempts", "retryHistory",
+  "diagnostics", "attempt", "attemptNumber", "attemptCount", "retryCount", "httpStatus",
+  "upstreamHttpStatus", "statusCode", "errorClassification", "errorCode", "graphqlCode",
+  "graphqlErrorCode", "nextRetryAt", "retryAfterSeconds", "startedAt", "completedAt",
+  "createdAt", "updatedAt", "durationMs", "ok", "success", "uncertain", "responseHadData",
+]);
+const DIAGNOSTIC_ARRAY_KEYS = new Set(["attempts", "upstreamAttempts", "retryHistory"]);
+const SAFE_RECEIPT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SAFE_DIAGNOSTIC_CODE = /^[A-Za-z0-9_.:-]{1,100}$/;
+const SAFE_DISPATCHER_STATES = new Set(["queued", "running", "retry_wait", "succeeded", "failed", "cancelled", "uncertain"]);
+
+function safeDiagnosticScalar(key: string, value: unknown): string | number | boolean | undefined {
+  if (typeof value === "boolean" && ["ok", "success", "uncertain", "responseHadData"].includes(key)) return value;
+  if (typeof value === "number" && ["attempt", "attemptNumber", "attemptCount", "retryCount", "httpStatus", "upstreamHttpStatus", "statusCode", "retryAfterSeconds", "durationMs"].includes(key)) {
+    if (!Number.isFinite(value) || !Number.isInteger(value)) return undefined;
+    if (["httpStatus", "upstreamHttpStatus", "statusCode"].includes(key)) return value >= 100 && value <= 599 ? value : undefined;
+    if (["retryAfterSeconds", "durationMs"].includes(key)) return value >= 0 && value <= 86_400_000 ? value : undefined;
+    return value >= 0 && value <= 100_000 ? value : undefined;
+  }
+  if (typeof value !== "string") return undefined;
+  if (key === "requestId") return SAFE_RECEIPT_ID.test(value) ? value : undefined;
+  if (key === "source") return value === "superops-mcp" ? value : undefined;
+  if (key === "status" || key === "state") return SAFE_DISPATCHER_STATES.has(value) ? value : undefined;
+  if (["startedAt", "completedAt", "createdAt", "updatedAt", "nextRetryAt"].includes(key)) {
+    return value.length <= 40 && Number.isFinite(Date.parse(value)) ? value : undefined;
+  }
+  if (["errorClassification", "errorCode", "graphqlCode", "graphqlErrorCode"].includes(key)) {
+    return SAFE_DIAGNOSTIC_CODE.test(value) ? value : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Read the dispatcher's receipt diagnostics without exposing request/response
+ * bodies, headers, idempotency keys, or free-text upstream errors.
+ */
+export async function dispatcherDiagnostics(requestId: string, env = dispatcherEnvironment()): Promise<unknown> {
+  if (!SAFE_RECEIPT_ID.test(requestId)) throw new Error("A valid dispatcher receipt ID is required.");
+  if (!dispatcherConfigured(env)) throw new Error("Dispatcher producer credentials are not configured.");
+  if (Boolean(env.CF_ACCESS_CLIENT_ID) !== Boolean(env.CF_ACCESS_CLIENT_SECRET)) {
+    throw new Error("Both Cloudflare Access credentials must be configured.");
+  }
+
+  const url = `${DISPATCHER_ORIGIN}/v1/requests/${requestId}/diagnostics`;
+  const counted = recordTypedSubrequestStart({type: "dispatcherPoll", endpoint: url, operationName: "dispatcherDiagnostics"});
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${env.DISPATCHER_TOKEN}`,
+    "X-Source": "superops-mcp",
+    Accept: "application/json",
+  };
+  if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
+    headers["CF-Access-Client-Id"] = env.CF_ACCESS_CLIENT_ID;
+    headers["CF-Access-Client-Secret"] = env.CF_ACCESS_CLIENT_SECRET;
+  }
+
+  let response: Response;
+  let body: unknown;
+  try {
+    response = await fetch(url, {method: "GET", headers, redirect: "manual", signal: AbortSignal.timeout(getExecutionConfig().requestTimeoutMs)});
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel();
+      recordSubrequestFinish(counted, response.status, false);
+      throw new Error("Dispatcher diagnostics rejected a redirect.");
+    }
+    body = await boundedJson(response);
+    recordSubrequestFinish(counted, response.status, response.ok);
+  } catch (error) {
+    if (!(error instanceof Error && error.message === "Dispatcher diagnostics rejected a redirect.")) {
+      recordSubrequestFinish(counted, "networkError", false);
+    }
+    throw new Error("Dispatcher diagnostics request failed; no receipt details were exposed.");
+  }
+  if (!response.ok) throw new Error(`Dispatcher diagnostics returned HTTP ${response.status}.`);
+
+  const sanitize = (value: unknown, depth = 0): unknown => {
+    if (depth > 3) return undefined;
+    if (Array.isArray(value)) return value.slice(0, 50).map((entry) => sanitize(entry, depth + 1)).filter((entry) => entry !== undefined);
+    if (typeof value !== "object" || value === null) return undefined;
+    const output: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (!DIAGNOSTIC_SAFE_KEYS.has(key)) continue;
+      if (DIAGNOSTIC_ARRAY_KEYS.has(key)) {
+        if (Array.isArray(child)) output[key] = child.slice(0, 50).map((entry) => sanitize(entry, depth + 1)).filter((entry) => entry !== undefined);
+        continue;
+      }
+      const scalar = safeDiagnosticScalar(key, child);
+      if (scalar !== undefined) output[key] = scalar;
+      else if (key === "diagnostics" && typeof child === "object" && child !== null) output[key] = sanitize(child, depth + 1);
+    }
+    return Object.keys(output).length ? output : undefined;
+  };
+
+  return {
+    requestId,
+    diagnostics: sanitize(body) ?? {},
+  };
+}
+
 /** POST is sent once. After any receipt (including 504), only GET is used.
  * A caller recovering a lost acknowledgement must supply the original key and
  * exact payload. The dispatcher owns durable idempotency and upstream retries.

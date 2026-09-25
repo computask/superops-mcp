@@ -123,6 +123,15 @@ endpoint_host and `/graphql`; these are NOT exact upstream physical-call counts.
 Use the dispatcher's attempt ledger for upstream quota evidence. Neither receipt
 polls nor operation checkpoints consume SuperOps upstream quota.
 
+Owner-visible durable operations now expose `superops_operations_dispatcher_diagnostics`.
+It follows only receipt IDs already persisted on that caller-owned operation and
+uses the existing dispatcher/Access bindings to make authenticated read-only
+`GET /v1/requests/{id}/diagnostics` calls. It returns bounded status, attempt
+timing, HTTP status, and allowlisted error codes only; request/response bodies,
+headers, idempotency keys, and free-text error messages are omitted. This tool is
+excluded from the targeted email Agent catalogue. It never resubmits a request
+or changes an operation's replay-safety state.
+
 The initial 23 September read-only Worker secret-name preflight found no
 `DISPATCHER_TOKEN`, `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` or
 `SUPEROPS_SUBDOMAIN` secret, so the first push was held. Subsequent explicit

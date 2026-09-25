@@ -32,6 +32,7 @@ export const READ_ONLY_TOOL_NAMES = new Set<string>([
   "superops_test_connection",
   "superops_operations_get",
   "superops_operations_results",
+  "superops_operations_dispatcher_diagnostics",
   "superops_clients_list",
   "superops_clients_get",
   "superops_clients_search",
