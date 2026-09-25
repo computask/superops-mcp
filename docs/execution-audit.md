@@ -123,9 +123,11 @@ endpoint_host and `/graphql`; these are NOT exact upstream physical-call counts.
 Use the dispatcher's attempt ledger for upstream quota evidence. Neither receipt
 polls nor operation checkpoints consume SuperOps upstream quota.
 
-Owner-visible durable operations now expose `superops_operations_dispatcher_diagnostics`.
-It follows only receipt IDs already persisted on that caller-owned operation and
-uses the existing dispatcher/Access bindings to make authenticated read-only
+The read-only `superops_operations_dispatcher_diagnostics` tool accepts either
+an owner-visible durable operation ID (and follows only receipt IDs persisted
+on that caller-owned operation) or up to 20 exact, validated dispatcher receipt
+UUIDs for calls that are not operation-ledger-backed. It uses the existing
+dispatcher/Access bindings to make authenticated read-only
 `GET /v1/requests/{id}/diagnostics` calls. It returns bounded status, attempt
 timing, HTTP status, and allowlisted error codes only; request/response bodies,
 headers, idempotency keys, and free-text error messages are omitted. This tool is
