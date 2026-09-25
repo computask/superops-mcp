@@ -14,7 +14,7 @@ interface AuditDatabase<Statement> {
   prepare(sql: string): { bind(...values: Cell[]): Statement };
   batch(statements: Statement[]): Promise<{ success: boolean }[]>;
 }
-const OUTCOMES = new Set(["success", "http_error", "graphql_error", "rate_limited", "network_error", "request_timeout", "malformed_response", "internal_error"]);
+const OUTCOMES = new Set(["success", "http_error", "graphql_error", "rate_limited", "network_error", "dispatcher_uncertain", "dispatcher_error", "request_timeout", "malformed_response", "internal_error"]);
 const PURPOSES = new Set(["initialRead", "paginationRead", "metadataValidation", "duplicateNoteCheck", "write", "fallbackWrite", "verificationRead", "retry", "custom"]);
 const WORKER_OUTCOMES = new Set(["unknown", "ok", "exception", "exceededCpu", "exceededMemory", "scriptNotFound", "canceled", "responseStreamDisconnected"]);
 

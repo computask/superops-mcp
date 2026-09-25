@@ -13,7 +13,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-29788ddfdd516b15a617ed47bf121f06f3ebc7a90d9cf378ffbd1ea80d87c58e.
+ce16e6d68246f8a1a21cbc794cf2a449fd1e82131ad34622a5b3a5a37c0735ac.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -86,11 +86,14 @@ and notifications received during a frozen run.
 
 The callback parser and published tool schema now accept the MCP's bounded
 dispatcher telemetry: dispatcherPoll, provider, timing, host-only endpoint,
-receipt ID/state, and structured outcome flags. Unknown keys, headers, bodies,
-URLs, and malformed values remain rejected. Dispatcher polls are transport
-coordination, not additional SuperOps calls; receipt-level upstream accounting
-remains authoritative. Refresh Triage Result Reporter v2 in ChatGPT after this
-Git deployment so its cached schema includes the additive fields.
+receipt ID/state, separate dispatcher/upstream HTTP statuses, and structured
+attempt diagnostics including GraphQL codes and field paths. Diagnostic
+retrieval failures are reported as their own bounded category. Unknown keys,
+headers, bodies, URLs, and malformed values remain rejected. Dispatcher polls
+are transport coordination, not additional SuperOps calls; receipt-level
+upstream accounting remains authoritative. Refresh Triage Result Reporter v2
+in ChatGPT after this Git deployment so its cached schema includes the additive
+fields.
 
 Safety/access denials (risk_gate, unacceptable_risk, apply_rejected,
 permission_denied, access_denied) are terminal even when read-only telemetry

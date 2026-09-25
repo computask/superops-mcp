@@ -579,7 +579,9 @@ var MCP_OPERATION_TYPES = /* @__PURE__ */ new Set([
 ]);
 var MCP_STATUSES = /* @__PURE__ */ new Set([
   "networkError",
-  "requestTimeout"
+  "requestTimeout",
+  "dispatcherUncertain",
+  "dispatcherError"
 ]);
 var RETRY_SOURCES = /* @__PURE__ */ new Set(["retry-after", "backoff"]);
 function isRecord2(value) {
@@ -748,6 +750,85 @@ function parseSafeFailureDiagnostics(value) {
   return diagnostics;
 }
 __name(parseSafeFailureDiagnostics, "parseSafeFailureDiagnostics");
+function parseDispatcherDiagnosticDetails(value) {
+  if (value === void 0) return void 0;
+  if (!isRecord2(value)) return null;
+  if (Object.hasOwn(value, "category")) {
+    if (!keysAreBounded(value, ["status", "category", "dispatcherHttpStatus"]) ||
+        value.status !== "failed" || typeof value.category !== "string" || !/^[a-z0-9_]{1,64}$/.test(value.category)) return null;
+    const dispatcherHttpStatus = boundedInteger(value.dispatcherHttpStatus, 100, 599);
+    if (dispatcherHttpStatus === null) return null;
+    return {status: "failed", category: value.category,
+      ...dispatcherHttpStatus === void 0 ? {} : {dispatcherHttpStatus}};
+  }
+  if (!keysAreBounded(value, ["schemaVersion", "status", "attemptCount", "upstreamHttpStatus", "errorClassification", "uncertain", "attempts", "attemptsTruncated"]) ||
+      value.schemaVersion !== 1 || typeof value.status !== "string" || !new Set(["queued", "running", "retry_wait", "succeeded", "failed", "cancelled", "uncertain"]).has(value.status) ||
+      boundedInteger(value.attemptCount, 0, 1000) === void 0 || boundedInteger(value.attemptCount, 0, 1000) === null || typeof value.uncertain !== "boolean" ||
+      typeof value.attemptsTruncated !== "boolean" || !Array.isArray(value.attempts) || value.attempts.length > 20) return null;
+  const upstreamHttpStatus = boundedInteger(value.upstreamHttpStatus, 100, 599);
+  if (upstreamHttpStatus === null) return null;
+  const errorClassification = value.errorClassification === void 0 ? void 0 : safeReference(value.errorClassification, /^[A-Z][A-Z0-9_]{0,79}$/);
+  if (errorClassification === null) return null;
+  const attempts = [];
+  for (const raw of value.attempts) {
+    if (!isRecord2(raw) || !keysAreBounded(raw, [
+      "attemptId", "attemptNumber", "startedAt", "completedAt", "upstreamHttpStatus", "classification",
+      "responseState", "responseHadData", "graphqlErrors", "uncertain", "retryDecision", "nextRetryAt",
+      "retryReason", "retryAfterMs"
+    ])) return null;
+    const attemptId = boundedInteger(raw.attemptId, 1, 1000000);
+    const attemptNumber = boundedInteger(raw.attemptNumber, 1, 1000);
+    if (attemptId === void 0 || attemptId === null || attemptNumber === void 0 || attemptNumber === null || typeof raw.classification !== "string" ||
+        !/^[A-Z][A-Z0-9_]{0,79}$/.test(raw.classification) || typeof raw.responseState !== "string" ||
+        !new Set(["no_response", "unparseable", "invalid_shape", "missing_data", "null_data", "data", "partial_data", "no_data", "unknown"]).has(raw.responseState) ||
+        typeof raw.uncertain !== "boolean" || typeof raw.retryDecision !== "string" ||
+        !new Set(["scheduled", "not_scheduled", "unknown"]).has(raw.retryDecision) ||
+        !Array.isArray(raw.graphqlErrors) || raw.graphqlErrors.length > 20) return null;
+    for (const key of ["startedAt", "completedAt", "nextRetryAt"]) {
+      if (raw[key] !== void 0 && (typeof raw[key] !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(raw[key]) || !Number.isFinite(Date.parse(raw[key])))) return null;
+    }
+    const attemptHttpStatus = boundedInteger(raw.upstreamHttpStatus, 100, 599);
+    const retryAfterMs = boundedInteger(raw.retryAfterMs, 0, 86400000);
+    if (attemptHttpStatus === null || retryAfterMs === null ||
+        (raw.responseHadData !== void 0 && typeof raw.responseHadData !== "boolean")) return null;
+    const retryReason = raw.retryReason === void 0 ? void 0 : safeReference(raw.retryReason, /^[a-z][a-z0-9_]{0,79}$/);
+    if (retryReason === null) return null;
+    const graphqlErrors = [];
+    for (const graphError of raw.graphqlErrors) {
+      if (!isRecord2(graphError) || !keysAreBounded(graphError, ["code", "path"])) return null;
+      const code = graphError.code === void 0 ? void 0 : safeReference(graphError.code, /^[A-Z][A-Z0-9_]{0,79}$/);
+      if (code === null) return null;
+      let path;
+      if (graphError.path !== void 0) {
+        if (!Array.isArray(graphError.path) || graphError.path.length > 16 || graphError.path.some(part =>
+          typeof part === "string" ? !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(part) : !Number.isInteger(part) || part < 0 || part > 10000)) return null;
+        path = [...graphError.path];
+      }
+      if (code === void 0 && path === void 0) return null;
+      graphqlErrors.push({...code === void 0 ? {} : {code}, ...path === void 0 ? {} : {path}});
+    }
+    attempts.push({
+      attemptId, attemptNumber,
+      ...raw.startedAt === void 0 ? {} : {startedAt: raw.startedAt},
+      ...raw.completedAt === void 0 ? {} : {completedAt: raw.completedAt},
+      ...attemptHttpStatus === void 0 ? {} : {upstreamHttpStatus: attemptHttpStatus},
+      classification: raw.classification,
+      responseState: raw.responseState,
+      ...raw.responseHadData === void 0 ? {} : {responseHadData: raw.responseHadData},
+      graphqlErrors, uncertain: raw.uncertain, retryDecision: raw.retryDecision,
+      ...raw.nextRetryAt === void 0 ? {} : {nextRetryAt: raw.nextRetryAt},
+      ...retryReason === void 0 ? {} : {retryReason},
+      ...retryAfterMs === void 0 ? {} : {retryAfterMs}
+    });
+  }
+  return {
+    schemaVersion: 1, status: value.status, attemptCount: value.attemptCount,
+    ...upstreamHttpStatus === void 0 ? {} : {upstreamHttpStatus},
+    ...errorClassification === void 0 ? {} : {errorClassification},
+    uncertain: value.uncertain, attempts, attemptsTruncated: value.attemptsTruncated
+  };
+}
+__name(parseDispatcherDiagnosticDetails, "parseDispatcherDiagnosticDetails");
 function parseMcpRequestTrace(value) {
   if (!isRecord2(value) || !keysAreBounded(value, [
     "index",
@@ -760,7 +841,8 @@ function parseMcpRequestTrace(value) {
     "durationMs",
     "ok", "provider", "startedAt", "completedAt", "endpointHost", "httpStatus",
     "outcome", "errorClass", "graphqlCode", "rateLimited", "retryAfterSupplied",
-    "responseHadData", "dispatcherRequestId", "dispatcherState"
+    "responseHadData", "dispatcherRequestId", "dispatcherState", "dispatcherErrorCode",
+    "dispatcherHttpStatus", "upstreamHttpStatus", "dispatcherDiagnostics", "dispatcherDiagnosticRetrieval"
   ])) return null;
   const index = boundedInteger(value.index, 1, 1e3);
   if (index === void 0 || index === null) return null;
@@ -782,7 +864,7 @@ function parseMcpRequestTrace(value) {
     if (typeof value[key] !== "boolean") return null;
     telemetry[key] = value[key];
   }
-  for (const key of ["errorClass", "graphqlCode", "dispatcherRequestId", "dispatcherState"]) {
+  for (const key of ["errorClass", "graphqlCode", "dispatcherRequestId", "dispatcherState", "dispatcherErrorCode"]) {
     const token = safeReference(value[key]);
     if (token === null) return null;
     if (token !== void 0) telemetry[key] = token;
@@ -801,12 +883,22 @@ function parseMcpRequestTrace(value) {
     telemetry.endpointHost = value.endpointHost;
   }
   if (value.outcome !== void 0) {
-    if (!["success", "http_error", "graphql_error", "rate_limited", "network_error", "request_timeout", "malformed_response", "internal_error"].includes(value.outcome)) return null;
+    if (!["success", "http_error", "graphql_error", "rate_limited", "network_error", "dispatcher_uncertain", "dispatcher_error", "request_timeout", "malformed_response", "internal_error"].includes(value.outcome)) return null;
     telemetry.outcome = value.outcome;
   }
   const httpStatus = boundedInteger(value.httpStatus, 100, 599);
   if (httpStatus === null) return null;
   if (httpStatus !== void 0) telemetry.httpStatus = httpStatus;
+  for (const key of ["dispatcherHttpStatus", "upstreamHttpStatus"]) {
+    const statusCode = boundedInteger(value[key], 100, 599);
+    if (statusCode === null) return null;
+    if (statusCode !== void 0) telemetry[key] = statusCode;
+  }
+  const dispatcherDiagnostics = parseDispatcherDiagnosticDetails(value.dispatcherDiagnostics);
+  const dispatcherDiagnosticRetrieval = parseDispatcherDiagnosticDetails(value.dispatcherDiagnosticRetrieval);
+  if (dispatcherDiagnostics === null || dispatcherDiagnosticRetrieval === null) return null;
+  if (dispatcherDiagnostics !== void 0) telemetry.dispatcherDiagnostics = dispatcherDiagnostics;
+  if (dispatcherDiagnosticRetrieval !== void 0) telemetry.dispatcherDiagnosticRetrieval = dispatcherDiagnosticRetrieval;
   return {
     index,
     ...telemetry,
@@ -4905,7 +4997,7 @@ function toolDefinition() {
                       status: {
                         oneOf: [
                           { type: "integer", minimum: 100, maximum: 599 },
-                          { type: "string", enum: ["networkError", "requestTimeout"] }
+                          { type: "string", enum: ["networkError", "requestTimeout", "dispatcherUncertain", "dispatcherError"] }
                         ]
                       },
                       retryCount: { type: "integer", minimum: 0, maximum: 100 },
@@ -4916,11 +5008,82 @@ function toolDefinition() {
                       completedAt: { type: "string", format: "date-time", maxLength: 24 },
                       endpointHost: { type: "string", pattern: "^[A-Za-z0-9.-]{1,253}$" },
                       httpStatus: { type: "integer", minimum: 100, maximum: 599 },
-                      outcome: { type: "string", enum: ["success", "http_error", "graphql_error", "rate_limited", "network_error", "request_timeout", "malformed_response", "internal_error"] },
+                      outcome: { type: "string", enum: ["success", "http_error", "graphql_error", "rate_limited", "network_error", "dispatcher_uncertain", "dispatcher_error", "request_timeout", "malformed_response", "internal_error"] },
                       errorClass: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$" },
                       graphqlCode: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$" },
                       dispatcherRequestId: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$" },
                       dispatcherState: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$" },
+                      dispatcherErrorCode: { type: "string", pattern: "^[A-Za-z0-9._:-]{1,128}$" },
+                      dispatcherHttpStatus: { type: "integer", minimum: 100, maximum: 599 },
+                      upstreamHttpStatus: { type: "integer", minimum: 100, maximum: 599 },
+                      dispatcherDiagnostics: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["schemaVersion", "status", "attemptCount", "uncertain", "attempts", "attemptsTruncated"],
+                        properties: {
+                          schemaVersion: { type: "integer", enum: [1] },
+                          status: { type: "string", enum: ["queued", "running", "retry_wait", "succeeded", "failed", "cancelled", "uncertain"] },
+                          attemptCount: { type: "integer", minimum: 0, maximum: 1000 },
+                          upstreamHttpStatus: { type: "integer", minimum: 100, maximum: 599 },
+                          errorClassification: { type: "string", pattern: "^[A-Z][A-Z0-9_]{0,79}$" },
+                          uncertain: { type: "boolean" },
+                          attemptsTruncated: { type: "boolean" },
+                          attempts: {
+                            type: "array",
+                            maxItems: 20,
+                            items: {
+                              type: "object",
+                              additionalProperties: false,
+                              required: ["attemptId", "attemptNumber", "classification", "responseState", "graphqlErrors", "uncertain", "retryDecision"],
+                              properties: {
+                                attemptId: { type: "integer", minimum: 1, maximum: 1000000 },
+                                attemptNumber: { type: "integer", minimum: 1, maximum: 1000 },
+                                startedAt: { type: "string", format: "date-time", maxLength: 24 },
+                                completedAt: { type: "string", format: "date-time", maxLength: 24 },
+                                upstreamHttpStatus: { type: "integer", minimum: 100, maximum: 599 },
+                                classification: { type: "string", pattern: "^[A-Z][A-Z0-9_]{0,79}$" },
+                                responseState: { type: "string", enum: ["no_response", "unparseable", "invalid_shape", "missing_data", "null_data", "data", "partial_data", "no_data", "unknown"] },
+                                responseHadData: { type: "boolean" },
+                                graphqlErrors: {
+                                  type: "array",
+                                  maxItems: 20,
+                                  items: {
+                                    type: "object",
+                                    additionalProperties: false,
+                                    minProperties: 1,
+                                    properties: {
+                                      code: { type: "string", pattern: "^[A-Z][A-Z0-9_]{0,79}$" },
+                                      path: {
+                                        type: "array",
+                                        maxItems: 16,
+                                        items: { oneOf: [
+                                          { type: "string", pattern: "^[A-Za-z_][A-Za-z0-9_]{0,63}$" },
+                                          { type: "integer", minimum: 0, maximum: 10000 }
+                                        ] }
+                                      }
+                                    }
+                                  }
+                                },
+                                uncertain: { type: "boolean" },
+                                retryDecision: { type: "string", enum: ["scheduled", "not_scheduled", "unknown"] },
+                                nextRetryAt: { type: "string", format: "date-time", maxLength: 24 },
+                                retryReason: { type: "string", pattern: "^[a-z][a-z0-9_]{0,79}$" },
+                                retryAfterMs: { type: "integer", minimum: 0, maximum: 86400000 }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      dispatcherDiagnosticRetrieval: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["status", "category"],
+                        properties: {
+                          status: { type: "string", enum: ["failed"] },
+                          category: { type: "string", pattern: "^[a-z0-9_]{1,64}$" },
+                          dispatcherHttpStatus: { type: "integer", minimum: 100, maximum: 599 }
+                        }
+                      },
                       rateLimited: { type: "boolean" },
                       retryAfterSupplied: { type: "boolean" },
                       responseHadData: { type: "boolean" }

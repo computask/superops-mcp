@@ -138,6 +138,73 @@ describe("operation store", () => {
     });
   });
 
+  it("persists bounded attempt diagnostics with the owner-visible receipt while keeping replay keys private", async () => {
+    const dispatcherDiagnostics = {
+      schemaVersion: 1 as const,
+      status: "uncertain",
+      attemptCount: 1,
+      upstreamHttpStatus: 200,
+      errorClassification: "GRAPHQL_ERROR",
+      uncertain: true,
+      attemptsTruncated: false,
+      attempts: [{
+        attemptId: 7,
+        attemptNumber: 1,
+        startedAt: "2026-09-25T06:00:03.000Z",
+        completedAt: "2026-09-25T06:00:04.000Z",
+        upstreamHttpStatus: 200,
+        classification: "GRAPHQL_ERROR",
+        responseState: "partial_data",
+        responseHadData: true,
+        graphqlErrors: [{code: "INTERNAL_SERVER_ERROR", path: ["updateTicket", "ticket", 0]}],
+        uncertain: true,
+        retryDecision: "not_scheduled",
+        retryReason: "ambiguous_mutation_requires_reconciliation",
+        retryAfterMs: 0,
+      }],
+    };
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      await store.put(record({
+        itemStates: {
+          "57400": record().itemStates["57400"],
+          "57401": {
+            ...record().itemStates["57401"],
+            dispatcherReceipt: {
+              requestId: "f870118d-6899-42ba-81bc-7742feea92f8",
+              idempotencyKey: "superops-mcp:synthetic-replay-key",
+              state: "uncertain",
+              diagnostics: dispatcherDiagnostics,
+            },
+          },
+        },
+      }));
+      const stored = await store.get("op-1");
+      const view = operationResultView(stored!);
+      expect(view.items).toContainEqual(expect.objectContaining({
+        itemId: "57401",
+        dispatcherRequestId: "f870118d-6899-42ba-81bc-7742feea92f8",
+        dispatcherState: "uncertain",
+        dispatcherDiagnostics,
+      }));
+      expect(JSON.stringify(view)).not.toMatch(/synthetic-replay-key|idempotencyKey|responseText|private note/);
+      await expect(store.put(record({
+        itemStates: {
+          "57400": record().itemStates["57400"],
+          "57401": {
+            ...record().itemStates["57401"],
+            dispatcherReceipt: {
+              requestId: "f870118d-6899-42ba-81bc-7742feea92f8",
+              idempotencyKey: "superops-mcp:synthetic-replay-key",
+              state: "uncertain",
+              diagnostics: {status: "failed", category: "http_403", headers: {authorization: "secret"}} as never,
+            },
+          },
+        },
+      }))).rejects.toThrow(MalformedStoredOperationError);
+    });
+  });
+
   it("lists real owner-scoped Durable Object operations through a bounded redacted index", async () => {
     const durable = ownerScopedDurableNamespace();
     const ownerHash = stableHash("owner@example.com");

@@ -43,7 +43,7 @@ describe("persistent API attempt metadata", () => {
   });
 
   it.each([
-    ["network_error", () => Promise.reject(new Error("credential-never-log")), null],
+    ["dispatcher_error", () => Promise.reject(new Error("credential-never-log")), null],
     ["request_timeout", () => Promise.reject(new DOMException("credential-never-log", "AbortError")), null],
     ["http_error", () => Promise.resolve(response(503)), 503],
     ["malformed_response", () => Promise.resolve(new Response("not-json-private", { status: 200 })), 200],
@@ -73,7 +73,7 @@ describe("persistent API attempt metadata", () => {
     const lines=capture();
     vi.stubGlobal("fetch",vi.fn(async()=>Response.json({requestId:"receipt-a",status:"retry_wait"},{status:202,headers:{"Retry-After":"60"}})));
     await expect(runWithExecutionContext("superops_tickets_field_options",()=>client().query("query Fields { getFields { fieldId } }"))).rejects.toThrow();
-    expect(rowsFromTail(trace(lines))[0]).toMatchObject({dispatcher_request_id:"receipt-a",dispatcher_state:"retry_wait",dispatcher_error_code:"pending",http_status:null,error_class:"Dispatcher_pending"});
+    expect(rowsFromTail(trace(lines))[0]).toMatchObject({dispatcher_request_id:"receipt-a",dispatcher_state:"retry_wait",dispatcher_error_code:"pending",http_status:null,outcome:"dispatcher_error",error_class:"Dispatcher_pending"});
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
@@ -87,6 +87,9 @@ describe("persistent API attempt metadata", () => {
     vi.stubGlobal("fetch",vi.fn(async()=>Response.json({requestId:"receipt-throttle",status:"retry_wait",httpStatus:200,errorClassification:"RATE_LIMITED"},{status:202,headers:{"Retry-After":"60"}})));
     await expect(runWithExecutionContext("superops_tickets_field_options",()=>client().query("query Fields { getFields { fieldId } }"))).rejects.toMatchObject({rateLimited:true});
     expect(rowsFromTail(trace(lines))[0]).toMatchObject({dispatcher_state:"retry_wait",dispatcher_error_code:"RATE_LIMITED",http_status:200,outcome:"rate_limited",rate_limited:1,retry_after_seconds:60});
+    const call = lines.map(line => { try { return JSON.parse(line); } catch { return undefined; } })
+      .find(event => event?.event === "superops.api_call");
+    expect(call).toMatchObject({dispatcherHttpStatus:202,upstreamHttpStatus:200});
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 

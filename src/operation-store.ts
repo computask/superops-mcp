@@ -1045,11 +1045,58 @@ function assertStringArray(value: unknown, field: string): asserts value is stri
 function validDispatcherReceipt(value: unknown): boolean {
   if (value === undefined) return true;
   if (!isRecordObject(value)) return false;
-  return Object.keys(value).every(key => ["requestId", "idempotencyKey", "state", "retryAfter"].includes(key)) &&
+  return Object.keys(value).every(key => ["requestId", "idempotencyKey", "state", "retryAfter", "diagnostics"].includes(key)) &&
     typeof value.requestId === "string" && /^[A-Za-z0-9_-]{1,160}$/.test(value.requestId) &&
     typeof value.idempotencyKey === "string" && /^superops-mcp:[A-Za-z0-9:_-]{1,160}$/.test(value.idempotencyKey) &&
     typeof value.state === "string" && /^[a-z_]{1,64}$/.test(value.state) &&
-    (value.retryAfter === undefined || (typeof value.retryAfter === "number" && Number.isFinite(value.retryAfter) && value.retryAfter >= 0));
+    (value.retryAfter === undefined || (typeof value.retryAfter === "number" && Number.isFinite(value.retryAfter) && value.retryAfter >= 0)) &&
+    validSafeDispatcherDiagnostics(value.diagnostics);
+}
+
+function validSafeDispatcherDiagnostics(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecordObject(value)) return false;
+  if ("category" in value) {
+    return Object.keys(value).every(key => ["status", "category", "dispatcherHttpStatus"].includes(key)) &&
+      typeof value.category === "string" && /^[a-z0-9_]{1,64}$/.test(value.category) &&
+      (value.dispatcherHttpStatus === undefined ||
+        (Number.isInteger(value.dispatcherHttpStatus) && (value.dispatcherHttpStatus as number) >= 100 && (value.dispatcherHttpStatus as number) <= 599));
+  }
+  const states = new Set(["queued", "running", "retry_wait", "succeeded", "failed", "cancelled", "uncertain"]);
+  const responseStates = new Set(["no_response", "unparseable", "invalid_shape", "missing_data", "null_data", "data", "partial_data", "no_data", "unknown"]);
+  const retryDecisions = new Set(["scheduled", "not_scheduled", "unknown"]);
+  const retryReasons = new Set(["success", "retryable_read", "configured_safe_mutation", "verified_rate_limit_rejection", "attempt_limit_reached", "ambiguous_mutation_requires_reconciliation", "non_retryable"]);
+  if (!Object.keys(value).every(key => ["schemaVersion", "status", "attemptCount", "upstreamHttpStatus", "errorClassification", "uncertain", "attempts", "attemptsTruncated"].includes(key)) ||
+      value.schemaVersion !== 1 || typeof value.status !== "string" || !states.has(value.status) ||
+      !isFiniteNonnegativeInteger(value.attemptCount) || (value.attemptCount as number) > 1000 ||
+      typeof value.uncertain !== "boolean" || typeof value.attemptsTruncated !== "boolean" ||
+      !Array.isArray(value.attempts) || value.attempts.length > 20 ||
+      (value.upstreamHttpStatus !== undefined && (!Number.isInteger(value.upstreamHttpStatus) || (value.upstreamHttpStatus as number) < 100 || (value.upstreamHttpStatus as number) > 599)) ||
+      (value.errorClassification !== undefined && (typeof value.errorClassification !== "string" || !/^[A-Z][A-Z0-9_]{0,79}$/.test(value.errorClassification)))) return false;
+  for (const attempt of value.attempts) {
+    if (!isRecordObject(attempt) ||
+        !Object.keys(attempt).every(key => ["attemptId", "attemptNumber", "startedAt", "completedAt", "upstreamHttpStatus", "classification", "responseState", "responseHadData", "graphqlErrors", "uncertain", "retryDecision", "nextRetryAt", "retryReason", "retryAfterMs"].includes(key)) ||
+        !isFiniteNonnegativeInteger(attempt.attemptId) || (attempt.attemptId as number) < 1 ||
+        !isFiniteNonnegativeInteger(attempt.attemptNumber) || (attempt.attemptNumber as number) < 1 ||
+        typeof attempt.classification !== "string" || !/^[A-Z][A-Z0-9_]{0,79}$/.test(attempt.classification) ||
+        typeof attempt.responseState !== "string" || !responseStates.has(attempt.responseState) ||
+        typeof attempt.uncertain !== "boolean" || typeof attempt.retryDecision !== "string" || !retryDecisions.has(attempt.retryDecision) ||
+        !Array.isArray(attempt.graphqlErrors) || attempt.graphqlErrors.length > 20 ||
+        (attempt.upstreamHttpStatus !== undefined && (!Number.isInteger(attempt.upstreamHttpStatus) || (attempt.upstreamHttpStatus as number) < 100 || (attempt.upstreamHttpStatus as number) > 599)) ||
+        (attempt.responseHadData !== undefined && typeof attempt.responseHadData !== "boolean") ||
+        (attempt.retryReason !== undefined && (typeof attempt.retryReason !== "string" || !retryReasons.has(attempt.retryReason))) ||
+        (attempt.retryAfterMs !== undefined && (!isFiniteNonnegativeInteger(attempt.retryAfterMs) || (attempt.retryAfterMs as number) > 86_400_000)) ||
+        ["startedAt", "completedAt", "nextRetryAt"].some(key => attempt[key] !== undefined &&
+          (typeof attempt[key] !== "string" || !Number.isFinite(Date.parse(attempt[key] as string))))) return false;
+    for (const error of attempt.graphqlErrors) {
+      if (!isRecordObject(error) || !Object.keys(error).every(key => ["code", "path"].includes(key)) ||
+          (error.code !== undefined && (typeof error.code !== "string" || !/^[A-Z][A-Z0-9_]{0,79}$/.test(error.code))) ||
+          (error.path !== undefined && (!Array.isArray(error.path) || error.path.length > 16 || error.path.some(part =>
+            typeof part === "string" ? !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(part) : !Number.isSafeInteger(part) || (part as number) < 0 || (part as number) > 10_000))) ||
+          (error.code === undefined && error.path === undefined)) return false;
+    }
+  }
+  return true;
 }
 
 function validOptionalRecoveryMetadata(item: Record<string, unknown>): boolean {
@@ -3089,11 +3136,17 @@ function operationItemTelemetry(record: OperationLedgerRecord): Record<string, u
       ) &&
       (!item.nextEligibleTime || item.nextEligibleTime <= now)
     );
+    const receiptDiagnostics = item?.dispatcherReceipt?.diagnostics;
     return {
       operationId: record.operationId,
       invocationId: record.lastInvocationId,
       itemId: itemKey,
       stage: item?.stage ?? "Unattempted",
+      dispatcherRequestId: item?.dispatcherReceipt?.requestId,
+      dispatcherState: item?.dispatcherReceipt?.state,
+      ...(receiptDiagnostics && "category" in receiptDiagnostics
+        ? {dispatcherDiagnosticRetrieval: receiptDiagnostics}
+        : receiptDiagnostics ? {dispatcherDiagnostics: receiptDiagnostics} : {}),
       finalErrorClass: item?.errorClass,
       attemptCount: item?.attemptCount ?? 0,
       retryEligible,
@@ -3118,19 +3171,19 @@ function operationItemTelemetry(record: OperationLedgerRecord): Record<string, u
   });
 }
 
-function redactPublicOperationValue(value: unknown, depth = 0): unknown {
-  if (depth > 8) return "[redacted]";
+function redactPublicOperationValue(value: unknown, depth = 0, maxDepth = 8): unknown {
+  if (depth > maxDepth) return "[redacted]";
   if (typeof value === "string") return sanitizeText(value);
   if (Array.isArray(value)) {
     return value.slice(0, MAX_OPERATION_ITEMS).map((entry) =>
-      redactPublicOperationValue(entry, depth + 1)
+      redactPublicOperationValue(entry, depth + 1, maxDepth)
     );
   }
   if (!isRecordObject(value)) return value;
   return Object.fromEntries(
     Object.entries(value)
       .filter(([key]) => !FORBIDDEN_PERSISTED_CONTENT_KEYS.has(key.toLowerCase()))
-      .map(([key, child]) => [key, redactPublicOperationValue(child, depth + 1)])
+      .map(([key, child]) => [key, redactPublicOperationValue(child, depth + 1, key === "dispatcherDiagnostics" ? 12 : maxDepth)])
   );
 }
 

@@ -4,6 +4,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { getCredentials, resetClient, SuperOpsClient, SuperOpsError } from "./client.js";
+import { withDispatcherOperation } from "./dispatcher.js";
 import {
   executionDiagnostics,
   getExecutionState,
@@ -63,6 +64,61 @@ describe("getCredentials", () => {
 describe("SuperOpsClient execution instrumentation", () => {
   beforeEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("preserves an uncertain mutation, enriches the same receipt once, and checkpoints diagnostic denial separately", async () => {
+    const requestId = "93af6168-727b-41a0-81f1-bfd546a7f972";
+    const checkpoints: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/graphql") && init?.method === "POST") {
+        return new Response(JSON.stringify({requestId, status: "queued"}), {
+          status: 202,
+          headers: {"X-Dispatcher-Request-Id": requestId},
+        });
+      }
+      if (url.endsWith("/v1/requests/" + requestId)) {
+        return Response.json({
+          requestId, source: "superops-mcp", status: "uncertain", uncertain: true,
+          httpStatus: 200, errorClassification: "GRAPHQL_ERROR",
+        });
+      }
+      if (url.endsWith("/v1/requests/" + requestId + "/safe-diagnostics")) {
+        return new Response("private denial detail", {status: 403});
+      }
+      throw new Error("Unexpected dispatcher request");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new SuperOpsClient({
+      apiToken: "synthetic-api-token",
+      subdomain: "example",
+      dispatcher: {DISPATCHER_TOKEN: "synthetic-producer-token"},
+    });
+    let diagnostics: ReturnType<typeof executionDiagnostics>;
+    await runWithExecutionContext("superops_tickets_apply_triage_plan", async () => {
+      await expect(withDispatcherOperation("operation-62966", "62966",
+        () => client.mutate("mutation UpdateTicket { updateTicket { id } }"),
+        async receipt => {
+          checkpoints.push(receipt as unknown as Record<string, unknown>);
+          if (receipt.diagnostics) throw new Error("synthetic checkpoint failure");
+        },
+      )).rejects.toThrow("uncertain");
+      diagnostics = executionDiagnostics();
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith("/graphql") && init?.method === "POST")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/safe-diagnostics"))).toHaveLength(1);
+    const write = (diagnostics?.requestTrace as Array<Record<string, unknown>>).find(item => item.type === "write");
+    expect(write).toMatchObject({
+      outcome: "dispatcher_uncertain",
+      dispatcherState: "uncertain",
+      dispatcherHttpStatus: 200,
+      upstreamHttpStatus: 200,
+      dispatcherDiagnosticRetrieval: {status: "failed", category: "http_403", dispatcherHttpStatus: 403},
+    });
+    expect(checkpoints.some(item => (item.diagnostics as Record<string, unknown> | undefined)?.category === "http_403")).toBe(true);
+    expect(JSON.stringify(diagnostics)).not.toContain("private denial detail");
   });
 
   it("counts successful GraphQL calls without logging credentials", async () => {

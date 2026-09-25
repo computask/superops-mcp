@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getExecutionConfig, hasExecutionBudgetFor, recordSubrequestFinish, recordTypedSubrequestStart, withExecutionItem } from "./execution.js";
+import { fetchSafeDispatcherDiagnostics, type DispatcherDiagnosticResult, type DispatcherDiagnosticRetrieval, type SafeDispatcherDiagnostics } from "./dispatcher-diagnostics.js";
 
 export const DISPATCHER_ORIGIN = "https://superops-api-dispatcher.taskgroup.co.uk";
 export interface DispatcherEnvironment {
@@ -13,8 +14,9 @@ export interface DispatcherReceipt {
   idempotencyKey: string;
   state: string;
   retryAfter?: number;
+  diagnostics?: SafeDispatcherDiagnostics | DispatcherDiagnosticRetrieval;
 }
-const operation = new AsyncLocalStorage<{operationId: string; itemKey: string; checkpoint?: (receipt: DispatcherReceipt) => Promise<void>}>();
+const operation = new AsyncLocalStorage<{operationId: string; itemKey: string; checkpoint?: (receipt: DispatcherReceipt) => Promise<void>; receipt?: DispatcherReceipt}>();
 export function withDispatcherOperation<T>(operationId: string, itemKey: string, fn: () => T,
   checkpoint?: (receipt: DispatcherReceipt) => Promise<void>): T {
   return operation.run({operationId, itemKey, checkpoint}, () => withExecutionItem(itemKey, fn));
@@ -26,6 +28,11 @@ export async function dispatcherIdempotencyKey(body: string, mutation: boolean):
   // distinguishes note/update stages without storing content or credentials.
   const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([scope.operationId, scope.itemKey, body])));
   return `superops-mcp:${Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+export async function checkpointDispatcherDiagnostics(requestId: string, diagnostics: SafeDispatcherDiagnostics | DispatcherDiagnosticRetrieval): Promise<void> {
+  const scope = operation.getStore();
+  if (!scope?.checkpoint || scope.receipt?.requestId !== requestId) return;
+  await scope.checkpoint({...scope.receipt, diagnostics});
 }
 export function runWithDispatcher<T>(env: DispatcherEnvironment, fn: () => T): T {
   return environment.run(env, fn);
@@ -41,7 +48,8 @@ export function dispatcherConfigured(env = dispatcherEnvironment()): boolean {
 export class DispatcherPendingError extends Error {
   constructor(readonly requestId: string | undefined, readonly idempotencyKey: string,
     readonly state: string, readonly retryAfter?: number,
-    readonly httpStatus?: number, readonly errorClassification?: string) {
+    readonly upstreamHttpStatus?: number, readonly errorClassification?: string,
+    readonly dispatcherHttpStatus?: number) {
     // Durable operations already persist/reconstruct the key. Avoid repeating
     // it in every compact per-item failure/result projection in the 512-KiB
     // ledger. Standalone callers still receive the key needed for recovery.
@@ -50,7 +58,8 @@ export class DispatcherPendingError extends Error {
       : `Dispatcher ${state}${errorClassification ? ` (${errorClassification})` : ""}; requestId=${requestId ?? "unknown"}; idempotencyKey=${idempotencyKey}. Recover this receipt; do not submit a new mutation.`);
     this.name = "DispatcherPendingError";
   }
-  get rateLimited(): boolean { return this.httpStatus === 429 || /RATE_LIMIT|THROTTL/.test(this.errorClassification ?? ""); }
+  get httpStatus(): number | undefined { return this.upstreamHttpStatus; }
+  get rateLimited(): boolean { return this.upstreamHttpStatus === 429 || /RATE_LIMIT|THROTTL/.test(this.errorClassification ?? ""); }
 }
 const pending = new Set(["queued", "running", "retry_wait"]);
 const terminal = new Set(["succeeded", "failed", "cancelled", "uncertain"]);
@@ -63,7 +72,7 @@ function retrySeconds(headers: Headers): number {
   const seconds = Number(raw);
   return Number.isFinite(seconds) && seconds >= 0 ? seconds : Math.max(1, (Date.parse(raw) - Date.now()) / 1000 || 1);
 }
-export async function boundedJson(response: Response): Promise<unknown> {
+export async function boundedJson(response: Response, maximumBytes = 4 * 1024 * 1024): Promise<unknown> {
   const reader = response.body?.getReader();
   if (!reader) throw new Error("Dispatcher response is empty");
   const chunks: Uint8Array[] = [];
@@ -73,7 +82,7 @@ export async function boundedJson(response: Response): Promise<unknown> {
       const part = await reader.read();
       if (part.done) break;
       size += part.value.byteLength;
-      if (size > 4 * 1024 * 1024) throw new Error("Dispatcher response-size limit exceeded");
+      if (size > maximumBytes) throw new Error("Dispatcher response-size limit exceeded");
       chunks.push(part.value);
     }
   } catch (error) { try { await reader.cancel(); } catch { /* Preserve the original read failure. */ } throw error; }
@@ -83,105 +92,18 @@ export async function boundedJson(response: Response): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
-const DIAGNOSTIC_SAFE_KEYS = new Set([
-  "requestId", "source", "status", "state", "attempts", "upstreamAttempts", "retryHistory",
-  "diagnostics", "attempt", "attemptNumber", "attemptCount", "retryCount", "httpStatus",
-  "upstreamHttpStatus", "statusCode", "errorClassification", "errorCode", "graphqlCode",
-  "graphqlErrorCode", "nextRetryAt", "retryAfterSeconds", "startedAt", "completedAt",
-  "createdAt", "updatedAt", "durationMs", "ok", "success", "uncertain", "responseHadData",
-]);
-const DIAGNOSTIC_ARRAY_KEYS = new Set(["attempts", "upstreamAttempts", "retryHistory"]);
-const SAFE_RECEIPT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const SAFE_DIAGNOSTIC_CODE = /^[A-Za-z0-9_.:-]{1,100}$/;
-const SAFE_DISPATCHER_STATES = new Set(["queued", "running", "retry_wait", "succeeded", "failed", "cancelled", "uncertain"]);
-
-function safeDiagnosticScalar(key: string, value: unknown): string | number | boolean | undefined {
-  if (typeof value === "boolean" && ["ok", "success", "uncertain", "responseHadData"].includes(key)) return value;
-  if (typeof value === "number" && ["attempt", "attemptNumber", "attemptCount", "retryCount", "httpStatus", "upstreamHttpStatus", "statusCode", "retryAfterSeconds", "durationMs"].includes(key)) {
-    if (!Number.isFinite(value) || !Number.isInteger(value)) return undefined;
-    if (["httpStatus", "upstreamHttpStatus", "statusCode"].includes(key)) return value >= 100 && value <= 599 ? value : undefined;
-    if (["retryAfterSeconds", "durationMs"].includes(key)) return value >= 0 && value <= 86_400_000 ? value : undefined;
-    return value >= 0 && value <= 100_000 ? value : undefined;
-  }
-  if (typeof value !== "string") return undefined;
-  if (key === "requestId") return SAFE_RECEIPT_ID.test(value) ? value : undefined;
-  if (key === "source") return value === "superops-mcp" ? value : undefined;
-  if (key === "status" || key === "state") return SAFE_DISPATCHER_STATES.has(value) ? value : undefined;
-  if (["startedAt", "completedAt", "createdAt", "updatedAt", "nextRetryAt"].includes(key)) {
-    return value.length <= 40 && Number.isFinite(Date.parse(value)) ? value : undefined;
-  }
-  if (["errorClassification", "errorCode", "graphqlCode", "graphqlErrorCode"].includes(key)) {
-    return SAFE_DIAGNOSTIC_CODE.test(value) ? value : undefined;
-  }
-  return undefined;
-}
-
 /**
- * Read the dispatcher's receipt diagnostics without exposing request/response
- * bodies, headers, idempotency keys, or free-text upstream errors.
+ * Read versioned, producer-scoped attempt diagnostics. The Dispatcher derives
+ * producer identity from the bearer token and returns no stored response data.
  */
-export async function dispatcherDiagnostics(requestId: string, env = dispatcherEnvironment()): Promise<unknown> {
-  if (!SAFE_RECEIPT_ID.test(requestId)) throw new Error("A valid dispatcher receipt ID is required.");
-  if (!dispatcherConfigured(env)) throw new Error("Dispatcher producer credentials are not configured.");
-  if (Boolean(env.CF_ACCESS_CLIENT_ID) !== Boolean(env.CF_ACCESS_CLIENT_SECRET)) {
-    throw new Error("Both Cloudflare Access credentials must be configured.");
-  }
-
-  const url = `${DISPATCHER_ORIGIN}/v1/requests/${requestId}/diagnostics`;
-  const counted = recordTypedSubrequestStart({type: "dispatcherPoll", endpoint: url, operationName: "dispatcherDiagnostics"});
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${env.DISPATCHER_TOKEN}`,
-    "X-Source": "superops-mcp",
-    Accept: "application/json",
-  };
-  if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
-    headers["CF-Access-Client-Id"] = env.CF_ACCESS_CLIENT_ID;
-    headers["CF-Access-Client-Secret"] = env.CF_ACCESS_CLIENT_SECRET;
-  }
-
-  let response: Response;
-  let body: unknown;
-  try {
-    response = await fetch(url, {method: "GET", headers, redirect: "manual", signal: AbortSignal.timeout(getExecutionConfig().requestTimeoutMs)});
-    if (response.status >= 300 && response.status < 400) {
-      await response.body?.cancel();
-      recordSubrequestFinish(counted, response.status, false);
-      throw new Error("Dispatcher diagnostics rejected a redirect.");
-    }
-    body = await boundedJson(response);
-    recordSubrequestFinish(counted, response.status, response.ok);
-  } catch (error) {
-    if (!(error instanceof Error && error.message === "Dispatcher diagnostics rejected a redirect.")) {
-      recordSubrequestFinish(counted, "networkError", false);
-    }
-    throw new Error("Dispatcher diagnostics request failed; no receipt details were exposed.");
-  }
-  if (!response.ok) throw new Error(`Dispatcher diagnostics returned HTTP ${response.status}.`);
-
-  const sanitize = (value: unknown, depth = 0): unknown => {
-    if (depth > 3) return undefined;
-    if (Array.isArray(value)) return value.slice(0, 50).map((entry) => sanitize(entry, depth + 1)).filter((entry) => entry !== undefined);
-    if (typeof value !== "object" || value === null) return undefined;
-    const output: Record<string, unknown> = {};
-    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      if (!DIAGNOSTIC_SAFE_KEYS.has(key)) continue;
-      if (DIAGNOSTIC_ARRAY_KEYS.has(key)) {
-        if (Array.isArray(child)) output[key] = child.slice(0, 50).map((entry) => sanitize(entry, depth + 1)).filter((entry) => entry !== undefined);
-        continue;
-      }
-      const scalar = safeDiagnosticScalar(key, child);
-      if (scalar !== undefined) output[key] = scalar;
-      else if (key === "diagnostics" && typeof child === "object" && child !== null) output[key] = sanitize(child, depth + 1);
-    }
-    return Object.keys(output).length ? output : undefined;
-  };
-
-  return {
-    requestId,
-    diagnostics: sanitize(body) ?? {},
-  };
+export async function dispatcherDiagnostics(requestId: string, env = dispatcherEnvironment()): Promise<DispatcherDiagnosticResult> {
+  return fetchSafeDispatcherDiagnostics(requestId, env, DISPATCHER_ORIGIN);
 }
-
+function publishReceipt(receipt: DispatcherReceipt, options: {onReceipt?: (receipt: DispatcherReceipt) => void}): void {
+  const scope = operation.getStore();
+  if (scope) scope.receipt = receipt;
+  options.onReceipt?.(receipt);
+}
 /** POST is sent once. After any receipt (including 504), only GET is used.
  * A caller recovering a lost acknowledgement must supply the original key and
  * exact payload. The dispatcher owns durable idempotency and upstream retries.
@@ -210,18 +132,19 @@ export async function dispatcherFetch(body: string, options: {
   }
   let requestId = options.requestId;
   let observedHttpStatus: number | undefined;
+  let observedDispatcherHttpStatus: number | undefined;
   let observedErrorClassification: string | undefined;
   let observedRetryAfter: number | undefined;
   const deadline = Date.now() + getExecutionConfig().requestTimeoutMs;
   for (let poll = 0; poll < 20; poll++) {
     if (requestId && !/^[A-Za-z0-9_-]{1,160}$/.test(requestId)) throw new DispatcherPendingError(undefined, options.idempotencyKey, "invalid_receipt");
     if (options.signal?.aborted || Date.now() >= deadline || !hasExecutionBudgetFor(requestId ? 1 : 0)) {
-      throw new DispatcherPendingError(requestId, options.idempotencyKey, "pending", observedRetryAfter, observedHttpStatus, observedErrorClassification);
+      throw new DispatcherPendingError(requestId, options.idempotencyKey, "pending", observedRetryAfter, observedHttpStatus, observedErrorClassification, observedDispatcherHttpStatus);
     }
     const polling = Boolean(requestId);
     const url = `${DISPATCHER_ORIGIN}${polling ? `/v1/requests/${requestId}` : "/graphql"}`;
     const counted = polling ? recordTypedSubrequestStart({type: "dispatcherPoll", endpoint: url, operationName: "dispatcherStatus"}) : undefined;
-    let response: Response;
+    let response: Response | undefined;
     let value: Record<string, unknown>;
     try {
       response = await fetch(url, {method: polling ? "GET" : "POST", headers,
@@ -229,10 +152,11 @@ export async function dispatcherFetch(body: string, options: {
         // Never follow redirects with producer or Access credentials attached.
         body: polling ? undefined : body, redirect: "manual",
         signal: options.signal ?? AbortSignal.timeout(Math.max(1, deadline - Date.now()))});
+      observedDispatcherHttpStatus = response.status;
       if (response.status >= 300 && response.status < 400) {
         await response.body?.cancel();
-        if (counted) recordSubrequestFinish(counted, response.status, false);
-        throw new DispatcherPendingError(requestId, options.idempotencyKey, "redirect_rejected");
+        if (counted) recordSubrequestFinish(counted, response.status, false, {outcome: "dispatcher_error", dispatcherHttpStatus: response.status});
+        throw new DispatcherPendingError(requestId, options.idempotencyKey, "redirect_rejected", undefined, observedHttpStatus, observedErrorClassification, response.status);
       }
       // Preserve an acknowledged receipt even if parsing its body subsequently
       // times out. It is evidence of accepted work, never replay permission.
@@ -240,7 +164,7 @@ export async function dispatcherFetch(body: string, options: {
       if (!polling && (response.status === 202 || response.status === 504) && headerReceipt && /^[A-Za-z0-9_-]{1,160}$/.test(headerReceipt)) {
         requestId = headerReceipt;
         const receipt = {requestId, idempotencyKey: options.idempotencyKey, state: "queued"};
-        options.onReceipt?.(receipt);
+        publishReceipt(receipt, options);
         if (options.mutation) await operation.getStore()?.checkpoint?.(receipt);
       }
       if (!polling && response.status !== 202 && response.status !== 504 &&
@@ -250,19 +174,23 @@ export async function dispatcherFetch(body: string, options: {
         const syncId = response.headers.get("X-Dispatcher-Request-Id");
         if (syncId && /^[A-Za-z0-9_-]{1,160}$/.test(syncId)) {
           const receipt = {requestId: syncId, idempotencyKey: options.idempotencyKey, state: response.headers.get("X-Dispatcher-Status") ?? "unknown"};
-          options.onReceipt?.(receipt);
+          publishReceipt(receipt, options);
           if (options.mutation) await operation.getStore()?.checkpoint?.(receipt);
         }
         return response;
       }
       value = object(await boundedJson(response));
-      if (counted) recordSubrequestFinish(counted, response.status, response.ok);
+      if (counted) recordSubrequestFinish(counted, response.status, response.ok, {dispatcherHttpStatus: response.status});
     } catch (error) {
       if (error instanceof DispatcherPendingError) throw error;
-      if (counted) recordSubrequestFinish(counted, "networkError", false);
+      if (counted) recordSubrequestFinish(counted, response?.status ?? "dispatcherTransportUnknown", false, {
+        outcome: response ? "dispatcher_error" : "network_error",
+        errorClass: response ? "DispatcherStatusBodyUnreadable" : "DispatcherTransportUnknown",
+        dispatcherHttpStatus: response?.status,
+      });
       throw new DispatcherPendingError(requestId, options.idempotencyKey,
         options.signal?.aborted || (error instanceof Error && error.name === "AbortError") ? "request_timeout" : "submission_or_status_unknown",
-        observedRetryAfter, observedHttpStatus, observedErrorClassification);
+        observedRetryAfter, observedHttpStatus, observedErrorClassification, response?.status);
     }
     const receipt = value.requestId ?? response.headers.get("X-Dispatcher-Request-Id");
     if (receipt !== undefined && receipt !== null) {
@@ -283,10 +211,18 @@ export async function dispatcherFetch(body: string, options: {
     observedHttpStatus = typeof value.httpStatus === "number" && Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599 ? value.httpStatus : undefined;
     observedErrorClassification = typeof value.errorClassification === "string" && /^[A-Z0-9_]{1,100}$/.test(value.errorClassification) ? value.errorClassification : undefined;
     observedRetryAfter = pending.has(state) ? seconds : undefined;
-    if (requestId) options.onReceipt?.({requestId, idempotencyKey: options.idempotencyKey, state: state || "queued"});
-    if (requestId && options.mutation) await operation.getStore()?.checkpoint?.({requestId, idempotencyKey: options.idempotencyKey, state: state || "queued", retryAfter: seconds});
+    if (requestId) {
+      const parsedReceipt: DispatcherReceipt = {
+        requestId,
+        idempotencyKey: options.idempotencyKey,
+        state: state || "queued",
+        ...(pending.has(state) ? {retryAfter: seconds} : {}),
+      };
+      publishReceipt(parsedReceipt, options);
+      if (options.mutation) await operation.getStore()?.checkpoint?.({...parsedReceipt, retryAfter: seconds});
+    }
     if (state === "uncertain" || response.headers.get("X-Dispatcher-Uncertain") === "true" || value.uncertain === true) {
-      throw new DispatcherPendingError(requestId, options.idempotencyKey, "uncertain");
+      throw new DispatcherPendingError(requestId, options.idempotencyKey, "uncertain", observedRetryAfter, observedHttpStatus, observedErrorClassification, response.status);
     }
     if (polling && terminal.has(state)) {
       const status = typeof value.httpStatus === "number" && Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599 ? value.httpStatus : undefined;
@@ -300,7 +236,7 @@ export async function dispatcherFetch(body: string, options: {
         const code = typeof value.errorClassification === "string" && /^[A-Z0-9_]{1,100}$/.test(value.errorClassification)
           ? value.errorClassification : undefined;
         throw new DispatcherPendingError(requestId, options.idempotencyKey, state,
-          response.headers.has("Retry-After") ? seconds : undefined, status, code);
+          response.headers.has("Retry-After") ? seconds : undefined, status, code, response.status);
       }
       const resultHeaders = new Headers({"Content-Type": "application/json", "X-Dispatcher-Status": state, "X-Dispatcher-Request-Id": requestId!});
       const retry = response.headers.get("Retry-After");
@@ -313,8 +249,8 @@ export async function dispatcherFetch(body: string, options: {
     }
     if (!requestId) throw new DispatcherPendingError(undefined, options.idempotencyKey, "missing_receipt");
     if (polling && response.ok && !pending.has(state)) throw new DispatcherPendingError(requestId, options.idempotencyKey, "invalid_status");
-    if (Date.now() + seconds * 1000 >= deadline) throw new DispatcherPendingError(requestId, options.idempotencyKey, "pending", seconds, observedHttpStatus, observedErrorClassification);
+    if (Date.now() + seconds * 1000 >= deadline) throw new DispatcherPendingError(requestId, options.idempotencyKey, "pending", seconds, observedHttpStatus, observedErrorClassification, response.status);
     await new Promise(resolve => setTimeout(resolve, seconds * 1000));
   }
-  throw new DispatcherPendingError(requestId, options.idempotencyKey, "poll_limit", observedRetryAfter, observedHttpStatus, observedErrorClassification);
+  throw new DispatcherPendingError(requestId, options.idempotencyKey, "poll_limit", observedRetryAfter, observedHttpStatus, observedErrorClassification, observedDispatcherHttpStatus);
 }

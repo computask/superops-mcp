@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getAuditContext } from "./audit.js";
+import type { DispatcherDiagnosticRetrieval, SafeDispatcherDiagnostics } from "./dispatcher-diagnostics.js";
 
 export type SubrequestType =
   | "dispatcherPoll"
@@ -78,6 +79,8 @@ export type SubrequestOutcome =
   | "graphql_error"
   | "rate_limited"
   | "network_error"
+  | "dispatcher_uncertain"
+  | "dispatcher_error"
   | "request_timeout"
   | "malformed_response"
   | "internal_error";
@@ -90,13 +93,16 @@ export interface SubrequestFinishDetails {
   retryAfterSupplied?: boolean;
   responseHadData?: boolean;
   graphqlCode?: string;
+  dispatcherHttpStatus?: number;
+  upstreamHttpStatus?: number;
+  dispatcherErrorCode?: string;
+  dispatcherDiagnostics?: SafeDispatcherDiagnostics;
+  dispatcherDiagnosticRetrieval?: DispatcherDiagnosticRetrieval;
 }
 
 export interface SubrequestRecord {
   dispatcherRequestId?: string;
   dispatcherState?: string;
-  /** Transport-local reason; never confused with upstream HTTP status. */
-  dispatcherErrorCode?: string;
   index: number;
   type: SubrequestType;
   operationType?: string;
@@ -118,6 +124,11 @@ export interface SubrequestRecord {
   retryAfterSupplied?: boolean;
   responseHadData?: boolean;
   graphqlCode?: string;
+  dispatcherHttpStatus?: number;
+  upstreamHttpStatus?: number;
+  dispatcherErrorCode?: string;
+  dispatcherDiagnostics?: SafeDispatcherDiagnostics;
+  dispatcherDiagnosticRetrieval?: DispatcherDiagnosticRetrieval;
 }
 
 export interface RetryDelayRecord {
@@ -658,6 +669,11 @@ export function recordSubrequestFinish(
   started.record.retryAfterSupplied = details.retryAfterSupplied;
   started.record.responseHadData = details.responseHadData;
   started.record.graphqlCode = safeDiagnosticToken(details.graphqlCode);
+  started.record.dispatcherHttpStatus = details.dispatcherHttpStatus;
+  started.record.upstreamHttpStatus = details.upstreamHttpStatus;
+  started.record.dispatcherErrorCode = safeDiagnosticToken(details.dispatcherErrorCode);
+  started.record.dispatcherDiagnostics = details.dispatcherDiagnostics;
+  started.record.dispatcherDiagnosticRetrieval = details.dispatcherDiagnosticRetrieval;
 
   const state = getExecutionState();
   if (state?.config.callAuditEnabled) {
@@ -678,6 +694,11 @@ export function recordSubrequestFinish(
       attempt: started.record.retryCount + 1,
       status: safeDiagnosticStatus(started.record.status),
       httpStatus: started.record.httpStatus,
+      dispatcherHttpStatus: started.record.dispatcherHttpStatus,
+      upstreamHttpStatus: started.record.upstreamHttpStatus,
+      dispatcherErrorCode: started.record.dispatcherErrorCode,
+      dispatcherDiagnostics: started.record.dispatcherDiagnostics,
+      dispatcherDiagnosticRetrieval: started.record.dispatcherDiagnosticRetrieval,
       ok: started.record.ok,
       outcome: started.record.outcome,
       errorClass: safeDiagnosticToken(started.record.errorClass),
@@ -793,6 +814,11 @@ export function executionDiagnostics(): Record<string, unknown> | undefined {
     completedAt: request.completedAt,
     endpointHost: request.endpoint,
     httpStatus: request.httpStatus,
+    dispatcherHttpStatus: request.dispatcherHttpStatus,
+    upstreamHttpStatus: request.upstreamHttpStatus,
+    dispatcherErrorCode: safeDiagnosticToken(request.dispatcherErrorCode),
+    dispatcherDiagnostics: request.dispatcherDiagnostics,
+    dispatcherDiagnosticRetrieval: request.dispatcherDiagnosticRetrieval,
     outcome: request.outcome,
     errorClass: safeDiagnosticToken(request.errorClass),
     graphqlCode: request.graphqlCode,

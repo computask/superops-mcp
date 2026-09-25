@@ -455,9 +455,24 @@ const dispatcherTrace={index:1,provider:'dispatcher',type:'paginationRead',opera
   completedAt:'2026-09-24T06:00:01.000Z',endpointHost:'superops-api-dispatcher.taskgroup.co.uk',
   httpStatus:200,outcome:'success',dispatcherRequestId:'synthetic-request-1',dispatcherState:'succeeded',
   responseHadData:true,rateLimited:false,retryAfterSupplied:false,durationMs:1000,ok:true};
-test('dispatcher transport and poll telemetry survive the callback parser exactly',()=>{
+const dispatcherFailureTrace={index:3,provider:'dispatcher',type:'write',operationType:'mutation',
+  operationName:'updateTicket',itemKey:'62966',status:'dispatcherUncertain',retryCount:0,
+  startedAt:'2026-09-24T06:00:02.000Z',completedAt:'2026-09-24T06:00:04.000Z',
+  endpointHost:'superops-api-dispatcher.taskgroup.co.uk',outcome:'dispatcher_uncertain',ok:false,
+  dispatcherRequestId:'synthetic-request-uncertain',dispatcherState:'uncertain',
+  dispatcherHttpStatus:200,upstreamHttpStatus:200,dispatcherErrorCode:'GRAPHQL_ERROR',
+  dispatcherDiagnostics:{schemaVersion:1,status:'uncertain',attemptCount:1,upstreamHttpStatus:200,
+    errorClassification:'GRAPHQL_ERROR',uncertain:true,attemptsTruncated:false,
+    attempts:[{attemptId:7,attemptNumber:1,startedAt:'2026-09-24T06:00:03.000Z',
+      completedAt:'2026-09-24T06:00:04.000Z',upstreamHttpStatus:200,classification:'GRAPHQL_ERROR',
+      responseState:'partial_data',responseHadData:true,
+      graphqlErrors:[{code:'INTERNAL_SERVER_ERROR',path:['updateTicket','ticket',0]}],
+      uncertain:true,retryDecision:'not_scheduled',retryReason:'ambiguous_mutation_requires_reconciliation',retryAfterMs:0}]},
+  dispatcherDiagnosticRetrieval:{status:'failed',category:'http_403',dispatcherHttpStatus:403}};
+test('dispatcher transport, failure, attempt, and poll telemetry survive the callback parser exactly',()=>{
   const execution={toolName:'superops_tickets_query',subrequestsUsed:2,
-    requestsByType:{paginationRead:1,dispatcherPoll:1},requestTrace:[dispatcherTrace,
+    requestsByType:{paginationRead:1,dispatcherPoll:1,write:1},requestTrace:[dispatcherTrace,
+      dispatcherFailureTrace,
       {...dispatcherTrace,index:2,type:'dispatcherPoll',operationName:'dispatcherStatus'}]};
   assert.deepEqual(parseSafeMcpExecution(execution),execution);
   const schema=toolDefinition().inputSchema.properties.metadata.properties.mcpExecution;
@@ -467,6 +482,14 @@ test('dispatcher transport and poll telemetry survive the callback parser exactl
   assert.equal(traceSchema.additionalProperties,false);
   assert(traceSchema.properties.type.enum.includes('dispatcherPoll'));
   for(const key of Object.keys(dispatcherTrace)) assert(traceSchema.properties[key],key);
+  for(const key of Object.keys(dispatcherFailureTrace)) assert(traceSchema.properties[key],key);
+  assert.equal(traceSchema.properties.dispatcherDiagnostics.properties.schemaVersion.enum[0],1);
+  assert.equal(traceSchema.properties.dispatcherDiagnosticRetrieval.properties.status.enum[0],'failed');
+  for(const invalid of [
+    {dispatcherDiagnostics:{...dispatcherFailureTrace.dispatcherDiagnostics,requestBody:'private'}},
+    {dispatcherDiagnostics:{...dispatcherFailureTrace.dispatcherDiagnostics,attempts:[{...dispatcherFailureTrace.dispatcherDiagnostics.attempts[0],graphqlErrors:[{message:'customer text'}]}]}},
+    {dispatcherDiagnosticRetrieval:{status:'failed',category:'http_403',headers:{authorization:'secret'}}}
+  ]) assert.equal(parseSafeMcpExecution({requestTrace:[{...dispatcherFailureTrace,...invalid}]}),null);
 });
 test('legacy traces remain valid and unsafe or malformed telemetry is rejected',()=>{
   const legacy={requestTrace:[{index:1,type:'initialRead',status:200,ok:true}]};

@@ -8,7 +8,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { SuperOpsCredentials, GraphQLResponse } from "./types.js";
 import { beginApiAttempt, endApiAttempt } from "./api-attempt-audit.js";
 import { assertPageBounds } from "./pagination.js";
-import { dispatcherIdempotencyKey } from "./dispatcher.js";
+import { checkpointDispatcherDiagnostics, dispatcherDiagnostics, dispatcherIdempotencyKey } from "./dispatcher.js";
 import { DISPATCHER_ORIGIN, DispatcherPendingError, dispatcherFetch, runWithDispatcher, dispatcherEnvironment, boundedJson } from "./dispatcher.js";
 import {
   classifyGraphQLRequest,
@@ -139,17 +139,41 @@ export class SuperOpsClient {
       });
     } catch (error) {
       clearTimeout(timeout);
-      if (error instanceof DispatcherPendingError && subrequest.record) {
-        subrequest.record.dispatcherRequestId = error.requestId ?? subrequest.record.dispatcherRequestId;
-        subrequest.record.dispatcherErrorCode = error.errorClassification ?? error.state;
+      let diagnosticResult: Awaited<ReturnType<typeof dispatcherDiagnostics>> | undefined;
+      if (error instanceof DispatcherPendingError && error.requestId && mutation) {
+        try {
+          diagnosticResult = await dispatcherDiagnostics(error.requestId, this.dispatcher);
+        } catch {
+          diagnosticResult = {requestId: error.requestId, retrieval: {status: "failed", category: "enrichment_exception"}};
+        }
+        const checkpointValue = diagnosticResult.diagnostics ?? diagnosticResult.retrieval;
+        if (checkpointValue) {
+          try { await checkpointDispatcherDiagnostics(error.requestId, checkpointValue); }
+          catch { /* Keep the retrieved evidence and primary mutation failure intact. */ }
+        }
       }
-      if (error instanceof DispatcherPendingError && (error.httpStatus !== undefined || error.rateLimited)) {
-        recordSubrequestFinish(subrequest, error.httpStatus ?? "networkError", false, {
-          outcome: error.rateLimited ? "rate_limited" : "http_error",
-          errorClass: error.errorClassification ?? "DispatcherTerminalFailure",
+      if (error instanceof DispatcherPendingError) {
+        if (subrequest.record) {
+          subrequest.record.dispatcherRequestId = error.requestId ?? subrequest.record.dispatcherRequestId;
+          subrequest.record.dispatcherState ??= error.state;
+          subrequest.record.dispatcherErrorCode = error.errorClassification ??
+            (error.state === "uncertain" ? "uncertain" : error.state);
+        }
+        const outcome = error.state === "uncertain" ? "dispatcher_uncertain"
+          : error.rateLimited ? "rate_limited"
+            : error.state === "request_timeout" ? "request_timeout" : "dispatcher_error";
+        recordSubrequestFinish(subrequest, error.state === "uncertain" ? "dispatcherUncertain" : "dispatcherError", false, {
+          outcome,
+          errorClass: error.errorClassification ?? "Dispatcher_" + error.state,
           graphqlCode: error.errorClassification,
-          httpStatus: error.httpStatus, rateLimited: error.rateLimited,
+          httpStatus: error.upstreamHttpStatus,
+          upstreamHttpStatus: error.upstreamHttpStatus,
+          dispatcherHttpStatus: error.dispatcherHttpStatus,
+          dispatcherErrorCode: error.errorClassification ?? error.state,
+          rateLimited: error.rateLimited,
           retryAfterSupplied: error.retryAfter !== undefined,
+          ...(diagnosticResult?.diagnostics ? {dispatcherDiagnostics: diagnosticResult.diagnostics} : {}),
+          ...(diagnosticResult?.retrieval ? {dispatcherDiagnosticRetrieval: diagnosticResult.retrieval} : {}),
         });
         throw error;
       }
@@ -158,11 +182,11 @@ export class SuperOpsClient {
         (error instanceof Error && error.name === "AbortError");
       recordSubrequestFinish(
         subrequest,
-        timedOut ? "requestTimeout" : "networkError",
+        timedOut ? "requestTimeout" : "dispatcherError",
         false,
         {
-          outcome: timedOut ? "request_timeout" : "network_error",
-          errorClass: error instanceof DispatcherPendingError ? error.errorClassification ?? `Dispatcher_${error.state}` : timedOut ? "SuperOpsRequestTimeout" : "UpstreamNetworkFailure",
+          outcome: timedOut ? "request_timeout" : "dispatcher_error",
+          errorClass: timedOut ? "DispatcherRequestTimeout" : "DispatcherRequestFailed",
         }
       );
       if (error instanceof DispatcherPendingError) throw error;
@@ -187,6 +211,8 @@ export class SuperOpsClient {
             ? "SuperOpsInternalError"
             : "SuperOpsHttpError",
         httpStatus: response.status,
+        upstreamHttpStatus: response.status,
+        dispatcherHttpStatus: response.status,
         rateLimited,
         retryAfterSupplied: retryAfter !== undefined,
       });
@@ -208,6 +234,8 @@ export class SuperOpsClient {
           outcome: timedOut ? "request_timeout" : "malformed_response",
           errorClass: timedOut ? "SuperOpsRequestTimeout" : "MalformedResponse",
           httpStatus: response.status,
+          upstreamHttpStatus: response.status,
+          dispatcherHttpStatus: response.status,
         });
         if (timedOut) {
           throw new SuperOpsTimeoutError(
@@ -256,6 +284,8 @@ export class SuperOpsClient {
         retryAfterSupplied: graphQLError.retryAfter !== undefined,
         responseHadData: Object.prototype.hasOwnProperty.call(result, "data"),
         graphqlCode: graphQLError.code,
+        upstreamHttpStatus: response.status,
+        dispatcherHttpStatus: response.status,
       });
         throw graphQLError;
       }
@@ -265,6 +295,8 @@ export class SuperOpsClient {
           outcome: "malformed_response",
           errorClass: "MalformedResponse",
           httpStatus: response.status,
+          upstreamHttpStatus: response.status,
+          dispatcherHttpStatus: response.status,
           responseHadData: false,
         });
         throw new SuperOpsMalformedResponseError("No data returned from GraphQL query");
@@ -273,6 +305,8 @@ export class SuperOpsClient {
       recordSubrequestFinish(subrequest, response.status, true, {
         outcome: "success",
         httpStatus: response.status,
+          upstreamHttpStatus: response.status,
+          dispatcherHttpStatus: response.status,
         responseHadData: true,
       });
       return result.data;
