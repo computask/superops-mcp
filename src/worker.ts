@@ -62,6 +62,7 @@ import { SuperOpsContinuationWorkflow } from "./continuation-workflow.js";
 import { getScriptCatalogueStore, runWithScriptCatalogueStore, SuperOpsScriptCatalogue } from "./script-catalogue-store.js";
 import { syncScriptCatalogue } from "./script-catalogue-sync.js";
 import { createRateLimitProbeAdapter, SuperOpsRateLimitProbe } from "./rate-limit-probe.js";
+import type { TriageAgentMcpCapture } from "./triage-agent-capture.js";
 export {
   SuperOpsOperationLedger,
   SuperOpsContinuationWorkflow,
@@ -193,9 +194,10 @@ function withCors(res: Response): Response {
 async function handleMcp(
   request: Request,
   blockedToolNames: ReadonlySet<string>,
-  rateLimitProbe?: ReturnType<typeof createRateLimitProbeAdapter>
+  rateLimitProbe?: ReturnType<typeof createRateLimitProbeAdapter>,
+  triageAgentCapture?: (capture: TriageAgentMcpCapture) => Promise<void>
 ): Promise<Response> {
-  const server = createMcpServer({ blockedToolNames, rateLimitProbe });
+  const server = createMcpServer({ blockedToolNames, rateLimitProbe, triageAgentCapture });
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -645,9 +647,9 @@ function allowedAccessEmails(env: Env): Set<string> {
 
 async function requireAllowedAccessUser(
   request: Request,
-  env: Env
+  env: Env,
+  allowedEmails: ReadonlySet<string> = allowedAccessEmails(env)
 ): Promise<{ email: string } | Response> {
-  const allowedEmails = allowedAccessEmails(env);
   const issuer = normalizeOrigin(env.CHATGPT_AUTH_ACCESS_ISSUER);
   const audience = env.CHATGPT_AUTH_ACCESS_AUD?.trim();
 
@@ -689,6 +691,61 @@ async function requireAllowedAccessUser(
   } catch {
     return json({ error: "Forbidden", message: "Invalid Access identity." }, 403);
   }
+}
+
+const TRIAGE_CAPTURE_TRIGGER_ID_PATTERN = /^triage-\d+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TRIAGE_CAPTURE_ADMIN_EMAIL = "sam@computask.co.uk";
+
+type TriageAgentCaptureNamespace = {
+  idFromName(name: string): unknown;
+  get(id: unknown): { fetch(request: Request): Promise<Response> };
+};
+
+function triageCaptureNamespace(env: Env): TriageAgentCaptureNamespace | undefined {
+  const namespace = env.SUPEROPS_OPERATION_LEDGER as TriageAgentCaptureNamespace | undefined;
+  return namespace && typeof namespace.idFromName === "function" && typeof namespace.get === "function"
+    ? namespace
+    : undefined;
+}
+
+async function triageCaptureObjectFetch(
+  env: Env,
+  triggerId: string,
+  request: Request
+): Promise<Response> {
+  const namespace = triageCaptureNamespace(env);
+  if (!namespace) throw new Error("triage_agent_capture_binding_unavailable");
+  const stub = namespace.get(namespace.idFromName(`triage-agent-capture:${triggerId}`));
+  return stub.fetch(request);
+}
+
+async function persistTriageAgentMcpCapture(env: Env, capture: TriageAgentMcpCapture): Promise<void> {
+  const response = await triageCaptureObjectFetch(
+    env,
+    capture.triggerId,
+    new Request("https://operation.local/triage-agent-captures", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(capture),
+    })
+  );
+  if (!response.ok) throw new Error(`triage_agent_capture_store_http_${response.status}`);
+}
+
+async function readTriageAgentMcpCaptures(
+  env: Env,
+  triggerId: string,
+  attempt: number,
+  limit: number,
+  offset: number
+): Promise<Response> {
+  return triageCaptureObjectFetch(
+    env,
+    triggerId,
+    new Request(
+      `https://operation.local/triage-agent-captures?triggerId=${encodeURIComponent(triggerId)}&attempt=${attempt}&limit=${limit}&offset=${offset}`
+    )
+  );
 }
 
 function isAllowedChatGptRedirectUri(value: unknown): boolean {
@@ -1088,6 +1145,45 @@ async function handleBaseWorkerFetch(
     });
   }
 
+  if (url.pathname === "/admin/triage-agent-captures") {
+    if (request.method !== "GET") {
+      return json({ error: "Method not allowed" }, 405, { Allow: "GET", "Cache-Control": "no-store" });
+    }
+    const allowedQueryKeys = new Set(["triggerId", "attempt", "limit", "offset"]);
+    if ([...url.searchParams.keys()].some((key) => !allowedQueryKeys.has(key)) ||
+        [...allowedQueryKeys].some((key) => url.searchParams.getAll(key).length > 1)) {
+      return json({ error: "Unsupported or repeated query parameter." }, 400, { "Cache-Control": "no-store" });
+    }
+    const triggerId = url.searchParams.get("triggerId") ?? "";
+    const attempt = Number(url.searchParams.get("attempt") ?? "1");
+    const limit = Number(url.searchParams.get("limit") ?? "5");
+    const offset = Number(url.searchParams.get("offset") ?? "0");
+    if (!TRIAGE_CAPTURE_TRIGGER_ID_PATTERN.test(triggerId) ||
+        !Number.isInteger(attempt) || attempt < 1 || attempt > 100 ||
+        !Number.isInteger(limit) || limit < 1 || limit > 5 ||
+        !Number.isInteger(offset) || offset < 0 || offset > 200) {
+      return json({ error: "Invalid triggerId, attempt, limit, or offset." }, 400, { "Cache-Control": "no-store" });
+    }
+    const accessResult = await requireAllowedAccessUser(
+      request,
+      env,
+      new Set([TRIAGE_CAPTURE_ADMIN_EMAIL])
+    );
+    if (accessResult instanceof Response) {
+      const headers = new Headers(accessResult.headers);
+      headers.set("Cache-Control", "no-store, private");
+      return new Response(accessResult.body, { status: accessResult.status, statusText: accessResult.statusText, headers });
+    }
+    try {
+      const captures = await readTriageAgentMcpCaptures(env, triggerId, attempt, limit, offset);
+      const headers = new Headers(captures.headers);
+      headers.set("Cache-Control", "no-store, private");
+      return new Response(captures.body, { status: captures.status, headers });
+    } catch {
+      return json({ error: "Triage Agent capture storage is unavailable." }, 503, { "Cache-Control": "no-store, private" });
+    }
+  }
+
   if (url.pathname === "/mcp") {
     const mcpBlockedToolNames =
       blockedToolNames ?? (await blockedToolNamesForWorkerEnv(env, false));
@@ -1130,10 +1226,14 @@ async function handleBaseWorkerFetch(
 
     // Propagate credentials through AsyncLocalStorage so getCredentials()/
     // getClient() resolve them (process.env is unavailable on workerd).
+    const captureAgentMcpCall = (capture: TriageAgentMcpCapture) =>
+      persistTriageAgentMcpCapture(env, capture);
     if (creds) {
-      return runWithCredentials(creds, () => handleMcp(request, mcpBlockedToolNames, rateLimitProbe));
+      return runWithCredentials(creds, () =>
+        handleMcp(request, mcpBlockedToolNames, rateLimitProbe, captureAgentMcpCall)
+      );
     }
-    return handleMcp(request, mcpBlockedToolNames, rateLimitProbe);
+    return handleMcp(request, mcpBlockedToolNames, rateLimitProbe, captureAgentMcpCall);
     };
 
     const runConfiguredMcpRequest = async () => {

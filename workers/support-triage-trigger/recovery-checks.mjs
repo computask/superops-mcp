@@ -5,8 +5,10 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 // Exercise the actual preserved production module, exposing internals only in
 // this in-memory test module. No test route or export is shipped to production.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
-const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState} = await import(
-  `data:text/javascript;base64,${Buffer.from(source + '\nexport {CoordinatorEngine, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState};').toString('base64')}`
+const testableSource = source.replace(/\nexport \{\s*TriageCoordinator,\s*index_default as default\s*\};\s*\/\/# sourceMappingURL=index\.js\.map\s*$/, '\n');
+assert.notEqual(testableSource, source, 'The preserved production module export footer must be isolated for the in-memory test harness');
+const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState} = await import(
+  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
@@ -15,6 +17,135 @@ test('dispatch input requires an actual no-apply cause and preserves receipt dia
   assert(source.includes('reason_unavailable if the cause genuinely cannot be established'));
   assert(source.includes('never invent HTTP 400/429/502'));
   assert(source.includes('Keep any observed denial terminal; do not retry or bypass it'));
+});
+
+test('Agent prompt requires exact MCP correlation and a report-only pre-apply capture',()=>{
+  const triggerId='triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632';
+  const prompt=buildAgentInput(triggerId,{mode:'new-email-tickets',source:'EMAIL',createdFrom:'2026-09-26T10:00:00.000Z',createdTo:'2026-09-26T10:01:00.000Z'},3,true);
+  assert(prompt.includes('On every superops_* MCP call, include triageCapture'));
+  assert(prompt.includes('triage_apply_intent_report'));
+  assert(prompt.includes('exact copy of the complete argument object'));
+  assert(prompt.includes('not approval and does not change or bypass'));
+  assert(prompt.includes(`Trigger ID: ${triggerId}`));
+});
+
+test('apply intent parser preserves exact plan JSON and rejects credential-like fields',()=>{
+  const triggerId='triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632';
+  const applyArguments={policyMode:'email-new-calls-v2',expectedCandidateTicketNumbers:['62992'],actions:[{ticketNumber:'62992',action:'leave',note:'<strong>TRIAGE SUMMARY</strong><br><br>Customer-provided detail',target:{impact:'High',category:'Security'},allowWriteIfUpdatedTimeChanged:false}],verify:true,dedupeNotes:true,triageCapture:{triggerId,attempt:3}};
+  const report={triggerId,attempt:3,applyArguments};
+  assert.deepEqual(parseTriageApplyIntentReport(report),report);
+  assert.equal(parseTriageApplyIntentReport({...report,applyArguments:{apiKey:'must-not-persist'}}),null);
+  assert.equal(parseTriageApplyIntentReport({...report,applyArguments:{apiToken:'must-not-persist'}}),null);
+  assert.equal(parseTriageApplyIntentReport({...report,applyArguments:{secret:'must-not-persist'}}),null);
+  assert.equal(applyIntentToolDefinition().name,'triage_apply_intent_report');
+});
+
+test('apply-intent MCP tool lists, forwards exact plan, and does not return the plan payload',async()=>{
+  const triggerId='triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632';
+  const applyArguments={expectedCandidateTicketNumbers:['62992'],actions:[{ticketNumber:'62992',action:'leave',note:'private-note'}]};
+  let forwarded;
+  const sink={report:async()=>({status:'recorded'}),reportApplyIntent:async(value)=>{forwarded=value;return {status:'recorded',triggerId:value.triggerId,attempt:value.attempt};}};
+  const listed=await handleTriageResultMcp(new Request('https://local/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/list'})}),sink);
+  const listBody=await listed.json();
+  assert.deepEqual(listBody.result.tools.map(tool=>tool.name),['triage_result_report','triage_apply_intent_report']);
+  const response=await handleTriageResultMcp(new Request('https://local/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'triage_apply_intent_report',arguments:{triggerId,attempt:1,applyArguments}}})}),sink);
+  const body=await response.json();
+  assert.deepEqual(forwarded,{triggerId,attempt:1,applyArguments});
+  assert.deepEqual(body.result.structuredContent,{status:'recorded',triggerId,attempt:1});
+  assert(!JSON.stringify(body).includes('private-note'));
+});
+
+test('trigger client captures the exact outgoing JSON body before sending without authorization',async()=>{
+  const triggerId='triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632';
+  const captures=[];
+  let sentBody;
+  const client=new WorkspaceAgentTriggerClient({workspaceAgentTriggerUrl:'https://agent.example/trigger',workspaceAgentAccessToken:'synthetic-token',triageCaptureReadToken:'synthetic-capture-read-token'},async(_url,init)=>{
+    assert.equal(captures.length,1,'private capture is persisted before network dispatch');
+    sentBody=init.body;
+    assert.equal(init.headers.Authorization,'Bearer synthetic-token');
+    return new Response(JSON.stringify({agent_trigger_run_id:'apirun_regression'}),{status:202});
+  },{info(){},warn(){}},async(record)=>{captures.push(record);return {status:'recorded'};});
+  const result=await client.trigger(triggerId,{mode:'new-email-tickets',source:'EMAIL',createdFrom:'2026-09-26T10:00:00.000Z',createdTo:'2026-09-26T10:01:00.000Z'},4,true);
+  assert.equal(result.kind,'accepted');
+  assert.equal(captures[0].kind,'agent_input');
+  assert.equal(captures[0].payload.requestBody,sentBody);
+  assert(JSON.parse(sentBody).input.includes('Trigger ID: '+triggerId));
+  assert(!JSON.stringify(captures[0]).includes('synthetic-token'));
+});
+
+test('trigger capture stays disabled until its dedicated retrieval secret is configured',async()=>{
+  let captureCalls=0;
+  const client=new WorkspaceAgentTriggerClient({workspaceAgentTriggerUrl:'https://agent.example/trigger',workspaceAgentAccessToken:'synthetic-token'},async(_url,init)=>{
+    assert(!JSON.parse(init.body).input.includes('Private diagnostic capture is enabled'));
+    return new Response(JSON.stringify({agent_trigger_run_id:'apirun_capture_disabled'}),{status:202});
+  },{info(){},warn(){}},async()=>{captureCalls+=1;return {status:'recorded'};});
+  const result=await client.trigger('triage-82-60d4e73d-5c40-4a75-89b5-31ac48f25632',{mode:'new-email-tickets',source:'EMAIL',createdFrom:'2026-09-26T10:00:00.000Z',createdTo:'2026-09-26T10:01:00.000Z'});
+  assert.equal(result.kind,'accepted');
+  assert.equal(captureCalls,0);
+});
+
+function privateCaptureSqlStorage(seed){
+  const rows=new Map();
+  const failures=new Map();
+  const state={value:structuredClone(seed),alarm:null};
+  const key=(triggerId,attempt,kind)=>`${triggerId}\0${attempt}\0${kind}`;
+  const sql={exec(query,...args){
+    const normalized=query.replace(/\s+/g,' ').trim();
+    if(normalized.startsWith('CREATE TABLE')||normalized.startsWith('CREATE INDEX')) return {toArray:()=>[],one:()=>({})};
+    if(normalized.includes('SELECT payload_json, expires_at')) {const row=rows.get(key(args[0],args[1],args[2]));return {toArray:()=>row?[row]:[],one:()=>row??{}};}
+    if(normalized.includes('FROM triage_agent_private_captures WHERE expires_at >')) {const active=[...rows.values()].filter(row=>row.expires_at>args[0]);return {toArray:()=>[],one:()=>({row_count:active.length,byte_count:active.reduce((sum,row)=>sum+row.payload_bytes,0)})};}
+    if(normalized.startsWith('DELETE FROM triage_agent_private_capture_failures WHERE expires_at <=')) {const deleted=[];for(const [rowKey,row] of failures)if(row.expires_at<=args[0]){failures.delete(rowKey);deleted.push(row);}return {toArray:()=>deleted,one:()=>({})};}
+    if(normalized.startsWith('DELETE FROM triage_agent_private_captures WHERE expires_at <=')) {const deleted=[];for(const [rowKey,row] of rows)if(row.expires_at<=args[0]){rows.delete(rowKey);deleted.push(row);}return {toArray:()=>deleted,one:()=>({})};}
+    if(normalized.includes('SELECT COUNT(*) AS row_count FROM triage_agent_private_capture_failures')) {const active=[...failures.values()].filter(row=>row.expires_at>args[0]);return {toArray:()=>[],one:()=>({row_count:active.length})};}
+    if(normalized.startsWith('INSERT INTO triage_agent_private_capture_failures')) {const row={failure_id:args[0],trigger_id:args[1],attempt:args[2],capture_kind:args[3],failed_at:args[4],reason:args[5],payload_bytes:args[6],expires_at:args[7]};failures.set(row.failure_id,row);return {toArray:()=>[],one:()=>({})};}
+    if(normalized.includes('FROM triage_agent_private_capture_failures')&&normalized.includes('ORDER BY failed_at')) {const selected=[...failures.values()].filter(row=>row.trigger_id===args[0]&&row.attempt===args[1]&&row.expires_at>args[2]).sort((a,b)=>a.failed_at-b.failed_at||a.failure_id.localeCompare(b.failure_id));return {toArray:()=>selected,one:()=>selected[0]??{}};}
+    if(normalized.startsWith('DELETE FROM triage_agent_private_captures WHERE trigger_id =')) {const deleted=rows.delete(key(args[0],args[1],args[2]));return {toArray:()=>deleted?[{}]:[],one:()=>({})};}
+    if(normalized.startsWith('INSERT INTO triage_agent_private_captures')) {const row={trigger_id:args[0],attempt:args[1],capture_kind:args[2],created_at:args[3],expires_at:args[4],payload_bytes:args[5],payload_json:args[6]};rows.set(key(row.trigger_id,row.attempt,row.capture_kind),row);return {toArray:()=>[],one:()=>({})};}
+    if(normalized.includes('SELECT capture_kind, created_at')) {const selected=[...rows.values()].filter(row=>row.trigger_id===args[0]&&row.attempt===args[1]&&row.expires_at>args[2]).sort((a,b)=>a.created_at-b.created_at||a.capture_kind.localeCompare(b.capture_kind));return {toArray:()=>selected,one:()=>selected[0]??{}};}
+    throw new Error(`unhandled test SQL: ${normalized}`);
+  }};
+  return {rows,failures,state,storage:{sql,async get(k){return k==='coordinator-state'?structuredClone(state.value):undefined;},async put(k,v){if(k==='coordinator-state')state.value=structuredClone(v);},async delete(){return false;},async list(){return new Map();},async setAlarm(at){state.alarm=at;}}};
+}
+
+test('private capture storage is idempotent, conflict-safe, and expires at seven days',()=>{
+  const {storage,rows,failures}=privateCaptureSqlStorage(createInitialState());
+  const triggerId='triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632';
+  const record={triggerId,attempt:2,kind:'agent_input',payload:{requestBody:'exact escaped JSON with customer detail'}};
+  const now=Date.parse('2026-09-26T10:00:00.000Z');
+  assert.equal(storeTriageAgentCapture(storage,record,now).status,'recorded');
+  assert.equal(storeTriageAgentCapture(storage,record,now+1).status,'duplicate');
+  assert.equal(storeTriageAgentCapture(storage,{...record,payload:{requestBody:'changed'}},now+2).status,'conflict');
+  const listed=listTriageAgentCaptures(storage,triggerId,2,now+3);
+  assert.equal(listed.length,1);
+  assert.deepEqual(listed[0].payload,record.payload);
+  assert.deepEqual(listTriageAgentCaptureFailures(storage,triggerId,2,now+3).map(item=>item.reason),['conflict']);
+  const afterExpiry=now+7*24*60*60*1000+10;
+  assert.equal(pruneTriageAgentCaptures(storage,afterExpiry),2);
+  assert.equal(rows.size,0);
+  assert.equal(failures.size,0);
+});
+
+test('coordinator accepts pre-apply intent only for the active trigger and exposes it privately',async()=>{
+  const {storage,state}=privateCaptureSqlStorage(createInitialState());
+  const triggerId='triage-83-60d4e73d-5c40-4a75-89b5-31ac48f25632';
+  const applyArguments={policyMode:'email-new-calls-v2',expectedCandidateTicketNumbers:['62992'],actions:[{ticketNumber:'62992',action:'leave',note:'exact private intent'}],verify:true,dedupeNotes:true};
+  state.value.pending=true;
+  state.value.executionPhase='awaiting_result';
+  state.value.pendingTriggerId=triggerId;
+  state.value.dispatchAttempt=2;
+  storeTriageAgentCapture(storage,{triggerId,attempt:2,kind:'agent_input',payload:{requestBody:'exact prompt body'}});
+  await storage.put('coordinator-state',state.value);
+  const coordinator=new TriageCoordinator({storage},{});
+  const report=await coordinator.fetch(new Request('https://local/internal/triage-apply-intent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({triggerId,attempt:2,applyArguments})}));
+  assert.equal(report.status,200);
+  const reportBody=await report.json();
+  assert.deepEqual({status:reportBody.status,triggerId:reportBody.triggerId,attempt:reportBody.attempt},{status:'recorded',triggerId,attempt:2});
+  assert(Date.parse(reportBody.expiresAt)>Date.now()+6*24*60*60*1000);
+  const read=await coordinator.fetch(new Request(`https://local/internal/agent-capture?triggerId=${encodeURIComponent(triggerId)}&attempt=2`));
+  const capture=await read.json();
+  assert.equal(capture.complete,true);
+  assert.equal(capture.captureFailureCount,0);
+  assert.equal(capture.records.find(item=>item.kind==='apply_intent').payload.applyArguments.actions[0].note,'exact private intent');
 });
 
 test('the single metadata lookup covers closure fields before a resolve plan',()=>{

@@ -9,6 +9,7 @@ import {
   recordTypedSubrequestStart,
 } from "./execution.js";
 import { canonicalizeNoteText } from "./utils/note-canonicalization.js";
+import type { TriageAgentMcpCapture } from "./triage-agent-capture.js";
 
 export type OperationState =
   | "Running"
@@ -459,6 +460,20 @@ interface DurableObjectState {
   storage: DurableObjectStorage;
 }
 
+interface StoredTriageAgentMcpCaptureMetadata {
+  captureId: string;
+  triggerId: string;
+  attempt: number;
+  mcpRequestId?: string | number;
+  toolName: string;
+  startedAt: string;
+  completedAt: string;
+  expiresAt: number;
+  serializedBytes: number;
+  chunkCount: number;
+  status: "writing" | "complete";
+}
+
 interface DurableContinuationEnv {
   SUPEROPS_CONTINUATION_WORKFLOW?: {
     createBatch(options: Array<{ id: string; params: Record<string, unknown> }>): Promise<Array<{ id: string }>>;
@@ -484,6 +499,13 @@ const MAX_APPROVED_PRIVATE_NOTE_BYTES = 128 * 1024;
 const MAX_RECENT_OPERATION_INDEX_ENTRIES = 50;
 const MAX_RECENT_OPERATION_RESULTS = 20;
 const MAX_RECENT_OPERATION_OUTPUT_BYTES = 128 * 1024;
+const TRIAGE_AGENT_CAPTURE_PREFIX = "triage-agent-capture:";
+const TRIAGE_AGENT_CAPTURE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const TRIAGE_AGENT_CAPTURE_MAX_RECORDS = 200;
+const TRIAGE_AGENT_CAPTURE_MAX_FAILURE_DETAILS = 50;
+const TRIAGE_AGENT_CAPTURE_MAX_RECORD_BYTES = 1.5 * 1024 * 1024;
+const TRIAGE_AGENT_CAPTURE_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+const TRIAGE_AGENT_CAPTURE_CHUNK_CHARS = 16_000;
 const OPERATION_STORE_RATE_LIMIT_MAX_ATTEMPTS = 3;
 const OPERATION_STORE_RATE_LIMIT_BACKOFF_MS = [25, 75];
 const OPERATION_STORE_CONFLICT_MAX_ATTEMPTS = 5;
@@ -3217,6 +3239,36 @@ function operationRecentView(record: OperationLedgerRecord): Record<string, unkn
   };
 }
 
+const TRIAGE_AGENT_TRIGGER_ID_PATTERN = /^triage-\d+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TRIAGE_AGENT_CAPTURE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TRIAGE_AGENT_CAPTURE_SECRET_KEY_PATTERN = /(authorization|bearer|api[_-]?(?:key|token)|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|password|secret)/i;
+const TRIAGE_AGENT_CAPTURE_SECRET_VALUE_PATTERN = /\b(?:Bearer\s+[A-Za-z0-9._~+/=-]{16,}|sk-[A-Za-z0-9]{20,})\b/i;
+
+function containsTriageAgentCaptureCredential(value: unknown, depth = 0): boolean {
+  if (depth > 20) return true;
+  if (typeof value === "string") return TRIAGE_AGENT_CAPTURE_SECRET_VALUE_PATTERN.test(value);
+  if (Array.isArray(value)) return value.some((item) => containsTriageAgentCaptureCredential(item, depth + 1));
+  if (!isRecordObject(value)) return false;
+  return Object.entries(value).some(([key, item]) =>
+    TRIAGE_AGENT_CAPTURE_SECRET_KEY_PATTERN.test(key) || containsTriageAgentCaptureCredential(item, depth + 1)
+  );
+}
+
+function isTriageAgentMcpCapture(value: unknown): value is TriageAgentMcpCapture {
+  if (!isRecordObject(value)) return false;
+  if (Object.keys(value).some((key) => ![
+    "captureId", "triggerId", "attempt", "mcpRequestId", "toolName", "startedAt", "completedAt", "input", "output",
+  ].includes(key))) return false;
+  return typeof value.captureId === "string" && TRIAGE_AGENT_CAPTURE_ID_PATTERN.test(value.captureId) &&
+    typeof value.triggerId === "string" && TRIAGE_AGENT_TRIGGER_ID_PATTERN.test(value.triggerId) &&
+    Number.isInteger(value.attempt) && Number(value.attempt) >= 1 && Number(value.attempt) <= 100 &&
+    (value.mcpRequestId === undefined || typeof value.mcpRequestId === "string" || typeof value.mcpRequestId === "number") &&
+    typeof value.toolName === "string" && /^superops_[A-Za-z0-9_]{1,96}$/.test(value.toolName) &&
+    typeof value.startedAt === "string" && Number.isFinite(Date.parse(value.startedAt)) &&
+    typeof value.completedAt === "string" && Number.isFinite(Date.parse(value.completedAt)) &&
+    isRecordObject(value.input) && isRecordObject(value.output);
+}
+
 export class SuperOpsOperationLedger {
   constructor(private readonly state: DurableObjectState, private readonly env: DurableContinuationEnv = {}) {}
 
@@ -3267,6 +3319,94 @@ export class SuperOpsOperationLedger {
     if (existingAlarm === null || existingAlarm === undefined || expiresAt < existingAlarm) {
       await this.state.storage.setAlarm(expiresAt);
     }
+  }
+
+  private async setTriageAgentCaptureAlarm(expiresAt: number): Promise<void> {
+    if (typeof this.state.storage.setAlarm !== "function") return;
+    const existingAlarm = await this.state.storage.getAlarm?.();
+    if (existingAlarm === null || existingAlarm === undefined || expiresAt < existingAlarm) {
+      await this.state.storage.setAlarm(expiresAt);
+    }
+  }
+
+  private async deleteTriageAgentCapture(captureId: string): Promise<void> {
+    await this.state.storage.delete(`${TRIAGE_AGENT_CAPTURE_PREFIX}record:${captureId}`);
+    const chunks = await this.state.storage.list({
+      prefix: `${TRIAGE_AGENT_CAPTURE_PREFIX}chunk:${captureId}:`,
+    });
+    for (const key of chunks.keys()) await this.state.storage.delete(key);
+  }
+
+  private async recordTriageAgentCaptureFailure(
+    capture: TriageAgentMcpCapture,
+    reason: "record_size_limit" | "record_limit" | "total_size_limit" | "credential_marker",
+    serializedBytes: number,
+    now: number
+  ): Promise<void> {
+    const key = `${TRIAGE_AGENT_CAPTURE_PREFIX}failure:${capture.triggerId}`;
+    const previous = await this.state.storage.get<{
+      triggerId: string;
+      count: number;
+      truncated: boolean;
+      entries: Array<{ captureId: string; attempt: number; toolName: string; occurredAt: string; reason: string; serializedBytes: number }>;
+      expiresAt: number;
+    }>(key);
+    const activePrevious = previous?.expiresAt !== undefined && previous.expiresAt > now
+      ? previous
+      : undefined;
+    const entries = (activePrevious?.entries ?? [])
+      .filter((entry) => Date.parse(entry.occurredAt) + TRIAGE_AGENT_CAPTURE_RETENTION_MS > now);
+    entries.push({
+      captureId: capture.captureId,
+      attempt: capture.attempt,
+      toolName: capture.toolName,
+      occurredAt: new Date(now).toISOString(),
+      reason,
+      serializedBytes,
+    });
+    const truncated = entries.length > TRIAGE_AGENT_CAPTURE_MAX_FAILURE_DETAILS;
+    const retainedEntries = entries.slice(-TRIAGE_AGENT_CAPTURE_MAX_FAILURE_DETAILS);
+    const metadata = {
+      triggerId: capture.triggerId,
+      count: retainedEntries.length,
+      truncated,
+      entries: retainedEntries,
+      expiresAt: now + TRIAGE_AGENT_CAPTURE_RETENTION_MS,
+    };
+    await this.state.storage.put(key, metadata);
+    await this.setTriageAgentCaptureAlarm(metadata.expiresAt);
+  }
+
+  private async pruneTriageAgentCaptures(now: number): Promise<number | undefined> {
+    const records = await this.state.storage.list<StoredTriageAgentMcpCaptureMetadata>({
+      prefix: `${TRIAGE_AGENT_CAPTURE_PREFIX}record:`,
+    });
+    let nextExpiry: number | undefined;
+    for (const [key, metadata] of records) {
+      if (!key.startsWith(`${TRIAGE_AGENT_CAPTURE_PREFIX}record:`)) continue;
+      const captureId = key.slice(`${TRIAGE_AGENT_CAPTURE_PREFIX}record:`.length);
+      if (!TRIAGE_AGENT_CAPTURE_ID_PATTERN.test(captureId) ||
+          !Number.isFinite(metadata?.expiresAt) || metadata.expiresAt <= now) {
+        await this.deleteTriageAgentCapture(captureId);
+      } else {
+        nextExpiry = nextExpiry === undefined ? metadata.expiresAt : Math.min(nextExpiry, metadata.expiresAt);
+      }
+    }
+    const failures = await this.state.storage.list<{
+      triggerId?: string;
+      expiresAt?: number;
+      entries?: Array<{ occurredAt?: string }>;
+    }>({ prefix: `${TRIAGE_AGENT_CAPTURE_PREFIX}failure:` });
+    for (const [key, failure] of failures) {
+      if (!key.startsWith(`${TRIAGE_AGENT_CAPTURE_PREFIX}failure:`)) continue;
+      if (!Number.isFinite(failure?.expiresAt) || Number(failure.expiresAt) <= now) {
+        await this.state.storage.delete(key);
+        continue;
+      }
+      const expiry = Number(failure.expiresAt);
+      nextExpiry = nextExpiry === undefined ? expiry : Math.min(nextExpiry, expiry);
+    }
+    return nextExpiry;
   }
 
   private watchdogAlarmAt(record: OperationLedgerRecord): number {
@@ -3560,6 +3700,10 @@ export class SuperOpsOperationLedger {
         }
       }
     }
+    const triageCaptureExpiry = await this.pruneTriageAgentCaptures(Date.parse(now));
+    if (triageCaptureExpiry !== undefined) {
+      nextAlarmAt = nextAlarmAt === undefined ? triageCaptureExpiry : Math.min(nextAlarmAt, triageCaptureExpiry);
+    }
     if (nextAlarmAt !== undefined && typeof this.state.storage.setAlarm === "function") {
       await this.state.storage.setAlarm(nextAlarmAt);
     }
@@ -3578,6 +3722,156 @@ export class SuperOpsOperationLedger {
     const operationMatch = url.pathname.match(/^\/operations\/([^/]+)$/);
     const operationActionMatch = url.pathname.match(/^\/operations\/([^/]+)\/(claim-next|complete-item|checkpoint-item|schedule-continuation|cancel)$/);
     const emergingIssueSignalMatch = url.pathname.match(/^\/signals\/emerging-issue\/([^/]+)$/);
+
+    if (request.method === "POST" && url.pathname === "/triage-agent-captures") {
+      let incoming: unknown;
+      try {
+        incoming = await request.json();
+      } catch {
+        return json({ error: "Invalid triage Agent capture JSON." }, 400);
+      }
+      if (!isTriageAgentMcpCapture(incoming)) {
+        return json({ error: "Invalid triage Agent capture record." }, 400);
+      }
+      const capture = incoming;
+      const payloadJson = JSON.stringify({ input: capture.input, output: capture.output });
+      const serializedBytes = new TextEncoder().encode(payloadJson).byteLength;
+      const now = Date.now();
+      await this.pruneTriageAgentCaptures(now);
+      const recordKey = `${TRIAGE_AGENT_CAPTURE_PREFIX}record:${capture.captureId}`;
+      const existing = await this.state.storage.get<StoredTriageAgentMcpCaptureMetadata>(recordKey);
+      if (existing) return json({ ok: true, duplicate: true, captureId: capture.captureId });
+      if (containsTriageAgentCaptureCredential({ input: capture.input, output: capture.output })) {
+        await this.recordTriageAgentCaptureFailure(capture, "credential_marker", serializedBytes, now);
+        return json({ ok: true, captureStatus: "not_captured", reason: "credential_marker" }, 202);
+      }
+      if (serializedBytes > TRIAGE_AGENT_CAPTURE_MAX_RECORD_BYTES) {
+        await this.recordTriageAgentCaptureFailure(capture, "record_size_limit", serializedBytes, now);
+        return json({ ok: true, captureStatus: "not_captured", reason: "record_size_limit" }, 202);
+      }
+      const records = await this.state.storage.list<StoredTriageAgentMcpCaptureMetadata>({
+        prefix: `${TRIAGE_AGENT_CAPTURE_PREFIX}record:`,
+      });
+      if (records.size >= TRIAGE_AGENT_CAPTURE_MAX_RECORDS) {
+        await this.recordTriageAgentCaptureFailure(capture, "record_limit", serializedBytes, now);
+        return json({ ok: true, captureStatus: "not_captured", reason: "record_limit" }, 202);
+      }
+      const retainedBytes = [...records.values()]
+        .filter((metadata) => metadata?.expiresAt > now)
+        .reduce((total, metadata) => total + (
+          Number.isFinite(metadata?.serializedBytes)
+            ? metadata.serializedBytes
+            : TRIAGE_AGENT_CAPTURE_MAX_TOTAL_BYTES
+        ), 0);
+      if (retainedBytes + serializedBytes > TRIAGE_AGENT_CAPTURE_MAX_TOTAL_BYTES) {
+        await this.recordTriageAgentCaptureFailure(capture, "total_size_limit", serializedBytes, now);
+        return json({ ok: true, captureStatus: "not_captured", reason: "total_size_limit" }, 202);
+      }
+
+      const chunks: string[] = [];
+      for (let offset = 0; offset < payloadJson.length; offset += TRIAGE_AGENT_CAPTURE_CHUNK_CHARS) {
+        chunks.push(payloadJson.slice(offset, offset + TRIAGE_AGENT_CAPTURE_CHUNK_CHARS));
+      }
+      const expiresAt = now + TRIAGE_AGENT_CAPTURE_RETENTION_MS;
+      const metadata: StoredTriageAgentMcpCaptureMetadata = {
+        captureId: capture.captureId,
+        triggerId: capture.triggerId,
+        attempt: capture.attempt,
+        ...(capture.mcpRequestId === undefined ? {} : { mcpRequestId: capture.mcpRequestId }),
+        toolName: capture.toolName,
+        startedAt: capture.startedAt,
+        completedAt: capture.completedAt,
+        expiresAt,
+        serializedBytes,
+        chunkCount: chunks.length,
+        status: "writing",
+      };
+      await this.state.storage.put(recordKey, metadata);
+      for (let index = 0; index < chunks.length; index += 1) {
+        await this.state.storage.put(
+          `${TRIAGE_AGENT_CAPTURE_PREFIX}chunk:${capture.captureId}:${String(index).padStart(4, "0")}`,
+          chunks[index]
+        );
+      }
+      await this.state.storage.put(recordKey, { ...metadata, status: "complete" });
+      await this.setTriageAgentCaptureAlarm(expiresAt);
+      return json({ ok: true, captureId: capture.captureId, expiresAt: new Date(expiresAt).toISOString() }, 201);
+    }
+
+    if (request.method === "GET" && url.pathname === "/triage-agent-captures") {
+      const triggerId = url.searchParams.get("triggerId") ?? "";
+      const attempt = Number(url.searchParams.get("attempt") ?? "1");
+      if (!TRIAGE_AGENT_TRIGGER_ID_PATTERN.test(triggerId)) {
+        return json({ error: "A valid triggerId is required." }, 400);
+      }
+      const rawLimit = Number(url.searchParams.get("limit") ?? "5");
+      const rawOffset = Number(url.searchParams.get("offset") ?? "0");
+      if (!Number.isInteger(attempt) || attempt < 1 || attempt > 100 ||
+          !Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 5 ||
+          !Number.isInteger(rawOffset) || rawOffset < 0 || rawOffset > TRIAGE_AGENT_CAPTURE_MAX_RECORDS) {
+        return json({ error: "attempt must be 1-100, limit 1-5, and offset 0-200." }, 400);
+      }
+      const expiry = await this.pruneTriageAgentCaptures(Date.now());
+      if (expiry !== undefined) await this.setTriageAgentCaptureAlarm(expiry);
+      const stored = await this.state.storage.list<StoredTriageAgentMcpCaptureMetadata>({
+        prefix: `${TRIAGE_AGENT_CAPTURE_PREFIX}record:`,
+      });
+      const all = [...stored.entries()]
+        .map(([, metadata]) => metadata)
+        .filter((metadata) => metadata?.triggerId === triggerId && metadata.attempt === attempt && metadata.expiresAt > Date.now())
+        .sort((left, right) => left.startedAt.localeCompare(right.startedAt) || left.captureId.localeCompare(right.captureId));
+      const page = all.slice(rawOffset, rawOffset + rawLimit);
+      const recordsWithPayload = await Promise.all(page.map(async (metadata) => {
+        if (metadata.status !== "complete") return { ...metadata, captureStatus: "incomplete" };
+        const chunkParts: string[] = [];
+        for (let index = 0; index < metadata.chunkCount; index += 1) {
+          const chunk = await this.state.storage.get<string>(
+            `${TRIAGE_AGENT_CAPTURE_PREFIX}chunk:${metadata.captureId}:${String(index).padStart(4, "0")}`
+          );
+          if (typeof chunk !== "string") return { ...metadata, captureStatus: "incomplete" };
+          chunkParts.push(chunk);
+        }
+        try {
+          const payload = JSON.parse(chunkParts.join("")) as { input?: unknown; output?: unknown };
+          if (!isRecordObject(payload.input) || !isRecordObject(payload.output)) {
+            return { ...metadata, captureStatus: "incomplete" };
+          }
+          return { ...metadata, captureStatus: "complete", input: payload.input, output: payload.output };
+        } catch {
+          return { ...metadata, captureStatus: "incomplete" };
+        }
+      }));
+      const nextOffset = rawOffset + page.length;
+      const hasMore = nextOffset < all.length;
+      const incompleteCount = recordsWithPayload.filter((record) => record.captureStatus !== "complete").length;
+      const failureSummary = await this.state.storage.get<{
+        triggerId: string;
+        count: number;
+        truncated: boolean;
+        entries: Array<Record<string, unknown>>;
+        expiresAt: number;
+      }>(`${TRIAGE_AGENT_CAPTURE_PREFIX}failure:${triggerId}`);
+      const activeFailureSummary = typeof failureSummary?.expiresAt === "number" &&
+        failureSummary.expiresAt > Date.now()
+        ? failureSummary
+        : undefined;
+      return json({
+        triggerId,
+        retentionDays: 7,
+        totalRecords: all.length,
+        offset: rawOffset,
+        records: recordsWithPayload,
+        hasMore,
+        nextOffset: hasMore ? nextOffset : null,
+        complete: !hasMore && incompleteCount === 0 && (activeFailureSummary?.count ?? 0) === 0,
+        truncated: hasMore || incompleteCount > 0 || (activeFailureSummary?.count ?? 0) > 0,
+        incompleteRecordCount: incompleteCount,
+        captureFailureCount: activeFailureSummary?.count ?? 0,
+        captureFailuresTruncated: activeFailureSummary?.truncated ?? false,
+        captureFailures: activeFailureSummary?.entries ?? [],
+        truncationReason: incompleteCount > 0 ? "capturePayloadIncomplete" : (activeFailureSummary?.count ?? 0) > 0 ? "captureWriteFailure" : hasMore ? "pageLimit" : null,
+      });
+    }
 
     if (request.method === "POST" && url.pathname === "/signals/emerging-issue/upsert") {
       try {

@@ -13,6 +13,7 @@
 - Ticket triage is safety-critical: `superops_tickets_triage_snapshot` is the read-only evidence collection path, and `superops_tickets_apply_triage_plan` is the approved fixed-candidate write path.
 - Historical ticket reporting is createdTime-based and implemented in `src/domains/ticket-reporting.ts`; it uses sequential bounded pagination and local post-filtering for most dimensions.
 - Never put SuperOps tokens, OAuth tokens, Cloudflare Access secrets, customer message bodies, full ticket descriptions, note bodies, attachment bodies, or sensitive headers in docs, tests, logs, or committed fixtures.
+- Explicit Workspace Agent diagnostic-capture exception: the approved triage capture feature may persist the exact trigger request body, correlated SuperOps MCP tool arguments/results, and pre-apply argument object in dedicated private durable stores for exactly seven days. These captures are not routine logs, operation records, or dispatch history; keep reads behind the designated admin authentication, exclude credentials, enforce size/retention bounds, and test expiry. This exception does not authorize copying real customer data into source fixtures, logs, or docs.
 
 ## Important Files And Architecture
 

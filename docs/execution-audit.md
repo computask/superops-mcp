@@ -257,6 +257,44 @@ database write or additional SuperOps call in the triage path. The table and
 per-minute/ticket views have bounded retention; see [API call table](api-call-table.md)
 for access, completeness limitations, SQL queries and rollback.
 
+## Private Workspace Agent request capture
+
+The separately authorized triage diagnostic capture is intentionally not part
+of `superops.api_call`, ordinary audit events, operation results, or
+`triage_dispatch_history`. For correlated runs it retains, in dedicated private
+Durable Object storage:
+
+- The exact JSON request body sent by the trigger Worker to the Workspace Agent
+  API. The Authorization header and access token are never stored.
+- Each `superops_*` MCP tool's exact argument object and the final MCP result
+  returned to the Agent, after the MCP's existing credential sanitization and
+  one-MiB result-size bound.
+- The exact structured `applyArguments` submitted to
+  `triage_apply_intent_report` immediately before the Agent attempts
+  `superops_tickets_apply_triage_plan`. This is diagnostic evidence only; it
+  does not approve or bypass auto-review or any MCP safety gate.
+
+Both capture stores expire records after seven days and expose them only through
+their separate administrator routes: the trigger's
+`/admin/agent-capture?triggerId=...&attempt=...` requires the distinct
+`TRIAGE_CAPTURE_READ_TOKEN`; the SO MCP's
+`/admin/triage-agent-captures?triggerId=...&attempt=...` requires a Cloudflare
+Access identity of `sam@computask.co.uk`. Capture-size/record bounds and failed
+capture receipts are reported separately so a partial capture is not represented
+as complete. Trigger-side Agent captures remain disabled until the distinct read
+token is configured outside Git; `/health` exposes only the boolean
+`triageAgentCaptureEnabled`. Never put the token value in source or
+request-body diagnostics.
+
+MCP-side retention is capped at 200 records and 32 MiB per Trigger ID, with a
+1.5 MiB per-record limit; trigger-side capture has its own 10,000-row,
+256 MiB-total, 256 KiB-per-record bounds. Limit and credential-marker rejections
+produce safe failure receipts and mark the relevant capture incomplete.
+
+This records the prompt and tool traffic available at the integration boundary;
+it cannot expose hidden OpenAI system/developer context, private reasoning, or
+the internal rationale for an auto-review denial. Those remain platform-side.
+
 ## Mutation classification
 
 - Durable: `superops_tickets_apply_triage_plan`. Primary production write path; mutation type, target hash, note fingerprint/ID, response observation, fallback, checkpoint, and verification state are authoritative.

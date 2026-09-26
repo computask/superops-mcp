@@ -2700,4 +2700,132 @@ describe("operation store", () => {
     await expect(response.json()).resolves.toMatchObject({ errorClass: "MalformedStoredOperation" });
     expect(values.get("op:malformed")).toEqual({ operationId: "malformed" });
   });
+
+  it("durably retains exact Agent MCP inputs and results for seven days, then purges them", async () => {
+    vi.useFakeTimers();
+    const createdAt = Date.parse("2026-09-26T10:00:00.000Z");
+    vi.setSystemTime(createdAt);
+    const durable = ownerScopedDurableNamespace();
+    const triggerId = `triage-81-${crypto.randomUUID()}`;
+    const capture = {
+      captureId: crypto.randomUUID(),
+      triggerId,
+      attempt: 2,
+      toolName: "superops_tickets_triage_evidence_recover",
+      startedAt: new Date(createdAt).toISOString(),
+      completedAt: new Date(createdAt + 340).toISOString(),
+      input: {
+        triageCapture: { triggerId, attempt: 2 },
+        ticketIds: ["ticket-1"],
+      },
+      output: {
+        content: [{ type: "text", text: "Private customer ticket content for exact regression coverage." }],
+      },
+    };
+    const stub = durable.namespace.get(durable.namespace.idFromName(`triage-agent-capture:${triggerId}`));
+    const stored = await stub.fetch(new Request("https://operation.local/triage-agent-captures", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(capture),
+    }));
+    expect(stored.status).toBe(201);
+    const read = await stub.fetch(new Request(
+      `https://operation.local/triage-agent-captures?triggerId=${encodeURIComponent(triggerId)}&attempt=2`
+    ));
+    const response = await read.json() as {
+      complete: boolean;
+      retentionDays: number;
+      records: Array<Record<string, unknown>>;
+    };
+    expect(response).toMatchObject({ complete: true, retentionDays: 7 });
+    expect(response.records).toHaveLength(1);
+    expect(response.records[0]).toMatchObject({
+      captureId: capture.captureId,
+      triggerId,
+      attempt: 2,
+      input: capture.input,
+      output: capture.output,
+      captureStatus: "complete",
+    });
+
+    vi.setSystemTime(createdAt + 7 * 24 * 60 * 60 * 1000 + 1);
+    const expired = await stub.fetch(new Request(
+      `https://operation.local/triage-agent-captures?triggerId=${encodeURIComponent(triggerId)}&attempt=2`
+    ));
+    const expiredBody = await expired.json() as { totalRecords: number; records: unknown[] };
+    expect(expiredBody.totalRecords).toBe(0);
+    expect(expiredBody.records).toEqual([]);
+  });
+
+  it("refuses credential-marked Agent MCP captures and exposes only a safe failure marker", async () => {
+    const durable = ownerScopedDurableNamespace();
+    const triggerId = `triage-82-${crypto.randomUUID()}`;
+    const capture = {
+      captureId: crypto.randomUUID(),
+      triggerId,
+      attempt: 1,
+      toolName: "superops_custom_graphql",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      input: { apiToken: "synthetic-secret-must-not-persist" },
+      output: { content: [{ type: "text", text: "safe" }] },
+    };
+    const stub = durable.namespace.get(durable.namespace.idFromName(`triage-agent-capture:${triggerId}`));
+    const stored = await stub.fetch(new Request("https://operation.local/triage-agent-captures", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(capture),
+    }));
+    expect(stored.status).toBe(202);
+    const body = await stored.json();
+    expect(body).toMatchObject({ captureStatus: "not_captured", reason: "credential_marker" });
+    expect(JSON.stringify(body)).not.toContain("synthetic-secret");
+
+    const read = await stub.fetch(new Request(
+      `https://operation.local/triage-agent-captures?triggerId=${encodeURIComponent(triggerId)}&attempt=1`
+    ));
+    const response = await read.json();
+    expect(response).toMatchObject({ complete: false, truncated: true, captureFailureCount: 1 });
+    expect(JSON.stringify(response)).not.toContain("synthetic-secret");
+  });
+
+  it("rejects captures beyond the per-trigger byte budget and records the reason", async () => {
+    const durable = ownerScopedDurableNamespace();
+    const triggerId = `triage-83-${crypto.randomUUID()}`;
+    const doName = `triage-agent-capture:${triggerId}`;
+    const existingCaptureId = crypto.randomUUID();
+    durable.valuesFor(doName).set(`triage-agent-capture:record:${existingCaptureId}`, {
+      captureId: existingCaptureId,
+      triggerId,
+      attempt: 1,
+      toolName: "superops_tickets_query",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      expiresAt: Date.now() + 60_000,
+      serializedBytes: 32 * 1024 * 1024,
+      chunkCount: 1,
+      status: "writing",
+    });
+    const capture = {
+      captureId: crypto.randomUUID(),
+      triggerId,
+      attempt: 1,
+      toolName: "superops_tickets_query",
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      input: {},
+      output: {},
+    };
+    const stub = durable.namespace.get(durable.namespace.idFromName(doName));
+    const stored = await stub.fetch(new Request("https://operation.local/triage-agent-captures", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(capture),
+    }));
+    expect(stored.status).toBe(202);
+    await expect(stored.json()).resolves.toMatchObject({
+      captureStatus: "not_captured",
+      reason: "total_size_limit",
+    });
+  });
 });

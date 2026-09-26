@@ -26,6 +26,14 @@ var DEFAULT_SUBSCRIPTION_LIFETIME_MINUTES = 45;
 var DEFAULT_SUBSCRIPTION_RENEWAL_LEAD_MINUTES = 15;
 var DEFAULT_HISTORY_RETENTION_DAYS = 30;
 var DEFAULT_HISTORY_MAX_ROWS = 5e4;
+var TRIAGE_AGENT_CAPTURE_PREFIX = "triage-agent-capture:";
+var TRIAGE_AGENT_CAPTURE_RETENTION_MS = 7 * 24 * 60 * 60 * 1e3;
+var TRIAGE_AGENT_CAPTURE_MAX_RECORDS = 1e4;
+var TRIAGE_AGENT_CAPTURE_MAX_RECORD_BYTES = 256 * 1024;
+var TRIAGE_AGENT_CAPTURE_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+var TRIAGE_AGENT_CAPTURE_CHUNK_CHARS = 16e3;
+var TRIAGE_AGENT_CAPTURE_MAX_FAILURE_RECORDS = 1e4;
+var TRIAGE_AGENT_CAPTURE_KINDS = /* @__PURE__ */ new Set(["agent_input", "apply_intent"]);
 function get(env, key) {
   const value = env[key];
   return typeof value === "string" && value.trim() !== "" ? value.trim() : void 0;
@@ -187,7 +195,8 @@ function loadConfig(env) {
     workspaceAgentTriggerUrl: get(env, "WORKSPACE_AGENT_TRIGGER_URL"),
     workspaceAgentAccessToken: get(env, "WORKSPACE_AGENT_ACCESS_TOKEN"),
     historyResetToken: get(env, "TRIAGE_HISTORY_RESET_TOKEN"),
-    replayAdminToken: get(env, "TRIAGE_REPLAY_ADMIN_TOKEN")
+    replayAdminToken: get(env, "TRIAGE_REPLAY_ADMIN_TOKEN"),
+    triageCaptureReadToken: get(env, "TRIAGE_CAPTURE_READ_TOKEN")
   };
 }
 __name(loadConfig, "loadConfig");
@@ -1955,7 +1964,13 @@ function isExplicitChannelUnavailableResponse(status, errorMetadata) {
   return status === 409 && errorMetadata.errorType === "invalid_request_error" && errorMetadata.errorMessage?.replace(/[.!?]+$/, "").trim().toLowerCase() === "the workspace agent trigger is not currently available";
 }
 __name(isExplicitChannelUnavailableResponse, "isExplicitChannelUnavailableResponse");
-function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = false) {
+function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = false, captureEnabled = true) {
+  const captureInstructions = captureEnabled ? [
+    "",
+    "Private diagnostic capture is enabled for this run. On every superops_* MCP call, include triageCapture exactly as {triggerId: the Trigger ID below, attempt: the dispatch attempt below}. This is diagnostic metadata; the SuperOps MCP removes it before executing the tool.",
+    "Immediately before calling superops_tickets_apply_triage_plan, call triage_apply_intent_report with this Trigger ID, this dispatch attempt, and applyArguments equal to an exact copy of the complete argument object you are about to pass to the apply tool, including triageCapture and every action, note, target value, expectation, default, and safety flag. Do not simplify, omit, or paraphrase fields. The report only records intent; it is not approval and does not change or bypass the apply tool's safety review. If the report is not accepted, do not call apply.",
+    "Never include API keys, bearer tokens, OAuth tokens, or other credentials in the capture report. The existing MCP credential sanitizer remains in effect."
+  ] : [];
   const resultCallbackInstructions = resultCallbackEnabled ? [
     "",
     "Result callback required: true",
@@ -2007,6 +2022,7 @@ function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = 
         resultCallbackRequired: resultCallbackEnabled
       }),
       `Trigger ID: ${triggerId}`,
+      ...captureInstructions,
       ...resultCallbackInstructions
     ].join("\n");
   }
@@ -2016,19 +2032,22 @@ function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = 
     `Scope reason: ${scope.reason}`,
     "",
     `Trigger ID: ${triggerId}`,
+    ...captureInstructions,
     ...resultCallbackInstructions
   ].join("\n");
 }
 __name(buildAgentInput, "buildAgentInput");
 var WorkspaceAgentTriggerClient = class {
-  constructor(config, fetcher = boundWorkerFetch, logger2) {
+  constructor(config, fetcher = boundWorkerFetch, logger2, captureInput) {
     this.config = config;
     this.fetcher = fetcher;
     this.logger = logger2;
+    this.captureInput = captureInput;
   }
   config;
   fetcher;
   logger;
+  captureInput;
   static {
     __name(this, "WorkspaceAgentTriggerClient");
   }
@@ -2101,6 +2120,34 @@ var WorkspaceAgentTriggerClient = class {
       return { kind: "configuration" };
     }
     try {
+      const captureEnabled = Boolean(this.config.triageCaptureReadToken);
+      const input = buildAgentInput(triggerId, scope, attempt, resultCallbackEnabled, captureEnabled);
+      const requestBody = JSON.stringify({ input });
+      try {
+        if (captureEnabled) {
+          const capture = await this.captureInput?.({
+            triggerId,
+            attempt,
+            kind: "agent_input",
+            payload: { requestBody }
+          });
+          if (capture && capture.status !== "recorded" && capture.status !== "duplicate") {
+            this.logger?.warn("agent_private_capture_unavailable", {
+              kind: "agent_input",
+              triggerSequence: triggerId.match(/^triage-(\d+)-/)?.[1] ?? null,
+              attempt,
+              reason: capture.status
+            });
+          }
+        }
+      } catch (error) {
+        this.logger?.warn("agent_private_capture_unavailable", {
+          kind: "agent_input",
+          triggerSequence: triggerId.match(/^triage-(\d+)-/)?.[1] ?? null,
+          attempt,
+          reason: error instanceof Error ? error.name : "unknown"
+        });
+      }
       const response = await this.fetcher(this.config.workspaceAgentTriggerUrl, {
         method: "POST",
         headers: {
@@ -2112,9 +2159,7 @@ var WorkspaceAgentTriggerClient = class {
           "Idempotency-Key": resultCallbackEnabled ? `workspace-agent-trigger-v4:${triggerId}:attempt:${attempt}` : `workspace-agent-trigger-v3:${triggerId}`,
           "OpenAI-Beta": "workspace_agent_runs=v1"
         },
-        body: JSON.stringify({
-          input: buildAgentInput(triggerId, scope, attempt, resultCallbackEnabled)
-        })
+        body: requestBody
       });
       if (response.status === 202) {
         let responseBody = null;
@@ -4654,8 +4699,11 @@ var CoordinatorEngine = class {
 // src/mcp.ts
 var MCP_PROTOCOL_VERSION = "2025-06-18";
 var TOOL_NAME = "triage_result_report";
+var APPLY_INTENT_TOOL_NAME = "triage_apply_intent_report";
 var TRIGGER_ID_PATTERN = /^triage-\d+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 var SAFE_REFERENCE_PATTERN2 = /^[A-Za-z0-9._:-]{1,128}$/;
+var PRIVATE_CAPTURE_SECRET_KEY_PATTERN = /(authorization|bearer|api[_-]?(?:key|token)|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|password|secret)/i;
+var PRIVATE_CAPTURE_SECRET_VALUE_PATTERN = /\b(?:Bearer\s+[A-Za-z0-9._~+/=-]{16,}|sk-[A-Za-z0-9]{20,})\b/i;
 var RESULT_STATUSES = /* @__PURE__ */ new Set([
   "complete",
   "retryable_rate_limit",
@@ -4786,6 +4834,70 @@ function parseTriageResultReport(value) {
   };
 }
 __name(parseTriageResultReport, "parseTriageResultReport");
+function isSafePrivateCaptureValue(value, depth = 0) {
+  if (depth > 12) return false;
+  if (value === null || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "string") return value.length <= 32768 && !PRIVATE_CAPTURE_SECRET_VALUE_PATTERN.test(value);
+  if (Array.isArray(value)) return value.length <= 500 && value.every((item) => isSafePrivateCaptureValue(item, depth + 1));
+  if (!isRecord5(value) || Object.keys(value).length > 64) return false;
+  return Object.entries(value).every(([key, item]) =>
+    key.length <= 96 && !PRIVATE_CAPTURE_SECRET_KEY_PATTERN.test(key) && isSafePrivateCaptureValue(item, depth + 1)
+  );
+}
+__name(isSafePrivateCaptureValue, "isSafePrivateCaptureValue");
+function parseTriageApplyIntentReport(value) {
+  if (!isRecord5(value) || !keysAreBounded2(value, ["triggerId", "attempt", "applyArguments"])) return null;
+  if (typeof value.triggerId !== "string" || !TRIGGER_ID_PATTERN.test(value.triggerId)) return null;
+  if (!Number.isInteger(value.attempt) || Number(value.attempt) < 1 || Number(value.attempt) > 100) return null;
+  if (!isRecord5(value.applyArguments) || !isSafePrivateCaptureValue(value.applyArguments)) return null;
+  let serialized;
+  try {
+    serialized = JSON.stringify(value.applyArguments);
+  } catch {
+    return null;
+  }
+  if (new TextEncoder().encode(serialized).byteLength > TRIAGE_AGENT_CAPTURE_MAX_RECORD_BYTES) return null;
+  return {
+    triggerId: value.triggerId,
+    attempt: Number(value.attempt),
+    applyArguments: value.applyArguments
+  };
+}
+__name(parseTriageApplyIntentReport, "parseTriageApplyIntentReport");
+function applyIntentToolDefinition() {
+  return {
+    name: APPLY_INTENT_TOOL_NAME,
+    title: "Record triage apply intent",
+    description: "Private diagnostic report, not a SuperOps write and not authorization. Immediately before applying, submit the exact complete superops_tickets_apply_triage_plan argument object, unchanged. The trigger stores it separately from routine history for seven days. Do not include API keys, bearer tokens, OAuth tokens, or other credentials. A recorded result does not grant approval or bypass the apply tool's review and safety checks.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["triggerId", "attempt", "applyArguments"],
+      properties: {
+        triggerId: {
+          type: "string",
+          pattern: "^triage-[0-9]+-[0-9a-fA-F-]{36}$",
+          description: "The exact opaque Trigger ID supplied for this run."
+        },
+        attempt: { type: "integer", minimum: 1, maximum: 100 },
+        applyArguments: {
+          type: "object",
+          maxProperties: 32,
+          additionalProperties: true,
+          description: "The complete, exact structured arguments intended for superops_tickets_apply_triage_plan, including candidate ticket numbers, per-ticket actions/dispositions, notes, proposed target fields, snapshot expectations, triageCapture, and every safety flag. Preserve the exact fields and values; never include credentials."
+        }
+      }
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    }
+  };
+}
+__name(applyIntentToolDefinition, "applyIntentToolDefinition");
 function toolDefinition() {
   const failureDiagnosticsSchema = {
     type: "array",
@@ -5146,6 +5258,19 @@ function toolCallResult(outcome) {
   };
 }
 __name(toolCallResult, "toolCallResult");
+function applyIntentToolCallResult(outcome) {
+  const text = JSON.stringify({
+    status: outcome.status,
+    triggerId: outcome.triggerId,
+    attempt: outcome.attempt
+  });
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: JSON.parse(text),
+    isError: outcome.status !== "recorded" && outcome.status !== "duplicate"
+  };
+}
+__name(applyIntentToolCallResult, "applyIntentToolCallResult");
 async function handleTriageResultMcp(request, sink) {
   if (request.method !== "POST") {
     return new Response("Method Not Allowed", {
@@ -5155,7 +5280,11 @@ async function handleTriageResultMcp(request, sink) {
   }
   let parsedBody;
   try {
-    parsedBody = await request.json();
+    const rawBody = await request.text();
+    if (new TextEncoder().encode(rawBody).byteLength > 512 * 1024) {
+      return rpcError(null, -32600, "Request body too large", 413);
+    }
+    parsedBody = JSON.parse(rawBody);
   } catch {
     return rpcError(null, -32700, "Parse error", 400);
   }
@@ -5174,20 +5303,32 @@ async function handleTriageResultMcp(request, sink) {
     });
   }
   if (body.method === "tools/list") {
-    return rpcResult(id, { tools: [toolDefinition()] });
+    return rpcResult(id, { tools: [toolDefinition(), applyIntentToolDefinition()] });
   }
   if (body.method !== "tools/call" || !isRecord5(body.params)) {
     return rpcError(id, -32601, "Method not found");
   }
-  if (body.params.name !== TOOL_NAME) return rpcError(id, -32601, "Tool not found");
-  const report = parseTriageResultReport(body.params.arguments);
-  if (!report) {
-    return rpcResult(id, {
-      content: [{ type: "text", text: JSON.stringify({ error: "invalid_safe_report" }) }],
-      isError: true
-    });
+  if (body.params.name === TOOL_NAME) {
+    const report = parseTriageResultReport(body.params.arguments);
+    if (!report) {
+      return rpcResult(id, {
+        content: [{ type: "text", text: JSON.stringify({ error: "invalid_safe_report" }) }],
+        isError: true
+      });
+    }
+    return rpcResult(id, toolCallResult(await sink.report(report)));
   }
-  return rpcResult(id, toolCallResult(await sink.report(report)));
+  if (body.params.name === APPLY_INTENT_TOOL_NAME) {
+    const report = parseTriageApplyIntentReport(body.params.arguments);
+    if (!report) {
+      return rpcResult(id, {
+        content: [{ type: "text", text: JSON.stringify({ error: "invalid_private_capture_report" }) }],
+        isError: true
+      });
+    }
+    return rpcResult(id, applyIntentToolCallResult(await sink.reportApplyIntent(report)));
+  }
+  return rpcError(id, -32601, "Tool not found");
 }
 __name(handleTriageResultMcp, "handleTriageResultMcp");
 
@@ -5821,6 +5962,199 @@ function clearDispatchHistory(storage) {
   ).toArray().length;
 }
 __name(clearDispatchHistory, "clearDispatchHistory");
+function ensureTriageAgentCaptureTable(storage) {
+  storage.sql.exec(`
+    CREATE TABLE IF NOT EXISTS triage_agent_private_captures (
+      trigger_id TEXT NOT NULL,
+      attempt INTEGER NOT NULL,
+      capture_kind TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      payload_bytes INTEGER NOT NULL,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY (trigger_id, attempt, capture_kind)
+    )
+  `);
+  storage.sql.exec(`
+    CREATE INDEX IF NOT EXISTS triage_agent_private_captures_expiry_idx
+      ON triage_agent_private_captures(expires_at)
+  `);
+  storage.sql.exec(`
+    CREATE INDEX IF NOT EXISTS triage_agent_private_captures_lookup_idx
+      ON triage_agent_private_captures(trigger_id, attempt, created_at)
+  `);
+  storage.sql.exec(`
+    CREATE TABLE IF NOT EXISTS triage_agent_private_capture_failures (
+      failure_id TEXT PRIMARY KEY,
+      trigger_id TEXT NOT NULL,
+      attempt INTEGER NOT NULL,
+      capture_kind TEXT NOT NULL,
+      failed_at INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      payload_bytes INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      CHECK (reason IN ('record_size_limit', 'record_limit', 'conflict'))
+    )
+  `);
+  storage.sql.exec(`
+    CREATE INDEX IF NOT EXISTS triage_agent_private_capture_failures_expiry_idx
+      ON triage_agent_private_capture_failures(expires_at)
+  `);
+  storage.sql.exec(`
+    CREATE INDEX IF NOT EXISTS triage_agent_private_capture_failures_lookup_idx
+      ON triage_agent_private_capture_failures(trigger_id, attempt, failed_at)
+  `);
+}
+__name(ensureTriageAgentCaptureTable, "ensureTriageAgentCaptureTable");
+function pruneTriageAgentCaptures(storage, now = Date.now()) {
+  ensureTriageAgentCaptureTable(storage);
+  const expiredCaptures = storage.sql.exec(
+    `DELETE FROM triage_agent_private_captures WHERE expires_at <= ? RETURNING trigger_id`,
+    now
+  ).toArray().length;
+  const expiredFailures = storage.sql.exec(
+    `DELETE FROM triage_agent_private_capture_failures WHERE expires_at <= ? RETURNING trigger_id`,
+    now
+  ).toArray().length;
+  return expiredCaptures + expiredFailures;
+}
+__name(pruneTriageAgentCaptures, "pruneTriageAgentCaptures");
+function recordTriageAgentCaptureFailure(storage, record, reason, payloadBytes, now) {
+  ensureTriageAgentCaptureTable(storage);
+  const retained = storage.sql.exec(
+    `SELECT COUNT(*) AS row_count FROM triage_agent_private_capture_failures WHERE expires_at > ?`,
+    now
+  ).one();
+  if (retained.row_count >= TRIAGE_AGENT_CAPTURE_MAX_FAILURE_RECORDS) return false;
+  storage.sql.exec(
+    `INSERT INTO triage_agent_private_capture_failures
+       (failure_id, trigger_id, attempt, capture_kind, failed_at, reason, payload_bytes, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    crypto.randomUUID(),
+    record.triggerId,
+    record.attempt,
+    record.kind,
+    now,
+    reason,
+    payloadBytes,
+    now + TRIAGE_AGENT_CAPTURE_RETENTION_MS
+  );
+  return true;
+}
+__name(recordTriageAgentCaptureFailure, "recordTriageAgentCaptureFailure");
+function storeTriageAgentCapture(storage, record, now = Date.now()) {
+  ensureTriageAgentCaptureTable(storage);
+  const payloadJson = JSON.stringify(record.payload);
+  const payloadBytes = new TextEncoder().encode(payloadJson).byteLength;
+  if (payloadBytes > TRIAGE_AGENT_CAPTURE_MAX_RECORD_BYTES) {
+    pruneTriageAgentCaptures(storage, now);
+    recordTriageAgentCaptureFailure(storage, record, "record_size_limit", payloadBytes, now);
+    return { status: "capture_too_large", payloadBytes };
+  }
+  pruneTriageAgentCaptures(storage, now);
+  const existing = storage.sql.exec(
+    `SELECT payload_json, expires_at FROM triage_agent_private_captures
+       WHERE trigger_id = ? AND attempt = ? AND capture_kind = ? LIMIT 1`,
+    record.triggerId,
+    record.attempt,
+    record.kind
+  ).toArray()[0];
+  if (existing && existing.expires_at > now) {
+    if (existing.payload_json === payloadJson) return { status: "duplicate", expiresAt: existing.expires_at };
+    recordTriageAgentCaptureFailure(storage, record, "conflict", payloadBytes, now);
+    return { status: "conflict" };
+  }
+  if (existing) {
+    storage.sql.exec(
+      `DELETE FROM triage_agent_private_captures
+         WHERE trigger_id = ? AND attempt = ? AND capture_kind = ?`,
+      record.triggerId,
+      record.attempt,
+      record.kind
+    );
+  }
+  const retained = storage.sql.exec(
+    `SELECT COUNT(*) AS row_count, COALESCE(SUM(payload_bytes), 0) AS byte_count
+       FROM triage_agent_private_captures WHERE expires_at > ?`,
+    now
+  ).one();
+  if (retained.row_count >= TRIAGE_AGENT_CAPTURE_MAX_RECORDS ||
+      retained.byte_count + payloadBytes > TRIAGE_AGENT_CAPTURE_MAX_TOTAL_BYTES) {
+    recordTriageAgentCaptureFailure(storage, record, "record_limit", payloadBytes, now);
+    return { status: "capture_capacity_reached", payloadBytes };
+  }
+  const expiresAt = now + TRIAGE_AGENT_CAPTURE_RETENTION_MS;
+  storage.sql.exec(
+    `INSERT INTO triage_agent_private_captures
+       (trigger_id, attempt, capture_kind, created_at, expires_at, payload_bytes, payload_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    record.triggerId,
+    record.attempt,
+    record.kind,
+    now,
+    expiresAt,
+    payloadBytes,
+    payloadJson
+  );
+  return { status: "recorded", expiresAt };
+}
+__name(storeTriageAgentCapture, "storeTriageAgentCapture");
+function listTriageAgentCaptures(storage, triggerId, attempt, now = Date.now()) {
+  ensureTriageAgentCaptureTable(storage);
+  pruneTriageAgentCaptures(storage, now);
+  return storage.sql.exec(
+    `SELECT capture_kind, created_at, expires_at, payload_bytes, payload_json
+       FROM triage_agent_private_captures
+       WHERE trigger_id = ? AND attempt = ? AND expires_at > ?
+       ORDER BY created_at ASC, capture_kind ASC`,
+    triggerId,
+    attempt,
+    now
+  ).toArray().map((row) => {
+    let payload;
+    try {
+      payload = JSON.parse(row.payload_json);
+    } catch {
+      return {
+        kind: row.capture_kind,
+        createdAt: new Date(row.created_at).toISOString(),
+        expiresAt: new Date(row.expires_at).toISOString(),
+        payloadBytes: row.payload_bytes,
+        status: "corrupt"
+      };
+    }
+    return {
+      kind: row.capture_kind,
+      createdAt: new Date(row.created_at).toISOString(),
+      expiresAt: new Date(row.expires_at).toISOString(),
+      payloadBytes: row.payload_bytes,
+      status: "complete",
+      payload
+    };
+  });
+}
+__name(listTriageAgentCaptures, "listTriageAgentCaptures");
+function listTriageAgentCaptureFailures(storage, triggerId, attempt, now = Date.now()) {
+  ensureTriageAgentCaptureTable(storage);
+  pruneTriageAgentCaptures(storage, now);
+  return storage.sql.exec(
+    `SELECT failure_id, capture_kind, failed_at, reason, payload_bytes, expires_at
+       FROM triage_agent_private_capture_failures
+       WHERE trigger_id = ? AND attempt = ? AND expires_at > ?
+       ORDER BY failed_at ASC, failure_id ASC`,
+    triggerId,
+    attempt,
+    now
+  ).toArray().map((row) => ({
+    failureId: row.failure_id,
+    kind: row.capture_kind,
+    failedAt: new Date(row.failed_at).toISOString(),
+    reason: row.reason,
+    payloadBytes: row.payload_bytes,
+    expiresAt: new Date(row.expires_at).toISOString()
+  }));
+}
+__name(listTriageAgentCaptureFailures, "listTriageAgentCaptureFailures");
 
 // src/safe-log.ts
 function redactLogFields(fields) {
@@ -6074,6 +6408,18 @@ var DurableObjectStore = class {
   pruneDispatchHistory(retentionDays, maxRows, now) {
     return pruneDispatchHistory(this.storage, retentionDays, maxRows, now);
   }
+  storeTriageAgentCapture(record, now = Date.now()) {
+    return storeTriageAgentCapture(this.storage, record, now);
+  }
+  listTriageAgentCaptures(triggerId, attempt, now = Date.now()) {
+    return listTriageAgentCaptures(this.storage, triggerId, attempt, now);
+  }
+  listTriageAgentCaptureFailures(triggerId, attempt, now = Date.now()) {
+    return listTriageAgentCaptureFailures(this.storage, triggerId, attempt, now);
+  }
+  pruneTriageAgentCaptures(now = Date.now()) {
+    return pruneTriageAgentCaptures(this.storage, now);
+  }
 };
 var TriageCoordinator = class {
   constructor(state, env) {
@@ -6121,6 +6467,13 @@ var TriageCoordinator = class {
     try {
       const state = await store.load();
       const now = Date.now();
+      const agentCapturesDeleted = store.pruneTriageAgentCaptures(now);
+      if (agentCapturesDeleted > 0) {
+        logger().info("triage_agent_private_captures_pruned", {
+          deleted: agentCapturesDeleted,
+          retentionDays: 7
+        });
+      }
       if (state.lastHistoryPrunedAt !== null && now - state.lastHistoryPrunedAt < HISTORY_PRUNE_INTERVAL_MS) {
         return;
       }
@@ -6153,7 +6506,12 @@ var TriageCoordinator = class {
       config,
       store,
       graph,
-      agent: new WorkspaceAgentTriggerClient(config, boundWorkerFetch, logger()),
+      agent: new WorkspaceAgentTriggerClient(
+        config,
+        boundWorkerFetch,
+        logger(),
+        (record) => store.storeTriageAgentCapture(record)
+      ),
       logger: logger()
     });
     if (request.method === "POST" && path === "/internal/admin/replay") {
@@ -6570,6 +6928,69 @@ var TriageCoordinator = class {
       });
       return json(result);
     }
+    if (request.method === "POST" && path === "/internal/triage-apply-intent") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ status: "invalid_report" }, 400);
+      }
+      const report = parseTriageApplyIntentReport(body);
+      if (!report) return json({ status: "invalid_report" }, 400);
+      const state = await store.load();
+      if (!state.pending || state.executionPhase !== "awaiting_result" ||
+          state.pendingTriggerId !== report.triggerId || state.dispatchAttempt !== report.attempt) {
+        return json({
+          status: "stale_or_unauthorized",
+          triggerId: report.triggerId,
+          attempt: report.attempt
+        }, 409);
+      }
+      const saved = store.storeTriageAgentCapture({
+        triggerId: report.triggerId,
+        attempt: report.attempt,
+        kind: "apply_intent",
+        payload: {
+          triggerId: report.triggerId,
+          attempt: report.attempt,
+          applyArguments: report.applyArguments
+        }
+      });
+      return json({
+        status: saved.status,
+        triggerId: report.triggerId,
+        attempt: report.attempt,
+        expiresAt: saved.expiresAt === void 0 ? void 0 : new Date(saved.expiresAt).toISOString()
+      }, saved.status === "recorded" || saved.status === "duplicate" ? 200 : 409);
+    }
+    if (request.method === "GET" && path === "/internal/agent-capture") {
+      const url = new URL(request.url);
+      const triggerId = url.searchParams.get("triggerId") ?? "";
+      const attempt = Number(url.searchParams.get("attempt"));
+      if (!TRIGGER_ID_PATTERN.test(triggerId) || !Number.isInteger(attempt) || attempt < 1 || attempt > 100) {
+        return json({ error: "invalid_trigger_or_attempt" }, 400);
+      }
+      const records = store.listTriageAgentCaptures(triggerId, attempt);
+      const captureFailures = store.listTriageAgentCaptureFailures(triggerId, attempt);
+      const presentKinds = records.filter((record) => record.status === "complete").map((record) => record.kind);
+      const missingKinds = ["agent_input"].filter((kind) => !presentKinds.includes(kind));
+      const captureFailureCount = captureFailures.length;
+      const incompleteRecords = records.some((record) => record.status !== "complete");
+      return json({
+        triggerId,
+        attempt,
+        retentionDays: 7,
+        records,
+        captureFailures,
+        captureFailureCount,
+        presentKinds,
+        missingKinds,
+        optionalKinds: ["apply_intent"],
+        complete: missingKinds.length === 0 && !incompleteRecords && captureFailureCount === 0,
+        truncated: missingKinds.length > 0 || incompleteRecords || captureFailureCount > 0,
+        truncationReason: captureFailureCount > 0 ? "captureWriteFailure" : incompleteRecords ? "capturePayloadIncomplete" : missingKinds.length > 0 ? "requiredCaptureMissing" : null
+      });
+    }
     return json({ error: "not_found" }, 404);
   }
   async alarm() {
@@ -6603,7 +7024,12 @@ var TriageCoordinator = class {
       config,
       store,
       graph,
-      agent: new WorkspaceAgentTriggerClient(config, boundWorkerFetch, logger()),
+      agent: new WorkspaceAgentTriggerClient(
+        config,
+        boundWorkerFetch,
+        logger(),
+        (record) => store.storeTriageAgentCapture(record)
+      ),
       logger: logger()
     });
     const startedAt = Date.now();
@@ -6716,6 +7142,7 @@ var index_default = {
         triageGraphSweepMaxMessages: config.graphSweepMaxMessages,
         triageHistoryRetentionDays: config.historyRetentionDays,
         triageHistoryMaxRows: config.historyMaxRows,
+        triageAgentCaptureEnabled: Boolean(config.triageCaptureReadToken),
         consumesEmailBodies: false,
         callsSuperOpsDirectly: false,
         coordinator: coordinatorStatus
@@ -6737,6 +7164,36 @@ var index_default = {
         return json2({ error: "history_unavailable" }, 503);
       }
       return coordinatorResponse;
+    }
+    if (url.pathname === "/admin/agent-capture") {
+      const privateJson = (body, status = 200) => new Response(JSON.stringify(body), {
+        status,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store, private"
+        }
+      });
+      if (request.method !== "GET") return privateJson({ error: "method_not_allowed" }, 405);
+      if (!config.triageCaptureReadToken) return privateJson({ error: "capture_read_not_configured" }, 503);
+      const authorization = request.headers.get("Authorization");
+      const actualToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+      if (!constantTimeEqual(config.triageCaptureReadToken, actualToken)) return privateJson({ error: "unauthorized" }, 401);
+      const allowed = new Set(["triggerId", "attempt"]);
+      if ([...url.searchParams.keys()].some((key) => !allowed.has(key)) ||
+          [...allowed].some((key) => url.searchParams.getAll(key).length !== 1)) {
+        return privateJson({ error: "invalid_query" }, 400);
+      }
+      const triggerId = url.searchParams.get("triggerId") ?? "";
+      const attempt = Number(url.searchParams.get("attempt"));
+      if (!TRIGGER_ID_PATTERN.test(triggerId) || !Number.isInteger(attempt) || attempt < 1 || attempt > 100) {
+        return privateJson({ error: "invalid_trigger_or_attempt" }, 400);
+      }
+      const captureResponse = await coordinator(env).fetch(new Request(
+        `https://coordinator.internal/internal/agent-capture?triggerId=${encodeURIComponent(triggerId)}&attempt=${attempt}`
+      ));
+      if (!captureResponse.ok) return privateJson({ error: "capture_unavailable" }, 503);
+      const result = await captureResponse.json();
+      return privateJson(result);
     }
     if (url.pathname === "/admin/history/reset" && request.method === "POST") {
       const authorization = request.headers.get("Authorization");
@@ -6777,6 +7234,26 @@ var index_default = {
             })
           );
           if (!response.ok) return { status: "stale_or_unauthorized" };
+          return response.json();
+        },
+        async reportApplyIntent(report) {
+          if (!config.triageCaptureReadToken) {
+            return { status: "capture_unavailable", triggerId: report.triggerId, attempt: report.attempt };
+          }
+          const response = await coordinator(env).fetch(
+            new Request("https://coordinator.internal/internal/triage-apply-intent", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(report)
+            })
+          );
+          if (!response.ok) {
+            try {
+              return await response.json();
+            } catch {
+              return { status: "stale_or_unauthorized", triggerId: report.triggerId, attempt: report.attempt };
+            }
+          }
           return response.json();
         }
       });

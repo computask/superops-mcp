@@ -7,7 +7,7 @@ const require=createRequire(import.meta.url);
 const wranglerRequire=createRequire(require.resolve('wrangler/package.json'));
 const {Miniflare}=wranglerRequire('miniflare');
 const code=readFileSync(new URL('./src/index.js',import.meta.url));
-assert.equal(createHash('sha256').update(code).digest('hex'),'ce16e6d68246f8a1a21cbc794cf2a449fd1e82131ad34622a5b3a5a37c0735ac','Reviewed production module must match the provenance record');
+assert.equal(createHash('sha256').update(code).digest('hex'),'c952fd9819eacdac04d6cfa2fe0b21cb873d42463a78809f4237bd0bd49019a6','Reviewed production module must match the provenance record');
 const config=JSON.parse(readFileSync(new URL('./wrangler.jsonc',import.meta.url),'utf8'));
 assert.equal(config.name,'support-triage-trigger');
 assert.equal(config.no_bundle,true);
@@ -18,23 +18,34 @@ assert.deepEqual(config.durable_objects.bindings,[{name:'TRIAGE_COORDINATOR',cla
 assert.deepEqual(config.migrations,[{tag:'v1',new_sqlite_classes:['TriageCoordinator']}]);
 assert.equal(config.compatibility_date,'2026-08-14');
 assert(!/https:\/\/(?:eu)?api\.superops\.ai/.test(code.toString()));
-for(const name of ['GRAPH_CLIENT_ID','GRAPH_CLIENT_SECRET','GRAPH_TENANT_ID','GRAPH_WEBHOOK_CLIENT_STATE','WORKSPACE_AGENT_ACCESS_TOKEN','TRIAGE_HISTORY_RESET_TOKEN','TRIAGE_REPLAY_ADMIN_TOKEN']) assert(!(name in config.vars),'Secret must not be committed: '+name);
+for(const name of ['GRAPH_CLIENT_ID','GRAPH_CLIENT_SECRET','GRAPH_TENANT_ID','GRAPH_WEBHOOK_CLIENT_STATE','WORKSPACE_AGENT_ACCESS_TOKEN','TRIAGE_HISTORY_RESET_TOKEN','TRIAGE_REPLAY_ADMIN_TOKEN','TRIAGE_CAPTURE_READ_TOKEN']) assert(!(name in config.vars),'Secret must not be committed: '+name);
 let outbound=0;
 const mf=new Miniflare({modules:true,scriptPath:fileURLToPath(new URL('./src/index.js',import.meta.url)),
   // Pinned Wrangler's local workerd is older than production's preserved date.
-  compatibilityDate:'2026-07-01', bindings:{...config.vars,AUTOMATED_TRIAGE_TRIGGER_ENABLED:'false',TRIAGE_REPLAY_ADMIN_TOKEN:'synthetic-replay-admin-token'},
+  compatibilityDate:'2026-07-01', bindings:{...config.vars,AUTOMATED_TRIAGE_TRIGGER_ENABLED:'false',TRIAGE_REPLAY_ADMIN_TOKEN:'synthetic-replay-admin-token',TRIAGE_CAPTURE_READ_TOKEN:'synthetic-capture-read-token'},
   durableObjects:{TRIAGE_COORDINATOR:{className:'TriageCoordinator',useSQLite:true}},
   outboundService:()=>{outbound++;throw Error('Local test must not make external requests');},
 });
 try {
   const health=await (await mf.dispatchFetch('http://local/health')).json();
   assert.equal(health.ok,true);assert.equal(health.automatedTriageTriggerEnabled,false);
+  assert.equal(health.triageAgentCaptureEnabled,true);
   assert.equal(health.triageAttentionTailIsolationEnabled,true);
   assert.equal(health.callsSuperOpsDirectly,false);assert.equal(health.consumesEmailBodies,false);
   assert.equal((await mf.dispatchFetch('http://local/admin/history/reset',{method:'POST'})).status,401);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST'})).status,401);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST',headers:{Authorization:'Bearer wrong-token'},body:'{}'})).status,401);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST',headers:{Authorization:'Bearer synthetic-replay-admin-token','Content-Type':'application/json'},body:'{}'})).status,400);
+  const captureUrl='http://local/admin/agent-capture?triggerId=triage-1-00000000-0000-4000-8000-000000000001&attempt=1';
+  assert.equal((await mf.dispatchFetch(captureUrl)).status,401);
+  assert.equal((await mf.dispatchFetch(captureUrl,{headers:{Authorization:'Bearer wrong-token'}})).status,401);
+  const capture=await mf.dispatchFetch(captureUrl,{headers:{Authorization:'Bearer synthetic-capture-read-token'}});
+  assert.equal(capture.status,200);assert.equal(capture.headers.get('Cache-Control'),'no-store, private');
+  assert.deepEqual(await capture.json(),{triggerId:'triage-1-00000000-0000-4000-8000-000000000001',attempt:1,retentionDays:7,records:[],captureFailures:[],captureFailureCount:0,presentKinds:[],missingKinds:['agent_input'],optionalKinds:['apply_intent'],complete:false,truncated:true,truncationReason:'requiredCaptureMissing'});
+  const toolList=await mf.dispatchFetch('http://local/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/list'})});
+  assert.deepEqual((await toolList.json()).result.tools.map(tool=>tool.name),['triage_result_report','triage_apply_intent_report']);
+  const staleIntent=await mf.dispatchFetch('http://local/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'triage_apply_intent_report',arguments:{triggerId:'triage-1-00000000-0000-4000-8000-000000000001',attempt:1,applyArguments:{expectedCandidateTicketNumbers:['62992'],actions:[]}}}})});
+  assert.equal(staleIntent.status,200);assert.equal((await staleIntent.json()).result.isError,true);
   assert.equal((await mf.dispatchFetch('http://local/history?beforeEventId=1')).status,400);
   const history=await mf.dispatchFetch('http://local/history?limit=5');
   assert.equal(history.status,200);assert.deepEqual((await history.json()).events,[]);

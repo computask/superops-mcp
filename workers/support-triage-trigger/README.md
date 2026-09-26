@@ -7,13 +7,32 @@ c902b1914961653c3567e0695a5f0c3badffa916c753055e93f8f170db4a8f4b.
 It is a preserved compiled baseline, not a claim that the older local TypeScript
 projects match production. no_bundle preserves that baseline at upload.
 
+Private Workspace Agent capture, 26 September 2026: each dispatched prompt's
+exact JSON request body (excluding Authorization) and each accepted
+`triage_apply_intent_report` payload are stored in a separate SQLite table in
+the existing coordinator DO, never in `/history` or ordinary logs. Both expire
+after seven days; trigger capture is bounded to 256 KiB per record and 256 MiB
+total. Retrieve one exact run with the bearer-protected
+`/admin/agent-capture?triggerId=...&attempt=...` endpoint. Provision the distinct
+`TRIAGE_CAPTURE_READ_TOKEN` as a Worker secret outside Git before deployment;
+capture remains off until that secret exists, and `/health` reports only its
+enabled boolean. Do not reuse the history-reset or replay token. The MCP-side captures of each
+correlated SuperOps tool call and returned result are stored separately by the
+SO MCP and retrieved through its Sam-only Cloudflare Access admin route.
+
+The pre-apply report is logging only and does not approve or bypass tool review.
+Missing/corrupt/over-limit captures are marked incomplete or returned as
+bounded failure metadata. This captures only the integration-visible request
+and tool traffic; it cannot expose hidden OpenAI system context or internal
+auto-review rationale.
+
 Reviewed reconciliation, 24 September 2026: the recorded-callback retry-drain
 branch now proceeds after a terminal run instead of fabricating a missing
 callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-ce16e6d68246f8a1a21cbc794cf2a449fd1e82131ad34622a5b3a5a37c0735ac.
+c952fd9819eacdac04d6cfa2fe0b21cb873d42463a78809f4237bd0bd49019a6.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

@@ -43,6 +43,12 @@ import {
 import { boundedToolResult } from "./utils/tool-result.js";
 import { publishToolDefinition } from "./tool-catalogue.js";
 import {
+  parseTriageAgentCaptureContext,
+  stripTriageAgentCaptureContext,
+  TRIAGE_AGENT_CAPTURE_CONTEXT_SCHEMA,
+  type TriageAgentMcpCapture,
+} from "./triage-agent-capture.js";
+import {
   handleTriageEmergingIssueUpsert,
   triageEmergingIssueTool,
 } from "./triage-emerging-issue.js";
@@ -173,7 +179,22 @@ async function getAllDomainTools(): Promise<ToolDefinition[]> {
 export type McpServerOptions = {
   blockedToolNames?: ReadonlySet<string>;
   rateLimitProbe?: RateLimitProbeAdapter;
+  triageAgentCapture?: (capture: TriageAgentMcpCapture) => Promise<void>;
 };
+
+function toolWithTriageCaptureContext(tool: ToolDefinition): ToolDefinition {
+  if (!tool.name.startsWith("superops_")) return tool;
+  return {
+    ...tool,
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...tool.inputSchema.properties,
+        triageCapture: TRIAGE_AGENT_CAPTURE_CONTEXT_SCHEMA,
+      },
+    },
+  };
+}
 
 export async function blockedToolNamesByCategory(
   categories: ReadonlySet<ToolCategory>
@@ -1003,6 +1024,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
     return {
       tools: tools
         .filter((tool) => !blockedToolNames.has(tool.name))
+        .map(toolWithTriageCaptureContext)
         .map(publishToolDefinition),
     };
   });
@@ -1010,11 +1032,36 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
   // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name } = request.params;
-    const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+    const rawArgs = (request.params.arguments ?? {}) as Record<string, unknown>;
+    const captureContext = parseTriageAgentCaptureContext(rawArgs.triageCapture);
+    const args = stripTriageAgentCaptureContext(rawArgs);
 
     return runWithExecutionContext(name, async () => {
       const started = Date.now();
       let metadata = toolAuditMetadata(name, args);
+
+      const captureResult = async (output: ToolResult): Promise<void> => {
+        if (!name.startsWith("superops_") || !captureContext || !options.triageAgentCapture) return;
+        try {
+          await options.triageAgentCapture({
+            captureId: crypto.randomUUID(),
+            ...captureContext,
+            toolName: name,
+            startedAt: new Date(started).toISOString(),
+            completedAt: new Date().toISOString(),
+            input: rawArgs,
+            output: output as unknown as Record<string, unknown>,
+          });
+        } catch (error) {
+          console.warn(JSON.stringify({
+            event: "triage_agent_mcp_capture_failed",
+            triggerSequence: captureContext.triggerId.match(/^triage-(\d+)-/)?.[1] ?? null,
+            attempt: captureContext.attempt,
+            toolName: name,
+            errorClass: error instanceof Error ? error.name : "unknown",
+          }));
+        }
+      };
 
       try {
         const result = boundedToolResult(
@@ -1035,7 +1082,9 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           metadata,
         });
         logExecutionDiagnostics(!result.isError, errorSummary);
-        return appendTriageExecutionTelemetry(name, result) as never;
+        const finalResult = appendTriageExecutionTelemetry(name, result) as ToolResult;
+        await captureResult(finalResult);
+        return finalResult as never;
       } catch (error) {
         const result = errorResult(sanitizeError(error));
         const errorSummary = errorSummaryFromResult(result);
@@ -1048,7 +1097,9 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           metadata,
         });
         logExecutionDiagnostics(false, errorSummary);
-        return appendTriageExecutionTelemetry(name, result) as never;
+        const finalResult = appendTriageExecutionTelemetry(name, result) as ToolResult;
+        await captureResult(finalResult);
+        return finalResult as never;
       }
     });
   });

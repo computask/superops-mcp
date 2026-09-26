@@ -11,7 +11,7 @@ import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import worker, { gatewayOwnerHash, type Env } from "./worker.js";
 import { chatGptDirectBlockedToolNames } from "./mcp-server.js";
 import { MUTATING_TOOL_NAMES, READ_ONLY_TOOL_NAMES } from "./tool-catalogue.js";
-import { getOperationStore, runWithOperationStore, stableHash, type OperationLedgerRecord } from "./operation-store.js";
+import { getOperationStore, runWithOperationStore, stableHash, SuperOpsOperationLedger, type OperationLedgerRecord } from "./operation-store.js";
 
 const MCP_HEADERS = {
   Accept: "application/json, text/event-stream",
@@ -129,6 +129,40 @@ function createMemoryKv() {
         list_complete: !next,
         ...(next ? { cursor: next } : {}),
       };
+    },
+  };
+}
+
+function createOperationLedgerNamespace() {
+  const valuesByName = new Map<string, Map<string, unknown>>();
+  const ledgers = new Map<string, SuperOpsOperationLedger>();
+  return {
+    idFromName: (name: string) => name,
+    get: (id: unknown) => {
+      const name = String(id);
+      let ledger = ledgers.get(name);
+      if (!ledger) {
+        let values = valuesByName.get(name);
+        if (!values) {
+          values = new Map<string, unknown>();
+          valuesByName.set(name, values);
+        }
+        ledger = new SuperOpsOperationLedger({
+          storage: {
+            get: async <T = unknown>(key: string) => values!.get(key) as T | undefined,
+            put: async (key: string | Record<string, unknown>, value?: unknown) => {
+              const entries = typeof key === "string" ? [[key, value] as const] : Object.entries(key);
+              for (const [entryKey, entryValue] of entries) values!.set(entryKey, entryValue);
+            },
+            delete: async (key: string) => values!.delete(key),
+            list: async <T = unknown>(options?: { prefix?: string }) => new Map(
+              [...values!.entries()].filter(([key]) => !options?.prefix || key.startsWith(options.prefix))
+            ) as Map<string, T>,
+          },
+        });
+        ledgers.set(name, ledger);
+      }
+      return { fetch: (request: Request) => ledger!.fetch(request) };
     },
   };
 }
@@ -587,6 +621,54 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { status?: string };
     expect(body.status).toBe("ok");
+  });
+
+  it("stores exact correlated SuperOps tool arguments and returned result behind Sam-only Access auth", async () => {
+    const namespace = createOperationLedgerNamespace();
+    const triggerId = `triage-1-${crypto.randomUUID()}`;
+    const args = { triageCapture: { triggerId, attempt: 2 } };
+    const env = chatGptEnv({ SUPEROPS_OPERATION_LEDGER: namespace });
+    const tools = await listPublishedTools(env);
+    expect(tools.find((tool) => tool.name === "superops_status")?.inputSchema.properties)
+      .toHaveProperty("triageCapture");
+
+    const callResponse = await mcp({
+      jsonrpc: "2.0",
+      id: 41,
+      method: "tools/call",
+      params: { name: "superops_status", arguments: args },
+    }, env);
+    expect(callResponse.status).toBe(200);
+    const callBody = await callResponse.json() as { result?: Record<string, unknown> };
+    expect(callBody.result).toBeDefined();
+
+    const adminUrl = `https://${DIRECT_HOST}/admin/triage-agent-captures?triggerId=${encodeURIComponent(triggerId)}&attempt=2`;
+    const denied = await worker.fetch(new Request(adminUrl), env);
+    expect(denied.status).toBe(403);
+
+    const otherUser = await worker.fetch(new Request(adminUrl, {
+      headers: { "CF-Access-Jwt-Assertion": await cloudflareAccessJwt(ADDITIONAL_ALLOWED_EMAIL) },
+    }), env);
+    expect(otherUser.status).toBe(403);
+
+    const admin = await worker.fetch(new Request(adminUrl, {
+      headers: { "CF-Access-Jwt-Assertion": await cloudflareAccessJwt(ALLOWED_EMAIL) },
+    }), env);
+    expect(admin.status).toBe(200);
+    expect(admin.headers.get("Cache-Control")).toContain("no-store");
+    const captured = await admin.json() as {
+      complete: boolean;
+      retentionDays: number;
+      records: Array<{ input?: unknown; output?: unknown; toolName?: string; attempt?: number }>;
+    };
+    expect(captured).toMatchObject({ complete: true, retentionDays: 7 });
+    expect(captured.records).toHaveLength(1);
+    expect(captured.records[0]).toMatchObject({
+      input: args,
+      output: callBody.result,
+      toolName: "superops_status",
+      attempt: 2,
+    });
   });
 
   it("requires an allowed Cloudflare Access identity for the rate-limit probe operator route", async () => {
