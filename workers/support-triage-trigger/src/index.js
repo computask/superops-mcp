@@ -6155,6 +6155,30 @@ function listTriageAgentCaptureFailures(storage, triggerId, attempt, now = Date.
   }));
 }
 __name(listTriageAgentCaptureFailures, "listTriageAgentCaptureFailures");
+function lookupTriageAgentCaptureTriggerId(storage, batchSequence, attempt, now = Date.now()) {
+  ensureTriageAgentCaptureTable(storage);
+  pruneTriageAgentCaptures(storage, now);
+  const pattern = `triage-${batchSequence}-*`;
+  const matches = storage.sql.exec(
+    `SELECT trigger_id FROM (
+       SELECT trigger_id FROM triage_agent_private_captures
+        WHERE trigger_id GLOB ? AND attempt = ? AND expires_at > ?
+       UNION
+       SELECT trigger_id FROM triage_agent_private_capture_failures
+        WHERE trigger_id GLOB ? AND attempt = ? AND expires_at > ?
+     ) LIMIT 2`,
+    pattern,
+    attempt,
+    now,
+    pattern,
+    attempt,
+    now
+  ).toArray();
+  if (matches.length > 1) return { status: "ambiguous" };
+  if (matches.length === 0 || typeof matches[0].trigger_id !== "string") return { status: "not_found" };
+  return { status: "found", triggerId: matches[0].trigger_id };
+}
+__name(lookupTriageAgentCaptureTriggerId, "lookupTriageAgentCaptureTriggerId");
 
 // src/safe-log.ts
 function redactLogFields(fields) {
@@ -6416,6 +6440,9 @@ var DurableObjectStore = class {
   }
   listTriageAgentCaptureFailures(triggerId, attempt, now = Date.now()) {
     return listTriageAgentCaptureFailures(this.storage, triggerId, attempt, now);
+  }
+  lookupTriageAgentCaptureTriggerId(batchSequence, attempt, now = Date.now()) {
+    return lookupTriageAgentCaptureTriggerId(this.storage, batchSequence, attempt, now);
   }
   pruneTriageAgentCaptures(now = Date.now()) {
     return pruneTriageAgentCaptures(this.storage, now);
@@ -6965,11 +6992,31 @@ var TriageCoordinator = class {
     }
     if (request.method === "GET" && path === "/internal/agent-capture") {
       const url = new URL(request.url);
-      const triggerId = url.searchParams.get("triggerId") ?? "";
+      const allowed = new Set(["triggerId", "batchSequence", "attempt"]);
+      if ([...url.searchParams.keys()].some((key) => !allowed.has(key)) ||
+          [...allowed].some((key) => url.searchParams.getAll(key).length > 1)) {
+        return json({ error: "invalid_capture_query" }, 400);
+      }
+      const hasTriggerId = url.searchParams.has("triggerId");
+      const hasBatchSequence = url.searchParams.has("batchSequence");
       const attempt = Number(url.searchParams.get("attempt"));
-      if (!TRIGGER_ID_PATTERN.test(triggerId) || !Number.isInteger(attempt) || attempt < 1 || attempt > 100) {
+      if (hasTriggerId === hasBatchSequence || !url.searchParams.has("attempt") ||
+          !Number.isInteger(attempt) || attempt < 1 || attempt > 100) {
         return json({ error: "invalid_trigger_or_attempt" }, 400);
       }
+      let triggerId = url.searchParams.get("triggerId") ?? "";
+      if (hasBatchSequence) {
+        const rawBatchSequence = url.searchParams.get("batchSequence") ?? "";
+        const batchSequence = Number(rawBatchSequence);
+        if (!/^\d{1,10}$/.test(rawBatchSequence) || !Number.isSafeInteger(batchSequence) || batchSequence < 1) {
+          return json({ error: "invalid_trigger_or_attempt" }, 400);
+        }
+        const lookup = store.lookupTriageAgentCaptureTriggerId(batchSequence, attempt);
+        if (lookup.status === "ambiguous") return json({ error: "ambiguous_capture_sequence" }, 409);
+        if (lookup.status !== "found") return json({ error: "capture_not_found" }, 404);
+        triggerId = lookup.triggerId;
+      }
+      if (!TRIGGER_ID_PATTERN.test(triggerId)) return json({ error: "invalid_trigger_or_attempt" }, 400);
       const records = store.listTriageAgentCaptures(triggerId, attempt);
       const captureFailures = store.listTriageAgentCaptureFailures(triggerId, attempt);
       const presentKinds = records.filter((record) => record.status === "complete").map((record) => record.kind);
@@ -7178,20 +7225,35 @@ var index_default = {
       const authorization = request.headers.get("Authorization");
       const actualToken = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
       if (!constantTimeEqual(config.triageCaptureReadToken, actualToken)) return privateJson({ error: "unauthorized" }, 401);
-      const allowed = new Set(["triggerId", "attempt"]);
+      const allowed = new Set(["triggerId", "batchSequence", "attempt"]);
       if ([...url.searchParams.keys()].some((key) => !allowed.has(key)) ||
-          [...allowed].some((key) => url.searchParams.getAll(key).length !== 1)) {
+          [...url.searchParams.keys()].some((key) => url.searchParams.getAll(key).length > 1) ||
+          url.searchParams.getAll("attempt").length !== 1) {
         return privateJson({ error: "invalid_query" }, 400);
       }
       const triggerId = url.searchParams.get("triggerId") ?? "";
+      const batchSequence = url.searchParams.get("batchSequence") ?? "";
       const attempt = Number(url.searchParams.get("attempt"));
-      if (!TRIGGER_ID_PATTERN.test(triggerId) || !Number.isInteger(attempt) || attempt < 1 || attempt > 100) {
+      const hasTriggerId = url.searchParams.has("triggerId");
+      const hasBatchSequence = url.searchParams.has("batchSequence");
+      if (hasTriggerId === hasBatchSequence ||
+          hasTriggerId && !TRIGGER_ID_PATTERN.test(triggerId) ||
+          hasBatchSequence && (!/^\d{1,10}$/.test(batchSequence) || !Number.isSafeInteger(Number(batchSequence)) || Number(batchSequence) < 1) ||
+          !Number.isInteger(attempt) || attempt < 1 || attempt > 100) {
         return privateJson({ error: "invalid_trigger_or_attempt" }, 400);
       }
+      const captureLookup = hasTriggerId
+        ? `triggerId=${encodeURIComponent(triggerId)}`
+        : `batchSequence=${encodeURIComponent(batchSequence)}`;
       const captureResponse = await coordinator(env).fetch(new Request(
-        `https://coordinator.internal/internal/agent-capture?triggerId=${encodeURIComponent(triggerId)}&attempt=${attempt}`
+        `https://coordinator.internal/internal/agent-capture?${captureLookup}&attempt=${attempt}`
       ));
-      if (!captureResponse.ok) return privateJson({ error: "capture_unavailable" }, 503);
+      if (!captureResponse.ok) {
+        if ([400, 404, 409].includes(captureResponse.status)) {
+          return privateJson(await captureResponse.json(), captureResponse.status);
+        }
+        return privateJson({ error: "capture_unavailable" }, 503);
+      }
       const result = await captureResponse.json();
       return privateJson(result);
     }

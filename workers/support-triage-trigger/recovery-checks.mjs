@@ -7,8 +7,8 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
 const testableSource = source.replace(/\nexport \{\s*TriageCoordinator,\s*index_default as default\s*\};\s*\/\/# sourceMappingURL=index\.js\.map\s*$/, '\n');
 assert.notEqual(testableSource, source, 'The preserved production module export footer must be isolated for the in-memory test harness');
-const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState} = await import(
-  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState};').toString('base64')}`
+const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState} = await import(
+  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
@@ -93,6 +93,7 @@ function privateCaptureSqlStorage(seed){
     const normalized=query.replace(/\s+/g,' ').trim();
     if(normalized.startsWith('CREATE TABLE')||normalized.startsWith('CREATE INDEX')) return {toArray:()=>[],one:()=>({})};
     if(normalized.includes('SELECT payload_json, expires_at')) {const row=rows.get(key(args[0],args[1],args[2]));return {toArray:()=>row?[row]:[],one:()=>row??{}};}
+    if(normalized.startsWith('SELECT trigger_id FROM ( SELECT trigger_id FROM triage_agent_private_captures')) {const pattern=args[0];const prefix=pattern.endsWith('*')?pattern.slice(0,-1):pattern;const attempt=args[1];const now=args[2];const matches=new Set([...rows.values(),...failures.values()].filter(row=>row.trigger_id.startsWith(prefix)&&row.attempt===attempt&&row.expires_at>now).map(row=>row.trigger_id));return {toArray:()=>[...matches].slice(0,2).map(trigger_id=>({trigger_id}))};}
     if(normalized.includes('FROM triage_agent_private_captures WHERE expires_at >')) {const active=[...rows.values()].filter(row=>row.expires_at>args[0]);return {toArray:()=>[],one:()=>({row_count:active.length,byte_count:active.reduce((sum,row)=>sum+row.payload_bytes,0)})};}
     if(normalized.startsWith('DELETE FROM triage_agent_private_capture_failures WHERE expires_at <=')) {const deleted=[];for(const [rowKey,row] of failures)if(row.expires_at<=args[0]){failures.delete(rowKey);deleted.push(row);}return {toArray:()=>deleted,one:()=>({})};}
     if(normalized.startsWith('DELETE FROM triage_agent_private_captures WHERE expires_at <=')) {const deleted=[];for(const [rowKey,row] of rows)if(row.expires_at<=args[0]){rows.delete(rowKey);deleted.push(row);}return {toArray:()=>deleted,one:()=>({})};}
@@ -125,6 +126,18 @@ test('private capture storage is idempotent, conflict-safe, and expires at seven
   assert.equal(failures.size,0);
 });
 
+test('private capture sequence lookup is exact, bounded, and rejects ambiguity',()=>{
+  const {storage}=privateCaptureSqlStorage(createInitialState());
+  const triggerId='triage-84-60d4e73d-5c40-4a75-89b5-31ac48f25632';
+  const now=Date.parse('2026-09-26T10:00:00.000Z');
+  storeTriageAgentCapture(storage,{triggerId,attempt:1,kind:'agent_input',payload:{requestBody:'synthetic only'}},now);
+  assert.deepEqual(lookupTriageAgentCaptureTriggerId(storage,84,1,now+1),{status:'found',triggerId});
+  const secondTriggerId='triage-84-60d4e73d-5c40-4a75-89b5-31ac48f25633';
+  storeTriageAgentCapture(storage,{triggerId:secondTriggerId,attempt:1,kind:'agent_input',payload:{requestBody:'synthetic only'}},now+2);
+  assert.deepEqual(lookupTriageAgentCaptureTriggerId(storage,84,1,now+3),{status:'ambiguous'});
+  assert.deepEqual(lookupTriageAgentCaptureTriggerId(storage,84,2,now+3),{status:'not_found'});
+});
+
 test('coordinator accepts pre-apply intent only for the active trigger and exposes it privately',async()=>{
   const {storage,state}=privateCaptureSqlStorage(createInitialState());
   const triggerId='triage-83-60d4e73d-5c40-4a75-89b5-31ac48f25632';
@@ -146,6 +159,12 @@ test('coordinator accepts pre-apply intent only for the active trigger and expos
   assert.equal(capture.complete,true);
   assert.equal(capture.captureFailureCount,0);
   assert.equal(capture.records.find(item=>item.kind==='apply_intent').payload.applyArguments.actions[0].note,'exact private intent');
+  const sequenceRead=await coordinator.fetch(new Request('https://local/internal/agent-capture?batchSequence=83&attempt=2'));
+  assert.equal(sequenceRead.status,200);
+  const sequenceCapture=await sequenceRead.json();
+  assert.equal(sequenceCapture.triggerId,triggerId);
+  assert.equal(sequenceCapture.complete,true);
+  assert.deepEqual(sequenceCapture.records.map(item=>item.kind),['agent_input','apply_intent']);
 });
 
 test('the single metadata lookup covers closure fields before a resolve plan',()=>{

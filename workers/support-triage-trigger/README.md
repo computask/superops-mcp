@@ -13,7 +13,11 @@ exact JSON request body (excluding Authorization) and each accepted
 the existing coordinator DO, never in `/history` or ordinary logs. Both expire
 after seven days; trigger capture is bounded to 256 KiB per record and 256 MiB
 total. Retrieve one exact run with the bearer-protected
-`/admin/agent-capture?triggerId=...&attempt=...` endpoint. Provision the distinct
+`/admin/agent-capture?triggerId=...&attempt=...` endpoint, or use the equally
+bounded `batchSequence` lookup when public dispatch history provides the batch
+number but intentionally omits the opaque trigger UUID. Sequence lookup remains
+behind the distinct capture-read bearer token and returns at most one matching
+run; missing or ambiguous matches fail closed. Provision the distinct
 `TRIAGE_CAPTURE_READ_TOKEN` as a Worker secret outside Git before deployment;
 capture remains off until that secret exists, and `/health` reports only its
 enabled boolean. Do not reuse the history-reset or replay token. The MCP-side captures of each
@@ -26,13 +30,21 @@ bounded failure metadata. This captures only the integration-visible request
 and tool traffic; it cannot expose hidden OpenAI system context or internal
 auto-review rationale.
 
+Protected capture lookup, 26 September 2026: the same bearer-protected route
+also accepts one numeric `batchSequence` plus `attempt` when the opaque trigger
+UUID is absent from public history. The Durable Object performs a bounded,
+parameterized lookup across unexpired capture and capture-failure rows; it
+returns a result only for exactly one matching trigger and fails closed for
+missing or ambiguous matches. Public `/history` remains unchanged and does not
+expose trigger UUIDs or capture contents.
+
 Reviewed reconciliation, 24 September 2026: the recorded-callback retry-drain
 branch now proceeds after a terminal run instead of fabricating a missing
 callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-c952fd9819eacdac04d6cfa2fe0b21cb873d42463a78809f4237bd0bd49019a6.
+1cc3e23fd7f47c19080855d98723ac69feecab64e21292564e307e743f94f766.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
