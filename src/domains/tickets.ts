@@ -4260,6 +4260,33 @@ async function resolveClientAccountId(
   return { error: `No client matched "${canonicalName}".` };
 }
 
+function approvedTriageClientMutationField(
+  accountId: string | undefined,
+  target: { clientId?: string; clientName?: string },
+  currentTicket?: Ticket
+): { client?: { accountId: string }; error?: string } {
+  if (!accountId) return {};
+
+  // An existing client is part of the frozen ticket identity, not a field to
+  // resend on every classification update. Validate any explicit target
+  // against the canonical ticket read, then leave `client` out of the write.
+  // Only an explicitly approved target for a ticket with no client becomes a
+  // client assignment in the mutation input.
+  if (currentTicket && currentTicket.client !== null && currentTicket.client !== undefined) {
+    const currentAccountId = ticketClientAccountId(currentTicket);
+    const currentName = ticketClientName(currentTicket);
+    const requestedName = target.clientName?.trim();
+    if (!currentAccountId || currentAccountId !== accountId ||
+        (requestedName !== undefined && currentName !== undefined &&
+          canonicalClientName(requestedName) !== canonicalClientName(currentName))) {
+      return { error: "Triage cannot reassign an already assigned client; any supplied client target must match the canonical ticket client." };
+    }
+    return {};
+  }
+
+  return { client: { accountId } };
+}
+
 async function resolveTechGroup(
   client: SuperOpsClientInstance,
   techGroupName: string | undefined
@@ -5107,9 +5134,13 @@ async function buildApprovedUpdateInput(
   if (resolvedClient.error) {
     return { error: resolvedClient.error };
   }
-  if (resolvedClient.accountId) {
-    input.client = { accountId: resolvedClient.accountId };
-  }
+  const clientField = approvedTriageClientMutationField(
+    resolvedClient.accountId,
+    target,
+    currentTicket
+  );
+  if (clientField.error) return { error: clientField.error };
+  if (clientField.client) input.client = clientField.client;
 
   const resolvedTechGroup = await resolveTechGroup(client, target.techGroupName);
   if (resolvedTechGroup.error) {
@@ -5255,7 +5286,8 @@ async function buildStagedResolveClassificationInput(
   client: SuperOpsClientInstance,
   ticketId: string,
   action: TriagePlanAction,
-  optionFieldsProvider?: TicketOptionFieldsProvider
+  optionFieldsProvider?: TicketOptionFieldsProvider,
+  currentTicket?: Ticket
 ): Promise<Record<string, unknown> | { error: string }> {
   const target = action.target ?? {};
   if (target.techGroupName !== undefined) {
@@ -5288,9 +5320,13 @@ async function buildStagedResolveClassificationInput(
   if (resolvedClient.error) {
     return { error: resolvedClient.error };
   }
-  if (resolvedClient.accountId) {
-    input.client = { accountId: resolvedClient.accountId };
-  }
+  const clientField = approvedTriageClientMutationField(
+    resolvedClient.accountId,
+    target,
+    currentTicket
+  );
+  if (clientField.error) return { error: clientField.error };
+  if (clientField.client) input.client = clientField.client;
   return input;
 }
 
@@ -5611,7 +5647,8 @@ async function applyStagedResolveAction(params: {
     client,
     params.resolvedTicketId,
     action,
-    params.optionFieldsProvider
+    params.optionFieldsProvider,
+    params.ticket
   );
   const classificationInputError = (classificationInput as { error?: unknown }).error;
   if (typeof classificationInputError === "string") {
@@ -7392,7 +7429,8 @@ async function applyApprovedTriageAction(params: {
         client,
         ticket.ticketId,
         action,
-        params.optionFieldsProvider
+        params.optionFieldsProvider,
+        ticket
       );
       const classificationError = (classificationInput as { error?: unknown }).error;
       const statusInput = buildStagedResolveStatusInput(ticket.ticketId, action.target?.status);
@@ -8208,7 +8246,8 @@ async function buildMissingOnlyRecoveryInput(params: {
         params.client,
         params.ticketId,
         params.action,
-        params.optionFieldsProvider
+        params.optionFieldsProvider,
+        params.ticket
       )
     : params.mutationType === "status" || params.mutationType === "resolveFallback"
       ? buildStagedResolveStatusInput(params.ticketId, params.action.target?.status)

@@ -4889,6 +4889,135 @@ describe("Tickets Domain", () => {
     expect(mockClient.mutate.mock.calls[0][0]).not.toContain("createTicketNote");
   });
 
+  it("preserves a verified existing client without resending it in a triage update mutation", async () => {
+    const ticketState: Record<string, unknown> = {
+      ticketId: "ticket-57403-existing-client",
+      displayId: "57403",
+      subject: "Existing client classification",
+      status: "New Calls",
+      client: { accountId: "client-1", name: "TaskGroup" },
+      updatedTime: "2026-07-26T09:00:00Z",
+    };
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        return { getTicketList: {
+          tickets: [{ ticketId: ticketState.ticketId, displayId: ticketState.displayId }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        } };
+      }
+      if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
+      if (query.includes("getTicket")) return { getTicket: { ...ticketState } };
+      return { getTicketNoteList: [] };
+    });
+    mockClient.mutate.mockImplementation(async (_mutation: string, variables: { input: Record<string, unknown> }) => {
+      Object.assign(ticketState, variables.input, { updatedTime: "2026-07-26T09:01:00Z" });
+      return { updateTicket: { ...ticketState } };
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57403"],
+      actions: [{
+        ticketNumber: "57403",
+        expectedTicketId: "ticket-57403-existing-client",
+        expectedSubject: "Existing client classification",
+        expectedClient: "TaskGroup",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T09:00:00Z",
+        contentVerified: true,
+        action: "leave",
+        target: {
+          ...TRIAGE_TEST_CLASSIFICATION,
+          clientName: "TaskGroup",
+          clientId: "client-1",
+        },
+      }],
+      verify: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      ticketNumber: "57403",
+      finalOutcome: "Left",
+      verified: true,
+      finalState: { clientName: "TaskGroup", clientId: "client-1" },
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    const mutationInput = mockClient.mutate.mock.calls[0][1].input;
+    expect(mutationInput).toEqual({
+      ticketId: "ticket-57403-existing-client",
+      ...TRIAGE_TEST_CLASSIFICATION,
+    });
+    expect(mutationInput).not.toHaveProperty("client");
+  });
+
+  it("preserves a verified existing client in the staged resolve classification mutation", async () => {
+    const ticketState: Record<string, unknown> = {
+      ticketId: "ticket-57404-existing-client",
+      displayId: "57404",
+      subject: "Existing client staged resolve",
+      status: "New Calls",
+      client: { accountId: "client-1", name: "TaskGroup" },
+      updatedTime: "2026-07-26T09:00:00Z",
+    };
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        return { getTicketList: {
+          tickets: [{ ticketId: ticketState.ticketId, displayId: ticketState.displayId }],
+          listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+        } };
+      }
+      if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
+      if (query.includes("getTicket")) return { getTicket: { ...ticketState } };
+      return { getTicketNoteList: [] };
+    });
+    mockClient.mutate.mockImplementation(async (_mutation: string, variables: { input: Record<string, unknown> }) => {
+      Object.assign(ticketState, variables.input, { updatedTime: "2026-07-26T09:01:00Z" });
+      return { updateTicket: { ...ticketState } };
+    });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      expectedCandidateTicketNumbers: ["57404"],
+      actions: [{
+        ticketNumber: "57404",
+        expectedTicketId: "ticket-57404-existing-client",
+        expectedSubject: "Existing client staged resolve",
+        expectedClient: "TaskGroup",
+        expectedStatus: "New Calls",
+        expectedUpdatedTime: "2026-07-26T09:00:00Z",
+        contentVerified: true,
+        action: "resolve",
+        target: {
+          ...TRIAGE_TEST_RESOLUTION_CLASSIFICATION,
+          status: "Resolved",
+          suppressCloseNotification: true,
+          clientName: "TaskGroup",
+          clientId: "client-1",
+        },
+      }],
+      verify: true,
+    });
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.results[0]).toMatchObject({
+      ticketNumber: "57404",
+      finalOutcome: "Resolved",
+      verified: true,
+      finalState: { clientName: "TaskGroup", clientId: "client-1" },
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    const classificationInput = mockClient.mutate.mock.calls[0][1].input;
+    expect(classificationInput).toEqual({
+      ticketId: "ticket-57404-existing-client",
+      ...TRIAGE_TEST_RESOLUTION_CLASSIFICATION,
+    });
+    expect(classificationInput).not.toHaveProperty("client");
+    expect(mockClient.mutate.mock.calls[1][1].input).toMatchObject({
+      ticketId: "ticket-57404-existing-client",
+      status: "Resolved",
+      suppressCloseNotification: true,
+    });
+  });
+
   it("adds and verifies one deduplicated private triage-summary note for a leave action", async () => {
     const triageNote = [
       "Ticket goal: Confirm the reported availability issue and route it safely.",
