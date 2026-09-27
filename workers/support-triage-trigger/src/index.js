@@ -2572,26 +2572,17 @@ function parkPendingAttentionWindow(state) {
 }
 __name(parkPendingAttentionWindow, "parkPendingAttentionWindow");
 function migrateLegacyAttentionBlockedQueue(state) {
-  if (!state.queuedPending || !state.queuedBlockedByAttention) return;
-  const hasQueuePayload = state.queuedNotificationWindowStartedAt !== null ||
-    state.queuedUnavailableRetryCount > 0 || state.queuedLifecycleRecoveryRequested || state.queuedLastLifecycleEvent !== null;
-  if (state.attentionBlockedWindow !== null && !hasQueuePayload) {
-    // Production versions used queuedPending as a sentinel for the attention
-    // fence. Drop only that empty sentinel, retaining the durable fence.
+  if (!state.queuedPending) return;
+  if (state.queuedNotificationWindowStartedAt === null) {
+    // A reason/retry label without a notification window has no safely
+    // actionable email scope. Preserve lifecycle intent separately, but never
+    // leave a scope-less queue marker capable of fencing later notifications.
+    state.lifecycleRecoveryRequested ||= state.queuedLifecycleRecoveryRequested;
+    state.lastLifecycleEvent ??= state.queuedLastLifecycleEvent;
     resetQueuedDispatch(state);
     return;
   }
-  if (state.attentionBlockedWindow === null) {
-    if (state.queuedNotificationWindowStartedAt !== null) {
-      parkQueuedAttentionWindow(state);
-      return;
-    }
-    if (state.queuedLifecycleRecoveryRequested || state.queuedLastLifecycleEvent !== null) {
-      state.lifecycleRecoveryRequested ||= state.queuedLifecycleRecoveryRequested;
-      state.lastLifecycleEvent ??= state.queuedLastLifecycleEvent;
-    }
-    resetQueuedDispatch(state);
-  }
+  if (state.queuedBlockedByAttention && state.attentionBlockedWindow === null) parkQueuedAttentionWindow(state);
 }
 __name(migrateLegacyAttentionBlockedQueue, "migrateLegacyAttentionBlockedQueue");
 function sharedRateLimitActive(state, now) {

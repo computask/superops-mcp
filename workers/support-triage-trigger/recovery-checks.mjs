@@ -589,12 +589,16 @@ test('attention fencing cannot erase an accepted Agent run or create a scope-les
   assert.equal(lifecycle.queuedPending,false);
   assert.equal(lifecycle.queuedBlockedByAttention,false);
   assert.equal(currentBatchIsFrozen(lifecycle),false,'scope-less lifecycle state cannot freeze a future email');
-  const legacyLifecycle={...createInitialState(),queuedPending:true,queuedBlockedByAttention:true,
-    queuedReason:'lifecycle',queuedLifecycleRecoveryRequested:true,queuedLastLifecycleEvent:'missed'};
+  const legacyLifecycle={...createInitialState(),needsAttentionScope:failedScope,needsAttentionScopes:[failedScope],
+    attentionBlockedWindow:{reason:'new_message',notificationWindowStartedAt:Date.parse(failedScope.createdFrom),
+      notificationWindowEndedAt:Date.parse(failedScope.createdTo),notificationLookbackMs:0,lastNotificationAt:Date.parse(failedScope.createdTo),
+      debounceWindowStartedAt:null,unavailableRetryCount:0,lifecycleRecoveryRequested:false,lastLifecycleEvent:null},
+    queuedPending:true,queuedBlockedByAttention:true,queuedReason:'new_message',queuedLifecycleRecoveryRequested:true,queuedLastLifecycleEvent:'missed'};
   migrateLegacyAttentionBlockedQueue(legacyLifecycle);
   assert.equal(legacyLifecycle.queuedPending,false);
   assert.equal(legacyLifecycle.queuedBlockedByAttention,false);
   assert.equal(legacyLifecycle.lifecycleRecoveryRequested,true,'legacy lifecycle recovery is preserved');
+  assert.equal(legacyLifecycle.lastLifecycleEvent,'missed');
 });
 test('legacy attention-only queue marker migrates away and a new email dispatches',async()=>{
   const f=fixture('completed',120000,{graphWebhookClientState:'synthetic-graph-state'});
