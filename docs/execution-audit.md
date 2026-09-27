@@ -107,6 +107,37 @@ preserve the last observed upstream classification, status and retry delay.
 This lets the existing rate-limit path distinguish throttling from a transport
 failure without changing dispatcher retries or re-POSTing the accepted request.
 
+## Dispatcher uncertainty and durable triage recovery — 27 September 2026
+
+The generic continuation receipt gate previously replaced the triage adapter's
+`AmbiguousWritePending` outcome with terminal `AmbiguousWriteUnresolved` whenever
+the dispatcher returned `uncertain`. This prevented the existing bounded
+reconciliation/recovery path from running after an internal-server-error receipt.
+
+The triage adapter now explicitly opts into receipt reconciliation only at known
+possible-write checkpoints (or verified state), with immutable ticket identity.
+Pending receipt waits preserve the physical mutation stage. Fresh continuations
+poll pending receipts first and pass the refreshed item to the adapter; generic
+adapters and failed/cancelled receipts remain conservative. No new mutation is
+authorised merely by the dispatcher error.
+
+The existing four-successful-read window, 15-second delayed continuations,
+baseline/identity/concurrent-edit checks, immediate pre-recovery read, missing-only
+input construction and one-recovery-per-mutation checkpoint remain authoritative.
+Only after that recovery checkpoint does the state-setting request receive a
+deterministic recovery discriminator in its dispatcher idempotency key. Ordinary
+keys are unchanged, so old receipts remain recoverable; a recovery attempt does
+not simply retrieve the original uncertain result. A second ambiguous result gets
+bounded read-only reconciliation, never a third write. Private-note ambiguity
+still prohibits replay. Unrelated eligible items proceed during the wait.
+
+`src/triage-dispatcher-recovery.test.ts` drives the real client, dispatcher, triage
+adapter and continuation against synthetic network responses. It covers the
+original error pattern, applied-but-uncertain results, queued-to-uncertain recovery,
+recovery exhaustion, concurrent edits, private-note non-replay, progress of another
+ticket, and approved client assignment when initially unassigned. It uses no live
+SuperOps traffic or customer fixtures.
+
 ## Dispatcher/pagination migration — 23 September 2026
 
 The older inventory below describes logical reads/writes, not current physical

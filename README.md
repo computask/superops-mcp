@@ -67,7 +67,16 @@ Durable triage derives mutation keys from the persisted operation/item and exact
 payload hash. Accepted receipts are checkpointed in the existing owner-scoped
 ledger; fresh continuation polls that receipt before the mutation adapter runs.
 Pending work stays pending; failed/cancelled/uncertain receipts require reconciliation,
-not a new mutation. Existing verification, stale checks and note dedupe remain.
+not blind resubmission. For durable triage, an `uncertain` receipt now enters the
+existing bounded read-back routine instead of immediately terminalising the item.
+Four successful delayed reads and a fresh pre-write check can authorise **one**
+state-setting recovery for proven unapplied/missing fields. That checkpointed
+recovery has its own deterministic idempotency key; pending receipts still use
+only polling. Concurrent changes stop recovery, an already-applied target is not
+repeated, and an ambiguous private-note creation is never replayed. Other eligible
+tickets continue while the affected item waits. Existing retry ceilings remain.
+An approved client assignment is still sent for a ticket with no client; a proven
+existing client is preserved and omitted from redundant classification writes.
 Other synchronous write tools do not gain a durable ledger: retain their returned
 receipt/key on failure and reconcile rather than repeat with a new key.
 

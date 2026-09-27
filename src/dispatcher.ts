@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { capturedDispatcherFetch } from "./graphql-capture.js";
 import { getExecutionConfig, hasExecutionBudgetFor, recordSubrequestFinish, recordTypedSubrequestStart, withExecutionItem } from "./execution.js";
 import { fetchSafeDispatcherDiagnostics, type DispatcherDiagnosticResult, type DispatcherDiagnosticRetrieval, type SafeDispatcherDiagnostics } from "./dispatcher-diagnostics.js";
+import type { OperationMutationType } from "./operation-store.js";
 
 export const DISPATCHER_ORIGIN = "https://superops-api-dispatcher.taskgroup.co.uk";
 export interface DispatcherEnvironment {
@@ -18,6 +19,14 @@ export interface DispatcherReceipt {
   diagnostics?: SafeDispatcherDiagnostics | DispatcherDiagnosticRetrieval;
 }
 const operation = new AsyncLocalStorage<{operationId: string; itemKey: string; checkpoint?: (receipt: DispatcherReceipt) => Promise<void>; receipt?: DispatcherReceipt}>();
+const recoveryAttempt = new AsyncLocalStorage<string>();
+/** Only enter after the triage adapter has durably checkpointed its one
+ * permitted, read-back-proven state-setting recovery. This is not a transport
+ * retry: reusing the original key would just return the uncertain receipt. */
+export function withDispatcherRecoveryAttempt<T>(mutationType: Exclude<OperationMutationType, "note">, fn: () => T): T {
+  if (!operation.getStore()?.checkpoint) throw new Error("Dispatcher recovery requires a durable operation checkpoint.");
+  return recoveryAttempt.run(`reconciled:${mutationType}:1`, fn);
+}
 export function withDispatcherOperation<T>(operationId: string, itemKey: string, fn: () => T,
   checkpoint?: (receipt: DispatcherReceipt) => Promise<void>): T {
   return operation.run({operationId, itemKey, checkpoint}, () => withExecutionItem(itemKey, fn));
@@ -27,7 +36,12 @@ export async function dispatcherIdempotencyKey(body: string, mutation: boolean):
   if (!scope) return `superops-mcp:${crypto.randomUUID()}`;
   // Durable operation and item identity already exist before I/O. Payload hash
   // distinguishes note/update stages without storing content or credentials.
-  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([scope.operationId, scope.itemKey, body])));
+  const identity = [scope.operationId, scope.itemKey, body];
+  // Preserve every existing ordinary mutation key. The recovery discriminator
+  // is deterministic across crashes and applies only to this one mutation.
+  const recovery = recoveryAttempt.getStore();
+  if (recovery) identity.push(recovery);
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(identity)));
   return `superops-mcp:${Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 export async function checkpointDispatcherDiagnostics(requestId: string, diagnostics: SafeDispatcherDiagnostics | DispatcherDiagnosticRetrieval): Promise<void> {

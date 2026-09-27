@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DISPATCHER_ORIGIN, dispatcherFetch, DispatcherPendingError, runWithDispatcher, dispatcherIdempotencyKey, withDispatcherOperation } from "./dispatcher.js";
+import { DISPATCHER_ORIGIN, dispatcherFetch, DispatcherPendingError, runWithDispatcher, dispatcherIdempotencyKey, withDispatcherOperation, withDispatcherRecoveryAttempt } from "./dispatcher.js";
 import { SuperOpsClient } from "./client.js";
 import { assertPageBounds, fetchAllPages } from "./pagination.js";
 import { executionDiagnostics, runWithExecutionConfig, runWithExecutionContext, recordSubrequestStart } from "./execution.js";
@@ -116,6 +116,19 @@ describe("dispatcher-only transport", () => {
     expect(await key("other:operation","1")).not.toBe(first);
     expect(await key("owner:operation","2")).not.toBe(first);
     expect(await key("owner:operation","1","different stage")).not.toBe(first);
+  });
+  it("isolates the one reconciled recovery key without changing ordinary keys or later notes", async () => {
+    const key = (recover: boolean, item = "1", mutationType: "update" | "status" = "update") => withDispatcherOperation("owner:operation", item,
+      () => recover ? withDispatcherRecoveryAttempt(mutationType, () => dispatcherIdempotencyKey("same payload", true))
+        : dispatcherIdempotencyKey("same payload", true), async () => {});
+    const original = await key(false);
+    const recovery = await key(true);
+    expect(recovery).not.toBe(original);
+    expect(await key(true)).toBe(recovery);
+    expect(await key(true, "2")).not.toBe(recovery);
+    expect(await key(true, "1", "status")).not.toBe(recovery);
+    expect(await key(false)).toBe(original);
+    expect(() => withDispatcherRecoveryAttempt("update", () => {})).toThrow("durable operation checkpoint");
   });
   it("has no direct upstream transport in either production caller", () => {
     for (const file of ["client.ts", "rate-limit-probe.ts"]) {

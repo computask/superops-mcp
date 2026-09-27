@@ -53,6 +53,9 @@ export interface ContinuationItemOutcome {
 export interface OperationContinuationAdapter {
   toolName: string;
   estimateItemSubrequests(record: OperationLedgerRecord, itemKey: string): number;
+  /** Opt in only with durable mutation checkpoints and bounded read-back
+   * reconciliation. An uncertain receipt itself never authorises a replay. */
+  canReconcileDispatcherReceipt?(item: OperationItemState): boolean;
   processItem(context: ContinuationItemContext): Promise<ContinuationItemOutcome>;
 }
 
@@ -325,9 +328,14 @@ export async function runOperationContinuation(
       const receiptOutcome = (): ContinuationItemOutcome | undefined => {
         const receipt = latestDurableItem.dispatcherReceipt;
         if (!receipt || receipt.state === "succeeded") return undefined;
+        const canReconcile = params.adapter.canReconcileDispatcherReceipt?.(latestDurableItem) === true;
+        if (receipt.state === "uncertain" && canReconcile) return undefined;
         const terminal = ["failed", "cancelled", "uncertain"].includes(receipt.state);
         return {
-          stage: terminal ? "AmbiguousWriteUnresolved" : "RateLimitedRescheduled",
+          // Retain the physical mutation checkpoint while a receipt is pending
+          // so an eventual uncertain/succeeded result enters read-back, not a
+          // fresh application of the original mutation.
+          stage: terminal ? "AmbiguousWriteUnresolved" : canReconcile ? latestDurableItem.stage : "RateLimitedRescheduled",
           outcome: terminal ? "DispatcherRequiresReconciliation" : "DispatcherPending",
           writeAttempted: true, writeMayHaveSucceeded: true, partialWrite: latestDurableItem.partialWrite,
           failureReason: `Dispatcher ${receipt.state}; receipt ${receipt.requestId}. No new mutation submitted.`,
@@ -353,7 +361,7 @@ export async function runOperationContinuation(
         if (waiting) return waiting;
         const processed = await params.adapter.processItem({
           record: currentRecord,
-          claim,
+          claim: { ...claim, item: latestDurableItem },
           checkpoint: async (patch) => {
             const checkpointed = await store.checkpointItem({
               operationId: params.operationId,

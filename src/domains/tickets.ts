@@ -1,5 +1,5 @@
 import { paginatedClient } from "../pagination.js";
-import { DispatcherPendingError } from "../dispatcher.js";
+import { DispatcherPendingError, withDispatcherRecoveryAttempt } from "../dispatcher.js";
 /**
  * SuperOps.ai Tickets Domain
  *
@@ -9150,7 +9150,9 @@ async function ambiguityCheckedTriageResult(params: {
   ];
 
   try {
-    const recovered = await mutateTicketUpdate(client, recoveryInput.input);
+    const recoveryMutationInput = recoveryInput.input;
+    const recovered = await withDispatcherRecoveryAttempt(mutationType,
+      () => mutateTicketUpdate(client, recoveryMutationInput));
     result.recoveryRetryOutcome = "Accepted";
     result.physicalWrites = [
       ...(result.physicalWrites ?? []),
@@ -9249,6 +9251,14 @@ async function ambiguityCheckedTriageResult(params: {
   ];
   return completeObservedTarget(result, verifiedRecovery, "CompletedAfterRetry");
 }
+const TRIAGE_AMBIGUOUS_WRITE_STAGES = new Set<OperationItemState["stage"]>([
+  "WriteStarted", "WriteAmbiguous", "FieldsUpdated",
+  "ClassificationWriteStarted", "ClassificationWriteSucceeded",
+  "ResolutionWriteStarted", "ResolutionWriteAmbiguous", "ResolutionWriteSucceeded",
+  "StatusWriteStarted", "StatusWriteSucceeded", "NoteWriteStarted", "NoteWriteAmbiguous",
+  "RecoveryWriteStarted", "RecoveryWriteAmbiguous",
+]);
+
 function createApplyTriageContinuationAdapter(
   client: SuperOpsClientInstance,
   liveParams?: ApplyTriagePlanParams
@@ -9256,6 +9266,10 @@ function createApplyTriageContinuationAdapter(
   const optionFieldsProvider = createApplyTicketOptionFieldsProvider(client);
   return {
     toolName: "superops_tickets_apply_triage_plan",
+    canReconcileDispatcherReceipt(item) {
+      return item.writeAttempted && Boolean(item.expectedTicketId) &&
+        (TRIAGE_AMBIGUOUS_WRITE_STAGES.has(item.stage) || item.verificationState === "Verified");
+    },
     estimateItemSubrequests(record, itemKey) {
       const storedParams = operationRequestApplyTriageParams(record.operationRequest);
       const action = actionByTicketFromApplyParams(storedParams ?? {}).get(itemKey);
@@ -9999,21 +10013,8 @@ function createApplyTriageContinuationAdapter(
           "RateLimitedRescheduled",
         ].includes(claim.item.stage)
       );
-      const shouldResolveAmbiguity = !noteVisibilityResolvedForStagedResolve && !noteOnlyContinuation && (
-        claim.item.stage === "WriteStarted" ||
-        claim.item.stage === "WriteAmbiguous" ||
-        claim.item.stage === "FieldsUpdated" ||
-        claim.item.stage === "ClassificationWriteStarted" ||
-        claim.item.stage === "ClassificationWriteSucceeded" ||
-        claim.item.stage === "ResolutionWriteStarted" ||
-        claim.item.stage === "ResolutionWriteAmbiguous" ||
-        claim.item.stage === "ResolutionWriteSucceeded" ||
-        claim.item.stage === "StatusWriteStarted" ||
-        claim.item.stage === "StatusWriteSucceeded" ||
-        claim.item.stage === "NoteWriteStarted" ||
-        claim.item.stage === "NoteWriteAmbiguous" ||
-        claim.item.stage === "RecoveryWriteStarted" ||
-        claim.item.stage === "RecoveryWriteAmbiguous");
+      const shouldResolveAmbiguity = !noteVisibilityResolvedForStagedResolve && !noteOnlyContinuation &&
+        TRIAGE_AMBIGUOUS_WRITE_STAGES.has(claim.item.stage);
       const applied = shouldResolveAmbiguity && action
         ? await ambiguityCheckedTriageResult({
             client,
