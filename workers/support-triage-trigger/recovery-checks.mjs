@@ -582,6 +582,30 @@ test('a held denied window does not block a disjoint new email',async()=>{
   assert(Date.parse(f.calls[0][1].createdFrom)>=Date.parse(f.scope.createdTo));
   assert.equal(f.state.needsAttentionScopes.length,1);
 });
+
+test('100 terminal-failure and duplicate-notification scenarios preserve later dispatch',async()=>{
+  for(let i=0;i<100;i++) {
+    const f=fixture(i%2===0?'completed':'failed',120000,{graphWebhookClientState:'synthetic-graph-state'});
+    const errorCode=i%2===0?'apply_rejected':'ambiguous_write';
+    await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',
+      metadata:{failureStage:'triage_apply',failureDiagnostics:[{stage:'triage_apply',errorType:'agent_action',errorCode}]}});
+    const held=structuredClone(f.state.needsAttentionScopes);
+    assert(held.length>0,`failed scope must remain protected in scenario ${i}`);
+    const arrivals=Date.parse(f.scope.createdTo)+120000+i*173;
+    for(let n=0;n<5;n++) {
+      f.setNow(new Date(arrivals+n*137).toISOString());
+      const notification={value:[{clientState:'synthetic-graph-state',changeType:'created',resourceData:{id:`synthetic-${i}-${n}`}}]};
+      await f.engine.accept(notification);
+      await f.engine.accept(notification); // Graph redelivery must not create extra work.
+    }
+    f.advance();
+    assert.equal((await f.engine.processAlarm()).status,'accepted',`fresh work must dispatch in scenario ${i}`);
+    assert.equal(f.calls.length,1,`one batch for the burst and redeliveries in scenario ${i}`);
+    assert(Date.parse(f.calls[0][1].createdFrom)>=Date.parse(f.scope.createdTo));
+    assert.deepEqual(f.state.needsAttentionScopes,held,'never erase/replay an ambiguous or denied old scope');
+    assert.equal(f.state.queuedBlockedByAttention,false);
+  }
+});
 test('attention fencing cannot erase an accepted Agent run or create a scope-less global lock',()=>{
   const config=loadConfig(vars),active={...createInitialState(),needsAttentionScope:failedScope,
     needsAttentionScopes:[failedScope],candidateAttentionFenceActive:true,pending:true,pendingReason:'new_message',
