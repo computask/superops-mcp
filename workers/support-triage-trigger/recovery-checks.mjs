@@ -604,11 +604,12 @@ test('legacy attention-only queue marker migrates away and a new email dispatche
     lifecycleRecoveryRequested:false,lastLifecycleEvent:null};
   f.seed({...createInitialState(),attentionBlockedWindow:fence,needsAttentionScope:failedScope,
     needsAttentionScopes:[failedScope],needsAttentionAt:Date.parse('2026-09-26T22:16:35.897Z'),
-    queuedPending:true,queuedBlockedByAttention:true,queuedDueAt:Date.parse('2026-09-26T22:16:28.232Z')});
+    queuedPending:true,queuedBlockedByAttention:true,queuedReason:'new_message',queuedDueAt:Date.parse('2026-09-26T22:16:28.232Z')});
   const migrated=structuredClone(f.state);
   migrateLegacyAttentionBlockedQueue(migrated);
   assert.equal(coordinatorProgressFields(migrated).currentAction,'attention_quarantine');
   assert.equal(migrated.queuedPending,false);
+  assert.equal(migrated.queuedBlockedByAttention,false);
   f.setNow('2026-09-27T06:30:00Z');
   await f.engine.accept({value:[{clientState:'synthetic-graph-state',changeType:'created',resourceData:{id:'mail-after-attention-fence'}}]});
   assert.equal(f.state.queuedPending,false,'empty legacy queue sentinel is cleared');

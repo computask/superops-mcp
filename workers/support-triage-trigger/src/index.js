@@ -2573,7 +2573,7 @@ function parkPendingAttentionWindow(state) {
 __name(parkPendingAttentionWindow, "parkPendingAttentionWindow");
 function migrateLegacyAttentionBlockedQueue(state) {
   if (!state.queuedPending || !state.queuedBlockedByAttention) return;
-  const hasQueuePayload = state.queuedNotificationWindowStartedAt !== null || state.queuedReason !== null ||
+  const hasQueuePayload = state.queuedNotificationWindowStartedAt !== null ||
     state.queuedUnavailableRetryCount > 0 || state.queuedLifecycleRecoveryRequested || state.queuedLastLifecycleEvent !== null;
   if (state.attentionBlockedWindow !== null && !hasQueuePayload) {
     // Production versions used queuedPending as a sentinel for the attention
