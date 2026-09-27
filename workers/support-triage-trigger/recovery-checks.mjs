@@ -7,8 +7,8 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
 const testableSource = source.replace(/\nexport \{\s*TriageCoordinator,\s*index_default as default\s*\};\s*\/\/# sourceMappingURL=index\.js\.map\s*$/, '\n');
 assert.notEqual(testableSource, source, 'The preserved production module export footer must be isolated for the in-memory test harness');
-const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState} = await import(
-  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState};').toString('base64')}`
+const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen} = await import(
+  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
@@ -318,8 +318,9 @@ test('an empty manual replay completes without widening the source window',async
   assert(!f.state.dispatchHistory.some(event=>event.event==='retry_scheduled'));
 });
 
-function fixture(status, age = 120000) {
+function fixture(status, age = 120000, configOverrides = {}) {
   let now = Date.parse('2026-09-24T06:00:00Z');
+  let agentStatus=status;
   const scope = {mode:'new-email-tickets', source:'EMAIL', createdFrom:new Date(now-60000).toISOString(), createdTo:new Date(now).toISOString()};
   let state = {...createInitialState(), pending:true, pendingReason:'new_message',
     pendingTriggerId:'email-triage:9001', pendingTriggerScope:scope,
@@ -329,10 +330,11 @@ function fixture(status, age = 120000) {
     resultDeadlineAt:now+30000};
   const calls = [];
   const alarms = [];
-  const engine = new CoordinatorEngine({config:loadConfig(vars), now:()=>now,
+  const config={...loadConfig({...vars,GRAPH_WEBHOOK_CLIENT_STATE:'synthetic-graph-state'}),...configOverrides};
+  const engine = new CoordinatorEngine({config, now:()=>now,
     store:{load:async()=>structuredClone(state),save:async s=>{state=structuredClone(s);},setAlarm:async at=>alarms.push(at)},
-    agent:{getRunDiagnostics:async()=>({status,httpStatus:200}),trigger:async(...args)=>{calls.push(args);return {kind:'accepted',runId:'apirun_retry'};}}});
-  return {engine,calls,alarms,scope,get state(){return state;},seed:patch=>{state={...state,...patch};},setNow:value=>{now=Date.parse(value);},advance:()=>{now=state.dueAt ?? now+40000;},expire:()=>{now+=40000;}};
+    agent:{getRunDiagnostics:async()=>({status:agentStatus,httpStatus:200}),trigger:async(...args)=>{calls.push(args);return {kind:'accepted',runId:'apirun_retry'};}}});
+  return {engine,calls,alarms,scope,config,get state(){return state;},seed:patch=>{state={...state,...patch};},setNow:value=>{now=Date.parse(value);},setRunStatus:value=>{agentStatus=value;},advance:()=>{now=state.dueAt ?? now+40000;},expire:()=>{now+=40000;}};
 }
 
 const emailScope=(from,to)=>({mode:'new-email-tickets',source:'EMAIL',createdFrom:from,createdTo:to});
@@ -569,6 +571,123 @@ test('a held denied window does not block a disjoint new email',async()=>{
   assert.equal(f.calls.length,1);
   assert(Date.parse(f.calls[0][1].createdFrom)>=Date.parse(f.scope.createdTo));
   assert.equal(f.state.needsAttentionScopes.length,1);
+});
+test('attention fencing cannot erase an accepted Agent run or create a scope-less global lock',()=>{
+  const config=loadConfig(vars),active={...createInitialState(),needsAttentionScope:failedScope,
+    needsAttentionScopes:[failedScope],candidateAttentionFenceActive:true,pending:true,pendingReason:'new_message',
+    pendingTriggerId:'triage-4-60d4e73d-5c40-4a75-89b5-31ac48f25632',pendingTriggerScope:failedScope,
+    pendingNotificationWindowStartedAt:Date.parse(failedScope.createdFrom),pendingNotificationWindowEndedAt:Date.parse(failedScope.createdTo),
+    executionPhase:'awaiting_result',dispatchAttempt:1,lastAcceptedTrigger:{triggerId:'triage-4-60d4e73d-5c40-4a75-89b5-31ac48f25632',runId:'apirun_active'}};
+  blockPendingIfAttentionOverlaps(active,config,Date.parse(failedScope.createdTo));
+  assert.equal(active.pending,true);
+  assert.equal(active.executionPhase,'awaiting_result');
+  assert.deepEqual(active.pendingTriggerScope,failedScope);
+  const lifecycle={...createInitialState(),needsAttentionScope:failedScope,needsAttentionScopes:[failedScope],
+    candidateAttentionFenceActive:true,pending:true,pendingReason:'lifecycle',pendingTriggerId:'triage-5-60d4e73d-5c40-4a75-89b5-31ac48f25632',executionPhase:'pending_dispatch'};
+  blockPendingIfAttentionOverlaps(lifecycle,config,Date.parse(failedScope.createdTo));
+  assert.equal(lifecycle.pending,true);
+  assert.equal(lifecycle.queuedPending,false);
+  assert.equal(lifecycle.queuedBlockedByAttention,false);
+  assert.equal(currentBatchIsFrozen(lifecycle),false,'scope-less lifecycle state cannot freeze a future email');
+  const legacyLifecycle={...createInitialState(),queuedPending:true,queuedBlockedByAttention:true,
+    queuedReason:'lifecycle',queuedLifecycleRecoveryRequested:true,queuedLastLifecycleEvent:'missed'};
+  migrateLegacyAttentionBlockedQueue(legacyLifecycle);
+  assert.equal(legacyLifecycle.queuedPending,false);
+  assert.equal(legacyLifecycle.queuedBlockedByAttention,false);
+  assert.equal(legacyLifecycle.lifecycleRecoveryRequested,true,'legacy lifecycle recovery is preserved');
+});
+test('legacy attention-only queue marker migrates away and a new email dispatches',async()=>{
+  const f=fixture('completed',120000,{graphWebhookClientState:'synthetic-graph-state'});
+  const oldStart=Date.parse('2026-09-15T13:41:12.228Z'),oldEnd=Date.parse('2026-09-25T15:01:45.995Z');
+  const fence={reason:'new_message',notificationWindowStartedAt:oldStart,notificationWindowEndedAt:oldEnd,
+    notificationLookbackMs:0,lastNotificationAt:oldEnd,debounceWindowStartedAt:null,unavailableRetryCount:0,
+    lifecycleRecoveryRequested:false,lastLifecycleEvent:null};
+  f.seed({...createInitialState(),attentionBlockedWindow:fence,needsAttentionScope:failedScope,
+    needsAttentionScopes:[failedScope],needsAttentionAt:Date.parse('2026-09-26T22:16:35.897Z'),
+    queuedPending:true,queuedBlockedByAttention:true,queuedDueAt:Date.parse('2026-09-26T22:16:28.232Z')});
+  const migrated=structuredClone(f.state);
+  migrateLegacyAttentionBlockedQueue(migrated);
+  assert.equal(coordinatorProgressFields(migrated).currentAction,'attention_quarantine');
+  assert.equal(migrated.queuedPending,false);
+  f.setNow('2026-09-27T06:30:00Z');
+  await f.engine.accept({value:[{clientState:'synthetic-graph-state',changeType:'created',resourceData:{id:'mail-after-attention-fence'}}]});
+  assert.equal(f.state.queuedPending,false,'empty legacy queue sentinel is cleared');
+  assert.equal(f.state.queuedDueAt,null);
+  assert(f.state.attentionBlockedWindow,'the old failed window remains durably fenced');
+  assert.equal(f.state.pending,true,'new disjoint email becomes the active pending batch');
+  assert.equal(coordinatorProgressFields(f.state).currentAction,'pending_dispatch');
+  f.advance();
+  assert.equal((await f.engine.processAlarm()).status,'accepted');
+  assert.equal(f.calls.length,1);
+  assert(f.state.attentionBlockedWindow,'dispatch does not clear the old quarantine');
+});
+test('an unavailable-trigger retry window does not freeze a disjoint new notification',async()=>{
+  const f=fixture('completed',120000,{graphWebhookClientState:'synthetic-graph-state'});
+  f.setNow('2026-09-24T09:32:16.410Z');
+  const retryAt=Date.parse('2026-09-24T10:00:00Z');
+  f.seed({...createInitialState(),unavailableRetryWindow:{scope:failedScope,
+    notificationWindowStartedAt:Date.parse(failedScope.createdFrom),notificationWindowEndedAt:Date.parse(failedScope.createdTo),
+    notificationLookbackMs:60000,lastNotificationAt:Date.parse(failedScope.createdTo),debounceWindowStartedAt:null,
+    retryCount:2,dueAt:retryAt}});
+  await f.engine.accept({value:[{clientState:'synthetic-graph-state',changeType:'created',resourceData:{id:'fresh-after-unavailable'}}]});
+  assert.equal(f.state.pending,true);
+  assert.equal(f.state.queuedPending,false);
+  f.advance();
+  assert.equal((await f.engine.processAlarm()).status,'accepted');
+  assert.equal(f.calls.length,1);
+  assert.equal(f.state.unavailableRetryWindow.dueAt,retryAt,'the old retry remains persisted');
+});
+test('eligible queued email is promoted before a future unavailable retry',async()=>{
+  const f=fixture('completed');
+  const queueStart=Date.parse('2026-09-24T09:32:00Z'),queueEnd=Date.parse('2026-09-24T09:32:30Z');
+  f.setNow('2026-09-24T09:33:00Z');
+  f.seed({...createInitialState(),queuedPending:true,queuedReason:'new_message',
+    queuedNotificationWindowStartedAt:queueStart,queuedNotificationWindowEndedAt:queueEnd,
+    queuedNotificationLookbackMs:0,queuedLastNotificationAt:queueEnd,queuedDebounceWindowStartedAt:queueStart,
+    queuedDueAt:Date.parse('2026-09-24T09:32:16Z'),unavailableRetryWindow:{scope:failedScope,
+      notificationWindowStartedAt:Date.parse(failedScope.createdFrom),notificationWindowEndedAt:Date.parse(failedScope.createdTo),
+      notificationLookbackMs:60000,lastNotificationAt:Date.parse(failedScope.createdTo),debounceWindowStartedAt:null,
+      retryCount:2,dueAt:Date.parse('2026-09-24T10:00:00Z')}});
+  assert.equal((await f.engine.processAlarm()).status,'accepted');
+  assert.equal(f.calls.length,1);
+  assert.equal(f.state.unavailableRetryWindow.dueAt,Date.parse('2026-09-24T10:00:00Z'));
+  assert.equal(f.state.queuedPending,false);
+});
+test('retry_wait yields its exact retry to fresh disjoint work, then keeps the retry held',async()=>{
+  const f=fixture('completed',120000,{graphWebhookClientState:'synthetic-graph-state'});
+  const callback={failureStage:'evidence_recovery',ticketsConsidered:1,ticketsCompleted:0,ticketsDeferred:1,
+    failureDiagnostics:[{stage:'evidence_recovery',errorCode:'read_failed',message:'Synthetic no-write failure'}]};
+  assert.equal((await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',metadata:callback})).status,'retry_scheduled');
+  f.setNow('2026-09-24T06:02:00Z');
+  await f.engine.accept({value:[{clientState:'synthetic-graph-state',changeType:'created',resourceData:{id:'fresh-during-retry-wait'}}]});
+  assert.equal(f.state.pending,true);
+  assert.equal(f.state.executionPhase,'pending_dispatch');
+  assert.deepEqual(f.state.reconciliationHold.scope,f.scope,'the original retry keeps its exact scope');
+  assert.equal(f.state.queuedPending,false);
+  assert(f.state.dispatchHistory.some(event=>event.event==='retry_yielded_to_fresh_work'));
+  f.advance();
+  assert.equal((await f.engine.processAlarm()).status,'accepted');
+  assert.equal(f.calls.length,1);
+  assert(Date.parse(f.calls[0][1].createdFrom)>=Date.parse(f.scope.createdTo));
+  assert.deepEqual(f.state.reconciliationHold.scope,f.scope);
+});
+test('retry_wait with an active Agent run waits for drain, then releases fresh work',async()=>{
+  const f=fixture('in_progress',120000,{graphWebhookClientState:'synthetic-graph-state'});
+  const callback={failureStage:'evidence_recovery',ticketsConsidered:1,ticketsCompleted:0,ticketsDeferred:1,
+    failureDiagnostics:[{stage:'evidence_recovery',errorCode:'read_failed',message:'Synthetic no-write failure'}]};
+  assert.equal((await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',metadata:callback})).status,'retry_scheduled');
+  f.setNow('2026-09-24T06:02:00Z');
+  await f.engine.accept({value:[{clientState:'synthetic-graph-state',changeType:'created',resourceData:{id:'fresh-during-active-retry-run'}}]});
+  f.setNow(new Date(f.state.queuedDueAt).toISOString());
+  assert.equal((await f.engine.processAlarm()).status,'awaiting_result');
+  assert.equal(f.calls.length,0,'one-active-run rule is preserved');
+  f.setRunStatus('completed');
+  f.setNow(new Date(f.alarms.at(-1)).toISOString());
+  assert.equal((await f.engine.processAlarm()).status,'fresh_work_promoted');
+  assert.equal(f.calls.length,0);
+  assert.equal((await f.engine.processAlarm()).status,'accepted');
+  assert.equal(f.calls.length,1);
+  assert.deepEqual(f.state.reconciliationHold.scope,f.scope);
 });
 test('five notification burst gives the final arrival its full ingestion grace',()=>{
   const config=loadConfig(vars), state=createInitialState();

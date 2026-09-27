@@ -44,10 +44,22 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-1cc3e23fd7f47c19080855d98723ac69feecab64e21292564e307e743f94f766.
+4eb0c749b50072dd53788cb1eb750e7772110151ba7825ee30cb3b640852b3fb.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
+
+Queue isolation, 27 September 2026: a needs-attention scope is no longer
+represented as a fake queued notification, and scope-less lifecycle recovery
+cannot set a global queue fence. Legacy attention-only sentinels are cleared
+on the next coordinator intake/alarm while the underlying failed scope stays
+durable. Disjoint email work is promoted ahead of delayed retry windows; exact
+overlapping prefixes stay fenced, and eligible suffixes may proceed. A retry
+whose Agent run is still active continues to hold the single-run lease until
+terminal status is confirmed. One automatic reconciliation retry is retained;
+if that slot is already occupied, additional failed scopes become
+needs-attention records rather than blocking fresh work or being merged into a
+wider replay. Provider-wide rate-limit Retry-After gates remain respected.
 
 Overlapping attention windows, 24 September 2026: an undispatched email window
 can now retain its protected prefix and release only the suffix after every

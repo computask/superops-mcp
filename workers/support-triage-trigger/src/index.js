@@ -1068,6 +1068,7 @@ var DISPATCH_HISTORY_EVENTS = /* @__PURE__ */ new Set([
   "batch_failed",
   "orphan_recovered",
   "reconciliation_parked",
+  "retry_yielded_to_fresh_work",
   "reconciliation_released",
   "attention_prefix_parked",
   "attention_tail_released",
@@ -1088,6 +1089,8 @@ var DISPATCH_HISTORY_WAIT_REASONS = /* @__PURE__ */ new Set([
   "unavailable_retry",
   "reconciliation_hold",
   "result_watchdog",
+  "callback_drain_check",
+  "fresh_queue_drain_check",
   "transport_retry",
   "callback_retry",
   "bounded_recovery",
@@ -1610,7 +1613,10 @@ function nextPendingTriggerId(state) {
 }
 __name(nextPendingTriggerId, "nextPendingTriggerId");
 function currentBatchIsFrozen(state) {
-  return state.pending && (state.pendingTriggerScope !== null || state.pendingDispatchWasQueued === true || state.pendingDispatchWaitReason !== null) || state.unavailableRetryWindow !== null || state.reconciliationHold !== null || state.queuedBlockedByAttention && state.attentionBlockedWindow === null;
+  // Only an active/persisted dispatch lease freezes registration. Deferred
+  // retries and quarantined scopes are independent work; they must not turn a
+  // later email into a global queue lock.
+  return state.pending && (state.pendingTriggerScope !== null || state.pendingDispatchWasQueued === true || state.pendingDispatchWaitReason !== null) || state.queuedBlockedByAttention && state.attentionBlockedWindow === null;
 }
 __name(currentBatchIsFrozen, "currentBatchIsFrozen");
 function registerLifecycleEvent(state, event, config, now) {
@@ -1772,7 +1778,7 @@ function resetPendingDispatch(state) {
 }
 __name(resetPendingDispatch, "resetPendingDispatch");
 function resetQueuedDispatch(state) {
-  state.queuedPending = state.attentionBlockedWindow !== null;
+  state.queuedPending = false;
   state.queuedReason = null;
   state.queuedNotificationWindowStartedAt = null;
   state.queuedNotificationWindowEndedAt = null;
@@ -1783,11 +1789,11 @@ function resetQueuedDispatch(state) {
   state.queuedUnavailableRetryCount = 0;
   state.queuedLifecycleRecoveryRequested = false;
   state.queuedLastLifecycleEvent = null;
-  state.queuedBlockedByAttention = state.attentionBlockedWindow !== null;
+  state.queuedBlockedByAttention = false;
 }
 __name(resetQueuedDispatch, "resetQueuedDispatch");
 function promoteQueuedDispatch(state, now, config) {
-  if (!state.queuedPending || state.unavailableRetryWindow !== null || state.queuedBlockedByAttention && state.attentionBlockedWindow === null || state.sharedRateLimitUntil !== null && state.sharedRateLimitUntil > now) return false;
+  if (!state.queuedPending || state.queuedBlockedByAttention && state.attentionBlockedWindow === null || state.sharedRateLimitUntil !== null && state.sharedRateLimitUntil > now) return false;
   const hasEmailWindow = state.queuedNotificationWindowStartedAt !== null;
   if (config.scopeMode === "new-email-tickets" && !hasEmailWindow) {
     state.lifecycleRecoveryRequested ||= state.queuedLifecycleRecoveryRequested;
@@ -2279,17 +2285,17 @@ function coordinatorProgressFields(state) {
     if (state.executionPhase === "pending_dispatch" && dueAt !== null) {
       dueAt = Math.max(dueAt, state.cooldownUntil);
     }
+  } else if (state.queuedPending && state.queuedNotificationWindowStartedAt !== null) {
+    action = legacyAttentionBlockedQueue ? "queued_attention_blocked" : "queued_dispatch";
+    dueAt = legacyAttentionBlockedQueue || state.queuedDueAt === null ? null : Math.max(state.queuedDueAt, state.cooldownUntil);
   } else if (state.unavailableRetryWindow !== null) {
     action = "unavailable_trigger_retry";
     dueAt = state.unavailableRetryWindow.dueAt;
   } else if (state.reconciliationHold !== null) {
     action = "reconciliation_hold";
     dueAt = state.reconciliationHold.dueAt;
-  } else if (state.queuedPending && state.queuedNotificationWindowStartedAt !== null) {
-    action = legacyAttentionBlockedQueue ? "queued_attention_blocked" : "queued_dispatch";
-    dueAt = legacyAttentionBlockedQueue || state.queuedDueAt === null ? null : Math.max(state.queuedDueAt, state.cooldownUntil);
   } else if (state.attentionBlockedWindow !== null) {
-    action = "queued_attention_blocked";
+    action = "attention_quarantine";
   }
   if (state.sharedRateLimitUntil !== null && state.sharedRateLimitUntil > Date.now()) {
     dueAt = dueAt === null ? state.sharedRateLimitUntil : Math.max(dueAt, state.sharedRateLimitUntil);
@@ -2391,7 +2397,7 @@ __name(opaqueAttentionCutoff, "opaqueAttentionCutoff");
 function scopeOverlapsAttention(state, config, candidate) {
   if (!attentionFenceIsActive(state, config)) return false;
   const blockedScope = attentionBlockedWindowScope(state, config);
-  const fences = [...attentionScopes(state), blockedScope].filter(Boolean);
+  const fences = [...attentionScopes(state), blockedScope, state.unavailableRetryWindow?.scope, state.reconciliationHold?.scope].filter(Boolean);
   if (candidate?.mode === "new-email-tickets" && candidate.replayOfEventId !== void 0 && candidate.targetTicketNumbers?.length === 1) {
     const matchingFences = fences.filter((scope) =>
       scope.mode === "new-email-tickets" && finiteScopeBounds(scope) !== null &&
@@ -2426,12 +2432,18 @@ __name(scopeOverlapsAttention, "scopeOverlapsAttention");
 // fence. Opaque legacy fences do not describe future email timestamps; the
 // exact durable notification window remains the quarantine boundary. This
 // never changes an accepted run, clears a hold, or replays its mutation.
-function attentionSafeTail(state, config, candidate, now) {
+function attentionSafeTail(state, config, candidate, now, queued = false) {
   if (!config.attentionTailIsolationEnabled || candidate?.mode !== "new-email-tickets") return null;
   const bounds = finiteScopeBounds(candidate);
   if (bounds === null) return null;
   let from = bounds.from;
-  const allFences = [...attentionScopes(state), attentionBlockedWindowScope(state, config)].filter(Boolean);
+  const allFences = [
+    ...attentionScopes(state),
+    attentionBlockedWindowScope(state, config),
+    state.unavailableRetryWindow?.scope,
+    state.reconciliationHold?.scope,
+    queued && state.pending && state.executionPhase === "retry_wait" ? state.pendingTriggerScope : null
+  ].filter(Boolean);
   const fences = allFences
     .filter((fence) => fence?.mode === "new-email-tickets" && finiteScopeBounds(fence) !== null);
   const opaqueFenceExists = fences.length !== allFences.length || fences.length === 0;
@@ -2448,7 +2460,7 @@ function isolateAttentionTail(state, config, now, queued) {
   // A frozen retry must retain its exact scope and accepted-write truth.
   if (!queued && (state.pendingTriggerScope !== null || state.dispatchAttempt > 0)) return false;
   const candidate = queued ? queuedEmailScope(state, config) : pendingEmailScopeForComparison(state, config);
-  const tail = attentionSafeTail(state, config, candidate, now);
+  const tail = attentionSafeTail(state, config, candidate, now, queued);
   const original = queued ? attentionBlockedWindowFromQueued(state) : attentionBlockedWindowFromPending(state);
   if (tail === null || original === null) return false;
   const boundary = Date.parse(tail.createdFrom);
@@ -2539,7 +2551,8 @@ function mergeAttentionBlockedWindow(state, incoming) {
     existing.lifecycleRecoveryRequested ||= incoming.lifecycleRecoveryRequested;
     existing.lastLifecycleEvent = incoming.lastLifecycleEvent ?? existing.lastLifecycleEvent;
   }
-  state.queuedBlockedByAttention = true;
+  // A quarantined time range is not queued work and never owns the queue lock.
+  state.queuedBlockedByAttention = false;
 }
 __name(mergeAttentionBlockedWindow, "mergeAttentionBlockedWindow");
 function parkQueuedAttentionWindow(state) {
@@ -2547,7 +2560,6 @@ function parkQueuedAttentionWindow(state) {
   if (blocked === null) return false;
   mergeAttentionBlockedWindow(state, blocked);
   resetQueuedDispatch(state);
-  state.queuedBlockedByAttention = true;
   return true;
 }
 __name(parkQueuedAttentionWindow, "parkQueuedAttentionWindow");
@@ -2556,14 +2568,30 @@ function parkPendingAttentionWindow(state) {
   if (blocked === null) return false;
   mergeAttentionBlockedWindow(state, blocked);
   resetPendingDispatch(state);
-  state.queuedPending = true;
-  state.queuedBlockedByAttention = true;
   return true;
 }
 __name(parkPendingAttentionWindow, "parkPendingAttentionWindow");
 function migrateLegacyAttentionBlockedQueue(state) {
-  if (!state.queuedBlockedByAttention || state.attentionBlockedWindow !== null || !state.queuedPending) return;
-  parkQueuedAttentionWindow(state);
+  if (!state.queuedPending || !state.queuedBlockedByAttention) return;
+  const hasQueuePayload = state.queuedNotificationWindowStartedAt !== null || state.queuedReason !== null ||
+    state.queuedUnavailableRetryCount > 0 || state.queuedLifecycleRecoveryRequested || state.queuedLastLifecycleEvent !== null;
+  if (state.attentionBlockedWindow !== null && !hasQueuePayload) {
+    // Production versions used queuedPending as a sentinel for the attention
+    // fence. Drop only that empty sentinel, retaining the durable fence.
+    resetQueuedDispatch(state);
+    return;
+  }
+  if (state.attentionBlockedWindow === null) {
+    if (state.queuedNotificationWindowStartedAt !== null) {
+      parkQueuedAttentionWindow(state);
+      return;
+    }
+    if (state.queuedLifecycleRecoveryRequested || state.queuedLastLifecycleEvent !== null) {
+      state.lifecycleRecoveryRequested ||= state.queuedLifecycleRecoveryRequested;
+      state.lastLifecycleEvent ??= state.queuedLastLifecycleEvent;
+    }
+    resetQueuedDispatch(state);
+  }
 }
 __name(migrateLegacyAttentionBlockedQueue, "migrateLegacyAttentionBlockedQueue");
 function sharedRateLimitActive(state, now) {
@@ -2585,7 +2613,9 @@ __name(setSharedRateLimitGate, "setSharedRateLimitGate");
 function queuedOverlapsAttention(state, config) {
   if (!attentionFenceIsActive(state, config) || !state.queuedPending) return false;
   const queuedScope = queuedEmailScope(state, config);
-  return queuedScope === null || scopeOverlapsAttention(state, config, queuedScope);
+  const currentRetryScope = state.pending && state.executionPhase === "retry_wait" ? state.pendingTriggerScope : null;
+  return queuedScope === null || scopeOverlapsAttention(state, config, queuedScope) ||
+    currentRetryScope !== null && targetedScopesOverlap(currentRetryScope, queuedScope);
 }
 __name(queuedOverlapsAttention, "queuedOverlapsAttention");
 function queuedOverlapsReconciliationHold(state, config) {
@@ -2594,6 +2624,15 @@ function queuedOverlapsReconciliationHold(state, config) {
   return queuedScope === null || targetedScopesOverlap(state.reconciliationHold.scope, queuedScope);
 }
 __name(queuedOverlapsReconciliationHold, "queuedOverlapsReconciliationHold");
+function queuedOverlapsDeferredWork(state, config) {
+  if (!state.queuedPending) return false;
+  const queuedScope = queuedEmailScope(state, config);
+  if (queuedScope === null) return true;
+  return [state.unavailableRetryWindow?.scope, state.reconciliationHold?.scope]
+    .filter(Boolean)
+    .some((scope) => targetedScopesOverlap(scope, queuedScope));
+}
+__name(queuedOverlapsDeferredWork, "queuedOverlapsDeferredWork");
 function refreshQueuedAttentionBlock(state, config, now = Date.now()) {
   if (!attentionFenceIsActive(state, config) || !state.queuedPending) return;
   if (queuedOverlapsAttention(state, config)) {
@@ -2603,17 +2642,16 @@ function refreshQueuedAttentionBlock(state, config, now = Date.now()) {
 }
 __name(refreshQueuedAttentionBlock, "refreshQueuedAttentionBlock");
 function blockPendingIfAttentionOverlaps(state, config, now) {
-  if (!attentionFenceIsActive(state, config) || !state.pending || state.needsAttentionScope === null) return;
+  if (!attentionFenceIsActive(state, config) || !state.pending) return;
+  // An accepted run, or a correlated retry whose Agent run has not drained,
+  // owns the dispatch lease. Never erase or reshape it to satisfy a fence.
+  if (state.executionPhase === "awaiting_result" || state.acceptedRunLeaseUnknown || previousRetryRunNeedsDrain(state)) return;
   const pendingScope = pendingEmailScopeForComparison(state, config);
-  if (pendingScope === null || scopeOverlapsAttention(state, config, pendingScope)) {
-    if (isolateAttentionTail(state, config, now, false)) return;
-    if (!parkPendingAttentionWindow(state)) {
-      queueCurrentEmailWindow(state, now);
-      state.queuedBlockedByAttention = true;
-      state.queuedDueAt = null;
-      resetPendingDispatch(state);
-    }
-  }
+  if (pendingScope === null || !scopeOverlapsAttention(state, config, pendingScope)) return;
+  if (isolateAttentionTail(state, config, now, false)) return;
+  // Scope-less lifecycle work is not an email candidate and must never be
+  // converted into a fake attention queue that freezes future notifications.
+  parkPendingAttentionWindow(state);
 }
 __name(blockPendingIfAttentionOverlaps, "blockPendingIfAttentionOverlaps");
 function batchSequenceFromTriggerId(triggerId) {
@@ -3130,12 +3168,10 @@ function queueCurrentEmailWindow(state, now) {
 }
 __name(queueCurrentEmailWindow, "queueCurrentEmailWindow");
 function nextDeferredAt(state, config) {
-  if (state.unavailableRetryWindow !== null) {
-    return state.unavailableRetryWindow.dueAt;
-  }
   const candidates = [
+    state.unavailableRetryWindow !== null ? state.unavailableRetryWindow.dueAt : void 0,
     state.reconciliationHold !== null ? state.reconciliationHold.dueAt : void 0,
-    state.queuedPending && !(state.queuedBlockedByAttention && state.attentionBlockedWindow === null) && !(config !== void 0 && queuedOverlapsAttention(state, config)) && !(config !== void 0 && queuedOverlapsReconciliationHold(state, config)) && state.queuedDueAt !== null ? state.queuedDueAt : void 0
+    state.queuedPending && !(state.queuedBlockedByAttention && state.attentionBlockedWindow === null) && !(config !== void 0 && queuedOverlapsAttention(state, config)) && !(config !== void 0 && queuedOverlapsReconciliationHold(state, config)) && !(config !== void 0 && queuedOverlapsDeferredWork(state, config)) && state.queuedDueAt !== null ? state.queuedDueAt : void 0
   ].filter((at) => at !== void 0 && Number.isFinite(at));
   return candidates.length === 0 ? void 0 : Math.min(...candidates);
 }
@@ -3159,6 +3195,7 @@ function canPromoteQueuedDispatch(state, now, config) {
     }
   }
   if (queuedOverlapsReconciliationHold(state, config)) return false;
+  if (queuedOverlapsDeferredWork(state, config)) return false;
   return true;
 }
 __name(canPromoteQueuedDispatch, "canPromoteQueuedDispatch");
@@ -3173,18 +3210,16 @@ function promoteUnavailableRetryDispatchSafely(state, now, config) {
 __name(promoteUnavailableRetryDispatchSafely, "promoteUnavailableRetryDispatchSafely");
 function promoteDueDeferredDispatch(state, now, config, includeOrdinaryQueue = true) {
   if (sharedRateLimitActive(state, now)) return false;
+  const queuedIsDue = state.queuedPending && (state.queuedDueAt === null || state.queuedDueAt <= now) &&
+    (includeOrdinaryQueue || state.queuedUnavailableRetryCount > 0);
+  if (queuedIsDue && promoteQueuedDispatchSafely(state, now, config)) return true;
   if (state.unavailableRetryWindow !== null) {
     if (state.unavailableRetryWindow.dueAt <= now) {
       return promoteUnavailableRetryDispatchSafely(state, now, config);
     }
-    return false;
   }
   if (state.reconciliationHold !== null && state.reconciliationHold.dueAt <= now) {
     return promoteReconciliationHold(state, now);
-  }
-  if (!includeOrdinaryQueue && state.queuedUnavailableRetryCount <= 0) return false;
-  if (state.queuedPending && (state.queuedDueAt === null || state.queuedDueAt <= now)) {
-    return promoteQueuedDispatchSafely(state, now, config);
   }
   return false;
 }
@@ -3313,23 +3348,34 @@ function promoteReconciliationHold(state, now) {
   return true;
 }
 __name(promoteReconciliationHold, "promoteReconciliationHold");
-function parkEmptyRecoveryForDisjointQueue(state, now, config) {
-  if (!separationEnabled(config) || !state.pending || state.executionPhase !== "retry_wait" || !state.emptyTargetedRecoveryPending || state.pendingTriggerScope?.mode !== "new-email-tickets" || state.queuedPending === false || state.queuedNotificationWindowStartedAt === null || state.dueAt === null || state.dueAt <= now || state.reconciliationHold !== null || previousRetryRunNeedsDrain(state)) return false;
+function parkRetryForDisjointQueue(state, now, config) {
+  if (!separationEnabled(config) || config.scopeMode !== "new-email-tickets" || !state.pending ||
+      state.executionPhase !== "retry_wait" || state.pendingTriggerScope?.mode !== "new-email-tickets" ||
+      !state.queuedPending || state.queuedNotificationWindowStartedAt === null || state.dueAt === null ||
+      previousRetryRunNeedsDrain(state)) return false;
   const queuedScope = queuedEmailScope(state, config);
   const hold = reconciliationHoldFromPending(state, now);
   if (queuedScope === null || hold === null || !targetedScopesDisjoint(hold.scope, queuedScope)) return false;
-  state.reconciliationHold = hold;
   recordDispatchHistory(state, now, {
-    event: "reconciliation_parked",
+    event: "retry_yielded_to_fresh_work",
     attempt: hold.dispatchAttempt > 0 ? hold.dispatchAttempt : void 0,
     retryCount: hold.retryCount,
     waitReason: "reconciliation_hold",
     nextAt: new Date(hold.dueAt).toISOString()
   }, hold.scope);
-  resetPendingDispatch(state);
+  if (state.reconciliationHold === null) {
+    state.reconciliationHold = hold;
+    resetPendingDispatch(state);
+  } else {
+    // Keep the single automatic retry slot bounded. Preserve any additional
+    // exact failed scope as attention work rather than letting it block fresh
+    // mail or merging it into a broader replay window.
+    recordReconciliationNeedsAttention(state, hold.scope, now, state.retryCount);
+  }
+  refreshQueuedAttentionBlock(state, config, now);
   return promoteQueuedDispatchSafely(state, now, config);
 }
-__name(parkEmptyRecoveryForDisjointQueue, "parkEmptyRecoveryForDisjointQueue");
+__name(parkRetryForDisjointQueue, "parkRetryForDisjointQueue");
 function recoverStaleAcceptedRun(state, config, now, diagnostics) {
   if (!config.staleRunRecoveryEnabled || !state.pending || state.executionPhase !== "awaiting_result" && state.executionPhase !== "retry_wait" || typeof state.lastAcceptedTrigger?.runId !== "string") {
     return false;
@@ -3538,7 +3584,13 @@ __name(targetedReconciliationRetryAt, "targetedReconciliationRetryAt");
 function previousRetryRunNeedsDrain(state) {
   const report = state.lastResultReport;
   const accepted = state.lastAcceptedTrigger;
-  return state.pendingDispatchWaitReason !== "unavailable_retry" && state.executionPhase === "retry_wait" && report !== null && report.status !== "complete" && accepted !== null && typeof accepted.runId === "string" && report.triggerId === accepted.triggerId && report.attempt === state.dispatchAttempt;
+  if (state.pendingDispatchWaitReason === "unavailable_retry" || state.executionPhase !== "retry_wait" || report === null || report.status === "complete" || accepted === null || typeof accepted.runId !== "string" || report.triggerId !== accepted.triggerId || report.attempt !== state.dispatchAttempt) return false;
+  const batchSequence = batchSequenceFromTriggerId(accepted.triggerId) ?? (state.pending ? state.triggerSequence : null);
+  const lastStatus = [...state.dispatchHistory].reverse().find((entry) =>
+    entry.event === "agent_run_status_checked" && entry.attempt === state.dispatchAttempt && entry.batchSequence === batchSequence
+  );
+  if (lastStatus?.agentRunStatus === "completed" || lastStatus?.agentRunStatus === "failed") return false;
+  return true;
 }
 __name(previousRetryRunNeedsDrain, "previousRetryRunNeedsDrain");
 var CoordinatorEngine = class {
@@ -3572,6 +3624,7 @@ var CoordinatorEngine = class {
     );
     blockPendingIfAttentionOverlaps(state, this.deps.config, now);
     refreshQueuedAttentionBlock(state, this.deps.config);
+    parkRetryForDisjointQueue(state, now, this.deps.config);
     recordNotificationRegistration(state, this.deps.config, result, wasFrozen, now);
     refreshQueuedAttentionBlock(state, this.deps.config);
     await this.deps.store.save(state);
@@ -3637,6 +3690,7 @@ var CoordinatorEngine = class {
       );
       blockPendingIfAttentionOverlaps(state, this.deps.config, now);
       refreshQueuedAttentionBlock(state, this.deps.config);
+      parkRetryForDisjointQueue(state, now, this.deps.config);
       recordNotificationRegistration(state, this.deps.config, result, wasFrozen, now);
       refreshQueuedAttentionBlock(state, this.deps.config);
       state.lastGraphSweepAt = now;
@@ -3703,7 +3757,8 @@ var CoordinatorEngine = class {
     const scheduledAt = nextScheduledAt(state, now, this.deps.config);
     recoverOrphanedAwaitingResult(state, this.deps.config, now);
     const staleRetryCount = recoverStaleRetryState(state, this.deps.config, now);
-    parkEmptyRecoveryForDisjointQueue(state, now, this.deps.config);
+    refreshQueuedAttentionBlock(state, this.deps.config, now);
+    parkRetryForDisjointQueue(state, now, this.deps.config);
     if (staleRetryCount !== null) {
       this.deps.logger?.warn("stale_retry_state_recovered", {
         previousRetryCount: staleRetryCount,
@@ -3932,6 +3987,60 @@ var CoordinatorEngine = class {
       };
     }
     const dueAt = state.dueAt;
+    const queuedWorkDue = state.queuedPending && state.queuedDueAt !== null && state.queuedDueAt <= now;
+    if (queuedWorkDue && previousRetryRunNeedsDrain(state) && state.lastAcceptedTrigger?.runId) {
+      const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId);
+      const failureDiagnostics = agentRunFailureDiagnostics(diagnostics);
+      recordDispatchHistory(state, now, {
+        event: "agent_run_status_checked",
+        attempt: state.dispatchAttempt,
+        retryCount: state.retryCount,
+        agentRunIdPresent: true,
+        agentRunStatus: diagnostics.status,
+        httpStatus: diagnostics.httpStatus,
+        errorType: diagnostics.errorType,
+        errorCode: diagnostics.errorCode,
+        upstreamRequestId: diagnostics.requestId,
+        failureDiagnostics,
+        waitReason: "fresh_queue_drain_check"
+      }, state.pendingTriggerScope);
+      if ((diagnostics.status === "completed" || diagnostics.status === "failed") &&
+          terminalApplyFailureNeedsHumanReconciliation(state.lastResultReport)) {
+        recordDispatchHistory(state, now, {
+          event: "batch_failed",
+          ...resultHistoryDetails(state.lastResultReport),
+          failureKind: "ambiguous"
+        }, state.pendingTriggerScope);
+        recordReconciliationNeedsAttention(state, state.pendingTriggerScope, now, state.retryCount);
+        const nextAt = this.finishCurrent(state, now);
+        await this.deps.store.save(state);
+        if (nextAt !== void 0) await this.deps.store.setAlarm(nextAt);
+        return { status: "terminal_failure", triggerId: state.lastResultReport?.triggerId, nextAt };
+      }
+      if (diagnostics.status === "completed" || diagnostics.status === "failed") {
+        if (parkRetryForDisjointQueue(state, now, this.deps.config)) {
+          const nextAt = Math.max(state.dueAt ?? now, state.cooldownUntil);
+          state.dueAt = nextAt;
+          await this.deps.store.save(state);
+          await this.deps.store.setAlarm(nextAt);
+          return { status: "fresh_work_promoted", nextAt, triggerId: state.pendingTriggerId ?? void 0 };
+        }
+      } else {
+        const nextAt = now + 15e3;
+        recordDispatchHistory(state, now, {
+          event: "active_run_wait",
+          attempt: state.dispatchAttempt,
+          retryCount: state.retryCount,
+          agentRunIdPresent: true,
+          nextAt: new Date(nextAt).toISOString(),
+          waitMs: nextAt - now,
+          waitReason: "active_agent_run"
+        }, state.pendingTriggerScope);
+        await this.deps.store.save(state);
+        await this.deps.store.setAlarm(nextAt);
+        return { status: "awaiting_result", nextAt, triggerId: state.pendingTriggerId ?? void 0 };
+      }
+    }
     if (dueAt !== null && dueAt > now) {
       await this.deps.store.save(state);
       await this.deps.store.setAlarm(dueAt);
@@ -4135,9 +4244,9 @@ var CoordinatorEngine = class {
       return { status: "stale_or_unauthorized" };
     }
     let effectiveReport = report;
-    if (report.status === "terminal_failure" && state.lastAcceptedTrigger?.runId) {
+    if (report.status !== "complete" && state.lastAcceptedTrigger?.runId) {
       const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId);
-      const runFailureDiagnostics = agentRunFailureDiagnostics(diagnostics);
+      const runFailureDiagnostics = report.status === "terminal_failure" ? agentRunFailureDiagnostics(diagnostics) : [];
       if (runFailureDiagnostics.length > 0) {
         effectiveReport = {
           ...report,
@@ -4150,6 +4259,19 @@ var CoordinatorEngine = class {
           }
         };
       }
+      recordDispatchHistory(state, now, {
+        event: "agent_run_status_checked",
+        attempt: report.attempt,
+        retryCount: state.retryCount,
+        agentRunIdPresent: true,
+        agentRunStatus: diagnostics.status,
+        httpStatus: diagnostics.httpStatus,
+        errorType: diagnostics.errorType,
+        errorCode: diagnostics.errorCode,
+        upstreamRequestId: diagnostics.requestId,
+        failureDiagnostics: runFailureDiagnostics,
+        waitReason: "callback_drain_check"
+      }, state.pendingTriggerScope);
       this.deps.logger?.info("agent_callback_run_diagnostics", {
         status: diagnostics.status,
         errorType: diagnostics.errorType ?? null,
@@ -4448,6 +4570,14 @@ var CoordinatorEngine = class {
     if (sharedRateLimitActive(state, now)) {
       return nextScheduledAt(state, now, this.deps.config);
     }
+    // Fresh, disjoint notifications take the single Agent slot before any
+    // delayed retry. A held retry remains durable and is reconsidered later.
+    if (state.queuedPending && (state.queuedDueAt === null || state.queuedDueAt <= now) &&
+        promoteQueuedDispatchSafely(state, now, this.deps.config)) {
+      const nextAt = Math.max(state.dueAt ?? now, state.cooldownUntil);
+      state.dueAt = nextAt;
+      return nextAt;
+    }
     const unavailableDueAt = state.unavailableRetryWindow?.dueAt ?? null;
     if (unavailableDueAt !== null && unavailableDueAt <= now) {
       promoteUnavailableRetryDispatchSafely(state, now, this.deps.config);
@@ -4455,7 +4585,7 @@ var CoordinatorEngine = class {
       return nextScheduledAt(state, now, this.deps.config);
     } else if (state.reconciliationHold !== null && state.reconciliationHold.dueAt <= now) {
       promoteReconciliationHold(state, now);
-    } else if (state.queuedPending) {
+    } else if (state.queuedPending && (state.queuedDueAt === null || state.queuedDueAt <= now)) {
       if (!promoteQueuedDispatchSafely(state, now, this.deps.config)) {
         return nextScheduledAt(state, now, this.deps.config);
       }
