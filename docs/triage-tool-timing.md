@@ -28,6 +28,15 @@ report from an unrelated later apply, match on ticket number alone, collapse
 retries, or fabricate a missing boundary. `outcome` describes the tool/report,
 not final ticket success. Independent readback still proves ticket effects.
 
+Intent-report outcomes preserve the bounded storage codes `conflict`,
+`capture_too_large`, `capture_capacity_reached` and `stale_or_unauthorized`,
+alongside `recorded`/`duplicate`. Unknown values remain redacted. These diagnose
+capture acceptance only, not the Agent platform's hidden review reason.
+The report receipt explicitly describes only that reporter call: it does not
+invoke apply or produce an operation ID, does not grant approval, and cannot
+establish whether any earlier apply ran. An actual missing/ambiguous apply
+result still requires the existing no-blind-replay handling.
+
 ```sql
 SELECT observed_at, producer, tool_name, stage, call_id, invocation_id,
        ticket_numbers_json, outcome, worker_outcome

@@ -44,7 +44,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-9725af84f0e82315792b9bbe8ce185a08d976a7ca486d3783e0cf51496e29760.
+d34103734338fc72c537264b63c4cdcbbf6563012baae7f3474d9d65149f24a1.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -55,6 +55,19 @@ These bracket report persistence without another Agent tool roundtrip or
 SuperOps call. Response-ready means the server is returning a response, not
 proof the Agent received it. No capture payload, note or credential is logged.
 See `../../docs/triage-tool-timing.md` for correlation and limitations.
+
+Intent-receipt correction, 27 September 2026: the five-email run recorded intent,
+then submitted another intent report and stopped without a correlated apply
+invocation. The conversation described a missing operation result, but the
+underlying review reason was not visible. The reporter now explicitly returns
+a diagnostic-only receipt, never an operation result or authorization. The
+trigger instructions distinguish the two calls and prohibit re-reporting merely
+to obtain an operation ID. This does not establish whether any earlier apply
+ran; actual missing/ambiguous results and observed denials still stop replay.
+Specific bounded capture failure codes are retained in timing diagnostics.
+No extra SuperOps call, queue reset, capture overwrite or safety override is
+introduced. Existing queue-isolation regressions retain the failed scope while
+proving that later disjoint notifications dispatch.
 
 Queue isolation, 27 September 2026: a needs-attention scope is no longer
 represented as a fake queued notification, and scope-less lifecycle recovery

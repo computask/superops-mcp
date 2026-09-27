@@ -77,3 +77,19 @@ it("bounds ticket numbers and never lets logging failure change the execution", 
   vi.mocked(console.log).mockImplementation(() => { throw new Error("logger offline"); });
   expect(() => beginTriageTiming("superops_tickets_field_options", args)("response_ready", "success")).not.toThrow();
 });
+
+it("retains bounded intent-capture failure codes without accepting arbitrary error contents", () => {
+  const event = {
+    event: "triage.tool_timing", callId: "17c7303c-1790-4472-a574-13994763493c", triggerId, attempt: 1,
+    timestamp: "2026-09-27T12:20:41.271Z", toolName: "triage_apply_intent_report", stage: "response_ready",
+    ticketNumbers: ["63009"], outcome: "recorded",
+  };
+  for (const outcome of ["recorded", "duplicate", "conflict", "capture_too_large", "capture_capacity_reached", "stale_or_unauthorized"]) {
+    const rows = timingRowsFromTail(tail([JSON.stringify({ ...event, outcome })], "support-triage-trigger"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0][11]).toBe(outcome);
+  }
+  const rows = timingRowsFromTail(tail([JSON.stringify({ ...event, outcome: "private failure content" })], "support-triage-trigger"));
+  expect(rows[0][11]).toBeNull();
+  expect(JSON.stringify(rows)).not.toContain("private failure content");
+});

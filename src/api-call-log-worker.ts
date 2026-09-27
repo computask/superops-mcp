@@ -123,7 +123,7 @@ export function timingRowsFromTail(events: readonly AuditTrace[]): Cell[][] {
         ? !TRIAGE_TIMING_TOOLS.has(e.toolName) : e.toolName !== "triage_apply_intent_report")) continue;
       if (!["received", "execution_finished", "response_ready"].includes(String(e.stage))) continue;
       const numbers = Array.isArray(e.ticketNumbers) ? [...new Set(e.ticketNumbers.map(n => id(n, 12)).filter(n => n !== null))].slice(0, 50) : [];
-      const outcome = ["success", "error", "recorded", "duplicate", "exception"].includes(String(e.outcome)) ? String(e.outcome) : null;
+      const outcome = ["success", "error", "recorded", "duplicate", "exception", "conflict", "capture_too_large", "capture_capacity_reached", "stale_or_unauthorized"].includes(String(e.outcome)) ? String(e.outcome) : null;
       const eventId = `${e.callId}:${e.stage}`;
       rows.set(eventId, [eventId, e.callId, context.triggerId, context.attempt, at, trace.scriptName,
         e.toolName, String(e.stage), token(e.invocationId), JSON.stringify(numbers),

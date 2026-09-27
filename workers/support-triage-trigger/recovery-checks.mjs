@@ -26,6 +26,10 @@ test('Agent prompt requires exact MCP correlation and a report-only pre-apply ca
   assert(prompt.includes('triage_apply_intent_report'));
   assert(prompt.includes('exact copy of the complete argument object'));
   assert(prompt.includes('not approval and does not change or bypass'));
+  assert(prompt.includes('diagnostic capture receipt, NOT an apply result'));
+  assert(prompt.includes('no actual apply has been attempted and no denial has occurred'));
+  assert(prompt.includes('capture receipt says nothing about earlier apply attempts'));
+  assert(prompt.includes('Any observed denial remains terminal'));
   assert(prompt.includes(`Trigger ID: ${triggerId}`));
 });
 
@@ -61,7 +65,18 @@ test('apply-intent MCP tool lists, forwards exact plan, and does not return the 
   const response=await handleTriageResultMcp(new Request('https://local/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'triage_apply_intent_report',arguments:{triggerId,attempt:1,applyArguments}}})}),sink);
   const body=await response.json();
   assert.deepEqual(forwarded,{triggerId,attempt:1,applyArguments});
-  assert.deepEqual(body.result.structuredContent,{status:'recorded',triggerId,attempt:1});
+  const receipt=body.result.structuredContent;
+  assert.deepEqual({status:receipt.status,triggerId:receipt.triggerId,attempt:receipt.attempt},{status:'recorded',triggerId,attempt:1});
+  assert.equal(receipt.receiptType,'diagnostic_capture_only');
+  assert.equal(receipt.intentRecorded,true);
+  assert.deepEqual(receipt.thisReporterCall,{invokedApply:false,superopsRequests:0});
+  assert.equal(receipt.approvalGranted,false);
+  assert.equal(receipt.earlierApplyState,'not_observed_by_reporter');
+  assert(receipt.guidance.includes('No operation ID is expected'));
+  assert(receipt.guidance.includes('no actual apply was attempted and no denial occurred'));
+  assert(receipt.guidance.includes('Preserve no-blind-replay'));
+  assert.equal(body.result.isError,false);
+  assert.deepEqual(JSON.parse(body.result.content[0].text),receipt);
   assert(!JSON.stringify(body).includes('private-note'));
 });
 
@@ -70,7 +85,7 @@ test('intent timing brackets storage, records failures and never logs plan conte
   t.mock.method(console,'log',value=>lines.push(JSON.parse(value)));
   const triggerId='triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632';
   const request=()=>new Request('https://local/mcp',{method:'POST',body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'triage_apply_intent_report',arguments:{triggerId,attempt:1,applyArguments:{expectedCandidateTicketNumbers:['62992'],actions:[{note:'private-note'}]}}}})});
-  for(const status of ['recorded','duplicate','stale_or_unauthorized']) {
+  for(const status of ['recorded','duplicate','conflict','capture_too_large','capture_capacity_reached','stale_or_unauthorized','unknown-private-status']) {
     lines.length=0;
     const response=await handleTriageResultMcp(request(),{reportApplyIntent:async()=>{
       assert.deepEqual(lines.map(e=>e.stage),['received']);
@@ -78,10 +93,18 @@ test('intent timing brackets storage, records failures and never logs plan conte
     }});
     assert.deepEqual(lines.map(e=>e.stage),['received','response_ready']);
     assert.equal(lines[0].callId,lines[1].callId);
-    assert.equal(lines[1].outcome,status==='stale_or_unauthorized'?'error':status);
+    assert.equal(lines[1].outcome,status==='unknown-private-status'?'error':status);
     assert(Date.parse(lines[1].timestamp)>=Date.parse(lines[0].timestamp));
     assert(!JSON.stringify(lines).includes('private-note'));
-    assert.equal((await response.json()).result.isError,status==='stale_or_unauthorized');
+    const result=(await response.json()).result;
+    const accepted=['recorded','duplicate'].includes(status);
+    assert.equal(result.isError,!accepted);
+    assert.equal(result.structuredContent.intentRecorded,accepted);
+    assert.equal(result.structuredContent.approvalGranted,false);
+    assert.equal(result.structuredContent.earlierApplyState,'not_observed_by_reporter');
+    assert.deepEqual(result.structuredContent.thisReporterCall,{invokedApply:false,superopsRequests:0});
+    if(!accepted) assert(result.structuredContent.guidance.includes('Do not call apply'));
+    assert(!JSON.stringify(lines).includes('unknown-private-status'));
   }
   lines.length=0;
   await assert.rejects(()=>handleTriageResultMcp(request(),{reportApplyIntent:async()=>{throw Error('private failure');}}));

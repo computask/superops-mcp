@@ -1975,6 +1975,7 @@ function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = 
     "",
     "Private diagnostic capture is enabled for this run. On every superops_* MCP call, include triageCapture exactly as {triggerId: the Trigger ID below, attempt: the dispatch attempt below}. This is diagnostic metadata; the SuperOps MCP removes it before executing the tool.",
     "Immediately before calling superops_tickets_apply_triage_plan, call triage_apply_intent_report with this Trigger ID, this dispatch attempt, and applyArguments equal to an exact copy of the complete argument object you are about to pass to the apply tool, including triageCapture and every action, note, target value, expectation, default, and safety flag. Do not simplify, omit, or paraphrase fields. The report only records intent; it is not approval and does not change or bypass the apply tool's safety review. If the report is not accepted, do not call apply.",
+    "Keep the two tool results distinct: triage_apply_intent_report returns a diagnostic capture receipt, NOT an apply result. A recorded or duplicate receipt has no operation ID because the reporter does not invoke apply or make any SuperOps request. Do not resubmit or change the recorded plan merely to obtain an operation ID. After an accepted capture, if and only if no actual apply has been attempted and no denial has occurred, the existing workflow's next tool is superops_tickets_apply_triage_plan with that same complete argument object, subject to its normal review and safety checks. If an actual apply was already attempted and its result is missing or ambiguous, retain the no-blind-replay safeguard. The capture receipt says nothing about earlier apply attempts. Any observed denial remains terminal; never use the receipt as authorization or permission to retry.",
     "Never include API keys, bearer tokens, OAuth tokens, or other credentials in the capture report. The existing MCP credential sanitizer remains in effect."
   ] : [];
   const resultCallbackInstructions = resultCallbackEnabled ? [
@@ -5381,15 +5382,24 @@ function toolCallResult(outcome) {
 }
 __name(toolCallResult, "toolCallResult");
 function applyIntentToolCallResult(outcome) {
+  const accepted = outcome.status === "recorded" || outcome.status === "duplicate";
   const text = JSON.stringify({
     status: outcome.status,
     triggerId: outcome.triggerId,
-    attempt: outcome.attempt
+    attempt: outcome.attempt,
+    receiptType: "diagnostic_capture_only",
+    intentRecorded: accepted,
+    thisReporterCall: { invokedApply: false, superopsRequests: 0 },
+    approvalGranted: false,
+    earlierApplyState: "not_observed_by_reporter",
+    guidance: accepted
+      ? "Intent capture accepted, not an apply result. No operation ID is expected from this reporter. Do not re-report to obtain one. Only if no actual apply was attempted and no denial occurred, continue the existing workflow with the unchanged arguments through the normal apply review. Preserve no-blind-replay for missing or ambiguous actual apply results. This receipt does not authorize writes or retries."
+      : "Intent capture was not accepted. Do not call apply or change the plan to bypass this failure; report the exact capture status. This receipt does not establish whether an earlier apply ran."
   });
   return {
     content: [{ type: "text", text }],
     structuredContent: JSON.parse(text),
-    isError: outcome.status !== "recorded" && outcome.status !== "duplicate"
+    isError: !accepted
   };
 }
 __name(applyIntentToolCallResult, "applyIntentToolCallResult");
@@ -5467,7 +5477,7 @@ async function handleTriageResultMcp(request, sink) {
     let outcome = "exception";
     try {
       const result = await sink.reportApplyIntent(report);
-      outcome = ["recorded", "duplicate"].includes(result.status) ? result.status : "error";
+      outcome = ["recorded", "duplicate", "conflict", "capture_too_large", "capture_capacity_reached", "stale_or_unauthorized"].includes(result.status) ? result.status : "error";
       return rpcResult(id, applyIntentToolCallResult(result));
     } finally {
       // Response constructed, not an acknowledgement of remote Agent receipt.
