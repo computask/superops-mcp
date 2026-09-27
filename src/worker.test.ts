@@ -671,6 +671,38 @@ describe("Cloudflare Worker entrypoint", () => {
     });
   });
 
+  it("captures live MCP dispatcher exchanges and restricts raw GraphQL retrieval to Sam", async () => {
+    const namespace = createOperationLedgerNamespace();
+    const env = chatGptEnv({SUPEROPS_OPERATION_LEDGER: namespace, SUPEROPS_GRAPHQL_CAPTURE_ENABLED: "true",
+      DISPATCHER_TOKEN: "synthetic-producer-secret", SUPEROPS_SUBDOMAIN: "synthetic-tenant"});
+    const before = globalThis.fetch;
+    const dispatcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input).startsWith("https://superops-api-dispatcher.taskgroup.co.uk/")) {
+        return Response.json({data: {getClientList: {clients: [], listInfo: {page: 1, pageSize: 100, hasMore: false, totalCount: 0}}}});
+      }
+      return before(input, init);
+    });
+    try {
+      const result = await mcp({jsonrpc: "2.0", id: 43, method: "tools/call", params: {name: "superops_clients_list", arguments: {}}}, env);
+      expect(result.status).toBe(200);
+      await result.text();
+      const adminUrl = `https://${DIRECT_HOST}/admin/graphql-captures?date=${new Date().toISOString().slice(0, 10)}`;
+      expect((await worker.fetch(new Request(adminUrl), env)).status).toBe(403);
+      expect((await worker.fetch(new Request(adminUrl, {headers: {"CF-Access-Jwt-Assertion": await cloudflareAccessJwt(ADDITIONAL_ALLOWED_EMAIL)}}), env)).status).toBe(403);
+      const headers = {"CF-Access-Jwt-Assertion": await cloudflareAccessJwt(ALLOWED_EMAIL)};
+      const list = await worker.fetch(new Request(adminUrl, {headers}), env);
+      expect(list.status).toBe(200);
+      expect(list.headers.get("Cache-Control")).toBe("no-store, private");
+      const index = await list.json() as {records: Array<{captureId: string}>};
+      expect(index.records).toHaveLength(1);
+      const raw = await worker.fetch(new Request(`${adminUrl}&captureId=${index.records[0].captureId}`, {headers}), env);
+      const data = await raw.json() as {exchanges: Array<{request: {body: {text: string}}}>};
+      expect(data.exchanges[0].request.body.text).toContain("getClientList");
+      expect(JSON.stringify(data)).not.toContain("synthetic-producer-secret");
+      expect(JSON.stringify(data)).not.toContain("synthetic-tenant");
+    } finally { dispatcher.mockRestore(); }
+  });
+
   it("requires an allowed Cloudflare Access identity for the rate-limit probe operator route", async () => {
     const res = await worker.fetch(
       new Request(`https://${DIRECT_HOST}/internal/rate-limit-probe`),

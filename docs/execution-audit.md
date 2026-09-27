@@ -1,5 +1,16 @@
 # SuperOps MCP Execution Safety Verification
 
+## Private GraphQL exchange capture — 27 September 2026
+
+The authorized [private capture](graphql-private-capture.md) observes the existing
+dispatcher transport without additional upstream requests or changed mutation
+semantics. One reserved internal binding request stores a bounded invocation
+batch in separate daily objects, not operation records or ordinary logs. Exact
+queries, variables and returned bodies (including all returned GraphQL errors)
+are credential-redacted, Sam-only and expire after seven days. Polls preserve
+receipt IDs for correlation with the dispatcher's private upstream attempt
+store. Missing upstream error text is not inferred from a safe receipt.
+
 ## Agent/report/apply boundary timing — 27 September 2026
 
 Content-free `triage.tool_timing` events now bracket the existing pre-apply

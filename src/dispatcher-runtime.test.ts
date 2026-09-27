@@ -14,11 +14,16 @@ describe("dispatcher in workerd", () => {
   it("submits and rejects redirects safely in the production runtime", async () => {
     const bundle = await build({
       stdin: {contents: `import {dispatcherFetch} from './src/dispatcher.ts';
+        import {runWithGraphqlCapture} from './src/graphql-capture.ts';
         export default {async fetch(request) {
+          let capture;
+          const result = await runWithGraphqlCapture({secrets:['synthetic'], persist:async value => {capture=value}}, async () => {
           try {
             const response = await dispatcherFetch('{}', {env:{DISPATCHER_TOKEN:'synthetic'}, idempotencyKey:'runtime-test'});
-            return Response.json({status:response.status, result:await response.json()});
-          } catch(error) {return Response.json({state:error.state, message:error.message})}
+            return {status:response.status, result:await response.json()};
+          } catch(error) {return {state:error.state, message:error.message}}
+          });
+          return Response.json({...result, capture});
         }};`, resolveDir: process.cwd(), loader:"ts"},
       bundle:true, write:false, format:"esm", platform:"neutral", external:["node:*", "cloudflare:workers"],
     });
@@ -34,7 +39,8 @@ describe("dispatcher in workerd", () => {
       },
     });
     try {
-      expect(await (await mf.dispatchFetch("http://localhost")).json()).toEqual({status:200,result:{data:{ok:true}}});
+      const success = await (await mf.dispatchFetch("http://localhost")).json();
+      expect(success).toMatchObject({status:200,result:{data:{ok:true}}, capture:{complete:true, exchanges:[{request:{headers:{authorization:"[REDACTED]"}},response:{status:200}}]}});
       redirect = true;
       expect(await (await mf.dispatchFetch("http://localhost")).json()).toMatchObject({state:"redirect_rejected"});
       expect(calls).toEqual(Array(2).fill("https://superops-api-dispatcher.taskgroup.co.uk/graphql"));

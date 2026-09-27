@@ -63,6 +63,7 @@ import { getScriptCatalogueStore, runWithScriptCatalogueStore, SuperOpsScriptCat
 import { syncScriptCatalogue } from "./script-catalogue-sync.js";
 import { createRateLimitProbeAdapter, SuperOpsRateLimitProbe } from "./rate-limit-probe.js";
 import type { TriageAgentMcpCapture } from "./triage-agent-capture.js";
+import { GRAPHQL_CAPTURE_VERSION, runWithGraphqlCapture } from "./graphql-capture.js";
 export {
   SuperOpsOperationLedger,
   SuperOpsContinuationWorkflow,
@@ -72,6 +73,7 @@ export {
 
 export interface Env {
   DISPATCHER_TOKEN?: string;
+  SUPEROPS_GRAPHQL_CAPTURE_ENABLED?: string;
   CF_ACCESS_CLIENT_ID?: string;
   CF_ACCESS_CLIENT_SECRET?: string;
   SUPEROPS_API_TOKEN?: string;
@@ -708,6 +710,27 @@ function triageCaptureNamespace(env: Env): TriageAgentCaptureNamespace | undefin
     : undefined;
 }
 
+function captureGraphql<T>(env: Env, ctx: {waitUntil(work: Promise<unknown>): void} | undefined, fn: () => Promise<T>): Promise<T> {
+  if (env.SUPEROPS_GRAPHQL_CAPTURE_ENABLED !== "true") return fn();
+  return runWithGraphqlCapture({
+    secrets: [env.DISPATCHER_TOKEN, env.CF_ACCESS_CLIENT_ID, env.CF_ACCESS_CLIENT_SECRET,
+      env.SUPEROPS_API_TOKEN, env.SUPEROPS_SUBDOMAIN, env.SUPEROPS_INTERNAL_CONTINUATION_TOKEN,
+      env.SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY, env.SUPEROPS_SCRIPT_CATALOGUE_ADMIN_TOKEN]
+      .filter((value): value is string => Boolean(value)),
+    waitUntil: ctx ? work => ctx.waitUntil(work) : undefined,
+    persist: async capture => {
+      const namespace = triageCaptureNamespace(env);
+      if (!namespace) throw new Error("graphql_capture_binding_unavailable");
+      const stub = namespace.get(namespace.idFromName(`graphql-capture:${capture.startedAt.slice(0, 10)}`));
+      const response = await stub.fetch(new Request("https://operation.local/graphql-captures", {
+        method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(capture),
+      }));
+      if (!response.ok) throw new Error(`capture_store_http_${response.status}`);
+      await response.body?.cancel();
+    },
+  }, fn);
+}
+
 async function triageCaptureObjectFetch(
   env: Env,
   triggerId: string,
@@ -1141,8 +1164,41 @@ async function handleBaseWorkerFetch(
       status: "ok",
       transport: "http",
       authMode: env.AUTH_MODE === "gateway" ? "gateway" : "env",
+      graphqlCapture: {enabled: env.SUPEROPS_GRAPHQL_CAPTURE_ENABLED === "true", version: GRAPHQL_CAPTURE_VERSION, retentionDays: 7},
       timestamp: new Date().toISOString(),
     });
+  }
+
+  if (url.pathname === "/admin/graphql-captures") {
+    const privateHeaders = {"Cache-Control": "no-store, private"};
+    if (request.method !== "GET") return json({error: "Method not allowed"}, 405, {...privateHeaders, Allow: "GET"});
+    const access = await requireAllowedAccessUser(request, env, new Set([TRIAGE_CAPTURE_ADMIN_EMAIL]));
+    if (access instanceof Response) {
+      const headers = new Headers(access.headers);
+      headers.set("Cache-Control", "no-store, private");
+      return new Response(access.body, {status: access.status, headers});
+    }
+    const date = url.searchParams.get("date") ?? "";
+    const allowed = new Set(["date", "captureId", "invocationId", "offset"]);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date ||
+        [...url.searchParams.keys()].some(key => !allowed.has(key) || url.searchParams.getAll(key).length !== 1)) {
+      return json({error: "Invalid or repeated query parameter"}, 400, privateHeaders);
+    }
+    const namespace = triageCaptureNamespace(env);
+    if (!namespace) return json({error: "GraphQL capture storage unavailable"}, 503, privateHeaders);
+    // Do not instantiate arbitrary historical/future daily objects on admin reads.
+    if (Date.parse(date) > Date.now() || Date.parse(date) + 8 * 86400_000 <= Date.now()) {
+      return json({error: "Date outside capture retention window"}, 404, privateHeaders);
+    }
+    try {
+      const query = new URLSearchParams(url.searchParams);
+      query.delete("date");
+      const stored = await namespace.get(namespace.idFromName(`graphql-capture:${date}`))
+        .fetch(new Request(`https://operation.local/graphql-captures?${query}`));
+      const headers = new Headers(stored.headers);
+      headers.set("Cache-Control", "no-store, private");
+      return new Response(stored.body, {status: stored.status, headers});
+    } catch { return json({error: "GraphQL capture storage unavailable"}, 503, privateHeaders); }
   }
 
   if (url.pathname === "/admin/triage-agent-captures") {
@@ -1351,16 +1407,18 @@ export default {
     env: Env,
     ctx?: WorkerExecutionContext
   ): Promise<Response> {
-    const url = new URL(request.url);
-    if (isChatGptDirectRequest(url, env)) {
-      return getChatGptOAuthProvider(env).fetch(
-        request,
-        env,
-        ensureExecutionContext(ctx) as never
-      );
-    }
+    return captureGraphql(env, ctx, async () => {
+      const url = new URL(request.url);
+      if (isChatGptDirectRequest(url, env)) {
+        return getChatGptOAuthProvider(env).fetch(
+          request,
+          env,
+          ensureExecutionContext(ctx) as never
+        );
+      }
 
-    return handleBaseWorkerFetch(request, env, ctx?.props, false, undefined, ctx);
+      return handleBaseWorkerFetch(request, env, ctx?.props, false, undefined, ctx);
+    });
   },
   scheduled(
     _controller: unknown,
@@ -1374,7 +1432,7 @@ export default {
       subdomain: env.SUPEROPS_SUBDOMAIN,
       region: env.SUPEROPS_REGION === "eu" ? "eu" : "us",
     };
-    const work = (async () => {
+    const work = captureGraphql(env, ctx, async () => {
       const tenantKey = await envTenantOwnerHash({
         subdomain: credentials.subdomain,
         region: credentials.region,
@@ -1398,7 +1456,7 @@ export default {
           )
         )
       );
-    })().catch((error) => {
+    }).catch((error) => {
       console.error("SuperOps script catalogue nightly sync failed:", safeCatalogueSyncError(error));
     });
     ctx.waitUntil(work);

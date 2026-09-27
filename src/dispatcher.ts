@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { capturedDispatcherFetch } from "./graphql-capture.js";
 import { getExecutionConfig, hasExecutionBudgetFor, recordSubrequestFinish, recordTypedSubrequestStart, withExecutionItem } from "./execution.js";
 import { fetchSafeDispatcherDiagnostics, type DispatcherDiagnosticResult, type DispatcherDiagnosticRetrieval, type SafeDispatcherDiagnostics } from "./dispatcher-diagnostics.js";
 
@@ -147,7 +148,7 @@ export async function dispatcherFetch(body: string, options: {
     let response: Response | undefined;
     let value: Record<string, unknown>;
     try {
-      response = await fetch(url, {method: polling ? "GET" : "POST", headers,
+      response = await capturedDispatcherFetch(url, {method: polling ? "GET" : "POST", headers,
         // workerd supports manual/follow, not Node's redirect:"error".
         // Never follow redirects with producer or Access credentials attached.
         body: polling ? undefined : body, redirect: "manual",

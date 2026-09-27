@@ -10,6 +10,7 @@ import {
 } from "./execution.js";
 import { canonicalizeNoteText } from "./utils/note-canonicalization.js";
 import type { TriageAgentMcpCapture } from "./triage-agent-capture.js";
+import { GraphqlCaptureStore } from "./graphql-capture-store.js";
 
 export type OperationState =
   | "Running"
@@ -3270,7 +3271,10 @@ function isTriageAgentMcpCapture(value: unknown): value is TriageAgentMcpCapture
 }
 
 export class SuperOpsOperationLedger {
-  constructor(private readonly state: DurableObjectState, private readonly env: DurableContinuationEnv = {}) {}
+  private readonly graphqlCaptures: GraphqlCaptureStore;
+  constructor(private readonly state: DurableObjectState, private readonly env: DurableContinuationEnv = {}) {
+    this.graphqlCaptures = new GraphqlCaptureStore(state.storage);
+  }
 
   private workflowUnavailableReason(): string | undefined {
     if (this.env.SUPEROPS_CONTINUATION_ENABLED !== "true") {
@@ -3704,12 +3708,17 @@ export class SuperOpsOperationLedger {
     if (triageCaptureExpiry !== undefined) {
       nextAlarmAt = nextAlarmAt === undefined ? triageCaptureExpiry : Math.min(nextAlarmAt, triageCaptureExpiry);
     }
+    const graphqlCaptureExpiry = await this.graphqlCaptures.prune(Date.parse(now));
+    if (graphqlCaptureExpiry !== undefined) {
+      nextAlarmAt = Math.min(nextAlarmAt ?? graphqlCaptureExpiry, graphqlCaptureExpiry);
+    }
     if (nextAlarmAt !== undefined && typeof this.state.storage.setAlarm === "function") {
       await this.state.storage.setAlarm(nextAlarmAt);
     }
   }
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/graphql-captures") return this.graphqlCaptures.fetch(request);
     const pathParts = url.pathname.split("/").filter(Boolean);
     const approvedPrivateNoteMatch = pathParts.length === 4 &&
       pathParts[0] === "operations" && pathParts[2] === "approved-private-note"

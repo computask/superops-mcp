@@ -588,6 +588,12 @@ stale-data, note-deduplication, mutation and verification helpers as the synchro
 path. Automatic fresh-invocation scheduling is disabled by default and requires both continuation flags, the internal service binding/token, and the Workflow binding for long waits. Long Retry-After values use a durable Workflow sleep with compact identity only; Durable Object alarms are retention cleanup only. The resumed adapter must reclaim the item, re-read it, and revalidate identity/`updatedTime`. Update, resolution, and note lifecycles persist `WriteStarted`, `ResolutionWriteStarted`, or `NoteWriteStarted` before mutation and persist `FieldsUpdated`, `ResolutionWriteSucceeded`/`ResolutionVerified`, or `NoteAdded` immediately after reliable success. A created note ID is retained in the public operation record. Approved private-note body content needed for durable recovery is persisted only as encrypted AES-GCM recovery content keyed by SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY; plaintext note bodies are excluded from operation status, compact results, diagnostics, logs, audit data, and errors. Ambiguity is verified rather than blindly retried. Use `superops_operations_get` to inspect the authoritative compact result. The audit record is high-risk write metadata only: batch ID,
 candidate count, ticket numbers, action types, dry-run/verify flags, and fallback
 allowance. It does not audit raw ticket content or full note bodies.
+
+The [private GraphQL capture](docs/graphql-private-capture.md) records full
+credential-redacted dispatcher requests/responses and receipt polls for seven
+days, with Sam-only retrieval and explicit storage limits. It is separate from
+ordinary content-free logs and adds no SuperOps calls.
+
 Separately, the authorized triage diagnostic capture retains the exact Agent
 request body, correlated SuperOps MCP tool arguments/results, and pre-apply plan
 for seven days in protected stores. It is not part of the normal audit or

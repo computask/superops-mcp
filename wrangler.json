@@ -28,6 +28,7 @@
     }
   ],
   "vars": {
+    "SUPEROPS_GRAPHQL_CAPTURE_ENABLED": "true",
     "AUTH_MODE": "env",
     "SUPEROPS_REGION": "us",
     "LOG_LEVEL": "warn",

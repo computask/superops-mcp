@@ -14,6 +14,7 @@
 - Historical ticket reporting is createdTime-based and implemented in `src/domains/ticket-reporting.ts`; it uses sequential bounded pagination and local post-filtering for most dimensions.
 - Never put SuperOps tokens, OAuth tokens, Cloudflare Access secrets, customer message bodies, full ticket descriptions, note bodies, attachment bodies, or sensitive headers in docs, tests, logs, or committed fixtures.
 - Explicit Workspace Agent diagnostic-capture exception: the approved triage capture feature may persist the exact trigger request body, correlated SuperOps MCP tool arguments/results, and pre-apply argument object in dedicated private durable stores for exactly seven days. These captures are not routine logs, operation records, or dispatch history; keep reads behind the designated admin authentication, exclude credentials, enforce size/retention bounds, and test expiry. This exception does not authorize copying real customer data into source fixtures, logs, or docs.
+- The authorized GraphQL diagnostic extension also captures credential-redacted MCP-to-dispatcher requests and responses (including polls and errors) in separate private daily Durable Objects for seven days. No raw content enters routine logs or operation records. Preserve the capture size/daily caps, explicit gaps, Sam-only Access retrieval, and fail-open behavior; no extra SuperOps requests, direct-call fallback, or write replay may be introduced by diagnostics.
 
 ## Important Files And Architecture
 

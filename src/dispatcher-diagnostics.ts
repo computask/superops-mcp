@@ -1,3 +1,4 @@
+import { capturedDispatcherFetch } from "./graphql-capture.js";
 import {
   getExecutionConfig,
   hasExecutionBudgetFor,
@@ -183,7 +184,7 @@ export async function fetchSafeDispatcherDiagnostics(
   let response: Response | undefined;
   let body: unknown;
   try {
-    response = await fetch(url, {
+    response = await capturedDispatcherFetch(url, {
       method: "GET", headers, redirect: "manual",
       signal: AbortSignal.timeout(getExecutionConfig().requestTimeoutMs),
     });
