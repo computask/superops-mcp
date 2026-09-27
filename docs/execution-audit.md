@@ -1,5 +1,15 @@
 # SuperOps MCP Execution Safety Verification
 
+## Agent/report/apply boundary timing — 27 September 2026
+
+Content-free `triage.tool_timing` events now bracket the existing pre-apply
+report and correlated MCP handlers. The private Tail Worker projects them into
+`triage_tool_timing` with run/attempt/call IDs and bounded ticket numbers.
+MCP response-ready is recorded after private capture settles; the older
+execution-finished event precedes that capture. Neither proves Agent receipt.
+This adds no SuperOps requests or Agent round trips and does not change any
+mutation safeguards. See [timing semantics and SQL](triage-tool-timing.md).
+
 ## Overlapping email windows — 24 September 2026
 
 Ticket 62890's updateTicket receipt `2f62fd34-3b2c-42f8-b4d3-f822e28710cd`,

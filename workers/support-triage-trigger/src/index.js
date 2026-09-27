@@ -5394,6 +5394,7 @@ function applyIntentToolCallResult(outcome) {
 }
 __name(applyIntentToolCallResult, "applyIntentToolCallResult");
 async function handleTriageResultMcp(request, sink) {
+  const receivedAt = new Date().toISOString();
   if (request.method !== "POST") {
     return new Response("Method Not Allowed", {
       status: 405,
@@ -5448,7 +5449,30 @@ async function handleTriageResultMcp(request, sink) {
         isError: true
       });
     }
-    return rpcResult(id, applyIntentToolCallResult(await sink.reportApplyIntent(report)));
+    const callId = crypto.randomUUID();
+    const numbers = Array.isArray(report.applyArguments.expectedCandidateTicketNumbers)
+      ? report.applyArguments.expectedCandidateTicketNumbers.filter(n => typeof n === "string" && /^\d{1,12}$/.test(n)) : [];
+    const mark = (stage, outcome = null) => {
+      try {
+        console.log(JSON.stringify({
+          event: "triage.tool_timing", callId, triggerId: report.triggerId, attempt: report.attempt,
+          toolName: APPLY_INTENT_TOOL_NAME, stage,
+          timestamp: stage === "received" ? receivedAt : new Date().toISOString(),
+          ticketNumbers: [...new Set(numbers)].slice(0, 50), ticketNumbersTruncated: numbers.length > 50,
+          outcome
+        }));
+      } catch { /* Diagnostics cannot change report acceptance or authorize an apply. */ }
+    };
+    mark("received");
+    let outcome = "exception";
+    try {
+      const result = await sink.reportApplyIntent(report);
+      outcome = ["recorded", "duplicate"].includes(result.status) ? result.status : "error";
+      return rpcResult(id, applyIntentToolCallResult(result));
+    } finally {
+      // Response constructed, not an acknowledgement of remote Agent receipt.
+      mark("response_ready", outcome);
+    }
   }
   return rpcError(id, -32601, "Tool not found");
 }

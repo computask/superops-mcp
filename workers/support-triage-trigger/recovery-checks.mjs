@@ -65,6 +65,31 @@ test('apply-intent MCP tool lists, forwards exact plan, and does not return the 
   assert(!JSON.stringify(body).includes('private-note'));
 });
 
+test('intent timing brackets storage, records failures and never logs plan contents',async(t)=>{
+  const lines=[];
+  t.mock.method(console,'log',value=>lines.push(JSON.parse(value)));
+  const triggerId='triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632';
+  const request=()=>new Request('https://local/mcp',{method:'POST',body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'triage_apply_intent_report',arguments:{triggerId,attempt:1,applyArguments:{expectedCandidateTicketNumbers:['62992'],actions:[{note:'private-note'}]}}}})});
+  for(const status of ['recorded','duplicate','stale_or_unauthorized']) {
+    lines.length=0;
+    const response=await handleTriageResultMcp(request(),{reportApplyIntent:async()=>{
+      assert.deepEqual(lines.map(e=>e.stage),['received']);
+      return {status,triggerId,attempt:1};
+    }});
+    assert.deepEqual(lines.map(e=>e.stage),['received','response_ready']);
+    assert.equal(lines[0].callId,lines[1].callId);
+    assert.equal(lines[1].outcome,status==='stale_or_unauthorized'?'error':status);
+    assert(Date.parse(lines[1].timestamp)>=Date.parse(lines[0].timestamp));
+    assert(!JSON.stringify(lines).includes('private-note'));
+    assert.equal((await response.json()).result.isError,status==='stale_or_unauthorized');
+  }
+  lines.length=0;
+  await assert.rejects(()=>handleTriageResultMcp(request(),{reportApplyIntent:async()=>{throw Error('private failure');}}));
+  assert.deepEqual(lines.map(e=>e.stage),['received','response_ready']);
+  assert.equal(lines[1].outcome,'exception');
+  assert(!JSON.stringify(lines).includes('private failure'));
+});
+
 test('trigger client captures the exact outgoing JSON body before sending without authorization',async()=>{
   const triggerId='triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632';
   const captures=[];

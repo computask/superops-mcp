@@ -7,7 +7,7 @@ const require=createRequire(import.meta.url);
 const wranglerRequire=createRequire(require.resolve('wrangler/package.json'));
 const {Miniflare}=wranglerRequire('miniflare');
 const code=readFileSync(new URL('./src/index.js',import.meta.url));
-assert.equal(createHash('sha256').update(code).digest('hex'),'4df8ea931b59b293a2e730d41355f8d30bcdd8792be8fc1433ef4418783baf1d','Reviewed production module must match the provenance record');
+assert.equal(createHash('sha256').update(code).digest('hex'),'9725af84f0e82315792b9bbe8ce185a08d976a7ca486d3783e0cf51496e29760','Reviewed production module must match the provenance record');
 const config=JSON.parse(readFileSync(new URL('./wrangler.jsonc',import.meta.url),'utf8'));
 assert.equal(config.name,'support-triage-trigger');
 assert.equal(config.no_bundle,true);

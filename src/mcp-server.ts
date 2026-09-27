@@ -36,11 +36,13 @@ import {
 import {
   executionDiagnostics,
   getExecutionConfig,
+  getExecutionState,
   finishExecution,
   logExecutionDiagnostics,
   runWithExecutionContext,
 } from "./execution.js";
 import { boundedToolResult } from "./utils/tool-result.js";
+import { beginTriageTiming } from "./triage-timing.js";
 import { publishToolDefinition } from "./tool-catalogue.js";
 import {
   parseTriageAgentCaptureContext,
@@ -1038,6 +1040,8 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
 
     return runWithExecutionContext(name, async () => {
       const started = Date.now();
+      const timing = beginTriageTiming(name, rawArgs, getExecutionState()?.invocationId);
+      let timingOutcome: "success" | "error" = "error";
       let metadata = toolAuditMetadata(name, args);
 
       const captureResult = async (output: ToolResult): Promise<void> => {
@@ -1083,9 +1087,12 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
         });
         logExecutionDiagnostics(!result.isError, errorSummary);
         const finalResult = appendTriageExecutionTelemetry(name, result) as ToolResult;
+        timingOutcome = result.isError ? "error" : "success";
+        timing("execution_finished", timingOutcome);
         await captureResult(finalResult);
         return finalResult as never;
       } catch (error) {
+        timingOutcome = "error";
         const result = errorResult(sanitizeError(error));
         const errorSummary = errorSummaryFromResult(result);
         finishExecution("unhandledError");
@@ -1098,8 +1105,13 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
         });
         logExecutionDiagnostics(false, errorSummary);
         const finalResult = appendTriageExecutionTelemetry(name, result) as ToolResult;
+        timing("execution_finished", "error");
         await captureResult(finalResult);
         return finalResult as never;
+      } finally {
+        // After the awaited private capture, immediately before the handler returns.
+        // This is not proof that the remote Agent has received the response.
+        timing("response_ready", timingOutcome);
       }
     });
   });

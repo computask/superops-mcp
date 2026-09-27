@@ -2,12 +2,13 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { INSERT_API_CALL, rowsFromTail, INSERT_TRIAGE_INVOCATION, invocationRowsFromTail } from '../dist/api-call-log-worker.js';
+import { INSERT_API_CALL, rowsFromTail, INSERT_TRIAGE_INVOCATION, invocationRowsFromTail, INSERT_TRIAGE_TIMING, timingRowsFromTail } from '../dist/api-call-log-worker.js';
 
 function database() {
   const db = new DatabaseSync(':memory:');
   db.exec(readFileSync(new URL('../migrations/api-call-log/0001_api_attempts.sql', import.meta.url), 'utf8'));
   db.exec(readFileSync(new URL('../migrations/api-call-log/0002_dispatcher_correlation.sql', import.meta.url), 'utf8'));
+  db.exec(readFileSync(new URL('../migrations/api-call-log/0003_triage_tool_timing.sql', import.meta.url), 'utf8'));
   return db;
 }
 function record(n, overrides = {}) {
@@ -82,5 +83,22 @@ test('bounded retention removes expired diagnostics and leaves recent attempts',
   const db = database(); insert(db, record(1, { startedAt: '2026-08-01T10:00:00.000Z' })); insert(db, record(2));
   db.prepare('DELETE FROM superops_api_calls WHERE call_id IN (SELECT call_id FROM superops_api_calls WHERE started_at < ? ORDER BY started_at LIMIT 10000)').run('2026-08-19T00:00:00.000Z');
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM superops_api_calls').get().n, 1);
+  db.close();
+});
+
+test('timing rows correlate report and apply, preserve incomplete starts, dedupe and expire',()=>{
+  const db=database();
+  const base={event:'triage.tool_timing',triggerId:'triage-1-00000000-0000-4000-8000-000000000001',attempt:1,ticketNumbers:['63007','customer-body'],secret:'never-store'};
+  const events=[
+    {scriptName:'support-triage-trigger',outcome:'ok',logs:[{message:[JSON.stringify({...base,callId:'00000000-0000-4000-8000-000000000001',toolName:'triage_apply_intent_report',stage:'response_ready',timestamp:'2026-09-27T08:00:00.100Z',outcome:'recorded'})]}]},
+    {scriptName:'superops-mcp',outcome:'exception',logs:[{message:[JSON.stringify({...base,callId:'00000000-0000-4000-8000-000000000002',toolName:'superops_tickets_apply_triage_plan',stage:'received',timestamp:'2026-09-27T08:00:03.100Z'})]}]},
+  ];
+  for(const row of timingRowsFromTail([...events,...events])) {db.prepare(INSERT_TRIAGE_TIMING).run(...row);db.prepare(INSERT_TRIAGE_TIMING).run(...row);}
+  const rows=db.prepare('SELECT * FROM triage_tool_timing ORDER BY observed_at').all();
+  assert.equal(rows.length,2);assert.equal(rows[1].stage,'received');assert.equal(rows[1].outcome,null);
+  assert.equal(Date.parse(rows[1].observed_at)-Date.parse(rows[0].observed_at),3000);
+  assert(!JSON.stringify(rows).includes('never-store'));assert(!JSON.stringify(rows).includes('customer-body'));
+  db.prepare('DELETE FROM triage_tool_timing WHERE event_id IN (SELECT event_id FROM triage_tool_timing WHERE observed_at < ? ORDER BY observed_at LIMIT 10000)').run('2026-09-27T08:00:01.000Z');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM triage_tool_timing').get().n,1);
   db.close();
 });

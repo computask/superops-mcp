@@ -44,10 +44,17 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-4df8ea931b59b293a2e730d41355f8d30bcdd8792be8fc1433ef4418783baf1d.
+9725af84f0e82315792b9bbe8ce185a08d976a7ca486d3783e0cf51496e29760.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
+
+Timing instrumentation, 27 September 2026: the existing pre-apply report emits
+content-free `received` and `response_ready` markers to the private Tail Worker.
+These bracket report persistence without another Agent tool roundtrip or
+SuperOps call. Response-ready means the server is returning a response, not
+proof the Agent received it. No capture payload, note or credential is logged.
+See `../../docs/triage-tool-timing.md` for correlation and limitations.
 
 Queue isolation, 27 September 2026: a needs-attention scope is no longer
 represented as a fake queued notification, and scope-less lifecycle recovery

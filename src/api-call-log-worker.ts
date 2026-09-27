@@ -1,4 +1,6 @@
 // Pure metadata projection shared by the private Tail Worker and offline tests.
+import { TRIAGE_TIMING_TOOLS } from "./triage-timing.js";
+import { parseTriageAgentCaptureContext } from "./triage-agent-capture.js";
 const COLUMNS = [
   "call_id", "started_at", "completed_at", "duration_ms", "tenant", "endpoint_host", "endpoint_path",
   "ticket_number", "ticket_id", "item_key", "request_id", "invocation_id", "execution_trace_id",
@@ -104,6 +106,35 @@ export function invocationRowsFromTail(events: readonly AuditTrace[]): Cell[][] 
 }
 export async function persistInvocations<Statement>(db: AuditDatabase<Statement>, rows: Cell[][]): Promise<void> {
   return persistCells(db, INSERT_TRIAGE_INVOCATION, rows);
+}
+export const INSERT_TRIAGE_TIMING = "INSERT OR IGNORE INTO triage_tool_timing (event_id,call_id,trigger_id,attempt,observed_at,producer,tool_name,stage,invocation_id,ticket_numbers_json,ticket_numbers_truncated,outcome,worker_outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
+export function timingRowsFromTail(events: readonly AuditTrace[]): Cell[][] {
+  const rows = new Map<string, Cell[]>();
+  for (const trace of events) {
+    if (!["superops-mcp", "support-triage-trigger"].includes(trace.scriptName ?? "")) continue;
+    for (const log of trace.logs) for (const message of log.message) {
+      if (typeof message !== "string" || message.length > 4096 || !message.startsWith('{"event":"triage.tool_timing"')) continue;
+      let e: Record<string, unknown>;
+      try { e = JSON.parse(message) as Record<string, unknown>; } catch { continue; }
+      const context = parseTriageAgentCaptureContext({ triggerId: e.triggerId, attempt: e.attempt });
+      const at = timestamp(e.timestamp);
+      if (!context || !at || typeof e.callId !== "string" || !/^[0-9a-f-]{36}$/.test(e.callId)) continue;
+      if (typeof e.toolName !== "string" || (trace.scriptName === "superops-mcp"
+        ? !TRIAGE_TIMING_TOOLS.has(e.toolName) : e.toolName !== "triage_apply_intent_report")) continue;
+      if (!["received", "execution_finished", "response_ready"].includes(String(e.stage))) continue;
+      const numbers = Array.isArray(e.ticketNumbers) ? [...new Set(e.ticketNumbers.map(n => id(n, 12)).filter(n => n !== null))].slice(0, 50) : [];
+      const outcome = ["success", "error", "recorded", "duplicate", "exception"].includes(String(e.outcome)) ? String(e.outcome) : null;
+      const eventId = `${e.callId}:${e.stage}`;
+      rows.set(eventId, [eventId, e.callId, context.triggerId, context.attempt, at, trace.scriptName,
+        e.toolName, String(e.stage), token(e.invocationId), JSON.stringify(numbers),
+        Number(e.ticketNumbersTruncated === true || (Array.isArray(e.ticketNumbers) && e.ticketNumbers.length > 50)),
+        outcome, WORKER_OUTCOMES.has(trace.outcome) ? trace.outcome : "unknown"]);
+    }
+  }
+  return [...rows.values()];
+}
+export async function persistTimings<Statement>(db: AuditDatabase<Statement>, rows: Cell[][]): Promise<void> {
+  return persistCells(db, INSERT_TRIAGE_TIMING, rows);
 }
 async function persistCells<Statement>(db: AuditDatabase<Statement>, sql: string, rows: Cell[][]): Promise<void> {
   // Bound each write batch; idempotent call IDs make uncertain D1 retries safe.

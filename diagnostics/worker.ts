@@ -1,4 +1,4 @@
-import { persistRows, rowsFromTail, persistInvocations, invocationRowsFromTail } from "../src/api-call-log-worker.js";
+import { persistRows, rowsFromTail, persistInvocations, invocationRowsFromTail, persistTimings, timingRowsFromTail } from "../src/api-call-log-worker.js";
 
 type AuditEnv = Omit<Cloudflare.Env, "AUDIT_ENABLED" | "RETENTION_DAYS"> & { AUDIT_ENABLED: string; RETENTION_DAYS: string };
 
@@ -7,12 +7,16 @@ export default {
     if (env.AUDIT_ENABLED === "false") return;
     await persistRows(env.API_CALL_LOG, rowsFromTail(events));
     await persistInvocations(env.API_CALL_LOG, invocationRowsFromTail(events));
+    // A timing-table failure must not prevent the established API audit writes.
+    await persistTimings(env.API_CALL_LOG, timingRowsFromTail(events));
   },
   async scheduled(_event, env) {
     const days = Math.max(1, Math.min(90, Number(env.RETENTION_DAYS) || 30));
     const cutoff = new Date(Date.now() - days * 86400_000).toISOString();
     // Only this diagnostic table is affected by indexed, bounded retention.
     await env.API_CALL_LOG.batch([
+      env.API_CALL_LOG.prepare("DELETE FROM triage_tool_timing WHERE event_id IN (SELECT event_id FROM triage_tool_timing WHERE observed_at < ? ORDER BY observed_at LIMIT 10000)").bind(cutoff),
+      env.API_CALL_LOG.prepare("DELETE FROM triage_tool_timing WHERE event_id IN (SELECT event_id FROM triage_tool_timing ORDER BY observed_at DESC LIMIT 10000 OFFSET 250000)"),
       env.API_CALL_LOG.prepare("DELETE FROM superops_api_calls WHERE call_id IN (SELECT call_id FROM superops_api_calls WHERE started_at < ? ORDER BY started_at LIMIT 10000)").bind(cutoff),
       env.API_CALL_LOG.prepare("DELETE FROM superops_api_calls WHERE call_id IN (SELECT call_id FROM superops_api_calls ORDER BY started_at DESC LIMIT 10000 OFFSET 250000)"),
       env.API_CALL_LOG.prepare("DELETE FROM triage_mcp_invocations WHERE invocation_id IN (SELECT invocation_id FROM triage_mcp_invocations WHERE completed_at < ? ORDER BY completed_at LIMIT 10000)").bind(cutoff),
