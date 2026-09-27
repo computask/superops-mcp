@@ -11,7 +11,7 @@
   "triggers": {
     "crons": ["0 2 * * *"]
   },
-  "keep_vars": true,
+  "keep_vars": false,
   "tail_consumers": [{ "service": "superops-api-call-log" }],
   "observability": {
     "enabled": true,
@@ -65,6 +65,7 @@
     "SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED": "true",
     "SUPEROPS_CONTINUATION_ENABLED": "true",
     "SUPEROPS_DURABLE_RETRY_ENABLED": "true",
+    "SUPEROPS_RATE_LIMIT_PROBE_AUTOSTART": "true",
     "SUPEROPS_RATE_LIMIT_PROBE_ENABLED": "true",
     "SUPEROPS_EXECUTION_CPU_GUARD_MS": "20000",
     "SUPEROPS_EXECUTION_MAX_CONTINUATION_COUNT": "100",

@@ -204,7 +204,7 @@ The repaired production path makes the complete fixed-candidate operation durabl
 | Retry ceilings | Continuation, durable attempt/duration/single-wait, scheduling, request, and lifetime ceilings terminalize honestly. | continuation and store tests |
 | Terminal retention | The configured retention duration restarts when an active operation first becomes terminal; creation-time expiry never erases newly terminal evidence. | memory and Durable Object operation-store tests |
 | Ledger safety | 500-item and 512-KiB limits, exact item coverage, shape/timestamp validation, forbidden-content scan, redacted compact results. | operation-store tests |
-| Default tool policy | Unreviewed synchronous writes, custom mutation, and direct-route mutations are false by default; durable apply-triage, reads, and status remain. Guards precede credential/client initialization. | audit/worker tests and `wrangler.json` |
+| Production tool policy | Standard ticket/alert writes require both `ENABLE_WRITE_TOOLS` and `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS`; the approved production configuration enables these for authenticated, allowlisted direct-MCP users. Custom mutation and script execution remain disabled. Guards precede credential/client initialization. | audit/worker tests and `wrangler.json` |
 | Fixed-seed acceptance harness | Exactly 250 items pass through public apply-triage and the real resume adapter with mocked SuperOps transport only. The checkpoint matrix terminates before and after every update, resolution, and private-note checkpoint, restarts through the production adapter, tests duplicate delivery under an active lease, and proves successful mutations are not repeated. | `src/continuation-mixed-fault-harness.test.ts` |
 
 ## Outbound call inventory
@@ -351,7 +351,7 @@ A second real-adapter crash matrix covers 28 deterministic before/after checkpoi
 
 ## Configuration and external validation
 
-`package.json` and the lockfile pin Wrangler `4.111.0`, whose CLI validation requires Node.js 22 or newer. `wrangler.json` validates against that installed package’s `config-schema.json`, declares the Workflow/DO/service bindings, and sets all write/continuation overrides false. In this restricted repair environment, typecheck, build, lint, JSON schema validation, version inspection, and `git diff --check` pass. Vitest and Wrangler’s esbuild build path are not runnable here because Windows child-process creation fails with `spawn EPERM`; that is not counted as passing evidence.
+`package.json` and the lockfile pin Wrangler `4.111.0`. `wrangler.json` declares the Workflow/DO/service bindings and is the source of truth for non-secret production variables; `keep_vars=false` makes Git-connected builds apply the committed variable set, while Cloudflare-managed secrets remain separate. Production enables the standard direct-MCP ticket/alert write gates; arbitrary custom mutation and script execution remain disabled. Verify the active Cloudflare version and runtime variables separately from Git push success.
 
 Before any staging change, run in an unrestricted environment:
 
