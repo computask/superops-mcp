@@ -29,6 +29,16 @@ test('Agent prompt requires exact MCP correlation and a report-only pre-apply ca
   assert(prompt.includes(`Trigger ID: ${triggerId}`));
 });
 
+test('targeted prompt reuses explicit null metadata without weakening the stale fence',()=>{
+  const prompt=buildAgentInput('triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632',
+    {mode:'new-email-tickets',source:'EMAIL',createdFrom:'2026-09-26T10:00:00.000Z',createdTo:'2026-09-26T10:01:00.000Z'},1,true);
+  assert(prompt.includes('Do not call get_safe just to confirm that same null field'));
+  assert(prompt.includes('never infer null from absence'));
+  assert(prompt.includes("MCP's mandatory live pre-write stale check"));
+  assert(prompt.includes('a test label never justifies General Admin'));
+  assert(prompt.includes('use the one bounded field-options lookup'));
+});
+
 test('apply intent parser preserves exact plan JSON and rejects credential-like fields',()=>{
   const triggerId='triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632';
   const applyArguments={policyMode:'email-new-calls-v2',expectedCandidateTicketNumbers:['62992'],actions:[{ticketNumber:'62992',action:'leave',note:'<strong>TRIAGE SUMMARY</strong><br><br>Customer-provided detail',target:{impact:'High',category:'Security'},allowWriteIfUpdatedTimeChanged:false}],verify:true,dedupeNotes:true,triageCapture:{triggerId,attempt:3}};

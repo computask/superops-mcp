@@ -44,7 +44,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-7214bc5f1f61e5babfc75f7595d33bc192c9fc82e753be85dafc10f1f0f8ad9a.
+4df8ea931b59b293a2e730d41355f8d30bcdd8792be8fc1433ef4418783baf1d.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -61,6 +61,14 @@ terminal status is confirmed. One automatic reconciliation retry is retained;
 if that slot is already occupied, additional failed scopes become
 needs-attention records rather than blocking fresh work or being merged into a
 wider replay. Provider-wide rate-limit Retry-After gates remain respected.
+
+Live-test prompt correction, 27 September 2026: targeted input now distinguishes
+explicit null classification from omitted/unknown data so the Agent need not
+repeat a successful canonical read merely to confirm null. The bounded options
+lookup, frozen updatedTime and mandatory MCP pre-write stale check remain.
+Meaningful technical test cases use evidence-based technical classification,
+not a historical General Admin test special case. Agent Builder edits and
+independent verification are recorded in the accompanying test-correction doc.
 
 Overlapping attention windows, 24 September 2026: an undispatched email window
 can now retain its protected prefix and release only the suffix after every
