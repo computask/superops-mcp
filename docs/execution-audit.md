@@ -319,7 +319,7 @@ the internal rationale for an auto-review denial. Those remain platform-side.
 ## Mutation classification
 
 - Durable: `superops_tickets_apply_triage_plan`. Primary production write path; mutation type, target hash, note fingerprint/ID, response observation, fallback, checkpoint, and verification state are authoritative.
-- Safe synchronous but blocked by default: direct ticket and alert mutations. Successful/rejected/ambiguous returns expose `writeAttempted`, `writeMayHaveSucceeded`, reliable-response state, replay safety, and classification. They are not automatically replayed.
+- Safe synchronous ticket and alert mutations are enabled on the ChatGPT direct route only when both `ENABLE_WRITE_TOOLS` and `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS` are true. Production currently enables these standard writes for authenticated, allowlisted users. Successful/rejected/ambiguous returns expose `writeAttempted`, `writeMayHaveSucceeded`, reliable-response state, replay safety, and classification. They are not automatically replayed. Arbitrary custom GraphQL mutations remain blocked by `ENABLE_CUSTOM_MUTATION=false`.
 - Opaque and blocked by default: `superops_custom_mutation`. It is bounded but cannot derive a canonical verification target.
 - Read-only: standard reads and operation-status tools. They remain available.
 

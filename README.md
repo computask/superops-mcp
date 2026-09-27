@@ -124,7 +124,7 @@ changed existing records outside Git. Never remove user grants as routine cleanu
 - MCP endpoint: `https://<your-mcp-host>/mcp`
 - Health endpoint: `https://<your-mcp-host>/health`
 - Required non-secret vars: `AUTH_MODE=env`, `SUPEROPS_REGION=us`, `LOG_LEVEL=warn`; provide the existing `SUPEROPS_SUBDOMAIN` identity through environment secrets.
-- Non-secret safety defaults: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=false`, `ENABLE_CUSTOM_MUTATION=false`, `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=false`, `CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION=false`
+- Production gate values: `MCP_ENABLED=true`, `ENABLE_WRITE_TOOLS=true`, `ENABLE_CUSTOM_MUTATION=false`, `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=true`, `CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION=false`. The two write gates expose standard ticket and alert mutation tools to the authenticated, allowlisted ChatGPT direct-MCP users. Arbitrary custom GraphQL mutations and script execution remain disabled.
 - Execution controls additionally include per-request timeout, CPU guard, continuation/retry/delay/scheduling ceilings, retention, and maximum operation lifetime. The exact committed values are in `wrangler.json` and are described in the continuation runbook.
 - Required secrets: `DISPATCHER_TOKEN`, `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`, the existing `SUPEROPS_SUBDOMAIN` identity, plus existing OAuth/session secrets. SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY remains required for approved private-note recovery and must stay distinct from SUPEROPS_INTERNAL_CONTINUATION_TOKEN.
 - Never commit: API token values, OAuth access/refresh tokens, bearer tokens, Cloudflare service token values, client secrets, private keys, or full request headers
@@ -167,7 +167,7 @@ a sanitised error summary on failure.
 Emergency disable process:
 
 - Set `MCP_ENABLED=false` to stop MCP tool execution.
-- `ENABLE_WRITE_TOOLS=false` blocks unreviewed synchronous ticket and alert writes; the reviewed durable apply-triage path remains available. Use `MCP_ENABLED=false` for an all-tool emergency stop.
+- `ENABLE_WRITE_TOOLS=false` or `CHATGPT_DIRECT_ALLOW_MUTATING_TOOLS=false` blocks standard synchronous writes on the ChatGPT direct route; the reviewed durable apply-triage path remains available. The production values are currently `true` for both gates to permit standard ticket and alert writes. `ENABLE_CUSTOM_MUTATION=false` continues to block arbitrary GraphQL writes. Use `MCP_ENABLED=false` for an all-tool emergency stop.
 - Set `ENABLE_CUSTOM_MUTATION=false` to block custom GraphQL mutations.
 - Keep `CHATGPT_DIRECT_ALLOW_SCRIPT_EXECUTION=false` unless single-asset saved-script execution has been explicitly reviewed for exposure.
 - Re-run the deployment pipeline after changing Worker vars, then verify `/health` and `superops_status`.
