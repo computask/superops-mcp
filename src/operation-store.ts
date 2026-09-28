@@ -3046,6 +3046,51 @@ function derivedOperationStall(record: OperationLedgerRecord): Record<string, un
   return derivedUnattemptedStall(record) ?? derivedRescheduledStall(record);
 }
 
+function legacyClientIdentityDiagnostic(
+  record: OperationLedgerRecord,
+  result: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  if (result.failureStage !== "validateClient" || isRecordObject(result.clientIdentityDiagnostic)) {
+    return undefined;
+  }
+  const ticketNumber = stringField(result, "ticketNumber");
+  const actions = Array.isArray(record.operationRequest?.actions)
+    ? record.operationRequest.actions
+    : [];
+  const action = actions.find((value) => isRecordObject(value) &&
+    stringField(value, "ticketNumber") === ticketNumber);
+  if (!isRecordObject(action)) return undefined;
+  const approvedClientNameHash = stringField(action, "expectedClientHash");
+  if (!approvedClientNameHash) return undefined;
+
+  const observedState = isRecordObject(result.observedFinalState)
+    ? result.observedFinalState
+    : isRecordObject(result.finalState) ? result.finalState : undefined;
+  const observedClientName = stringField(observedState, "clientName") ??
+    stringField(observedState, "client");
+  const observedClientNameHash = observedClientName === undefined
+    ? undefined
+    : stableHash(observedClientName);
+  const target = isRecordObject(action.target) ? action.target : undefined;
+  return {
+    schemaVersion: 1,
+    source: "legacy_record_reconstruction",
+    check: "clientName",
+    approvedNameSource: "stored_hash_only",
+    approvedClientNameAvailable: false,
+    approvedClientNameHash,
+    observedClientNameAvailable: observedClientName !== undefined,
+    ...(observedClientName !== undefined ? { observedClientName } : {}),
+    ...(observedClientNameHash !== undefined ? { observedClientNameHash } : {}),
+    ...(observedClientNameHash !== undefined
+      ? { fingerprintMatch: observedClientNameHash === approvedClientNameHash }
+      : {}),
+    targetClientIdProvided: stringField(target, "clientId") !== undefined,
+    observedClientIdPresent: stringField(observedState, "clientId") !== undefined,
+    clientIdCompared: false,
+  };
+}
+
 export function operationManualResumeEligibility(
   record: OperationLedgerRecord,
   now = new Date().toISOString()
@@ -3138,7 +3183,11 @@ export function operationResultView(record: OperationLedgerRecord): Record<strin
     totals: operationTotals(record),
     summary: record.summary,
     items: operationItemTelemetry(record),
-    results: record.compactResults,
+    results: record.compactResults.map((value) => {
+      if (!isRecordObject(value)) return value;
+      const diagnostic = legacyClientIdentityDiagnostic(record, value);
+      return diagnostic ? { ...value, clientIdentityDiagnostic: diagnostic } : value;
+    }),
   }) as Record<string, unknown>;
 }
 

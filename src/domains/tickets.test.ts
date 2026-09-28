@@ -4950,6 +4950,77 @@ describe("Tickets Domain", () => {
     expect(mutationInput).not.toHaveProperty("client");
   });
 
+  it("records the exact client-name validation operands without attempting a write", async () => {
+    mockClient.query.mockImplementation(async (query: string) => {
+      if (query.includes("getTicketList")) {
+        return {
+          getTicketList: {
+            tickets: [{ ticketId: "ticket-client-identity-mismatch", displayId: "57405" }],
+            listInfo: { page: 1, pageSize: 5, hasMore: false, totalCount: 1 },
+          },
+        };
+      }
+      return {
+        getTicket: {
+          ticketId: "ticket-client-identity-mismatch",
+          displayId: "57405",
+          subject: "Client identity mismatch",
+          status: "New Calls",
+          client: { accountId: "observed-client-id", name: "Current Client" },
+          updatedTime: "2026-07-26T09:00:00Z",
+        },
+      };
+    });
+
+    const response = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", {
+      batchId: "client-identity-mismatch-diagnostic",
+      expectedCandidateTicketNumbers: ["57405"],
+      actions: [{
+        ticketNumber: "57405",
+        expectedTicketId: "ticket-client-identity-mismatch",
+        expectedClient: "Approved Client",
+        action: "skip",
+      }],
+    });
+    const parsed = JSON.parse(response.content[0].text);
+    const result = parsed.results[0];
+
+    expect(result).toMatchObject({
+      ticketNumber: "57405",
+      finalOutcome: "Blocked",
+      failureStage: "validateClient",
+      writeAttempted: false,
+      clientIdentityDiagnostic: {
+        schemaVersion: 1,
+        source: "live_validation",
+        check: "clientName",
+        approvedNameSource: "exact_name",
+        approvedClientNameAvailable: true,
+        approvedClientName: "Approved Client",
+        approvedClientNameHash: stableHash("Approved Client"),
+        observedClientNameAvailable: true,
+        observedClientName: "Current Client",
+        observedClientNameHash: stableHash("Current Client"),
+        exactNameMatch: false,
+        fingerprintMatch: false,
+        targetClientIdProvided: false,
+        observedClientIdPresent: true,
+        clientIdCompared: false,
+      },
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+
+    const stored = await getOperationStore().get(parsed.operation.operationId);
+    expect(stored?.compactResults[0]).toMatchObject({
+      failureStage: "validateClient",
+      clientIdentityDiagnostic: {
+        approvedClientName: "Approved Client",
+        observedClientName: "Current Client",
+        clientIdCompared: false,
+      },
+    });
+  });
+
   it("preserves a verified existing client in the staged resolve classification mutation", async () => {
     const ticketState: Record<string, unknown> = {
       ticketId: "ticket-57404-existing-client",

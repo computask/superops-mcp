@@ -1214,6 +1214,8 @@ interface ApplyTriagePlanResult {
   finalState?: Record<string, unknown> | null;
   failureStage?: string | null;
   failureReason?: string | null;
+  /** Exact, bounded operands for a client-name snapshot mismatch; never a write payload. */
+  clientIdentityDiagnostic?: ClientIdentityValidationDiagnostic;
   primaryWriteMethod?: string | null;
   primaryWriteOutcome?: string | null;
   primaryFailureDiagnostics?: Record<string, unknown> | null;
@@ -1282,6 +1284,82 @@ interface ApplyTriagePlanResult {
   terminalFailureClass?: string | null;
   replaySafe?: boolean;
   humanReconciliationRequired?: boolean;
+}
+
+interface ClientIdentityValidationDiagnostic {
+  schemaVersion: 1;
+  source: "live_validation";
+  check: "clientName";
+  approvedNameSource: "exact_name" | "input_hash_only" | "missing";
+  approvedClientNameAvailable: boolean;
+  approvedClientName?: string;
+  approvedClientNameOmittedForBounds?: boolean;
+  approvedClientNameHash?: string;
+  observedClientNameAvailable: boolean;
+  observedClientName?: string;
+  observedClientNameOmittedForBounds?: boolean;
+  observedClientNameHash?: string;
+  exactNameMatch?: boolean;
+  inputHashMatch?: boolean;
+  fingerprintMatch?: boolean;
+  targetClientIdProvided: boolean;
+  observedClientIdPresent: boolean;
+  /** This guard compares client names/hashes, not client IDs. */
+  clientIdCompared: false;
+}
+
+const MAX_CLIENT_IDENTITY_DIAGNOSTIC_VALUE_LENGTH = 256;
+
+function boundedClientIdentityValue(value: string | undefined): {
+  value?: string;
+  omittedForBounds?: boolean;
+} {
+  if (typeof value !== "string") return {};
+  if (value.length <= MAX_CLIENT_IDENTITY_DIAGNOSTIC_VALUE_LENGTH) return { value };
+  return { omittedForBounds: true };
+}
+
+function clientIdentityValidationDiagnostic(
+  action: TriagePlanAction,
+  ticket: Ticket,
+  expectedClientName: string | undefined,
+  expectedClientHash: string | undefined
+): ClientIdentityValidationDiagnostic {
+  const observedClientName = ticketClientName(ticket);
+  const approvedName = boundedClientIdentityValue(expectedClientName);
+  const observedName = boundedClientIdentityValue(observedClientName);
+  const approvedClientNameHash = expectedClientHash ??
+    (expectedClientName !== undefined ? stableHash(expectedClientName) : undefined);
+  return {
+    schemaVersion: 1,
+    source: "live_validation",
+    check: "clientName",
+    approvedNameSource: expectedClientName
+      ? "exact_name"
+      : expectedClientHash ? "input_hash_only" : "missing",
+    approvedClientNameAvailable: expectedClientName !== undefined,
+    ...(approvedName.value !== undefined ? { approvedClientName: approvedName.value } : {}),
+    ...(approvedName.omittedForBounds ? { approvedClientNameOmittedForBounds: true } : {}),
+    ...(approvedClientNameHash ? { approvedClientNameHash } : {}),
+    observedClientNameAvailable: observedClientName !== undefined,
+    ...(observedName.value !== undefined ? { observedClientName: observedName.value } : {}),
+    ...(observedName.omittedForBounds ? { observedClientNameOmittedForBounds: true } : {}),
+    ...(observedClientName !== undefined
+      ? { observedClientNameHash: stableHash(observedClientName) }
+      : {}),
+    ...(expectedClientName !== undefined
+      ? { exactNameMatch: observedClientName === expectedClientName }
+      : {}),
+    ...(action.expectedClientHash !== undefined
+      ? { inputHashMatch: stableHash(observedClientName) === action.expectedClientHash }
+      : {}),
+    ...(approvedClientNameHash !== undefined && observedClientName !== undefined
+      ? { fingerprintMatch: stableHash(observedClientName) === approvedClientNameHash }
+      : {}),
+    targetClientIdProvided: typeof action.target?.clientId === "string" && action.target.clientId.length > 0,
+    observedClientIdPresent: ticketClientAccountId(ticket) !== undefined,
+    clientIdCompared: false,
+  };
 }
 interface StructuredValidationFailure {
   ok: false;
@@ -4777,7 +4855,12 @@ function validateExpectedTicket(
   action: TriagePlanAction,
   ticket: Ticket,
   allowChanged: boolean
-): { stage: string; reason: string; outcome?: TriageFinalOutcome } | undefined {
+): {
+  stage: string;
+  reason: string;
+  outcome?: TriageFinalOutcome;
+  clientIdentityDiagnostic?: ClientIdentityValidationDiagnostic;
+} | undefined {
   if (ticket.displayId && ticket.displayId !== ticketNumber) {
     return {
       stage: "validateTicketNumber",
@@ -4816,6 +4899,12 @@ function validateExpectedTicket(
     return {
       stage: "validateClient",
       reason: "Ticket client no longer matches the approved snapshot identity.",
+      clientIdentityDiagnostic: clientIdentityValidationDiagnostic(
+        action,
+        ticket,
+        expectedClientName,
+        expectedClientHash
+      ),
     };
   }
   if (action.expectedStatus && ticket.status !== action.expectedStatus) {
@@ -6664,6 +6753,7 @@ function compactApplyResult(
     verified: result.verified,
     failureStage: result.failureStage,
     failureReason: result.failureReason,
+    clientIdentityDiagnostic: result.clientIdentityDiagnostic,
     primaryWriteMethod: result.primaryWriteMethod,
     primaryWriteOutcome: result.primaryWriteOutcome,
     primaryFailureDiagnostics: trimmedVerifiedSuccess ? undefined : result.primaryFailureDiagnostics,
@@ -7361,6 +7451,7 @@ async function applyApprovedTriageAction(params: {
     result.finalOutcome = validationFailure.outcome ?? "Blocked";
     result.failureStage = validationFailure.stage;
     result.failureReason = validationFailure.reason;
+    result.clientIdentityDiagnostic = validationFailure.clientIdentityDiagnostic;
     return result;
   }
 

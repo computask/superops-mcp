@@ -323,6 +323,49 @@ describe("operation store", () => {
     expect(JSON.stringify(view)).not.toContain("public-result-secret");
   });
 
+  it("reconstructs a legacy client-name mismatch from the stored approval hash", () => {
+    const approvedClientNameHash = stableHash("Approved Client");
+    const stored = record({
+      operationRequest: {
+        kind: "applyTriagePlan",
+        actions: [{
+          ticketNumber: "57400",
+          expectedClientHash: approvedClientNameHash,
+          target: { clientId: "approved-target-id" },
+        }],
+      },
+      compactResults: [{
+        ticketNumber: "57400",
+        failureStage: "validateClient",
+        observedFinalState: {
+          clientName: "Current Client",
+          clientId: "observed-client-id",
+        },
+      }],
+    });
+
+    const view = operationResultView(stored);
+
+    expect(view.results).toContainEqual(expect.objectContaining({
+      ticketNumber: "57400",
+      clientIdentityDiagnostic: {
+        schemaVersion: 1,
+        source: "legacy_record_reconstruction",
+        check: "clientName",
+        approvedNameSource: "stored_hash_only",
+        approvedClientNameAvailable: false,
+        approvedClientNameHash,
+        observedClientNameAvailable: true,
+        observedClientName: "Current Client",
+        observedClientNameHash: stableHash("Current Client"),
+        fingerprintMatch: false,
+        targetClientIdProvided: true,
+        observedClientIdPresent: true,
+        clientIdCompared: false,
+      },
+    }));
+  });
+
   it("derives an overdue Workflow wait as stalled without mutating the ledger", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-18T00:07:01.000Z"));
