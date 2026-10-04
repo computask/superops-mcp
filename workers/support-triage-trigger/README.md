@@ -1,5 +1,15 @@
 # Email triage trigger — Git deployment
 
+4 October 2026: terminal durable operations are classified independently of
+callback failureStage. CompletedWithFailures/Failed/Cancelled are fenced even
+when replaySafe is true; they cannot be repaired under the same operation ID.
+Result and transport retries stop at the configured cap, including restored
+retry state. Existing uncertain scopes and active leases remain protected.
+The dispatch prompt requires contract 2026-10-04.1 and read-only preparation
+before the diagnostic intent and one separately reviewed apply. Canonical Agent
+instructions are in `../../agent/superops-triage-instructions.md`; Builder and
+API-channel readback must be checked separately at release.
+
 This is the canonical deployment folder for the existing support-triage-trigger
 Worker. The initial JavaScript module is byte-for-byte production version
 8bcfcc94-ec82-44db-8715-4c276817fc12, SHA-256
@@ -44,7 +54,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-d34103734338fc72c537264b63c4cdcbbf6563012baae7f3474d9d65149f24a1.
+6d11f159be32a4fbc2f95fae18dd900d9ba4e9c87cb09c6b4f5d3131ccd32ab3.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { safeStructuredErrorMetadata } from "./error-contract.js";
 
 export type ToolCategory = "read" | "write" | "script_execution" | "custom_query" | "custom_mutation";
 
@@ -17,6 +18,7 @@ export interface AuditContext {
 
 export interface ToolResult {
   content: { type: string; text: string }[];
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
 }
 
@@ -513,6 +515,7 @@ export function sanitizeToolResult(result: ToolResult): ToolResult {
 
   return {
     ...result,
+    ...(result.structuredContent ? { structuredContent: safeStructuredErrorMetadata(result.structuredContent) } : {}),
     content: result.content.map((item) =>
       item.type === "text" ? { ...item, text: sanitizeText(item.text) } : item
     ),

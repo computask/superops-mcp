@@ -1971,6 +1971,10 @@ function isExplicitChannelUnavailableResponse(status, errorMetadata) {
 }
 __name(isExplicitChannelUnavailableResponse, "isExplicitChannelUnavailableResponse");
 function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = false, captureEnabled = true) {
+  const preparationInstructions = [
+    "",
+    "Policy contract version: 2026-10-04.1. Before any intent report or apply, call the read-only superops_tickets_prepare_triage_plan with the complete frozen proposal and batchId equal to this Trigger ID. Require ok:true, complete:true, operationCreated:false and this policyContractVersion. Copy the entire preparedPlan unchanged, including preparationFingerprint, into the intent and the ONE reviewed apply call. Do not add dryRun or change defaults afterward. A checksum and preparation result never grant approval. Correct a construction error at most once by repeating read-only preparation using supported evidence, before any apply exists. After ANY actual apply response, even zero-call validation, do not resubmit or repair under the same operation ID. Terminal ledger status stops regardless of callback stage or replaySafe. Any observed platform denial remains terminal. Missing preparation action or contract mismatch is configuration failure before writes."
+  ];
   const captureInstructions = captureEnabled ? [
     "",
     "Private diagnostic capture is enabled for this run. On every superops_* MCP call, include triageCapture exactly as {triggerId: the Trigger ID below, attempt: the dispatch attempt below}. This is diagnostic metadata; the SuperOps MCP removes it before executing the tool.",
@@ -2030,6 +2034,7 @@ function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = 
         resultCallbackRequired: resultCallbackEnabled
       }),
       `Trigger ID: ${triggerId}`,
+      ...preparationInstructions,
       ...captureInstructions,
       ...resultCallbackInstructions
     ].join("\n");
@@ -2040,6 +2045,7 @@ function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = 
     `Scope reason: ${scope.reason}`,
     "",
     `Trigger ID: ${triggerId}`,
+    ...preparationInstructions,
     ...captureInstructions,
     ...resultCallbackInstructions
   ].join("\n");
@@ -3490,14 +3496,17 @@ var PENDING_OPERATION_STATES = /* @__PURE__ */ new Set([
 ]);
 function operationContinuationDisposition(report) {
   const metadata = report.metadata;
-  if (metadata?.failureStage !== "operation_continuation") return "not_applicable";
-  const hasCorrelation = metadata.operationId !== void 0 || metadata.resultReference !== void 0;
-  const operation = metadata.operationStatus;
+  const hasCorrelation = metadata?.operationId !== void 0 || metadata?.resultReference !== void 0;
+  const operation = metadata?.operationStatus;
+  if (!hasCorrelation && operation === void 0 && metadata?.failureStage !== "operation_continuation") return "not_applicable";
   if (!hasCorrelation || operation === void 0) return "human_reconciliation";
   const unsafeAmbiguity = operation.humanReconciliationRequired === true || (operation.ambiguousWriteCount ?? 0) > 0;
   if (unsafeAmbiguity) return "human_reconciliation";
   const terminal = TERMINAL_OPERATION_STATES.has(operation.state);
   const pending = PENDING_OPERATION_STATES.has(operation.state);
+  // Terminal ledger operations cannot accept a repaired plan under the same ID.
+  // replaySafe describes write ambiguity; it never authorizes another Agent run.
+  if (terminal) return "terminal_failure";
   if (report.status === "complete") {
     if (terminal || operation.continuationRequired === false && operation.pendingCount !== void 0 && operation.pendingCount > 0) {
       return operation.replaySafe === true ? "replayable_failure" : "human_reconciliation";
@@ -3509,7 +3518,6 @@ function operationContinuationDisposition(report) {
     return operation.replaySafe === true ? "replayable_failure" : "human_reconciliation";
   }
   if (report.status !== "terminal_failure") return "human_reconciliation";
-  if (terminal && operation.replaySafe === true) return "replayable_failure";
   return "human_reconciliation";
 }
 __name(operationContinuationDisposition, "operationContinuationDisposition");
@@ -3548,7 +3556,7 @@ __name(isEmptyTargetedQueryCompletion, "isEmptyTargetedQueryCompletion");
 function hasUnfinishedTargetedWork(report) {
   if (!report.metadata) return false;
   const continuationDisposition = operationContinuationDisposition(report);
-  if (continuationDisposition === "human_reconciliation") return false;
+  if (continuationDisposition === "human_reconciliation" || continuationDisposition === "terminal_failure" || continuationDisposition === "handoff") return false;
   if (continuationDisposition === "replayable_failure") {
     return report.status === "terminal_failure" && ((report.metadata.ticketsConsidered ?? 0) > 0 || (report.metadata.operationStatus?.failedCount ?? 0) > 0);
   }
@@ -3751,6 +3759,12 @@ var CoordinatorEngine = class {
     recoverOrphanedAwaitingResult(state, this.deps.config, now);
     const staleRetryCount = recoverStaleRetryState(state, this.deps.config, now);
     refreshQueuedAttentionBlock(state, this.deps.config, now);
+    if (this.deps.config.enabled && state.executionPhase === "retry_wait" &&
+        (operationContinuationDisposition(state.lastResultReport ?? {}) === "terminal_failure" ||
+         state.retryCount > this.deps.config.resultMaxRetries ||
+         state.retryCount >= this.deps.config.resultMaxRetries && state.dispatchAttempt > this.deps.config.resultMaxRetries)) {
+      return await this.stopAutomaticRetry(state, state.lastResultReport, now);
+    }
     parkRetryForDisjointQueue(state, now, this.deps.config);
     if (staleRetryCount !== null) {
       this.deps.logger?.warn("stale_retry_state_recovered", {
@@ -3793,6 +3807,12 @@ var CoordinatorEngine = class {
     if (!this.deps.config.enabled) {
       await this.deps.store.save(state);
       return { status: "disabled" };
+    }
+    if (state.executionPhase === "retry_wait" &&
+        (operationContinuationDisposition(state.lastResultReport ?? {}) === "terminal_failure" ||
+         state.retryCount > this.deps.config.resultMaxRetries ||
+         state.retryCount >= this.deps.config.resultMaxRetries && state.dispatchAttempt > this.deps.config.resultMaxRetries)) {
+      return await this.stopAutomaticRetry(state, state.lastResultReport, now);
     }
     if (sharedRateLimitActive(state, now) && state.executionPhase !== "awaiting_result") {
       const nextAt = nextScheduledAt(state, now, this.deps.config);
@@ -4297,6 +4317,10 @@ var CoordinatorEngine = class {
     const firstEmptyTargetedQuery = !state.emptyTargetedRecoveryPending && this.deps.config.fastTargetedModeEnabled && state.pendingTriggerScope?.mode === "new-email-tickets" && state.pendingTriggerScope.targetTicketNumbers === void 0 && isEmptyTargetedQueryCompletion(report);
     const settledEmptyTargetedRetry = !firstEmptyTargetedQuery && state.retryCount > 0 && this.deps.config.scopeMode === "new-email-tickets" && state.pendingTriggerScope?.mode === "new-email-tickets" && isEmptyTargetedQueryCompletion(report);
     const continuationDisposition = operationContinuationDisposition(effectiveReport);
+    if (continuationDisposition === "terminal_failure" ||
+        report.status !== "complete" && state.retryCount >= this.deps.config.resultMaxRetries) {
+      return await this.stopAutomaticRetry(state, effectiveReport, now);
+    }
     if (report.status === "complete" && continuationDisposition === "human_reconciliation") {
       recordDispatchHistory(state, now, {
         event: "batch_failed",
@@ -4557,6 +4581,20 @@ var CoordinatorEngine = class {
     await this.deps.store.setAlarm(nextAt);
     return { status: "retry_scheduled", triggerId: report.triggerId, nextAt };
   }
+  async stopAutomaticRetry(state, report, now) {
+    report = report ?? { triggerId: state.pendingTriggerId, attempt: state.dispatchAttempt, status: "terminal_failure", metadata: { failureStage: "configuration" } };
+    recordDispatchHistory(state, now, {
+      event: "batch_failed", ...resultHistoryDetails(report), failureKind: "permanent"
+    }, state.pendingTriggerScope);
+    if (state.pendingTriggerScope !== null) {
+      recordReconciliationNeedsAttention(state, state.pendingTriggerScope, now, state.retryCount);
+    }
+    markFailure(state, "permanent", now);
+    const nextAt = this.finishCurrent(state, now);
+    await this.deps.store.save(state);
+    if (nextAt !== void 0) await this.deps.store.setAlarm(nextAt);
+    return { status: "terminal_failure", triggerId: report?.triggerId, nextAt };
+  }
   finishCurrent(state, now) {
     resetPendingDispatch(state);
     clearExpiredSharedRateLimit(state, now);
@@ -4705,6 +4743,8 @@ var CoordinatorEngine = class {
       }
     }
     if (attempt.kind === "authentication" || attempt.kind === "configuration") {
+      if (state.retryCount >= this.deps.config.resultMaxRetries) return await this.stopAutomaticRetry(state, null, now);
+      state.retryCount += 1;
       const nextAt2 = now + 15 * 60 * 1e3;
       recordDispatchHistory(state, now, {
         event: "agent_trigger_failed",
@@ -4745,6 +4785,9 @@ var CoordinatorEngine = class {
       };
     }
     if (attempt.kind === "transient" || attempt.kind === "ambiguous") {
+      if (state.retryCount >= this.deps.config.resultMaxRetries) {
+        return await this.stopAutomaticRetry(state, null, now);
+      }
       const nextRetryCount = Math.min(
         this.deps.config.resultMaxRetries,
         state.retryCount + 1

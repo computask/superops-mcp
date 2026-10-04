@@ -7,8 +7,8 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
 const testableSource = source.replace(/\nexport \{\s*TriageCoordinator,\s*index_default as default\s*\};\s*\/\/# sourceMappingURL=index\.js\.map\s*$/, '\n');
 assert.notEqual(testableSource, source, 'The preserved production module export footer must be isolated for the in-memory test harness');
-const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen} = await import(
-  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen};').toString('base64')}`
+const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen, listRelevantDispatchHistory} = await import(
+  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen, listRelevantDispatchHistory};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
@@ -41,6 +41,20 @@ test('targeted prompt reuses explicit null metadata without weakening the stale 
   assert(prompt.includes("MCP's mandatory live pre-write stale check"));
   assert(prompt.includes('a test label never justifies General Admin'));
   assert(prompt.includes('use the one bounded field-options lookup'));
+});
+
+test('preparation contract remains mandatory without diagnostic capture or callbacks',()=>{
+  for (const scope of [{mode:'full-new-calls',reason:'regression'},
+    {mode:'new-email-tickets',source:'EMAIL',createdFrom:'2026-10-04T10:00:00.000Z',createdTo:'2026-10-04T10:01:00.000Z'}]) {
+    for (const callback of [false,true]) {
+      const prompt=buildAgentInput('triage-preparation-regression',scope,1,callback,false);
+      assert(prompt.includes('Policy contract version: 2026-10-04.1'));
+      assert(prompt.includes('superops_tickets_prepare_triage_plan'));
+      assert(prompt.includes('operationCreated:false'));
+      assert(prompt.includes('After ANY actual apply response'));
+      assert(!prompt.includes('Private diagnostic capture is enabled'));
+    }
+  }
 });
 
 test('apply intent parser preserves exact plan JSON and rejects credential-like fields',()=>{
@@ -255,6 +269,26 @@ function historyRow(entry) {
     operator_confirmed_no_mcp_calls:entry.operatorConfirmedNoMcpCalls?1:0};
   return new Proxy(row,{get(target,key){return key in target?target[key]:null;}});
 }
+test('relevant history filters routine rows before LIMIT and resumes a frozen cursor',()=>{
+  const relevant=[101,102,103].map(eventId=>({eventId,at:'2026-10-04T10:00:00Z',event:'batch_failed'}));
+  let oldest=1;
+  const sql={exec(query,...args){
+    if(query.includes('MIN(event_id)')) return {one:()=>({oldest_event_id:oldest,newest_event_id:104})};
+    if(query.includes('SELECT *')) {
+      assert(query.indexOf('AND (')<query.indexOf('LIMIT'),'filter must precede limit');
+      assert(query.includes('ORDER BY event_id ASC'));
+      const rows=relevant.filter(row=>row.eventId>args[0]&&row.eventId<=args[1]).slice(0,args[2]).map(historyRow);
+      return {toArray:()=>rows};
+    }
+    return {toArray:()=>[],one:()=>({})};
+  }};
+  const first=listRelevantDispatchHistory({sql},0,2,103);
+  assert.deepEqual(first.events.map(row=>row.eventId),[101,102]); assert.equal(first.hasMore,true); assert.equal(first.coverage.complete,false);
+  const second=listRelevantDispatchHistory({sql},first.nextAfterEventId,2,first.coverage.throughEventId);
+  assert.deepEqual(second.events.map(row=>row.eventId),[103]); assert.equal(second.hasMore,false); assert.equal(second.coverage.complete,true);
+  oldest=80;
+  assert.equal(listRelevantDispatchHistory({sql},0,10,103).coverage.complete,false,'retention gap is never complete coverage');
+});
 function replayCoordinator(seed, archivedEvents=seed.dispatchHistory??[]) {
   const storage={value:structuredClone(seed),alarm:null,
     async get(){return structuredClone(this.value);},
@@ -396,6 +430,39 @@ function fixture(status, age = 120000, configOverrides = {}) {
 }
 
 const emailScope=(from,to)=>({mode:'new-email-tickets',source:'EMAIL',createdFrom:from,createdTo:to});
+const terminalValidationMetadata = {failureStage:'triage_apply',ticketsConsidered:1,ticketsCompleted:0,ticketsDeferred:1,
+  operationId:'synthetic-terminal-operation',operationStatus:{state:'CompletedWithFailures',continuationRequired:false,
+    failedCount:1,pendingCount:0,replaySafe:true,humanReconciliationRequired:false,ambiguousWriteCount:0,partialWriteCount:0},
+  ticketOutcomes:[{ticketNumber:'90101',outcome:'failed',reasonCode:'validation'}],
+  mcpExecution:{toolName:'superops_tickets_apply_triage_plan',requestsByType:{metadataValidation:1},requestTrace:[],retryCount:0}};
+for (const stage of ['triage_apply','operation_continuation']) for (const retries of [0,6]) {
+  test(`terminal validation stops at ${stage}, retry count ${retries}`,async()=>{
+    const f=fixture('completed'); f.seed({retryCount:retries});
+    const result=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',metadata:{...terminalValidationMetadata,failureStage:stage}});
+    assert.equal(result.status,'terminal_failure'); assert.equal(f.calls.length,0);
+    assert.equal(f.state.needsAttentionScopes.length,1); f.advance(); await f.engine.processAlarm(); assert.equal(f.calls.length,0);
+  });
+}
+for (const failureStage of ['configuration','bounded_query','evidence_recovery','triage_apply']) {
+  test(`retry exhaustion fences ${failureStage} rather than scheduling again`,async()=>{
+    const f=fixture('completed'); f.seed({retryCount:f.config.resultMaxRetries});
+    const result=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',
+      metadata:{failureStage,ticketsConsidered:1,ticketsCompleted:0,ticketsDeferred:1}});
+    assert.equal(result.status,'terminal_failure'); assert.equal(f.state.needsAttentionScopes.length,1);
+    f.advance(); await f.engine.processAlarm(); assert.equal(f.calls.length,0);
+  });
+}
+test('rate-limit exhaustion retains the scope without another dispatch',async()=>{
+  const f=fixture('completed'); f.seed({retryCount:f.config.resultMaxRetries});
+  const result=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'retryable_rate_limit',retryAfterSeconds:120,
+    metadata:{failureStage:'bounded_query',ticketsConsidered:0,ticketsCompleted:0,ticketsDeferred:0}});
+  assert.equal(result.status,'terminal_failure'); assert.equal(f.calls.length,0); assert.equal(f.state.needsAttentionScopes.length,1);
+});
+test('persisted terminal retry from the old coordinator is fenced after restart',async()=>{
+  const f=fixture('completed'); f.seed({executionPhase:'retry_wait',retryCount:6,dispatchAttempt:7,dueAt:0,
+    lastResultReport:{triggerId:f.state.pendingTriggerId,attempt:7,status:'terminal_failure',metadata:terminalValidationMetadata}});
+  assert.equal((await f.engine.processAlarm()).status,'terminal_failure'); assert.equal(f.calls.length,0); assert.equal(f.state.needsAttentionScopes.length,1);
+});
 const failedScope=emailScope('2026-09-24T09:28:12.295Z','2026-09-24T09:29:45.946Z');
 function overlappingQueue() {
   return {...createInitialState(),needsAttentionScope:failedScope,needsAttentionScopes:[failedScope],candidateAttentionFenceActive:true,

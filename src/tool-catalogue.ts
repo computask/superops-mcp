@@ -47,6 +47,7 @@ export const READ_ONLY_TOOL_NAMES = new Set<string>([
   "superops_tickets_get_safe",
   "superops_tickets_triage_evidence_recover",
   "superops_tickets_triage_snapshot",
+  "superops_tickets_prepare_triage_plan",
   "superops_tickets_conversation_list",
   "superops_tickets_notes_list",
   "superops_tickets_field_options",

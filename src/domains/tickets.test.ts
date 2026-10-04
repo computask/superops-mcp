@@ -603,6 +603,7 @@ describe("Tickets Domain", () => {
     const domain = getTicketsTools();
 
     expect(domain.tools.map((tool) => tool.name)).toEqual([
+      "superops_tickets_prepare_triage_plan",
       "superops_tickets_list",
       "superops_tickets_recent",
       "superops_tickets_query",

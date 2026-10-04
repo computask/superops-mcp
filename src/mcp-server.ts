@@ -11,6 +11,7 @@
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { attachSafeErrorContract, safeSuperOpsErrorMetadata } from "./error-contract.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -435,10 +436,11 @@ export function resolveGatewayCredentials(
   return { creds: { apiToken, subdomain } };
 }
 
-function errorResult(message: string): ToolResult {
+function errorResult(message: string, metadata?: Record<string, unknown>): ToolResult {
   return {
     content: [{ type: "text", text: `Error: ${message}` }],
     isError: true,
+    ...(metadata ? { structuredContent: metadata } : {}),
   };
 }
 
@@ -758,6 +760,7 @@ function isTriageTelemetryTool(toolName: string): boolean {
     toolName === "superops_tickets_get_safe_by_number" ||
     toolName === "superops_tickets_field_options" ||
     toolName === "superops_tickets_triage_snapshot" ||
+    toolName === "superops_tickets_prepare_triage_plan" ||
     toolName === "superops_tickets_triage_evidence_recover" ||
     toolName === "superops_tickets_apply_triage_plan";
 }
@@ -1086,14 +1089,17 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           metadata,
         });
         logExecutionDiagnostics(!result.isError, errorSummary);
-        const finalResult = appendTriageExecutionTelemetry(name, result) as ToolResult;
+        const finalResult = boundedToolResult(attachSafeErrorContract(appendTriageExecutionTelemetry(name, result) as ToolResult));
         timingOutcome = result.isError ? "error" : "success";
         timing("execution_finished", timingOutcome);
         await captureResult(finalResult);
         return finalResult as never;
       } catch (error) {
         timingOutcome = "error";
-        const result = errorResult(sanitizeError(error));
+        const safeMetadata = safeSuperOpsErrorMetadata(error, ["read", "custom_query"].includes(classifyTool(name).category));
+        const result = errorResult(safeMetadata
+          ? safeMetadata.rateLimited ? "SuperOps request was rate limited; use the bounded retry metadata." : "SuperOps request failed; inspect safe diagnostics."
+          : sanitizeError(error), safeMetadata);
         const errorSummary = errorSummaryFromResult(result);
         finishExecution("unhandledError");
         auditToolCall({
@@ -1104,7 +1110,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           metadata,
         });
         logExecutionDiagnostics(false, errorSummary);
-        const finalResult = appendTriageExecutionTelemetry(name, result) as ToolResult;
+        const finalResult = boundedToolResult(attachSafeErrorContract(appendTriageExecutionTelemetry(name, result) as ToolResult));
         timing("execution_finished", "error");
         await captureResult(finalResult);
         return finalResult as never;

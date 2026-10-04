@@ -7,7 +7,8 @@ function textBytes(value: string): number {
 }
 
 function resultBytes(result: ToolResult): number {
-  return result.content.reduce((sum, item) => sum + textBytes(item.text), 0);
+  return result.content.reduce((sum, item) => sum + textBytes(item.text), 0) +
+    (result.structuredContent ? textBytes(JSON.stringify(result.structuredContent)) : 0);
 }
 
 export function boundedToolResult(

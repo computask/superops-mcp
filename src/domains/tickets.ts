@@ -35,6 +35,7 @@ import {
   ExecutionTimeoutBudgetExceededError,
   getExecutionConfig,
   hasExecutionBudgetFor,
+  getExecutionState,
 } from "../execution.js";
 import {
   runOperationContinuation,
@@ -56,6 +57,8 @@ import {
   type ReconciliationDisposition,
 } from "../operation-store.js";
 import { canonicalizeNoteText } from "../utils/note-canonicalization.js";
+import { safeStructuredErrorMetadata, safeSuperOpsErrorMetadata } from "../error-contract.js";
+import { TRIAGE_POLICY_CONTRACT_VERSION, triagePreparationFingerprint } from "../triage-contract.js";
 
 const DEFAULT_LIST_PAGE = 1;
 
@@ -796,6 +799,8 @@ interface TriagePlanAction {
 }
 
 interface ApplyTriagePlanParams {
+  policyContractVersion?: string;
+  preparationFingerprint?: string;
   batchId?: string;
   expectedOperationUpdatedAt?: string;
   policyMode?: TriagePolicyMode;
@@ -3897,7 +3902,9 @@ async function getTicketOptionFieldsForTool(
   // SuperOpsClient.query owns the bounded upstream retry policy. This helper
   // deliberately performs one client call only; retrying here would multiply
   // an already-exhausted client retry sequence and amplify a throttle.
-  const attempts = 1;
+  const traceStart = getExecutionState()?.requests.length ?? 0;
+  const readAttempts = () => Math.max(1, (getExecutionState()?.requests.slice(traceStart) ?? [])
+    .filter(request => request.operationName === "GetTicketFields" || request.operationName === "getFields").length);
   let retryAfterPresent = false;
   let lastError: unknown;
 
@@ -3931,8 +3938,8 @@ async function getTicketOptionFieldsForTool(
         source: "fresh",
         cacheStatus: cacheIdentity ? "miss" : "unavailable",
         cacheTtlSeconds: FIELD_OPTIONS_CACHE_TTL_MS / 1000,
-        attempts,
-        retried: false,
+        attempts: readAttempts(),
+        retried: readAttempts() > 1,
         rateLimited: false,
         retryAfterPresent: false,
       },
@@ -3946,6 +3953,7 @@ async function getTicketOptionFieldsForTool(
   const fallbackCacheLookup = isRateLimitError(lastError)
     ? await readTicketOptionFieldsCache(cacheIdentity)
     : { available: false, valid: false, readFailed: false, nativeAvailable: Boolean(defaultFieldOptionsNativeCache()) };
+  const attempts = readAttempts();
   if (isRateLimitError(lastError) && fallbackCacheLookup.entry) {
     return {
       fields: cloneTicketOptionFields(fallbackCacheLookup.entry.fields),
@@ -3982,7 +3990,10 @@ async function getTicketOptionFieldsForTool(
     cacheEntryValid: fallbackCacheLookup.valid,
     cacheReadFailed: fallbackCacheLookup.readFailed,
     nativeCacheAvailable: fallbackCacheLookup.nativeAvailable,
-    finalReason: safeErrorMessage(lastError),
+    retried: attempts > 1,
+    retryable: isRateLimitError(lastError),
+    retryScope: isRateLimitError(lastError) ? "read" : "none",
+    reasonCode: isRateLimitError(lastError) ? "superops_read_rate_limited" : "superops_metadata_failed",
   };
 }
 
@@ -7343,6 +7354,8 @@ async function applyApprovedTriageAction(params: {
   resumeWriteMayHaveSucceeded?: boolean;
   resumePartialWrite?: boolean;
   optionFieldsProvider?: TicketOptionFieldsProvider;
+  /** Read-only preparation can reuse its canonical lookup without ledger callbacks. */
+  prefetchedTicket?: Ticket;
   beforeNoteCheck?: () => Promise<void>;
   afterPreflightValidation?: () => Promise<void>;
   beforeMutation?: (
@@ -7382,7 +7395,9 @@ async function applyApprovedTriageAction(params: {
 
   let approvedLookup: ApprovedTicketLookup;
   try {
-    approvedLookup = await lookupApprovedTicket(client, ticketNumber, action.expectedTicketId);
+    approvedLookup = params.prefetchedTicket
+      ? { ticketId: params.prefetchedTicket.ticketId, ticket: params.prefetchedTicket, immutableIdentityRecovered: true, operationName: "getTicket" }
+      : await lookupApprovedTicket(client, ticketNumber, action.expectedTicketId);
   } catch (error) {
     if (isExecutionStopError(error)) throw error;
     return preserveResumedWriteProgress(preWriteReadFailureResult({
@@ -7541,7 +7556,7 @@ async function applyApprovedTriageAction(params: {
       result.suppressCloseNotificationRequested = true;
       result.suppressCloseNotificationIncluded = true;
     } else if (action.action === "update" || action.action === "leave") {
-      const dryRunInput = await buildApprovedUpdateInput(client, ticket.ticketId, action, undefined, undefined, ticket);
+      const dryRunInput = await buildApprovedUpdateInput(client, ticket.ticketId, action, undefined, params.optionFieldsProvider, ticket);
       const dryRunError = (dryRunInput as { error?: unknown }).error;
       if (typeof dryRunError === "string") {
         result.finalOutcome = "Blocked";
@@ -10233,9 +10248,114 @@ function errorResult(message: string) {
   };
 }
 
+async function prepareTriagePlan(client: SuperOpsClientInstance, proposal: ApplyTriagePlanParams) {
+  const expected = Array.isArray(proposal.expectedCandidateTicketNumbers)
+    ? proposal.expectedCandidateTicketNumbers.map(normaliseTicketNumber) : [];
+  const actions = Array.isArray(proposal.actions) ? structuredClone(proposal.actions) : [];
+  const invalid = (error: string) => ({ content: [{ type: "text", text: JSON.stringify({
+    ok: false, complete: false, preparationOnly: true, operationCreated: false,
+    policyContractVersion: TRIAGE_POLICY_CONTRACT_VERSION, error,
+  }) }], isError: true });
+  if (expected.length === 0 || expected.length > 50 || expected.some(value => !value) || new Set(expected).size !== expected.length) {
+    return invalid("Preparation requires 1 to 50 unique frozen candidate numbers.");
+  }
+  if (!isScheduledNewCallsPolicy(proposal.policyMode)) return invalid("Preparation requires a supported standing triage policyMode.");
+  if (proposal.policyContractVersion !== undefined && proposal.policyContractVersion !== TRIAGE_POLICY_CONTRACT_VERSION) {
+    return invalid("Proposal policy contract differs from this runtime.");
+  }
+  if (proposal.preparationFingerprint || proposal.expectedOperationUpdatedAt || proposal.dryRun === true) {
+    return invalid("Prepare a new proposal before an operation exists; do not pass recovery or dryRun arguments.");
+  }
+  const shapeError = validateTriagePlanActions(actions);
+  if (shapeError) return invalid(shapeError);
+  const policyError = validateScheduledNewCallsPolicy(proposal, expected, actions);
+  if (policyError) return invalid(policyError);
+  const plan: ApplyTriagePlanParams = { ...proposal, actions,
+    expectedCandidateTicketNumbers: expected, verify: true, dedupeNotes: true,
+    policyContractVersion: TRIAGE_POLICY_CONTRACT_VERSION };
+  const results: ApplyTriagePlanResult[] = [];
+  const corrections: Array<{ticketNumber: string; fields: string[]}> = [];
+  // Per-invocation field metadata reuse, without changing the apply validator.
+  const options = new Map<ValidatedTicketOptionField, SuperOpsField>();
+  const provider: TicketOptionFieldsProvider = async fields => {
+    const missing = fields.filter(field => !options.has(field));
+    if (missing.length) for (const [key, value] of await getTicketOptionFields(client, missing)) options.set(key, value);
+    return options;
+  };
+  let stopped = false;
+  for (const action of actions) {
+    const number = normaliseTicketNumber(action.ticketNumber);
+    if (stopped) {
+      results.push({ ...baseApplyResult(number, action), finalOutcome: "Blocked", failureStage: "preparationBudget", failureReason: "Preparation stopped; no complete plan is available." });
+      continue;
+    }
+    try {
+      assertExecutionBudget();
+      const lookup = await lookupApprovedTicket(client, number, action.expectedTicketId);
+      const ticket = lookup.ticket;
+      if (!ticket || lookup.error) throw new Error("Canonical ticket identity could not be established.");
+      if (ticket.client === undefined) throw new Error("Canonical client data is unavailable; missing data cannot authorize fallback assignment.");
+      const fields: string[] = [];
+      if (ticket.client === null) {
+        if (action.target?.clientName || action.target?.clientId) {
+          if (action.target.clientName !== SCHEDULED_TRIAGE_TASKGROUP_NAME || action.target.clientId !== SCHEDULED_TRIAGE_TASKGROUP_ID) {
+            throw new Error("A null-client proposal contains a different or incomplete client target.");
+          }
+        } else if (["resolve", "update", "leave"].includes(action.action)) {
+          action.target = { ...action.target, clientName: SCHEDULED_TRIAGE_TASKGROUP_NAME, clientId: SCHEDULED_TRIAGE_TASKGROUP_ID };
+          fields.push("target.clientName", "target.clientId");
+        }
+      } else {
+        const name = ticketClientName(ticket);
+        if (!name || !ticketClientAccountId(ticket) || action.expectedClient !== name) {
+          throw new Error("The frozen client name must match a complete canonical assigned client.");
+        }
+        const hash = stableHash(name);
+        if (action.expectedClientHash !== hash) { action.expectedClientHash = hash; fields.push("expectedClientHash"); }
+      }
+      const result = await applyApprovedTriageAction({ client, ticketNumber: number, action,
+        dryRun: true, verify: true, dedupeNotes: true, policyMode: plan.policyMode,
+        allowResolveFullFallbackToUpdate: false, allowWriteIfUpdatedTimeChanged: false,
+        allowWriteWithoutVerifiedContent: false, prefetchedTicket: ticket, optionFieldsProvider: provider });
+      results.push(result);
+      if (fields.length) corrections.push({ ticketNumber: number, fields });
+    } catch (error) {
+      stopped = isExecutionStopError(error);
+      const metadata = safeSuperOpsErrorMetadata(error, true);
+      results.push({ ...baseApplyResult(number, action), finalOutcome: "Blocked", failureStage: stopped ? "preparationBudget" : "preparationValidation", failureReason: metadata ? "Canonical preparation read failed; no prepared plan is available." : safeErrorMessage(error), ...(metadata ? { readFailure: metadata } : {}) });
+    }
+  }
+  const complete = results.length === expected.length && results.every(result => result.writeMethod === "dryRun");
+  if (complete) plan.preparationFingerprint = triagePreparationFingerprint(plan);
+  return { content: [{ type: "text", text: JSON.stringify({ ok: complete, complete,
+    preparationOnly: true, operationCreated: false, policyContractVersion: TRIAGE_POLICY_CONTRACT_VERSION,
+    corrections, results, ...(complete ? { preparedPlan: plan } : {}) }) }], ...(!complete ? { isError: true } : {}) };
+}
+
 export function getTicketsTools(): DomainTools {
   return {
     tools: [
+      {
+        name: "superops_tickets_prepare_triage_plan",
+        description: "Read-only preparation of a complete frozen standing-policy triage proposal. Creates no operation and performs no mutations. Derives canonical client hashes, fills the fixed fallback only for explicit null clients, and checks stale identity, policy, private notes and live field dependencies. Only an entirely valid result contains preparedPlan. Copy that complete object unchanged to the separately reviewed apply action. A checksum never grants approval.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            batchId: { type: "string" },
+            policyMode: { type: "string", enum: [...TRIAGE_POLICY_MODES] },
+            policyContractVersion: { type: "string" },
+            expectedCandidateTicketNumbers: { type: "array", minItems: 1, maxItems: 50, items: { type: "string" } },
+            actions: { type: "array", minItems: 1, maxItems: 50, items: TRIAGE_PLAN_ACTION_SCHEMA },
+            verify: { type: "boolean", default: true },
+            dedupeNotes: { type: "boolean", default: true },
+            stopOnFirstFailure: { type: "boolean", default: false },
+            allowResolveFullFallbackToUpdate: { type: "boolean", default: false },
+            allowWriteIfUpdatedTimeChanged: { type: "boolean", default: false },
+            allowWriteWithoutVerifiedContent: { type: "boolean", default: false },
+          },
+          required: ["policyMode", "expectedCandidateTicketNumbers", "actions"],
+        },
+      },
       {
         name: "superops_tickets_list",
         description:
@@ -10560,6 +10680,8 @@ export function getTicketsTools(): DomainTools {
         inputSchema: {
           type: "object",
           properties: {
+            policyContractVersion: { type: "string", description: "Version from read-only preparation; mismatch is rejected before operation creation." },
+            preparationFingerprint: { type: "string", description: "Checksum of the complete prepared plan; detects accidental edits and grants no approval." },
             batchId: {
               type: "string",
               description: "Optional batch identifier. To resume an existing nonterminal operation, send its exact expectedCandidateTicketNumbers and omit actions and override flags.",
@@ -11168,8 +11290,7 @@ export function getTicketsTools(): DomainTools {
               retrieval = await getTicketOptionFieldsForTool(client, requestedFields);
             } catch (error) {
               if (typeof error === "object" && error !== null && "fieldOptionsError" in error) {
-                const structured = { ...(error as Record<string, unknown>) };
-                delete structured.fieldOptionsError;
+                const structured = safeStructuredErrorMetadata(error);
                 return {
                   content: [
                     {
@@ -11178,6 +11299,7 @@ export function getTicketsTools(): DomainTools {
                     },
                   ],
                   isError: true,
+                  structuredContent: structured,
                 };
               }
               throw error;
@@ -11666,8 +11788,18 @@ export function getTicketsTools(): DomainTools {
               ],
             };
           }
+          case "superops_tickets_prepare_triage_plan": {
+            return await prepareTriagePlan(client, args as ApplyTriagePlanParams);
+          }
           case "superops_tickets_apply_triage_plan": {
             const params = args as ApplyTriagePlanParams;
+            if (params.policyContractVersion !== undefined && params.policyContractVersion !== TRIAGE_POLICY_CONTRACT_VERSION) {
+              return errorResult("Prepared policy contract differs from this runtime; prepare again before creating an operation.");
+            }
+            if (params.preparationFingerprint !== undefined &&
+                (params.policyContractVersion === undefined || params.preparationFingerprint !== triagePreparationFingerprint(params))) {
+              return errorResult("Prepared plan checksum does not match; prepare the complete changed proposal before apply.");
+            }
             const rawPolicyMode = (args as { policyMode?: unknown }).policyMode;
             if (rawPolicyMode !== undefined &&
                 !(TRIAGE_POLICY_MODES as readonly unknown[]).includes(rawPolicyMode)) {
