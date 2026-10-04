@@ -136,7 +136,18 @@ standard test command. Existing apply validators and durable uncertainty remain.
 | September dispatcher diagnostics | Already tracked in MCP commit 5a4a037 and released separately in Dispatcher before the newer October 3 scheduler release. Retain the newer Dispatcher and its native adapter/uncertainty state. Historical untracked ZIP/log/snapshot artifacts are retained outside this runtime release. |
 | Untouched failed-run recovery | Current conservative behavior is retained: a missing callback or uncertain accepted lease never proves no MCP calls. Existing bounded one-shot operator reconciliation remains separate from terminal validation repair. No automatic replay is introduced. |
 
-Local release checks: 710 MCP tests, typecheck, lint, build and diff checks pass.
+Local initial release checks: 710 MCP tests, typecheck, lint, build and diff checks pass.
 The trigger's 74 regressions and workerd/auth/config smoke pass with zero live
 SuperOps mutations. Deployment and controlled outcomes are recorded separately
 after the actual Git builds and Agent/API-channel readbacks complete.
+
+The first controlled Agent probe established an additional HTML-note defect
+before any write: section bodies after a label line break were treated as empty.
+The follow-up correction reads only within each section, retains rejection of
+empty sections, and keeps existing HTML labels, privacy, history-state checks,
+dedupe and verification. The preparation schema also omits technician-group
+assignment, which the standing-policy validator already prohibits. A regression
+validates the saved paused-history example against the runtime schema, including
+the canonical follow_up_unknown enum. Legacy full-queue policy selection remains
+explicit in the consolidated instructions. Final verification is recorded in
+the release evidence document.

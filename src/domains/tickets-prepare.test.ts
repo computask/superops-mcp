@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 vi.mock("../client.js", async importOriginal => ({
   ...await importOriginal<typeof import("../client.js")>(), getClient: vi.fn(),
   getCredentials: vi.fn(() => ({ apiToken: "synthetic", subdomain: "prepare-tests", region: "us" })),
@@ -28,6 +29,11 @@ async function prepare(input = proposal()) {
   const response = await getTicketsTools().handleCall("superops_tickets_prepare_triage_plan", input);
   return { response, data: JSON.parse(response.content[0].text) };
 }
+function pausedHistoryFromInstructions() {
+  const text = readFileSync(new URL("../../agent/superops-triage-instructions.md", import.meta.url), "utf8");
+  const example = text.match(/While history is paused use exactly: ([^.]+)\./)![1];
+  return Object.fromEntries(example.split(", ").map(pair => pair.split(" ")));
+}
 describe("read-only complete triage preparation", () => {
   beforeEach(() => { vi.clearAllMocks(); resetTicketFieldOptionsCacheForTests();
     vi.mocked(getClient).mockReturnValue({ query, mutate } as never);
@@ -45,6 +51,8 @@ describe("read-only complete triage preparation", () => {
     expect(mutate).not.toHaveBeenCalled();
     expect(await getOperationStore().get(proposal().batchId, currentOwnerHash())).toBeUndefined();
     const definition = getTicketsTools().tools.find(tool => tool.name === "superops_tickets_prepare_triage_plan")!;
+    const schema = definition.inputSchema.properties.actions as { items: { properties: { target: { properties: Record<string, unknown> } } } };
+    expect(schema.items.properties.target.properties).not.toHaveProperty("techGroupName");
     expect(publishToolDefinition(definition).annotations?.readOnlyHint).toBe(true);
   });
   it("fills both fixed fallback fields for an explicit null client", async () => {
@@ -54,6 +62,25 @@ describe("read-only complete triage preparation", () => {
     expect(data.complete).toBe(true);
     expect(data.preparedPlan.actions[0].target).toMatchObject({ clientName: "TaskGroup", clientId: "2993553194649526272" });
     expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it("accepts non-empty HTML section bodies after a label line break", async () => {
+    const input = { ...proposal(), policyMode: "email-new-calls-v2" };
+    Object.assign(input.actions[0], { historyAssessment: pausedHistoryFromInstructions(),
+      note: note.replace(/<\/strong>(?!<br><br>)/g, "</strong><br>") });
+    const { data } = await prepare(input);
+    expect(data.complete).toBe(true); expect(data.operationCreated).toBe(false);
+    expect(data.preparedPlan.actions[0].note).toBe(input.actions[0].note);
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty HTML section without borrowing the next label or its body", async () => {
+    const input = { ...proposal(), policyMode: "email-new-calls-v2" };
+    Object.assign(input.actions[0], { historyAssessment: pausedHistoryFromInstructions(),
+      note: note.replace("</strong> Restore access.", "</strong><br>") });
+    const { data } = await prepare(input);
+    expect(data.complete).toBe(false); expect(data.error).toContain("non-empty Ticket goal:");
+    expect(data.preparedPlan).toBeUndefined(); expect(query).not.toHaveBeenCalled(); expect(mutate).not.toHaveBeenCalled();
   });
   for (const [label, change] of [
     ["unknown client", { client: undefined }], ["changed timestamp", { updatedTime: "2026-10-04T09:01:00Z" }],

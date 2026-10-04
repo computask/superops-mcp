@@ -1185,6 +1185,20 @@ const TRIAGE_PLAN_ACTION_SCHEMA = {
   required: ["ticketNumber", "action"],
 } as const;
 
+// Preparation supports standing triage only, which never assigns a group.
+// Keep the legacy apply schema unchanged while avoiding an unusable proposal field.
+const TRIAGE_PREPARATION_ACTION_SCHEMA = {
+  ...TRIAGE_PLAN_ACTION_SCHEMA,
+  properties: {
+    ...TRIAGE_PLAN_ACTION_SCHEMA.properties,
+    target: {
+      ...TRIAGE_PLAN_ACTION_SCHEMA.properties.target,
+      properties: Object.fromEntries(Object.entries(TRIAGE_PLAN_ACTION_SCHEMA.properties.target.properties)
+        .filter(([field]) => field !== "techGroupName")),
+    },
+  },
+};
+
 interface ApplyTriagePlanResult {
   ticketNumber: string;
   ticketId?: string;
@@ -2087,8 +2101,20 @@ function scheduledTriageV2NoteValidation(
     return "the scheduled-new-calls-v2 note requires <br><br> between each section";
   }
 
+  // HTML labels may put their body after <br>. Read through that section only;
+  // a following label must never supply content for an empty preceding section.
+  const sectionLines = new Map<string, string>();
   for (const section of sections) {
-    const line = lines.find((candidate) => candidate.startsWith(section));
+    const start = lines.findIndex((candidate) => candidate.startsWith(section));
+    if (start >= 0) {
+      const body = [lines[start].slice(section.length)];
+      for (let index = start + 1; index < lines.length; index += 1) {
+        if (labels.some(label => lines[index].startsWith(label))) break;
+        body.push(lines[index]);
+      }
+      sectionLines.set(section, `${section} ${body.join(" ").trim()}`);
+    }
+    const line = sectionLines.get(section);
     if (!line || line.slice(section.length).trim().length === 0) {
       return `the private note requires a non-empty ${section} section`;
     }
@@ -2198,7 +2224,7 @@ function scheduledTriageV2NoteValidation(
   ];
   for (const { section, state, canonical } of stateChecks) {
     if (!relevantHistorySections.has(section)) continue;
-    const line = lines.find((candidate) => candidate.startsWith(section));
+    const line = sectionLines.get(section);
     const lowerLine = line?.toLowerCase() ?? "";
     if (!historyStateLineMatches(section, state, lowerLine)) {
       return `${section} must explicitly state ${canonical} or an unambiguous equivalent.`;
@@ -10345,7 +10371,7 @@ export function getTicketsTools(): DomainTools {
             policyMode: { type: "string", enum: [...TRIAGE_POLICY_MODES] },
             policyContractVersion: { type: "string" },
             expectedCandidateTicketNumbers: { type: "array", minItems: 1, maxItems: 50, items: { type: "string" } },
-            actions: { type: "array", minItems: 1, maxItems: 50, items: TRIAGE_PLAN_ACTION_SCHEMA },
+            actions: { type: "array", minItems: 1, maxItems: 50, items: TRIAGE_PREPARATION_ACTION_SCHEMA },
             verify: { type: "boolean", default: true },
             dedupeNotes: { type: "boolean", default: true },
             stopOnFirstFailure: { type: "boolean", default: false },
