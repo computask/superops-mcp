@@ -37,6 +37,10 @@ clients. Structured content contributes to the existing response-size limit.
 The Git instruction source is `agent/superops-triage-instructions.md`.
 `node scripts/check-triage-contract.mjs` checks the source/trigger/Agent version.
 Optional supported-UI instruction exports can be supplied as arguments for
-content comparison. Publishing the Builder does not establish API-channel sync;
-read back both separately. Rollback uses Git and the prior published instruction
+content comparison. The checker reports both raw and policy-text hashes. It
+accepts only the observed Builder Markdown escapes before underscore, less-than
+and asterisk, CRLF conversion, surrounding whitespace and repeated paragraph
+newlines; words, line boundaries, inline spacing and HTML tags must still match.
+The source is not unescaped. Publishing the Builder does not establish API-channel
+sync; read back both separately. Rollback uses Git and the prior published instruction
 version while preserving Durable Object identities and uncertainty fences.

@@ -21,7 +21,7 @@
     "start": "node dist/index.js",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run && node scripts/check-triage-contract.mjs",
+    "test": "vitest run && node --test scripts/triage-policy-text.checks.mjs && node scripts/check-triage-contract.mjs",
     "test:watch": "vitest",
     "test:triage-harness": "vitest run src/triage-apply-harness.test.ts",
     "test:continuation-harness": "vitest run src/continuation-mixed-fault-harness.test.ts",
