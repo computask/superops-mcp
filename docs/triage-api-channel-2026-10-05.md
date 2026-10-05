@@ -55,14 +55,23 @@ and `git diff --check`.
 
 ## Cutover and rollback
 
-Only the trigger URL changes in the trigger Worker configuration. Existing
+The initial URL-only cutover exposed a polling defect: an accepted old run was
+polled beneath the new channel and returned 404. Commit `35012d7` restored the
+old URL through Git. The corrected cutover persists the original trigger URL
+with every accepted run and passes it through every status-poll branch. An
+explicit legacy URL covers accepted records written before this field existed.
+The two new trigger regressions verify durable restoration, coordinator polling,
+old/new channel routing and rejection of unsafe credential-forwarding URLs.
+
+The corrected cutover changes the trigger URL and adds its legacy fallback. Existing
 bindings, namespace, secrets, intake scope, cooldowns, rate fences and approval
 controls are preserved. Previously accepted runs retain their original run
 identity; no old mutation scope is replayed.
 
-Rollback is a normal Git revert of the URL change to
+Rollback is a normal Git change of the dispatch URL to
 `agtch_6aa8549398188191ab83ec01e16bf474`, followed by the Git-connected build.
-It restores the previous channel and its known limitations; it does not erase
+Keep the endpoint-persistence correction when rolling back the channel. It
+restores the previous channel and its known limitations; it does not erase
 queued runs or operation history.
 
 Credential-redacted live source/configuration backups were saved privately in

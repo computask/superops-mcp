@@ -1,5 +1,13 @@
 # Email triage trigger — Git deployment
 
+5 October 2026: accepted runs persist their original trigger URL and every
+status-poll branch uses it. `WORKSPACE_AGENT_LEGACY_TRIGGER_URL` identifies the
+old channel for accepted records written before URL persistence existed. Fresh
+dispatches use `WORKSPACE_AGENT_TRIGGER_URL`; never remove the legacy fallback
+until old accepted records have drained. Stored polling endpoints are restricted
+to the exact HTTPS Workspace Agents route on api.chatgpt.com. No scopes, leases,
+attention fences or mutation retry rules are reset during a channel cutover.
+
 4 October 2026: terminal durable operations are classified independently of
 callback failureStage. CompletedWithFailures/Failed/Cancelled are fenced even
 when replaySafe is true; they cannot be repaired under the same operation ID.
@@ -54,7 +62,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-6d11f159be32a4fbc2f95fae18dd900d9ba4e9c87cb09c6b4f5d3131ccd32ab3.
+b5cc186a0322d3393d67f7d22a1ccdfd06028ca7ad1105892503855a77cb7482.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

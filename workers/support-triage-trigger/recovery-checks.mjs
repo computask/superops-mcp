@@ -12,6 +12,47 @@ const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, reg
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
+test('channel cutover preserves the accepted run endpoint through durable state and polling',async()=>{
+  const original='https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic_original/trigger';
+  const replacement='https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic_replacement/trigger';
+  const requested=[];
+  const fetcher=async(url,init)=>{
+    requested.push({url:String(url),method:init.method});
+    return new Response(JSON.stringify(init.method==='POST'?{agent_trigger_run_id:'apirun_synthetic_cutover'}:{status:'completed'}),{status:init.method==='POST'?202:200});
+  };
+  const config={...loadConfig(vars),workspaceAgentTriggerUrl:original,workspaceAgentAccessToken:'synthetic-token'};
+  const oldClient=new WorkspaceAgentTriggerClient(config,fetcher);
+  const f=fixture('completed');
+  const attempt=await oldClient.trigger('synthetic-cutover',f.scope,1,true);
+  await f.engine.recordAttempt(f.state,attempt,'synthetic-cutover',f.scope,1,Date.parse('2026-10-05T10:00:00Z'));
+  const restored=normalizeState(JSON.parse(JSON.stringify(f.state)));
+  assert.equal(restored.lastAcceptedTrigger.triggerUrl,original);
+  let pollArguments;
+  f.engine.deps.agent.getRunDiagnostics=async(...args)=>{pollArguments=args;return {status:'in_progress',httpStatus:200};};
+  f.setNow('2026-10-05T10:00:31Z');
+  await f.engine.processAlarm();
+  assert.deepEqual(pollArguments,[restored.lastAcceptedTrigger.runId,original]);
+  const newClient=new WorkspaceAgentTriggerClient({...config,workspaceAgentTriggerUrl:replacement,workspaceAgentLegacyTriggerUrl:original},fetcher);
+  assert.equal((await newClient.getRunDiagnostics(restored.lastAcceptedTrigger.runId,restored.lastAcceptedTrigger.triggerUrl)).status,'completed');
+  assert.equal(requested.at(-1).url,original.replace('/trigger','/runs/apirun_synthetic_cutover'));
+  const next=await newClient.trigger('synthetic-fresh',f.scope,1,true);
+  assert.equal(next.triggerUrl,replacement);
+  await newClient.getRunDiagnostics(next.runId,next.triggerUrl);
+  assert.equal(requested.at(-1).url,replacement.replace('/trigger','/runs/apirun_synthetic_cutover'));
+  await newClient.getRunDiagnostics('apirun_synthetic_legacy');
+  assert.equal(requested.at(-1).url,original.replace('/trigger','/runs/apirun_synthetic_legacy'));
+  assert.equal(requested.filter(r=>r.method==='POST').length,2);
+});
+
+test('stored run endpoint cannot forward the Agent credential to another origin',async()=>{
+  let calls=0;
+  const client=new WorkspaceAgentTriggerClient({workspaceAgentTriggerUrl:'https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic/trigger',workspaceAgentAccessToken:'synthetic-token'},async()=>{calls++;return new Response('{}');});
+  for(const endpoint of ['https://example.invalid/v1/workspace_agents/agtch_synthetic/trigger','https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic/trigger?redirect=1','https://user@api.chatgpt.com/v1/workspace_agents/agtch_synthetic/trigger','https://api.chatgpt.com/wrong/trigger']) {
+    assert.equal((await client.getRunDiagnostics('apirun_synthetic',endpoint)).status,'unavailable');
+  }
+  assert.equal(calls,0);
+});
+
 test('dispatch input requires an actual no-apply cause and preserves receipt diagnostics',()=>{
   assert(source.includes('apply_not_attempted describes an outcome, not a cause'));
   assert(source.includes('reason_unavailable if the cause genuinely cannot be established'));

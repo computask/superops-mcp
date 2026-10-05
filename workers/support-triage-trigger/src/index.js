@@ -193,6 +193,7 @@ function loadConfig(env) {
     graphLifecycleNotificationUrl: get(env, "GRAPH_LIFECYCLE_NOTIFICATION_URL") ?? get(env, "GRAPH_NOTIFICATION_URL"),
     graphApiBaseUrl: get(env, "GRAPH_API_BASE_URL") ?? "https://graph.microsoft.com/v1.0",
     workspaceAgentTriggerUrl: get(env, "WORKSPACE_AGENT_TRIGGER_URL"),
+    workspaceAgentLegacyTriggerUrl: get(env, "WORKSPACE_AGENT_LEGACY_TRIGGER_URL"),
     workspaceAgentAccessToken: get(env, "WORKSPACE_AGENT_ACCESS_TOKEN"),
     historyResetToken: get(env, "TRIAGE_HISTORY_RESET_TOKEN"),
     replayAdminToken: get(env, "TRIAGE_REPLAY_ADMIN_TOKEN"),
@@ -1856,7 +1857,8 @@ function markAccepted(state, now, record, cooldownMs) {
     acceptedAt: new Date(now).toISOString(),
     scopeMode: record.scopeMode,
     conversationUrl: record.conversationUrl,
-    runId: record.runId
+    runId: record.runId,
+    triggerUrl: record.triggerUrl
   };
 }
 __name(markAccepted, "markAccepted");
@@ -1874,7 +1876,8 @@ function markAcceptedAwaitingResult(state, now, record, cooldownMs, watchdogMs) 
     acceptedAt: new Date(now).toISOString(),
     scopeMode: record.scopeMode,
     conversationUrl: record.conversationUrl,
-    runId: record.runId
+    runId: record.runId,
+    triggerUrl: record.triggerUrl
   };
   state.lastFailure = null;
   state.acceptedRunLeaseUnknown = false;
@@ -2065,12 +2068,16 @@ var WorkspaceAgentTriggerClient = class {
   static {
     __name(this, "WorkspaceAgentTriggerClient");
   }
-  async getRunDiagnostics(runId) {
+  async getRunDiagnostics(runId, acceptedTriggerUrl) {
     if (missingAgentConfiguration(this.config).length > 0 || !/^apirun_[A-Za-z0-9_-]{1,128}$/.test(runId)) {
       return { status: "unavailable" };
     }
     try {
-      const triggerUrl = new URL(this.config.workspaceAgentTriggerUrl);
+      const channelUrl = acceptedTriggerUrl ?? this.config.workspaceAgentLegacyTriggerUrl ?? this.config.workspaceAgentTriggerUrl;
+      const triggerUrl = new URL(channelUrl);
+      if (acceptedTriggerUrl !== void 0 || this.config.workspaceAgentLegacyTriggerUrl !== void 0) {
+        if (triggerUrl.origin !== "https://api.chatgpt.com" || triggerUrl.username || triggerUrl.password || triggerUrl.search || triggerUrl.hash || !/^\/v1\/workspace_agents\/agtch_[A-Za-z0-9_-]+\/trigger$/.test(triggerUrl.pathname)) return { status: "unavailable" };
+      }
       if (!triggerUrl.pathname.endsWith("/trigger")) return { status: "unavailable" };
       triggerUrl.pathname = `${triggerUrl.pathname.slice(0, -"/trigger".length)}/runs/${encodeURIComponent(runId)}`;
       const response = await this.fetcher(triggerUrl, {
@@ -2084,7 +2091,7 @@ var WorkspaceAgentTriggerClient = class {
         const errorMetadata2 = await readSafeErrorMetadata2(response);
         this.logger?.warn("agent_run_status_unavailable", {
           status: response.status,
-          apiTriggerId: safeApiTriggerId(this.config.workspaceAgentTriggerUrl) ?? null,
+          apiTriggerId: safeApiTriggerId(channelUrl) ?? null,
           errorType: errorMetadata2.errorType ?? null,
           errorCode: errorMetadata2.errorCode ?? null,
           requestIdPresent: errorMetadata2.requestId !== void 0
@@ -2105,7 +2112,7 @@ var WorkspaceAgentTriggerClient = class {
       };
       this.logger?.info("agent_run_diagnostics", {
         status: diagnostics.status,
-        apiTriggerId: safeApiTriggerId(this.config.workspaceAgentTriggerUrl) ?? null,
+        apiTriggerId: safeApiTriggerId(channelUrl) ?? null,
         errorType: diagnostics.errorType ?? null,
         errorCode: diagnostics.errorCode ?? null,
         requestIdPresent: diagnostics.requestId !== void 0
@@ -2125,8 +2132,8 @@ var WorkspaceAgentTriggerClient = class {
       };
     }
   }
-  async getRunStatus(runId) {
-    return (await this.getRunDiagnostics(runId)).status;
+  async getRunStatus(runId, acceptedTriggerUrl) {
+    return (await this.getRunDiagnostics(runId, acceptedTriggerUrl)).status;
   }
   async trigger(triggerId, scope, attempt = 1, resultCallbackEnabled = false) {
     if (missingAgentConfiguration(this.config).length > 0) {
@@ -2195,6 +2202,7 @@ var WorkspaceAgentTriggerClient = class {
         return {
           kind: "accepted",
           conversationUrl,
+          triggerUrl: this.config.workspaceAgentTriggerUrl,
           runId
         };
       }
@@ -3856,7 +3864,7 @@ var CoordinatorEngine = class {
       }
       if (state.lastAcceptedTrigger?.runId) {
         const statusPollStartedAt = this.deps.config.agentTimingTelemetryEnabled ? this.now() : void 0;
-        const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId);
+        const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId, state.lastAcceptedTrigger.triggerUrl);
         const runStatus = diagnostics.status;
         const statusPollDurationMs = statusPollStartedAt === void 0 ? void 0 : boundedAgentTimingMs(this.now() - statusPollStartedAt);
         const statusPollNumber = statusPollStartedAt === void 0 ? void 0 : agentStatusPollCount(
@@ -4002,7 +4010,7 @@ var CoordinatorEngine = class {
     const dueAt = state.dueAt;
     const queuedWorkDue = state.queuedPending && state.queuedDueAt !== null && state.queuedDueAt <= now;
     if (queuedWorkDue && previousRetryRunNeedsDrain(state) && state.lastAcceptedTrigger?.runId) {
-      const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId);
+      const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId, state.lastAcceptedTrigger.triggerUrl);
       const failureDiagnostics = agentRunFailureDiagnostics(diagnostics);
       recordDispatchHistory(state, now, {
         event: "agent_run_status_checked",
@@ -4065,7 +4073,7 @@ var CoordinatorEngine = class {
     }
     if (previousRetryRunNeedsDrain(state)) {
       const statusPollStartedAt = this.deps.config.agentTimingTelemetryEnabled ? this.now() : void 0;
-      const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId);
+      const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId, state.lastAcceptedTrigger.triggerUrl);
       const statusPollDurationMs = statusPollStartedAt === void 0 ? void 0 : boundedAgentTimingMs(this.now() - statusPollStartedAt);
       const statusPollNumber = statusPollStartedAt === void 0 ? void 0 : agentStatusPollCount(
         state,
@@ -4258,7 +4266,7 @@ var CoordinatorEngine = class {
     }
     let effectiveReport = report;
     if (report.status !== "complete" && state.lastAcceptedTrigger?.runId) {
-      const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId);
+      const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId, state.lastAcceptedTrigger.triggerUrl);
       const runFailureDiagnostics = report.status === "terminal_failure" ? agentRunFailureDiagnostics(diagnostics) : [];
       if (runFailureDiagnostics.length > 0) {
         effectiveReport = {
@@ -6833,7 +6841,7 @@ var TriageCoordinator = class {
           config,
           boundWorkerFetch,
           logger()
-        ).getRunDiagnostics(state.lastAcceptedTrigger.runId);
+        ).getRunDiagnostics(state.lastAcceptedTrigger.runId, state.lastAcceptedTrigger.triggerUrl);
         resetRunStatus = diagnostics.status;
         if (diagnostics.status !== "completed" && diagnostics.status !== "failed") {
           return json({
