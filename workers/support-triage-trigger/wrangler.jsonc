@@ -9,6 +9,7 @@
   "preview_urls": false,
   "tail_consumers": [{ "service": "superops-api-call-log" }],
   "keep_vars": false,
+  "services": [{"binding": "TRIAGE_WRITE_GUARD_SERVICE", "service": "superops-mcp"}],
   "durable_objects": {
     "bindings": [
       {
@@ -31,6 +32,7 @@
     ]
   },
   "vars": {
+    "TRIAGE_RUN_LEASE_EXPIRY_ENABLED": "true",
     "AUTOMATED_TRIAGE_TRIGGER_ENABLED": "true",
     "GRAPH_LIFECYCLE_NOTIFICATION_URL": "https://support-triage-trigger.sam-c6d.workers.dev/graph/lifecycle",
     "GRAPH_NOTIFICATION_URL": "https://support-triage-trigger.sam-c6d.workers.dev/graph/notifications",

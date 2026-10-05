@@ -62,7 +62,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-b5cc186a0322d3393d67f7d22a1ccdfd06028ca7ad1105892503855a77cb7482.
+d49abbdcb76026cd05a1f70764c56ce7077fb3aff0620babdc01aa1d2084599c.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -218,3 +218,10 @@ The one-minute cron maintains Graph subscriptions and bounded fallback discovery
 New-mail Graph notifications remain the primary trigger; this is not a periodic
 full-ticket-queue triage job. No email bodies or direct SuperOps requests are
 performed by this Worker. The MCP remains the mutation authority.
+
+Automatic run expiry now uses independent MCP-enforced write leases. Before
+releasing an expired run, the coordinator requires a live write-guard capability
+handshake, persists revocation, and retains the exact old EMAIL scope for
+reconciliation. It promotes only disjoint queued work and never replays an
+accepted mutation. See ../../docs/triage-run-expiry.md for the authenticated
+preview/recovery control, deployment ordering and rollback requirements.

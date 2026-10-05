@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { assertTriageRunWriteLease } from "./triage-run-lease.js";
 import { capturedDispatcherFetch } from "./graphql-capture.js";
 import { getExecutionConfig, hasExecutionBudgetFor, recordSubrequestFinish, recordTypedSubrequestStart, withExecutionItem } from "./execution.js";
 import { fetchSafeDispatcherDiagnostics, type DispatcherDiagnosticResult, type DispatcherDiagnosticRetrieval, type SafeDispatcherDiagnostics } from "./dispatcher-diagnostics.js";
@@ -157,6 +158,11 @@ export async function dispatcherFetch(body: string, options: {
       throw new DispatcherPendingError(requestId, options.idempotencyKey, "pending", observedRetryAfter, observedHttpStatus, observedErrorClassification, observedDispatcherHttpStatus);
     }
     const polling = Boolean(requestId);
+    // Expiry prevents NEW submissions only. Existing receipts must still be
+    // polled with their original IDs, including after revocation.
+    if (!polling && options.mutation) await assertTriageRunWriteLease({
+      operationId: operation.getStore()?.operationId, itemKey: operation.getStore()?.itemKey,
+    });
     const url = `${DISPATCHER_ORIGIN}${polling ? `/v1/requests/${requestId}` : "/graphql"}`;
     const counted = polling ? recordTypedSubrequestStart({type: "dispatcherPoll", endpoint: url, operationName: "dispatcherStatus"}) : undefined;
     let response: Response | undefined;

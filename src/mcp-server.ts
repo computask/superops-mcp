@@ -11,6 +11,7 @@
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { assertTriageRunWriteLease, runWithTriageRunContext } from "./triage-run-lease.js";
 import { attachSafeErrorContract, safeSuperOpsErrorMetadata } from "./error-contract.js";
 import {
   CallToolRequestSchema,
@@ -1041,7 +1042,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
     const captureContext = parseTriageAgentCaptureContext(rawArgs.triageCapture);
     const args = stripTriageAgentCaptureContext(rawArgs);
 
-    return runWithExecutionContext(name, async () => {
+    return runWithTriageRunContext(captureContext, () => runWithExecutionContext(name, async () => {
       const started = Date.now();
       const timing = beginTriageTiming(name, rawArgs, getExecutionState()?.invocationId);
       let timingOutcome: "success" | "error" = "error";
@@ -1071,6 +1072,10 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
       };
 
       try {
+        if (name === "superops_tickets_apply_triage_plan") {
+          if (rawArgs.triageCapture !== undefined && !captureContext) throw new Error("Invalid automatic triage correlation; no apply permitted.");
+          await assertTriageRunWriteLease({operationId: typeof args.batchId === "string" ? args.batchId : undefined});
+        }
         const result = boundedToolResult(
           sanitizeToolResult(
               blockedToolNames.has(name)
@@ -1119,7 +1124,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
         // This is not proof that the remote Agent has received the response.
         timing("response_ready", timingOutcome);
       }
-    });
+    }));
   });
 
   return server;

@@ -30,6 +30,7 @@ import {
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { runWithCredentials } from "./client.js";
+import { runWithTriageLeaseEnvironment, triageLeaseCapability, type TriageLeaseEnvironment } from "./triage-run-lease.js";
 import {
   blockedToolNamesByCategory,
   chatGptDirectBlockedToolNames,
@@ -71,7 +72,7 @@ export {
   SuperOpsRateLimitProbe,
 };
 
-export interface Env {
+export interface Env extends TriageLeaseEnvironment {
   DISPATCHER_TOKEN?: string;
   SUPEROPS_GRAPHQL_CAPTURE_ENABLED?: string;
   CF_ACCESS_CLIENT_ID?: string;
@@ -1141,6 +1142,10 @@ async function handleBaseWorkerFetch(
 ): Promise<Response> {
   const url = new URL(request.url);
 
+  if (url.pathname === "/internal/triage-run-lease-capability" && request.method === "GET") {
+    return json(triageLeaseCapability(env), 200, {"Cache-Control": "no-store"});
+  }
+
   if (url.pathname === "/internal/script-catalogue/publish") {
     return handleInternalScriptCataloguePublish(request, env);
   }
@@ -1407,7 +1412,7 @@ export default {
     env: Env,
     ctx?: WorkerExecutionContext
   ): Promise<Response> {
-    return captureGraphql(env, ctx, async () => {
+    return runWithTriageLeaseEnvironment(env, () => captureGraphql(env, ctx, async () => {
       const url = new URL(request.url);
       if (isChatGptDirectRequest(url, env)) {
         return getChatGptOAuthProvider(env).fetch(
@@ -1418,7 +1423,7 @@ export default {
       }
 
       return handleBaseWorkerFetch(request, env, ctx?.props, false, undefined, ctx);
-    });
+    }));
   },
   scheduled(
     _controller: unknown,

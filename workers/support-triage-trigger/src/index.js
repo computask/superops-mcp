@@ -149,6 +149,8 @@ function loadConfig(env) {
       DEFAULT_RECONCILIATION_ELIGIBILITY_SEPARATION_ENABLED
     ),
     attentionTailIsolationEnabled: parseBoolean(get(env, "TRIAGE_ATTENTION_TAIL_ISOLATION_ENABLED"), false),
+    runLeaseExpiryEnabled: get(env, "TRIAGE_RUN_LEASE_EXPIRY_ENABLED") === "true",
+    runLeaseGuardService: env.TRIAGE_WRITE_GUARD_SERVICE,
     acceptedRunMaxAgeMs: parsePositiveSeconds(
       get(env, "TRIAGE_ACCEPTED_RUN_MAX_AGE_SECONDS"),
       DEFAULT_ACCEPTED_RUN_MAX_AGE_SECONDS
@@ -1437,6 +1439,7 @@ function createInitialState() {
     lastGraphSweepMessageCount: 0,
     lastGraphSweepErrorAt: null,
     pendingTicketOutcomes: null,
+    runWriteLeases: [],
     acceptedRunLeaseUnknown: false,
     queuedPending: false,
     queuedReason: null,
@@ -1487,6 +1490,11 @@ function normalizeState(value) {
   const normalized = {
     ...initial,
     ...value,
+    runWriteLeases: Array.isArray(value?.runWriteLeases) ? value.runWriteLeases.filter(lease =>
+      isRecord(lease) && typeof lease.triggerId === "string" && Number.isInteger(lease.attempt) &&
+      Number.isFinite(lease.issuedAt) && Number.isFinite(lease.expiresAt) &&
+      (lease.revokedAt === null || Number.isFinite(lease.revokedAt)) && Array.isArray(lease.authorizedItems))
+      .map(lease => ({...lease, authorizedItems: lease.authorizedItems.filter(item => typeof item === "string" && /^\d{1,24}$/.test(item)).slice(0, 500)})).slice(-256) : [],
     emptyTargetedRecoveryPending: value?.emptyTargetedRecoveryPending === true,
     seenNotificationFingerprints: Array.isArray(value?.seenNotificationFingerprints) ? value.seenNotificationFingerprints : initial.seenNotificationFingerprints,
     pendingDispatchWasQueued: value?.pendingDispatchWasQueued === true,
@@ -3422,6 +3430,78 @@ function recoverStaleAcceptedRun(state, config, now, diagnostics) {
   return true;
 }
 __name(recoverStaleAcceptedRun, "recoverStaleAcceptedRun");
+// A write lease is independent of diagnostic captures and callback receipts.
+// It cannot authorize a plan; the MCP's existing approval/stale/dedupe gates remain.
+const RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
+function ensureAcceptedWriteLease(state, config) {
+  const accepted = state.lastAcceptedTrigger;
+  const issuedAt = Date.parse(accepted?.acceptedAt ?? "");
+  if (!accepted?.triggerId || state.pendingTriggerId !== accepted.triggerId || !Number.isFinite(issuedAt) || !state.pendingTriggerScope) return;
+  const attempt = accepted.attempt ?? state.dispatchAttempt;
+  if (state.runWriteLeases.some(lease => lease.triggerId === accepted.triggerId && lease.attempt === attempt)) return;
+  state.runWriteLeases.push({triggerId: accepted.triggerId, attempt, runId: accepted.runId,
+    scope: state.pendingTriggerScope, issuedAt, expiresAt: issuedAt + config.acceptedRunMaxAgeMs,
+    revokedAt: null, authorizedItems: []});
+  state.runWriteLeases = state.runWriteLeases.slice(-256);
+}
+function checkRunWriteLease(state, config, body, now) {
+  ensureAcceptedWriteLease(state, config);
+  const lease = [...state.runWriteLeases].reverse().find(value => value.triggerId === body.triggerId);
+  const denied = {protocol: RUN_LEASE_PROTOCOL, allowed: false, reason: "expired_revoked_or_unknown"};
+  if (!lease || lease.revokedAt !== null || now >= lease.expiresAt ||
+      body.attempt !== undefined && body.attempt !== lease.attempt) return denied;
+  if (body.itemKey !== undefined) {
+    if (typeof body.itemKey !== "string" || !/^\d{1,24}$/.test(body.itemKey)) return denied;
+    if (body.ticketCreatedTime !== undefined || body.ticketSource !== undefined) {
+      // These fields come from the MCP's mandatory live pre-write read, not Agent evidence.
+      const createdText = body.ticketCreatedTime ?? "";
+      const created = Date.parse(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(createdText) ? createdText + "Z" : createdText);
+      const scope = lease.scope;
+      if (scope?.mode !== "new-email-tickets" || body.ticketSource !== scope.source ||
+          !Number.isFinite(created) || created < Date.parse(scope.createdFrom) || created >= Date.parse(scope.createdTo)) {
+        return {...denied, reason: "ticket_outside_frozen_scope"};
+      }
+      if (!lease.authorizedItems.includes(body.itemKey)) {
+        if (lease.authorizedItems.length >= 500) return denied;
+        lease.authorizedItems.push(body.itemKey);
+      }
+    } else if (!lease.authorizedItems.includes(body.itemKey)) return {...denied, reason: "live_scope_check_required"};
+  }
+  return {protocol: RUN_LEASE_PROTOCOL, allowed: true, expiresAt: lease.expiresAt};
+}
+async function recoverExpiredWriteLease(engine, state, now) {
+  const config = engine.deps.config;
+  ensureAcceptedWriteLease(state, config);
+  const accepted = state.lastAcceptedTrigger;
+  const lease = state.runWriteLeases.find(value => value.triggerId === accepted?.triggerId &&
+    value.attempt === (accepted?.attempt ?? state.dispatchAttempt));
+  if (!config.runLeaseExpiryEnabled || !config.enabled || !state.pending ||
+      !["awaiting_result", "retry_wait"].includes(state.executionPhase) ||
+      state.pendingTriggerId !== accepted?.triggerId || !accepted?.runId ||
+      !lease || now < lease.expiresAt || lease.scope?.mode !== "new-email-tickets") return null;
+  // Publishing order is safe: the old coordinator cannot release an active run
+  // until the deployed MCP confirms its fail-closed mutation guard is enabled.
+  let capability;
+  try {
+    const response = await config.runLeaseGuardService?.fetch(new Request("https://mcp.internal/internal/triage-run-lease-capability", {signal: AbortSignal.timeout(5000)}));
+    if (response?.ok) capability = await response.json();
+  } catch { }
+  if (capability?.protocol !== RUN_LEASE_PROTOCOL || capability.enforced !== true) return null;
+  lease.revokedAt ??= now;
+  // Durably fence before releasing or promoting ANY scope. Existing dispatcher
+  // receipts remain reconcilable; this never cancels or replays an accepted write.
+  await engine.deps.store.save(state);
+  recordDispatchHistory(state, now, {event: "stale_run_recovered", failureKind: "ambiguous",
+    attempt: lease.attempt, agentRunIdPresent: true, waitReason: "bounded_recovery",
+    failureDiagnostics: {source: "run_write_lease", stage: "expiry", message: "Write permission expired; old scope retained for reconciliation. No replay."}}, lease.scope);
+  recordReconciliationNeedsAttention(state, lease.scope, now, state.retryCount);
+  refreshQueuedAttentionBlock(state, config, now);
+  promoteQueuedDispatchSafely(state, now, config);
+  const nextAt = state.pending ? Math.max(state.dueAt ?? now, state.cooldownUntil) : void 0;
+  await engine.deps.store.save(state);
+  if (nextAt !== void 0) await engine.deps.store.setAlarm(nextAt);
+  return {status: "expired_run_quarantined", nextAt};
+}
 function recoverOrphanedAwaitingResult(state, config, now) {
   if (config.scopeMode !== "new-email-tickets" || !state.pending || state.executionPhase !== "awaiting_result" || typeof state.pendingTriggerId !== "string" || typeof state.lastAcceptedTrigger?.runId === "string") {
     return false;
@@ -3761,6 +3841,8 @@ var CoordinatorEngine = class {
   async processAlarm() {
     const now = this.now();
     const state = normalizeState(await this.deps.store.load());
+    const leaseRecovery = await recoverExpiredWriteLease(this, state, now);
+    if (leaseRecovery) return leaseRecovery;
     migrateLegacyAttentionBlockedQueue(state);
     clearExpiredSharedRateLimit(state, now);
     const scheduledAt = nextScheduledAt(state, now, this.deps.config);
@@ -4662,6 +4744,7 @@ var CoordinatorEngine = class {
           this.deps.config.cooldownMs
         );
       }
+      ensureAcceptedWriteLease(state, this.deps.config);
       await this.deps.store.save(state);
       if (nextAt2 !== void 0) await this.deps.store.setAlarm(nextAt2);
       return { status: "accepted", triggerId, nextAt: nextAt2 };
@@ -6748,6 +6831,32 @@ var TriageCoordinator = class {
       ),
       logger: logger()
     });
+    if (request.method === "POST" && path === "/internal/run-lease/check") {
+      let body;
+      try { body = await request.json(); } catch { return json({error: "invalid_payload"}, 400); }
+      if (!isRecord(body) || typeof body.triggerId !== "string" || body.triggerId.length > 160) return json({error: "invalid_payload"}, 400);
+      const state = normalizeState(await store.load());
+      const result = checkRunWriteLease(state, config, body, Date.now());
+      await store.save(state);
+      return json(result, result.allowed ? 200 : 409);
+    }
+    if (request.method === "POST" && path === "/internal/admin/run/recover") {
+      let body;
+      try { body = await request.json(); } catch { return json({error: "invalid_payload"}, 400); }
+      const state = normalizeState(await store.load());
+      const accepted = state.lastAcceptedTrigger;
+      if (!isRecord(body) || typeof body.triggerId !== "string" || typeof body.runId !== "string" ||
+          body.triggerId !== state.pendingTriggerId || body.runId !== accepted?.runId ||
+          typeof body.dryRun !== "boolean") return json({error: "exact_active_run_required"}, 409);
+      const now = Date.now();
+      ensureAcceptedWriteLease(state, config);
+      const lease = state.runWriteLeases.find(value => value.triggerId === accepted?.triggerId && value.attempt === (accepted?.attempt ?? state.dispatchAttempt));
+      const preview = {triggerId: accepted.triggerId, runId: accepted.runId, scope: lease?.scope,
+        expired: Boolean(lease && now >= lease.expiresAt), action: "revoke_write_permission_and_quarantine_exact_scope", replay: false};
+      if (body.dryRun) return json(preview);
+      const result = await recoverExpiredWriteLease(engine, state, now);
+      return json(result ?? {error: "write_guard_not_ready_or_run_not_expired"}, result ? 200 : 409);
+    }
     if (request.method === "POST" && path === "/internal/admin/replay") {
       let body;
       try {
@@ -6941,12 +7050,17 @@ var TriageCoordinator = class {
     }
     if (request.method === "GET" && path === "/internal/status") {
       const state = await store.load();
-      return json(safeCoordinatorStatus(
+      const status = safeCoordinatorStatus(
         state,
         Date.now(),
         state.dispatchHistory.slice(-MAX_DISPATCH_HISTORY),
         state.dispatchHistory.length
-      ));
+      );
+      const age = state.executionPhase === "awaiting_result" ? acceptedRunAgeMs(state, Date.now()) : null;
+      return json({...status, runLease: {protocol: RUN_LEASE_PROTOCOL, recoveryEnabled: config.runLeaseExpiryEnabled,
+        acceptedAgeMs: age, expiresAt: state.lastAcceptedTrigger?.acceptedAt ? new Date(Date.parse(state.lastAcceptedTrigger.acceptedAt) + config.acceptedRunMaxAgeMs).toISOString() : null,
+        stalled: age !== null && age >= config.acceptedRunMaxAgeMs,
+        reason: age !== null && age >= config.acceptedRunMaxAgeMs ? "awaiting_expiry_recovery_or_guard_readiness" : null}});
     }
     if (request.method === "GET" && path === "/internal/history") {
       const url = new URL(request.url);
@@ -7491,6 +7605,16 @@ var index_default = {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       }));
+    }
+    if (url.pathname === "/admin/run/recover" && request.method === "POST") {
+      const actualToken = request.headers.get("Authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
+      if (!config.replayAdminToken || !constantTimeEqual(config.replayAdminToken, actualToken)) return json2({error: "unauthorized"}, 401);
+      let body;
+      try { body = await request.json(); } catch { return json2({error: "invalid_payload"}, 400); }
+      const response = await coordinator(env).fetch(new Request("https://coordinator.internal/internal/admin/run/recover", {
+        method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+      }));
+      return new Response(response.body, {status: response.status, headers: {"Content-Type": "application/json", "Cache-Control": "no-store, private"}});
     }
     if (url.pathname === "/mcp" && request.method === "POST") {
       return handleTriageResultMcp(request, {

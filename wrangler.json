@@ -28,6 +28,7 @@
     }
   ],
   "vars": {
+    "TRIAGE_RUN_WRITE_GUARD_ENABLED": "true",
     "SUPEROPS_GRAPHQL_CAPTURE_ENABLED": "true",
     "AUTH_MODE": "env",
     "SUPEROPS_REGION": "us",
@@ -76,6 +77,11 @@
   },
   "durable_objects": {
     "bindings": [
+      {
+        "name": "TRIAGE_RUN_COORDINATOR",
+        "class_name": "TriageCoordinator",
+        "script_name": "support-triage-trigger"
+      },
       {
         "name": "SUPEROPS_OPERATION_LEDGER",
         "class_name": "SuperOpsOperationLedger"

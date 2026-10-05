@@ -7,8 +7,8 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
 const testableSource = source.replace(/\nexport \{\s*TriageCoordinator,\s*index_default as default\s*\};\s*\/\/# sourceMappingURL=index\.js\.map\s*$/, '\n');
 assert.notEqual(testableSource, source, 'The preserved production module export footer must be isolated for the in-memory test harness');
-const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen, listRelevantDispatchHistory} = await import(
-  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen, listRelevantDispatchHistory};').toString('base64')}`
+const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen, listRelevantDispatchHistory, checkRunWriteLease, ensureAcceptedWriteLease} = await import(
+  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen, listRelevantDispatchHistory, checkRunWriteLease, ensureAcceptedWriteLease};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
@@ -469,6 +469,62 @@ function fixture(status, age = 120000, configOverrides = {}) {
     agent:{getRunDiagnostics:async()=>({status:agentStatus,httpStatus:200}),trigger:async(...args)=>{calls.push(args);return {kind:'accepted',runId:'apirun_retry'};}}});
   return {engine,calls,alarms,scope,config,get state(){return state;},seed:patch=>{state={...state,...patch};},setNow:value=>{now=Date.parse(value);},setRunStatus:value=>{agentStatus=value;},advance:()=>{now=state.dueAt ?? now+40000;},expire:()=>{now+=40000;}};
 }
+
+test('write lease binds the live ticket to its exact half-open window and cannot be renewed by checking it',()=>{
+  const f=fixture('in_progress');
+  const state=normalizeState(f.state), now=Date.parse('2026-09-24T06:00:00Z');
+  ensureAcceptedWriteLease(state,f.config);
+  const input={triggerId:state.pendingTriggerId,attempt:1,itemKey:'90001',ticketCreatedTime:f.scope.createdFrom,ticketSource:'EMAIL'};
+  assert.equal(checkRunWriteLease(state,f.config,input,now).allowed,true);
+  const deadline=state.runWriteLeases[0].expiresAt;
+  assert.equal(checkRunWriteLease(state,f.config,{triggerId:input.triggerId,itemKey:'90001'},now).allowed,true);
+  assert.equal(checkRunWriteLease(state,f.config,{...input,ticketCreatedTime:f.scope.createdTo},now).allowed,false);
+  assert.equal(checkRunWriteLease(state,f.config,{...input,ticketSource:'PHONE'},now).allowed,false);
+  assert.equal(checkRunWriteLease(state,f.config,{...input,attempt:2},now).allowed,false);
+  assert.equal(checkRunWriteLease(state,f.config,{triggerId:input.triggerId,itemKey:'90002'},now).allowed,false);
+  assert.equal(checkRunWriteLease(state,f.config,input,deadline).allowed,false);
+  const restored=normalizeState(JSON.parse(JSON.stringify(state)));
+  assert.equal(checkRunWriteLease(restored,f.config,input,deadline+1).allowed,false);
+  assert.equal(restored.runWriteLeases[0].expiresAt,deadline);
+});
+
+for(const status of ['in_progress','queued','suspended','unavailable']) {
+  test(`expired ${status} run is fenced before a disjoint queue is promoted; late callback cannot disturb it`,async()=>{
+    const f=fixture(status,360000,{runLeaseExpiryEnabled:true,runLeaseGuardService:{fetch:async()=>Response.json({protocol:'triage-run-lease-v1',enforced:true})}});
+    const oldId=f.state.pendingTriggerId;
+    const fresh=emailScope('2026-09-24T06:00:00Z','2026-09-24T06:01:00Z');
+    f.seed({queuedPending:true,queuedReason:'new_message',queuedNotificationWindowStartedAt:Date.parse(fresh.createdFrom),
+      queuedNotificationWindowEndedAt:Date.parse(fresh.createdTo),queuedNotificationLookbackMs:0,
+      queuedLastNotificationAt:Date.parse(fresh.createdTo),queuedDueAt:Date.parse(fresh.createdTo)});
+    const saved=[];
+    const originalSave=f.engine.deps.store.save;
+    f.engine.deps.store.save=async state=>{saved.push(structuredClone(state));await originalSave(state);};
+    assert.equal((await f.engine.processAlarm()).status,'expired_run_quarantined');
+    assert.equal(saved[0].pendingTriggerId,oldId);
+    assert.equal(saved[0].runWriteLeases[0].revokedAt,Date.parse('2026-09-24T06:00:00Z'));
+    assert.deepEqual(f.state.needsAttentionScopes,[f.scope]);
+    assert.equal(f.calls.length,0,'recovery does not dispatch or replay inside the revocation transaction');
+    const afterRecovery=f.state.pendingTriggerId;
+    assert.notEqual(afterRecovery,oldId);
+    const late=await f.engine.reportResult({triggerId:oldId,attempt:1,status:'complete',metadata:{ticketsConsidered:0,ticketsCompleted:0,ticketsDeferred:0}});
+    assert.equal(late.status,'stale_or_unauthorized');
+    assert.equal(f.state.pendingTriggerId,afterRecovery);
+    assert.equal(checkRunWriteLease(normalizeState(f.state),f.config,{triggerId:oldId},Date.parse('2026-09-24T06:00:00Z')).allowed,false);
+    f.advance(); await f.engine.processAlarm();
+    assert.equal(f.calls.length,1);
+    assert(Date.parse(f.calls[0][1].createdFrom)>=Date.parse(f.scope.createdTo));
+  });
+}
+test('expiry never releases a lease without a live deployed write guard handshake',async()=>{
+  for(const capability of [undefined,{protocol:'triage-run-lease-v1',enforced:false},{protocol:'different',enforced:true}]) {
+    const f=fixture('in_progress',360000,{runLeaseExpiryEnabled:true,runLeaseGuardService:capability?{fetch:async()=>Response.json(capability)}:undefined});
+    f.expire();
+    await f.engine.processAlarm();
+    assert.equal(f.state.executionPhase,'awaiting_result');
+    assert.equal(f.state.needsAttentionScopes.length,0);
+    assert.equal(f.calls.length,0);
+  }
+});
 
 const emailScope=(from,to)=>({mode:'new-email-tickets',source:'EMAIL',createdFrom:from,createdTo:to});
 const terminalValidationMetadata = {failureStage:'triage_apply',ticketsConsidered:1,ticketsCompleted:0,ticketsDeferred:1,

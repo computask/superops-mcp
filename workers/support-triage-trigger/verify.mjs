@@ -7,7 +7,7 @@ const require=createRequire(import.meta.url);
 const wranglerRequire=createRequire(require.resolve('wrangler/package.json'));
 const {Miniflare}=wranglerRequire('miniflare');
 const code=readFileSync(new URL('./src/index.js',import.meta.url));
-assert.equal(createHash('sha256').update(code).digest('hex'),'b5cc186a0322d3393d67f7d22a1ccdfd06028ca7ad1105892503855a77cb7482','Reviewed production module must match the provenance record');
+assert.equal(createHash('sha256').update(code).digest('hex'),'d49abbdcb76026cd05a1f70764c56ce7077fb3aff0620babdc01aa1d2084599c','Reviewed production module must match the provenance record');
 const config=JSON.parse(readFileSync(new URL('./wrangler.jsonc',import.meta.url),'utf8'));
 assert.equal(config.name,'support-triage-trigger');
 assert.equal(config.no_bundle,true);
@@ -34,6 +34,9 @@ try {
   assert.equal(health.callsSuperOpsDirectly,false);assert.equal(health.consumesEmailBodies,false);
   assert.equal((await mf.dispatchFetch('http://local/admin/history/reset',{method:'POST'})).status,401);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST'})).status,401);
+  assert.equal((await mf.dispatchFetch('http://local/admin/run/recover',{method:'POST'})).status,401);
+  assert.equal((await mf.dispatchFetch('http://local/internal/run-lease/check',{method:'POST',body:'{}'})).status,404);
+  assert.equal((await mf.dispatchFetch('http://local/admin/run/recover',{method:'POST',headers:{Authorization:'Bearer synthetic-replay-admin-token','Content-Type':'application/json'},body:'{}'})).status,409);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST',headers:{Authorization:'Bearer wrong-token'},body:'{}'})).status,401);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST',headers:{Authorization:'Bearer synthetic-replay-admin-token','Content-Type':'application/json'},body:'{}'})).status,400);
   const captureUrl='http://local/admin/agent-capture?triggerId=triage-1-00000000-0000-4000-8000-000000000001&attempt=1';

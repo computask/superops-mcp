@@ -1,4 +1,5 @@
 import { paginatedClient } from "../pagination.js";
+import { assertTriageRunWriteLease } from "../triage-run-lease.js";
 import { DispatcherPendingError, withDispatcherRecoveryAttempt } from "../dispatcher.js";
 /**
  * SuperOps.ai Tickets Domain
@@ -9704,6 +9705,8 @@ function createApplyTriageContinuationAdapter(
         updatedTimeExpectation?: string,
         baselineTicket?: Ticket
       ) => {
+        await assertTriageRunWriteLease({ operationId: record.operationId,
+          itemKey: claim.itemKey, ticketCreatedTime: baselineTicket?.createdTime, ticketSource: baselineTicket?.source });
         const checkpointCount = mutationType === "note" ? 2 : mutationType === "resolveFallback" || mutationType === "status" ? 1 : mutationType === "classification" ? 2 : 3;
         const verificationReserve = mutationType === "note"
           ? (storedParams.verify === false ? 0 : 2)
