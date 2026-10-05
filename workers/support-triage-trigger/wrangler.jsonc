@@ -64,6 +64,6 @@
     "TRIAGE_TRIGGER_MAX_DEBOUNCE_SECONDS": "120",
     "TRIAGE_TRIGGER_SCOPE_MODE": "new-email-tickets",
     "WORKSPACE_AGENT_TRIGGER_COOLDOWN_SECONDS": "120",
-    "WORKSPACE_AGENT_TRIGGER_URL": "https://api.chatgpt.com/v1/workspace_agents/agtch_6aa8549398188191ab83ec01e16bf474/trigger"
+    "WORKSPACE_AGENT_TRIGGER_URL": "https://api.chatgpt.com/v1/workspace_agents/agtch_6ac3b3695f8c8191811c41b71ef650cc/trigger"
   }
 }

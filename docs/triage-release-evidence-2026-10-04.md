@@ -107,6 +107,12 @@ testing after the channel's instruction copy is corrected.
 
 ## Instruction drift and remaining completion condition
 
+**2026-10-05 correction:** The completion prescription below is superseded by
+`triage-api-channel-2026-10-05.md`. A channel's stored guidance is not proof of
+the complete runtime prompt, and equality with the full Agent policy is not a
+requirement for a fresh channel. The replacement also fixes a independently
+verified HTML action-constraint defect.
+
 The canonical Git instruction contract is `2026-10-04.1`. The Builder is
 published as version **462**, `agtv_6ac23d51f7348191925fd877bea87e28`.
 A normal supported-UI published-version response was read independently.

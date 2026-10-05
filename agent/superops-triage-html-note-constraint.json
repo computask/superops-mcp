@@ -1,0 +1,21 @@
+{
+  "name": "Scheduled triage HTML note shape",
+  "constraints": [
+    {
+      "action_name": "superops_tickets_apply_triage_plan",
+      "parameter": "actions",
+      "constraint": {
+        "items": {
+          "properties": {
+            "note": {
+              "pattern": "^<strong>TRIAGE SUMMARY</strong><br><br><strong>Ticket goal:</strong>(?:[ \\t\\r\\n]|<br\\s*/?>)*[^<\\s](?:(?!<br><br><strong>)[\\s\\S])*<br><br><strong>What needs to be known:</strong>(?:[ \\t\\r\\n]|<br\\s*/?>)*[^<\\s](?:(?!<br><br><strong>)[\\s\\S])*(?:<br><br><strong>Historical issue:</strong>(?:[ \\t\\r\\n]|<br\\s*/?>)*[^<\\s](?:(?!<br><br><strong>)[\\s\\S])*)?(?:<br><br><strong>Historical solution:</strong>(?:[ \\t\\r\\n]|<br\\s*/?>)*[^<\\s](?:(?!<br><br><strong>)[\\s\\S])*)?(?:<br><br><strong>Post-solution recurrence:</strong>(?:[ \\t\\r\\n]|<br\\s*/?>)*[^<\\s](?:(?!<br><br><strong>)[\\s\\S])*)?(?:<br><br><strong>Cross-client signal:</strong>(?:[ \\t\\r\\n]|<br\\s*/?>)*[^<\\s](?:(?!<br><br><strong>)[\\s\\S])*)?(?:<br><br><strong>Emerging issue:</strong>(?:[ \\t\\r\\n]|<br\\s*/?>)*[^<\\s](?:(?!<br><br><strong>)[\\s\\S])*)?(?:<br><br><strong>Current script recommendation:</strong>(?:[ \\t\\r\\n]|<br\\s*/?>)*[^<\\s](?:(?!<br><br><strong>)[\\s\\S])*)?<br><br><strong>Next step:</strong>(?:[ \\t\\r\\n]|<br\\s*/?>)*[^<\\s](?:(?!<br><br><strong>)[\\s\\S])*<br><br><strong>When:</strong>(?:[ \\t\\r\\n]|<br\\s*/?>)*[^<\\s](?:(?!<br><br><strong>)[\\s\\S])*(?:<br><br>)?$"
+            },
+            "isPublicNote": {
+              "const": false
+            }
+          }
+        }
+      }
+    }
+  ]
+}
