@@ -6,7 +6,7 @@ vi.mock("../client.js", async importOriginal => ({
 }));
 import { getClient, SuperOpsError } from "../client.js";
 import { getTicketsTools, resetTicketFieldOptionsCacheForTests } from "./tickets.js";
-import { currentOwnerHash, getOperationStore, stableHash } from "../operation-store.js";
+import { currentOwnerHash, getOperationStore, runWithOperationStore, stableHash } from "../operation-store.js";
 import { runWithExecutionContext, runWithExecutionConfig, recordTypedSubrequestStart } from "../execution.js";
 import { publishToolDefinition } from "../tool-catalogue.js";
 
@@ -48,6 +48,9 @@ describe("read-only complete triage preparation", () => {
     expect(data.complete).toBe(true);
     expect(data.preparedPlan.actions[0].expectedClientHash).toBe(stableHash(original.client.name));
     expect(data.preparedPlan.preparationFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(data.preparedPlan).toMatchObject({ stopOnFirstFailure: false,
+      allowResolveFullFallbackToUpdate: false, allowWriteIfUpdatedTimeChanged: false,
+      allowWriteWithoutVerifiedContent: false });
     expect(mutate).not.toHaveBeenCalled();
     expect(await getOperationStore().get(proposal().batchId, currentOwnerHash())).toBeUndefined();
     const definition = getTicketsTools().tools.find(tool => tool.name === "superops_tickets_prepare_triage_plan")!;
@@ -113,6 +116,52 @@ describe("read-only complete triage preparation", () => {
       expect((await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", plan)).isError).toBe(true);
     }
     expect(query).not.toHaveBeenCalled(); expect(mutate).not.toHaveBeenCalled();
+  });
+  it("accepts equivalent disabled overrides but still blocks an engineer edit after preparation", async () => {
+    await runWithOperationStore({}, async () => {
+      const { data } = await prepare({ ...proposal(), batchId: "synthetic-prepared-stale" }); query.mockClear();
+      query.mockResolvedValue({ getTicket: { ...original, updatedTime: "2026-10-04T09:01:00Z" } });
+      const plan = { ...data.preparedPlan };
+      delete plan.allowResolveFullFallbackToUpdate; delete plan.allowWriteIfUpdatedTimeChanged;
+      delete plan.allowWriteWithoutVerifiedContent;
+      const response = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", plan);
+      expect(response.content[0].text).not.toContain("checksum does not match");
+      expect(JSON.parse(response.content[0].text).results[0]).toMatchObject({ finalOutcome: "SkippedChangedSinceSnapshot" });
+      expect(query).toHaveBeenCalled(); expect(mutate).not.toHaveBeenCalled();
+    });
+  });
+  it("applies one complete prepared proposal and returns the stored result for duplicate calls", async () => {
+    await runWithOperationStore({}, async () => {
+      const ticket: Record<string, unknown> = structuredClone(original);
+      const notes: Array<Record<string, unknown>> = [];
+      query.mockImplementation(async (document: string) => {
+        if (document.includes("getFields")) return { getFields: fields() };
+        if (document.includes("getTicketNoteList")) return { getTicketNoteList: structuredClone(notes) };
+        return { getTicket: structuredClone(ticket) };
+      });
+      mutate.mockImplementation(async (document: string, variables: { input: Record<string, unknown> }) => {
+        if (document.includes("createTicketNote")) {
+          notes.push({ noteId: "synthetic-prepared-note", content: variables.input.content, privacyType: "PRIVATE" });
+          return { createTicketNote: { noteId: "synthetic-prepared-note", privacyType: "PRIVATE" } };
+        }
+        Object.assign(ticket, variables.input, { updatedTime: "2026-10-04T09:01:00Z" });
+        return { updateTicket: { ticketId: original.ticketId } };
+      });
+      const { data } = await prepare({ ...proposal(), batchId: "synthetic-prepared-duplicate" });
+      const first = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", data.preparedPlan);
+      expect(JSON.parse(first.content[0].text).results[0]).toMatchObject({ finalOutcome: "Left", verified: true });
+      expect(JSON.parse(first.content[0].text).operation.state).toBe("Completed");
+      const writes = mutate.mock.calls.length;
+      expect(writes).toBeGreaterThan(0); expect(notes).toHaveLength(1);
+      query.mockClear();
+      const duplicate = { ...data.preparedPlan };
+      delete duplicate.allowResolveFullFallbackToUpdate; delete duplicate.allowWriteIfUpdatedTimeChanged;
+      delete duplicate.allowWriteWithoutVerifiedContent;
+      const second = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", duplicate);
+      expect(JSON.parse(second.content[0].text).operation.state).toBe("Completed");
+      expect(mutate).toHaveBeenCalledTimes(writes); expect(query).not.toHaveBeenCalled();
+      expect(notes).toHaveLength(1);
+    });
   });
   it("reports central-client attempts without an outer retry or raw provider reason", async () => {
     query.mockImplementation(async () => {

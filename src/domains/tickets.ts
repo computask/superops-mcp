@@ -59,7 +59,7 @@ import {
 } from "../operation-store.js";
 import { canonicalizeNoteText } from "../utils/note-canonicalization.js";
 import { safeStructuredErrorMetadata, safeSuperOpsErrorMetadata } from "../error-contract.js";
-import { TRIAGE_POLICY_CONTRACT_VERSION, triagePreparationFingerprint } from "../triage-contract.js";
+import { TRIAGE_POLICY_CONTRACT_VERSION, triagePreparationFingerprint, triagePreparationFingerprintMatches } from "../triage-contract.js";
 
 const DEFAULT_LIST_PAGE = 1;
 
@@ -10301,6 +10301,10 @@ async function prepareTriagePlan(client: SuperOpsClientInstance, proposal: Apply
   if (policyError) return invalid(policyError);
   const plan: ApplyTriagePlanParams = { ...proposal, actions,
     expectedCandidateTicketNumbers: expected, verify: true, dedupeNotes: true,
+    stopOnFirstFailure: false,
+    allowResolveFullFallbackToUpdate: proposal.allowResolveFullFallbackToUpdate ?? false,
+    allowWriteIfUpdatedTimeChanged: proposal.allowWriteIfUpdatedTimeChanged ?? false,
+    allowWriteWithoutVerifiedContent: proposal.allowWriteWithoutVerifiedContent ?? false,
     policyContractVersion: TRIAGE_POLICY_CONTRACT_VERSION };
   const results: ApplyTriagePlanResult[] = [];
   const corrections: Array<{ticketNumber: string; fields: string[]}> = [];
@@ -11826,7 +11830,7 @@ export function getTicketsTools(): DomainTools {
               return errorResult("Prepared policy contract differs from this runtime; prepare again before creating an operation.");
             }
             if (params.preparationFingerprint !== undefined &&
-                (params.policyContractVersion === undefined || params.preparationFingerprint !== triagePreparationFingerprint(params))) {
+                (params.policyContractVersion === undefined || !triagePreparationFingerprintMatches(params))) {
               return errorResult("Prepared plan checksum does not match; prepare the complete changed proposal before apply.");
             }
             const rawPolicyMode = (args as { policyMode?: unknown }).policyMode;

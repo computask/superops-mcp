@@ -11,8 +11,32 @@ function canonical(value: unknown): unknown {
     .map(([key, item]) => [key, canonical(item)]));
 }
 
+const DISABLED_WRITE_OVERRIDES = [
+  "allowResolveFullFallbackToUpdate",
+  "allowWriteIfUpdatedTimeChanged",
+  "allowWriteWithoutVerifiedContent",
+] as const;
+
+function fingerprint(plan: object, normalizeDisabledOverrides: boolean): string {
+  const { preparationFingerprint: _checksum, triageCapture: _capture, ...input } = plan as Record<string, unknown>;
+  // Apply and its durable approved-input contract already default these exact
+  // top-level flags to false. Do not normalize notes, targets, fences or any
+  // other field, and never erase true, null or an invalid override value.
+  if (normalizeDisabledOverrides) {
+    for (const key of DISABLED_WRITE_OVERRIDES) if (input[key] === false) delete input[key];
+  }
+  return createHash("sha256").update(JSON.stringify(canonical(input))).digest("hex");
+}
+
 /** Detect accidental edits; this checksum is never write approval. */
 export function triagePreparationFingerprint(plan: object): string {
-  const { preparationFingerprint: _checksum, triageCapture: _capture, ...input } = plan as Record<string, unknown>;
-  return createHash("sha256").update(JSON.stringify(canonical(input))).digest("hex");
+  return fingerprint(plan, true);
+}
+
+export function triagePreparationFingerprintMatches(plan: object): boolean {
+  const checksum = (plan as Record<string, unknown>).preparationFingerprint;
+  // The exact legacy representation remains valid across deployment for plans
+  // prepared before disabled-override normalization. All its fields still hash.
+  return typeof checksum === "string" &&
+    (checksum === triagePreparationFingerprint(plan) || checksum === fingerprint(plan, false));
 }

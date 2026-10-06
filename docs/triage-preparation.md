@@ -21,6 +21,16 @@ When supplied, apply checks them before operation creation, then independently
 retains live stale-data validation, field checks, private-note dedupe and final
 verification. Existing clients and v1 inputs retain their required fields.
 
+Preparation returns `stopOnFirstFailure:false` and the three disabled write
+overrides explicitly. The checksum treats omission and literal `false` as
+equivalent only for the top-level `allowResolveFullFallbackToUpdate`,
+`allowWriteIfUpdatedTimeChanged` and `allowWriteWithoutVerifiedContent` flags,
+matching the existing apply and durable-input defaults. `true`, invalid values,
+nested flags and all other fields remain part of the checksum. An unchanged
+legacy checksum is also accepted during deployment; it does not permit edits
+to its proposal. Continue copying the returned plan unchanged, and prepare
+again before apply after a genuine proposal change.
+
 Repair a correctable construction defect during bounded read-only preparation.
 Do not resubmit apply after any actual response or change approved input under
 the same operation ID. A zero-SuperOps-call validation response can still belong
