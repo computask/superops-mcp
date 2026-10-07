@@ -1,0 +1,412 @@
+{
+  "schemaVersion": 1,
+  "issue": 6,
+  "verifiedAt": "2026-10-07T16:28:57.915Z",
+  "commits": {
+    "mcp": "22dcc9618a67b8b3f15006a21a800d1aa3512dce",
+    "dispatcher": "831cee858ec42cf5482c3b1e3f4ec9ba69135485"
+  },
+  "workers": {
+    "superops-api-dispatcher": {
+      "version": "ce3bd1e7-5a32-4e18-a06a-55b18685300b",
+      "deployedAt": "2026-10-07T16:21:54.092622Z",
+      "traffic": [
+        {
+          "version_id": "ce3bd1e7-5a32-4e18-a06a-55b18685300b",
+          "percentage": 100
+        }
+      ],
+      "modules": [
+        {
+          "file": "index.js",
+          "bytes": 210494,
+          "sha256": "abf518e12fe6089f021606cb9d1cc4285d03cc4fd7719ba2acdb072cf6cf4cad"
+        }
+      ],
+      "configurationPreserved": true,
+      "versionNumber": 21,
+      "deploymentId": "ec9cd6fa-aeca-4bdd-a479-10725f7dc8f7"
+    },
+    "superops-mcp": {
+      "version": "55cb3fc8-6fa2-4ae3-865e-8cc66bbfbc2a",
+      "deployedAt": "2026-10-07T16:27:07.520255Z",
+      "traffic": [
+        {
+          "version_id": "55cb3fc8-6fa2-4ae3-865e-8cc66bbfbc2a",
+          "percentage": 100
+        }
+      ],
+      "modules": [
+        {
+          "file": "worker.js",
+          "bytes": 2084940,
+          "sha256": "4e45ae76534ad9d74287e08eec1dc1303791a58db494e72629291449092b3905"
+        }
+      ],
+      "configurationPreserved": true,
+      "versionNumber": 306,
+      "deploymentId": "e9c681d5-5a34-4981-84a8-5ca98e7232b1"
+    },
+    "support-triage-trigger": {
+      "version": "3d14b832-8641-4689-a8f4-0da71c0d9312",
+      "deployedAt": "2026-10-07T16:27:00.061963Z",
+      "traffic": [
+        {
+          "version_id": "3d14b832-8641-4689-a8f4-0da71c0d9312",
+          "percentage": 100
+        }
+      ],
+      "modules": [
+        {
+          "file": "index.js",
+          "bytes": 376522,
+          "sha256": "d49abbdcb76026cd05a1f70764c56ce7077fb3aff0620babdc01aa1d2084599c"
+        }
+      ],
+      "configurationPreserved": true
+    },
+    "superops-rewst-adapter": {
+      "version": "73274cda-2804-41ae-8d38-19ab9666bc03",
+      "deployedAt": "2026-10-02T14:49:16.989512Z",
+      "traffic": [
+        {
+          "version_id": "73274cda-2804-41ae-8d38-19ab9666bc03",
+          "percentage": 100
+        }
+      ],
+      "modules": [
+        {
+          "file": "index.js",
+          "bytes": 14189,
+          "sha256": "041c15eaa26497eadc99fe14c2c5daab50d2fe9c1a3ad4a7d453e2f986c8e5a5"
+        }
+      ],
+      "configurationPreserved": true
+    }
+  },
+  "githubChecks": {
+    "mcp": [
+      {
+        "id": 112897916890,
+        "name": "Workers Builds: superops-mcp",
+        "status": "completed",
+        "conclusion": "success",
+        "headSha": "22dcc9618a67b8b3f15006a21a800d1aa3512dce",
+        "detailsUrl": "https://dash.cloudflare.com/c6dba133601075b447e306ebb826a33b/workers/services/view/superops-mcp/production/builds/f506925f-f60d-452d-b1ec-026e40c53491",
+        "startedAt": "2026-10-07T16:27:15Z",
+        "completedAt": "2026-10-07T16:27:15Z"
+      },
+      {
+        "id": 112897846722,
+        "name": "Workers Builds: support-triage-trigger",
+        "status": "completed",
+        "conclusion": "success",
+        "headSha": "22dcc9618a67b8b3f15006a21a800d1aa3512dce",
+        "detailsUrl": "https://dash.cloudflare.com/c6dba133601075b447e306ebb826a33b/workers/services/view/support-triage-trigger/production/builds/fb9e8e21-4035-4064-8145-401f4aff7633",
+        "startedAt": "2026-10-07T16:27:05Z",
+        "completedAt": "2026-10-07T16:27:05Z"
+      },
+      {
+        "id": 112897818458,
+        "name": "Workers Builds: superops-api-call-log",
+        "status": "completed",
+        "conclusion": "success",
+        "headSha": "22dcc9618a67b8b3f15006a21a800d1aa3512dce",
+        "detailsUrl": "https://dash.cloudflare.com/c6dba133601075b447e306ebb826a33b/workers/services/view/superops-api-call-log/production/builds/b43d1541-f126-4c89-971f-7b4d06afbd70",
+        "startedAt": "2026-10-07T16:27:02Z",
+        "completedAt": "2026-10-07T16:27:02Z"
+      }
+    ],
+    "dispatcher": [
+      {
+        "id": 112895523102,
+        "name": "Workers Builds: superops-api-dispatcher",
+        "status": "completed",
+        "conclusion": "success",
+        "headSha": "831cee858ec42cf5482c3b1e3f4ec9ba69135485",
+        "detailsUrl": "https://dash.cloudflare.com/c6dba133601075b447e306ebb826a33b/workers/services/view/superops-api-dispatcher/production/builds/c250cfbd-1959-4842-abc3-6b82b0de5220",
+        "startedAt": "2026-10-07T16:22:01Z",
+        "completedAt": "2026-10-07T16:22:01Z"
+      }
+    ]
+  },
+  "dispatcherLocalRebuildMatchesLive": true,
+  "mcpBundleComparison": {
+    "checkedAt": "2026-10-07T16:31:44.131Z",
+    "files": [
+      {
+        "name": "mcp-bundle/worker.js",
+        "bytes": 2084892,
+        "sha256": "b904e167b14c4927ad78637e7f9d3324dc5be8ffb42fb0f3d2544772ad16d86e"
+      },
+      {
+        "name": "mcp-rebuild/worker.js",
+        "bytes": 2084892,
+        "sha256": "b904e167b14c4927ad78637e7f9d3324dc5be8ffb42fb0f3d2544772ad16d86e"
+      },
+      {
+        "name": "final/superops-mcp/worker.js",
+        "bytes": 2084940,
+        "sha256": "4e45ae76534ad9d74287e08eec1dc1303791a58db494e72629291449092b3905"
+      }
+    ],
+    "comparisons": [
+      {
+        "comparison": "mcp-bundle/worker.js",
+        "lineCounts": [
+          48185,
+          48185
+        ],
+        "generatedPathCommentsChanged": 12,
+        "executableCodeIdentical": true,
+        "canonicalSha256": "4e45ae76534ad9d74287e08eec1dc1303791a58db494e72629291449092b3905"
+      },
+      {
+        "comparison": "mcp-rebuild/worker.js",
+        "lineCounts": [
+          48185,
+          48185
+        ],
+        "generatedPathCommentsChanged": 12,
+        "executableCodeIdentical": true,
+        "canonicalSha256": "4e45ae76534ad9d74287e08eec1dc1303791a58db494e72629291449092b3905"
+      }
+    ]
+  },
+  "callLogComparison": {
+    "checkedAt": "2026-10-07T16:28:33.491Z",
+    "worker": "superops-api-call-log",
+    "unchangedBundle": true,
+    "versions": [
+      {
+        "stage": "previous",
+        "version": "f364d7a4-b416-47bf-810c-3003bda32e29",
+        "deployedAt": "2026-10-06T17:32:14.807462Z",
+        "traffic": [
+          {
+            "version_id": "f364d7a4-b416-47bf-810c-3003bda32e29",
+            "percentage": 100
+          }
+        ],
+        "modules": [
+          {
+            "file": "worker.js",
+            "bytes": 13514,
+            "sha256": "6e713d4c66176b2f7a8e05ae0b791eaf66b81d4b89e690f86706aa8b49de2c5f"
+          }
+        ]
+      },
+      {
+        "stage": "current",
+        "version": "5d9435ba-2357-4201-afcc-9bdbb10f8acc",
+        "deployedAt": "2026-10-07T16:26:57.213621Z",
+        "traffic": [
+          {
+            "version_id": "5d9435ba-2357-4201-afcc-9bdbb10f8acc",
+            "percentage": 100
+          }
+        ],
+        "modules": [
+          {
+            "file": "worker.js",
+            "bytes": 13514,
+            "sha256": "6e713d4c66176b2f7a8e05ae0b791eaf66b81d4b89e690f86706aa8b49de2c5f"
+          }
+        ]
+      }
+    ]
+  },
+  "validation": {
+    "mcp": {
+      "vitestTests": 754,
+      "vitestFiles": 36,
+      "policyTextTests": 3,
+      "policyContractShaVerified": true,
+      "typecheckPassed": true,
+      "buildPassed": true,
+      "lintPassed": true,
+      "diffCheckPassed": true
+    },
+    "dispatcher": {
+      "nodeTests": 153,
+      "cloudflareTests": 60,
+      "compiledIntegrationTests": 6,
+      "fullGatePassed": true,
+      "diffCheckPassed": true
+    },
+    "mixedFaultHarness": {
+      "items": 250,
+      "allItemsAccounted": true,
+      "duplicateAcceptedWrites": 0,
+      "normalInvocationSubrequestsMaximum": 37,
+      "operationBytesMaximum": 524288
+    }
+  },
+  "liveSmoke": {
+    "checkedAt": "2026-10-07T16:25:41.306Z",
+    "liveSuperOpsMutations": 0,
+    "producerAuthentication": [
+      {
+        "source": "dashboard",
+        "status": 404,
+        "authenticated": true
+      },
+      {
+        "source": "call-logger",
+        "status": 404,
+        "authenticated": true
+      },
+      {
+        "source": "ticket-scheduler",
+        "status": 404,
+        "authenticated": true
+      },
+      {
+        "source": "quote-unquote",
+        "status": 404,
+        "authenticated": true
+      },
+      {
+        "source": "superops-mcp",
+        "status": 404,
+        "authenticated": true
+      }
+    ],
+    "checks": [
+      {
+        "check": "dispatcher_health",
+        "status": 200
+      },
+      {
+        "check": "verification_auth_and_read_rejection",
+        "source": "superops-mcp",
+        "status": 409,
+        "code": "VERIFICATION_INTENT_MISMATCH"
+      },
+      {
+        "check": "verification_auth_and_read_rejection",
+        "source": "admin",
+        "status": 404,
+        "code": "NOT_FOUND"
+      },
+      {
+        "check": "verification_auth_and_read_rejection",
+        "source": "dashboard",
+        "status": 404,
+        "code": "NOT_FOUND"
+      },
+      {
+        "check": "verification_auth_and_read_rejection",
+        "source": "call-logger",
+        "status": 404,
+        "code": "NOT_FOUND"
+      },
+      {
+        "check": "verification_auth_and_read_rejection",
+        "source": "ticket-scheduler",
+        "status": 404,
+        "code": "NOT_FOUND"
+      },
+      {
+        "check": "verification_auth_and_read_rejection",
+        "source": "quote-unquote",
+        "status": 404,
+        "code": "NOT_FOUND"
+      },
+      {
+        "check": "original_read_receipt_unchanged",
+        "status": 200
+      }
+    ],
+    "readReceipt": {
+      "requestId": "3ed7001d-5993-448e-a6fe-7cceb9bc830e",
+      "status": "succeeded",
+      "attemptCount": 1
+    },
+    "productionConnector": {
+      "name": "SO MCP v6 Live 2026-09-05",
+      "statusPassed": true,
+      "testConnectionPassed": true,
+      "checkedAfterMcpDeployment": true
+    }
+  },
+  "historical": {
+    "baselineUncertainPreserved": 108,
+    "sourceCounts": {
+      "ticket-scheduler": 34,
+      "superops-mcp": 73,
+      "call-logger": 1
+    },
+    "receipts": [
+      {
+        "requestId": "d2d64876-0df1-48e7-a763-8ad749f69e7a",
+        "status": "uncertain",
+        "attemptCount": 1,
+        "reconciliationCount": 0,
+        "fingerprint": "ee95bd41e1a1915b3480fa003b5ccbca8e67c1e4de0e94dee4aaf1135f45038c"
+      },
+      {
+        "requestId": "34550fa8-ac3a-4a0d-80d1-2f26d636d1f4",
+        "status": "uncertain",
+        "attemptCount": 1,
+        "reconciliationCount": 0,
+        "fingerprint": "ee95bd41e1a1915b3480fa003b5ccbca8e67c1e4de0e94dee4aaf1135f45038c"
+      }
+    ],
+    "historicalMutationReplays": 0,
+    "historicalReconciliations": 0
+  },
+  "preservation": {
+    "configurationBindingsPreserved": true,
+    "secretBindingNamesPreserved": true,
+    "secretUploads": 0,
+    "accessPolicyChanges": 0,
+    "issue2DispatcherReadRecoveryPreserved": true,
+    "rewstPageSizePassthrough": true,
+    "rewstKeylessMutationPolicy": true,
+    "issue7ChecksumAndApprovalPolicyPreserved": true,
+    "publicMcpToolCatalogueChanged": false
+  },
+  "archives": {
+    "root": ".wrangler/issue6-reconciliation-20261007",
+    "sourceArchives": [
+      {
+        "file": "mcp-before-source.zip",
+        "bytes": 965645,
+        "sha256": "f8c1bb79e94a44a9c854863deb5f834d483024f09536b1218c87b5b796f8654b"
+      },
+      {
+        "file": "dispatcher-before-source.zip",
+        "bytes": 1400207,
+        "sha256": "27ace9fdf1726624fc95a07e9ab77f1dfffbf7cf7e710c8243310529ac7664d7"
+      },
+      {
+        "file": "mcp-tested-source.zip",
+        "bytes": 970459,
+        "sha256": "82f30e6d1c83fc3b652e8ca3b0ea0518b4aa0b15965ec99a2c245acc1e64d4e0"
+      },
+      {
+        "file": "dispatcher-tested-source.zip",
+        "bytes": 1415496,
+        "sha256": "648aac23bb088de73f6eff5d88f4fddc9ddc3f963874ca4135dc0fe038aab94b"
+      }
+    ],
+    "workerSnapshotStages": [
+      "before",
+      "after",
+      "final"
+    ],
+    "integrityVerified": true,
+    "liveDurableObjectDatabaseBackedUp": false
+  },
+  "boundaries": {
+    "liveSuperOpsMutationProbes": 0,
+    "unsupportedEffectsRemainUncertain": true,
+    "missingStateProvesRejection": false,
+    "publicMcpResumeToolAdded": false
+  },
+  "ownership": {
+    "issue6Released": true,
+    "next": "Issue 2 MCP durable read-receipt journal may continue from these reviewed source commits."
+  }
+}
