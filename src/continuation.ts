@@ -250,8 +250,6 @@ export async function runOperationContinuation(
       // not turn it into an ordinary reschedule just because this invocation
       // cannot fund its reconciliation unit: that would lose the ambiguity
       // marker and could permit a duplicate mutation on a later invocation.
-      const hasPriorWrite = claim.item.writeAttempted === true ||
-        claim.item.writeMayHaveSucceeded === true;
       const noteWrite = claim.item.stage === "NoteWriteStarted" ||
         claim.item.stage === "NoteWriteAmbiguous";
       const resolutionWrite = claim.item.stage === "ResolutionWriteStarted" ||
@@ -264,7 +262,9 @@ export async function runOperationContinuation(
         claim.item.stage === "WriteAmbiguous" || resolutionWrite || noteWrite || stagedWrite || recoveryWrite;
       // Only an in-flight mutation boundary becomes explicitly ambiguous.
       // A later durable stage (for example FieldsUpdated) already records a
-      // reliable response and must retain that exact progress instead.
+      // reliable response and must retain that exact progress instead. Read-only
+      // checkpoints also retain their stage: NoteChecked, for example, cannot
+      // transition back to Rescheduled. Scheduling belongs to the operation.
       const stage = mutationBoundary
         ? recoveryWrite
           ? "RecoveryWriteAmbiguous"
@@ -273,7 +273,9 @@ export async function runOperationContinuation(
             : resolutionWrite
               ? "ResolutionWriteAmbiguous"
               : "WriteAmbiguous"
-        : hasPriorWrite ? claim.item.stage : "Rescheduled";
+        : claim.item.stage === "Pending" || claim.item.stage === "Unattempted"
+          ? "Rescheduled"
+          : claim.item.stage;
       record = await store.completeItem({
         operationId: params.operationId,
         ownerHash: params.ownerHash,
@@ -602,10 +604,9 @@ export async function runOperationContinuation(
         // a later read or write consumed the last available subrequest. Read
         // the current state rather than trusting the original claim: completing
         // that item as an ordinary reschedule would both erase the checkpoint
-        // and permit a duplicate write on the next invocation.
+        // and permit a duplicate write on the next invocation. Preserve read-only
+        // progress too; only untouched items move to the Rescheduled item stage.
         const currentItem = (await store.get(params.operationId, params.ownerHash))?.itemStates[claim.itemKey];
-        const hasPriorWrite = currentItem?.writeAttempted === true ||
-          currentItem?.writeMayHaveSucceeded === true;
 
         const noteWrite = currentItem?.stage === "NoteWriteStarted" ||
           currentItem?.stage === "NoteWriteAmbiguous";
@@ -632,7 +633,9 @@ export async function runOperationContinuation(
                   : resolutionWrite
                     ? "ResolutionWriteAmbiguous"
                     : "WriteAmbiguous"
-              : hasPriorWrite ? preservedStage : "Rescheduled",
+              : preservedStage === "Pending" || preservedStage === "Unattempted"
+                ? "Rescheduled"
+                : preservedStage,
             outcome: mutationBoundary
               ? "AmbiguousWriteRequiresVerification"
               : caughtError instanceof ExecutionBudgetExceededError

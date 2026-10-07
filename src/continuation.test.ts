@@ -647,6 +647,65 @@ describe("durable continuation runner", () => {
     expect(processed).toBe(0);
   });
 
+  it.each(["during-item", "before-resumed-item"] as const)(
+    "preserves NoteChecked and resumes after budget exhaustion %s", async (stopAt) => {
+      const ownerHash = stableHash("checkpoint-owner");
+      const operationId = `op-note-checked-${stopAt}`;
+      let completed = 0;
+      const stop: OperationContinuationAdapter = {
+        toolName: "test_batch_tool",
+        estimateItemSubrequests: () => stopAt === "before-resumed-item" ? 38 : 1,
+        async processItem({ checkpoint }) {
+          expect(stopAt).toBe("during-item");
+          await checkpoint({ stage: "NoteChecked" });
+          // Reproduce the production 45 - 8 boundary, including internal calls.
+          for (let index = 0; index < 37; index += 1) countedRequest("verificationRead");
+          countedRequest("verificationRead");
+          throw new Error("budget must stop execution");
+        },
+      };
+      const resume: OperationContinuationAdapter = {
+        toolName: "test_batch_tool",
+        estimateItemSubrequests: () => 1,
+        async processItem({ claim }) {
+          expect(claim.item.stage).toBe("NoteChecked");
+          expect(claim.item.writeAttempted).toBe(false);
+          expect(claim.item.writeMayHaveSucceeded).toBe(false);
+          completed += 1;
+          return {
+            stage: "Completed", outcome: "Completed", verified: true,
+            writeAttempted: false, writeMayHaveSucceeded: false, partialWrite: false,
+          };
+        },
+      };
+      await runWithOperationStore({}, async () => {
+        const store = getOperationStore();
+        const record = ledgerRecord({ operationId, ownerHash, itemKeys: ["ticket-checkpoint"] });
+        if (stopAt === "before-resumed-item") record.itemStates["ticket-checkpoint"].stage = "NoteChecked";
+        await store.put(record);
+        const invoke = (adapter: OperationContinuationAdapter) => runWithExecutionConfig({
+          SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "45",
+          SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8",
+          SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+        }, () => runWithExecutionContext("test_batch_tool", () => runOperationContinuation({
+          operationId, ownerHash, adapter, leaseOwner: "test-invocation",
+        })));
+        await invoke(stop);
+        await expect(store.get(operationId)).resolves.toMatchObject({
+          state: "ContinuationRequired", pendingItems: ["ticket-checkpoint"], failedItems: [],
+          itemStates: { "ticket-checkpoint": {
+            stage: "NoteChecked", writeAttempted: false, writeMayHaveSucceeded: false,
+          } },
+        });
+        await invoke(resume);
+        await expect(store.get(operationId)).resolves.toMatchObject({
+          state: "Completed", completedItems: ["ticket-checkpoint"], pendingItems: [], failedItems: [],
+        });
+      });
+      expect(completed).toBe(1);
+    }
+  );
+
   it("preserves a write-start checkpoint when the execution budget stops the item", async () => {
     const ownerHash = stableHash("owner@example.com");
     let resumedItems = 0;
