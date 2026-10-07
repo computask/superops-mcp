@@ -4,6 +4,7 @@ import type { DispatcherDiagnosticRetrieval, SafeDispatcherDiagnostics } from ".
 
 export type SubrequestType =
   | "dispatcherPoll"
+  | "dispatcherVerification"
   | "initialRead"
   | "paginationRead"
   | "metadataValidation"

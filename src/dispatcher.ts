@@ -3,7 +3,7 @@ import { assertTriageRunWriteLease } from "./triage-run-lease.js";
 import { capturedDispatcherFetch } from "./graphql-capture.js";
 import { getExecutionConfig, hasExecutionBudgetFor, recordSubrequestFinish, recordTypedSubrequestStart, withExecutionItem } from "./execution.js";
 import { fetchSafeDispatcherDiagnostics, type DispatcherDiagnosticResult, type DispatcherDiagnosticRetrieval, type SafeDispatcherDiagnostics } from "./dispatcher-diagnostics.js";
-import type { OperationMutationType } from "./operation-store.js";
+import { validDispatcherVerification, type DispatcherVerification } from "./dispatcher-verification.js";
 
 export const DISPATCHER_ORIGIN = "https://superops-api-dispatcher.taskgroup.co.uk";
 export interface DispatcherEnvironment {
@@ -17,20 +17,15 @@ export interface DispatcherReceipt {
   idempotencyKey: string;
   state: string;
   retryAfter?: number;
+  mutationFingerprint?: string;
+  attemptCount?: number;
+  verification?: DispatcherVerification;
   diagnostics?: SafeDispatcherDiagnostics | DispatcherDiagnosticRetrieval;
 }
-const operation = new AsyncLocalStorage<{operationId: string; itemKey: string; checkpoint?: (receipt: DispatcherReceipt) => Promise<void>; receipt?: DispatcherReceipt}>();
-const recoveryAttempt = new AsyncLocalStorage<string>();
-/** Only enter after the triage adapter has durably checkpointed its one
- * permitted, read-back-proven state-setting recovery. This is not a transport
- * retry: reusing the original key would just return the uncertain receipt. */
-export function withDispatcherRecoveryAttempt<T>(mutationType: Exclude<OperationMutationType, "note">, fn: () => T): T {
-  if (!operation.getStore()?.checkpoint) throw new Error("Dispatcher recovery requires a durable operation checkpoint.");
-  return recoveryAttempt.run(`reconciled:${mutationType}:1`, fn);
-}
+const operation = new AsyncLocalStorage<{operationId: string; itemKey: string; checkpoint?: (receipt: DispatcherReceipt) => Promise<void>; receipt?: DispatcherReceipt; readRequestIds: string[]}>();
 export function withDispatcherOperation<T>(operationId: string, itemKey: string, fn: () => T,
-  checkpoint?: (receipt: DispatcherReceipt) => Promise<void>): T {
-  return operation.run({operationId, itemKey, checkpoint}, () => withExecutionItem(itemKey, fn));
+  checkpoint?: (receipt: DispatcherReceipt) => Promise<void>, receipt?: DispatcherReceipt): T {
+  return operation.run({operationId, itemKey, checkpoint, receipt, readRequestIds: []}, () => withExecutionItem(itemKey, fn));
 }
 export async function dispatcherIdempotencyKey(body: string, mutation: boolean): Promise<string> {
   const scope = mutation ? operation.getStore() : undefined;
@@ -38,10 +33,6 @@ export async function dispatcherIdempotencyKey(body: string, mutation: boolean):
   // Durable operation and item identity already exist before I/O. Payload hash
   // distinguishes note/update stages without storing content or credentials.
   const identity = [scope.operationId, scope.itemKey, body];
-  // Preserve every existing ordinary mutation key. The recovery discriminator
-  // is deterministic across crashes and applies only to this one mutation.
-  const recovery = recoveryAttempt.getStore();
-  if (recovery) identity.push(recovery);
   const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(identity)));
   return `superops-mcp:${Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("")}`;
 }
@@ -115,10 +106,82 @@ export async function boundedJson(response: Response, maximumBytes = 4 * 1024 * 
 export async function dispatcherDiagnostics(requestId: string, env = dispatcherEnvironment()): Promise<DispatcherDiagnosticResult> {
   return fetchSafeDispatcherDiagnostics(requestId, env, DISPATCHER_ORIGIN);
 }
-function publishReceipt(receipt: DispatcherReceipt, options: {onReceipt?: (receipt: DispatcherReceipt) => void}): void {
+function publishReceipt(receipt: DispatcherReceipt, options: {mutation?: boolean; onReceipt?: (receipt: DispatcherReceipt) => void}, body = ""): void {
   const scope = operation.getStore();
-  if (scope) scope.receipt = receipt;
+  if (scope && options.mutation) scope.receipt = receipt;
+  if (scope && !options.mutation && receipt.state === "succeeded" && /\b(?:getTicket|getTicketNoteList|getAlertList)\s*\(/.test(body)) {
+    scope.readRequestIds = [...scope.readRequestIds.filter(id => id !== receipt.requestId), receipt.requestId].slice(-8);
+  }
   options.onReceipt?.(receipt);
+}
+function producerHeaders(env: DispatcherEnvironment): Record<string, string> {
+  if (!dispatcherConfigured(env)) throw new Error("Dispatcher producer credentials are not configured; direct SuperOps access is disabled.");
+  if (Boolean(env.CF_ACCESS_CLIENT_ID) !== Boolean(env.CF_ACCESS_CLIENT_SECRET)) throw new Error("Both Cloudflare Access credentials must be configured.");
+  return {
+    Authorization: `Bearer ${env.DISPATCHER_TOKEN}`, "X-Source": "superops-mcp", "Content-Type": "application/json", Accept: "application/json",
+    ...(env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET ? {"CF-Access-Client-Id": env.CF_ACCESS_CLIENT_ID, "CF-Access-Client-Secret": env.CF_ACCESS_CLIENT_SECRET} : {}),
+  };
+}
+function receiptMetadata(value: Record<string, unknown>, receipt: DispatcherReceipt): DispatcherReceipt {
+  return {...receipt,
+    ...(typeof value.fingerprint === "string" && /^[a-f0-9]{64}$/.test(value.fingerprint) ? {mutationFingerprint: value.fingerprint} : {}),
+    ...(Number.isInteger(value.attemptCount) && (value.attemptCount as number) >= 1 && (value.attemptCount as number) <= 1000 ? {attemptCount: value.attemptCount as number} : {}),
+    ...(validDispatcherVerification(value.verification) && value.verification.requestId === receipt.requestId ? {verification: value.verification} : {}),
+  };
+}
+/** Settle only the original uncertain receipt, using existing dispatcher reads.
+ * Failure, missing fields, or negative observation never authorizes a replay. */
+export async function reconcileCurrentDispatcherReceipt(requireApplied = false): Promise<DispatcherVerification | undefined> {
+  const scope = operation.getStore();
+  let receipt = scope?.receipt;
+  if (!scope || !receipt || receipt.state !== "uncertain") return receipt?.verification;
+  const hold = (state: string) => new DispatcherPendingError(receipt?.requestId, receipt!.idempotencyKey, state);
+  const headers = producerHeaders(dispatcherEnvironment());
+  const request = async (suffix: string, body?: string) => {
+    if (!hasExecutionBudgetFor(1)) throw hold("verification_budget_exhausted");
+    const url = `${DISPATCHER_ORIGIN}/v1/requests/${receipt!.requestId}${suffix}`;
+    const counted = recordTypedSubrequestStart({type: "dispatcherVerification", endpoint: url, operationName: suffix ? "verifyMutationTarget" : "mutationIntentStatus"});
+    let response: Response | undefined;
+    try {
+      response = await capturedDispatcherFetch(url, {method: body ? "POST" : "GET", body, headers, redirect: "manual", signal: AbortSignal.timeout(getExecutionConfig().requestTimeoutMs)});
+      if (!response.ok) { await response.body?.cancel(); throw hold("verification_unavailable"); }
+      const value = object(await boundedJson(response, 64 * 1024));
+      recordSubrequestFinish(counted, response.status, true, {dispatcherHttpStatus: response.status});
+      return value;
+    } catch (error) {
+      recordSubrequestFinish(counted, response?.status ?? "dispatcherVerificationUnknown", false, {outcome: "dispatcher_error", errorClass: "DispatcherVerificationUnavailable", dispatcherHttpStatus: response?.status});
+      if (error instanceof DispatcherPendingError) throw error;
+      throw hold("verification_unavailable");
+    }
+  };
+  // Recover a settlement whose acknowledgement or local checkpoint was lost.
+  {
+    const value = await request("");
+    if (value.requestId !== receipt.requestId || value.source !== "superops-mcp" || value.type !== "mutation" || !["uncertain", "succeeded"].includes(String(value.status))) throw hold("invalid_verification_identity");
+    if ((receipt.mutationFingerprint && value.fingerprint !== receipt.mutationFingerprint) || (receipt.attemptCount && value.attemptCount !== receipt.attemptCount)) throw hold("invalid_verification_identity");
+    receipt = receiptMetadata(value, receipt);
+    if (!receipt.mutationFingerprint || !receipt.attemptCount) throw hold("verification_intent_unavailable");
+    if (value.status === "succeeded") {
+      if (value.errorClassification !== "RECONCILED_APPLIED" || receipt.verification?.outcome !== "applied" || receipt.verification.mutationFingerprint !== receipt.mutationFingerprint || receipt.verification.attemptCount !== receipt.attemptCount) throw hold("invalid_verification_identity");
+      receipt = {...receipt, state: "succeeded"};
+      await scope.checkpoint?.(receipt); scope.receipt = receipt;
+      return receipt.verification;
+    }
+    await scope.checkpoint?.(receipt); scope.receipt = receipt;
+  }
+  const readRequestIds = [...scope.readRequestIds].sort();
+  if (!readRequestIds.length) { if (requireApplied) throw hold("verification_evidence_unavailable"); return undefined; }
+  const body = {schemaVersion: 1, mutationFingerprint: receipt.mutationFingerprint, expectedAttemptCount: receipt.attemptCount, readRequestIds};
+  const evidenceHash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(body)))), byte => byte.toString(16).padStart(2, "0")).join("");
+  const value = await request("/verify", JSON.stringify(body));
+  const proof = value.verification;
+  if (value.requestId !== receipt.requestId || value.source !== "superops-mcp" || value.fingerprint !== receipt.mutationFingerprint || value.attemptCount !== receipt.attemptCount || !validDispatcherVerification(proof) ||
+      proof.requestId !== receipt.requestId || proof.mutationFingerprint !== receipt.mutationFingerprint || proof.attemptCount !== receipt.attemptCount || proof.evidenceHash !== evidenceHash || JSON.stringify(proof.readRequestIds) !== JSON.stringify(readRequestIds) ||
+      value.status !== (proof.outcome === "applied" ? "succeeded" : "uncertain") || value.uncertain !== (proof.outcome !== "applied")) throw hold("invalid_verification_identity");
+  receipt = {...receipt, state: proof.outcome === "applied" ? "succeeded" : "uncertain", verification: proof};
+  await scope.checkpoint?.(receipt); scope.receipt = receipt;
+  if (requireApplied && proof.outcome !== "applied") throw hold("verification_unresolved");
+  return proof;
 }
 /** POST is sent once. After any receipt (including 504), only GET is used.
  * A caller recovering a lost acknowledgement must supply the original key and
@@ -147,6 +210,11 @@ export async function dispatcherFetch(body: string, options: {
     headers["CF-Access-Client-Secret"] = env.CF_ACCESS_CLIENT_SECRET;
   }
   let requestId = options.requestId;
+  const prior = options.mutation ? operation.getStore()?.receipt : undefined;
+  if (!requestId && prior && !["succeeded", "failed", "cancelled"].includes(prior.state)) {
+    if (prior.idempotencyKey === options.idempotencyKey) requestId = prior.requestId;
+    else throw new DispatcherPendingError(prior.requestId, prior.idempotencyKey, "unresolved_prior_mutation");
+  }
   let observedHttpStatus: number | undefined;
   let observedDispatcherHttpStatus: number | undefined;
   let observedErrorClassification: string | undefined;
@@ -185,7 +253,7 @@ export async function dispatcherFetch(body: string, options: {
       if (!polling && (response.status === 202 || response.status === 504) && headerReceipt && /^[A-Za-z0-9_-]{1,160}$/.test(headerReceipt)) {
         requestId = headerReceipt;
         const receipt = {requestId, idempotencyKey: options.idempotencyKey, state: "queued"};
-        publishReceipt(receipt, options);
+        publishReceipt(receipt, options, body);
         if (options.mutation) await operation.getStore()?.checkpoint?.(receipt);
       }
       if (!polling && response.status !== 202 && response.status !== 504 &&
@@ -195,7 +263,7 @@ export async function dispatcherFetch(body: string, options: {
         const syncId = response.headers.get("X-Dispatcher-Request-Id");
         if (syncId && /^[A-Za-z0-9_-]{1,160}$/.test(syncId)) {
           const receipt = {requestId: syncId, idempotencyKey: options.idempotencyKey, state: response.headers.get("X-Dispatcher-Status") ?? "unknown"};
-          publishReceipt(receipt, options);
+          publishReceipt(receipt, options, body);
           if (options.mutation) await operation.getStore()?.checkpoint?.(receipt);
         }
         return response;
@@ -233,19 +301,22 @@ export async function dispatcherFetch(body: string, options: {
     observedErrorClassification = typeof value.errorClassification === "string" && /^[A-Z0-9_]{1,100}$/.test(value.errorClassification) ? value.errorClassification : undefined;
     observedRetryAfter = pending.has(state) ? seconds : undefined;
     if (requestId) {
-      const parsedReceipt: DispatcherReceipt = {
+      const parsedReceipt: DispatcherReceipt = receiptMetadata(value, {
         requestId,
         idempotencyKey: options.idempotencyKey,
         state: state || "queued",
         ...(pending.has(state) ? {retryAfter: seconds} : {}),
-      };
-      publishReceipt(parsedReceipt, options);
+      });
+      publishReceipt(parsedReceipt, options, body);
       if (options.mutation) await operation.getStore()?.checkpoint?.({...parsedReceipt, retryAfter: seconds});
     }
     if (state === "uncertain" || response.headers.get("X-Dispatcher-Uncertain") === "true" || value.uncertain === true) {
       throw new DispatcherPendingError(requestId, options.idempotencyKey, "uncertain", observedRetryAfter, observedHttpStatus, observedErrorClassification, response.status);
     }
     if (polling && terminal.has(state)) {
+      if (state === "succeeded" && value.errorClassification === "RECONCILED_APPLIED" && validDispatcherVerification(value.verification) && value.verification.outcome === "applied" && value.verification.requestId === requestId) {
+        throw new DispatcherPendingError(requestId, options.idempotencyKey, "reconciled_applied");
+      }
       const status = typeof value.httpStatus === "number" && Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599 ? value.httpStatus : undefined;
       if (state === "succeeded" && (status === undefined || status < 200 || status >= 300 || value.errorClassification)) {
         throw new DispatcherPendingError(requestId, options.idempotencyKey, "invalid_success");

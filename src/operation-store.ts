@@ -11,6 +11,7 @@ import {
 import { canonicalizeNoteText } from "./utils/note-canonicalization.js";
 import type { TriageAgentMcpCapture } from "./triage-agent-capture.js";
 import { GraphqlCaptureStore } from "./graphql-capture-store.js";
+import { validDispatcherVerification } from "./dispatcher-verification.js";
 
 export type OperationState =
   | "Running"
@@ -133,6 +134,8 @@ export type ReconciliationDisposition =
 export interface OperationItemState {
   /** Content-free, owner-scoped recovery receipt; never the request payload. */
   dispatcherReceipt?: import("./dispatcher.js").DispatcherReceipt;
+  /** Prior verified receipts, bounded and content-free; uncertain stages never advance. */
+  dispatcherReceiptHistory?: Array<{requestId: string; evidenceHash: string; outcome: "applied"; verifiedAt: string}>;
   itemKey: string;
   stage: OperationItemStage;
   outcome?: string;
@@ -1068,12 +1071,22 @@ function assertStringArray(value: unknown, field: string): asserts value is stri
 function validDispatcherReceipt(value: unknown): boolean {
   if (value === undefined) return true;
   if (!isRecordObject(value)) return false;
-  return Object.keys(value).every(key => ["requestId", "idempotencyKey", "state", "retryAfter", "diagnostics"].includes(key)) &&
+  return Object.keys(value).every(key => ["requestId", "idempotencyKey", "state", "retryAfter", "diagnostics", "mutationFingerprint", "attemptCount", "verification"].includes(key)) &&
     typeof value.requestId === "string" && /^[A-Za-z0-9_-]{1,160}$/.test(value.requestId) &&
     typeof value.idempotencyKey === "string" && /^superops-mcp:[A-Za-z0-9:_-]{1,160}$/.test(value.idempotencyKey) &&
     typeof value.state === "string" && /^[a-z_]{1,64}$/.test(value.state) &&
     (value.retryAfter === undefined || (typeof value.retryAfter === "number" && Number.isFinite(value.retryAfter) && value.retryAfter >= 0)) &&
+    (value.mutationFingerprint === undefined || (typeof value.mutationFingerprint === "string" && /^[a-f0-9]{64}$/.test(value.mutationFingerprint))) &&
+    (value.attemptCount === undefined || (Number.isInteger(value.attemptCount) && (value.attemptCount as number) >= 1 && (value.attemptCount as number) <= 1000)) &&
+    (value.verification === undefined || (validDispatcherVerification(value.verification) && value.verification.requestId === value.requestId && value.verification.mutationFingerprint === value.mutationFingerprint && value.verification.attemptCount === value.attemptCount)) &&
     validSafeDispatcherDiagnostics(value.diagnostics);
+}
+function validDispatcherReceiptHistory(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.length <= 8 && value.every(v => isRecordObject(v) &&
+    Object.keys(v).every(k => ["requestId", "evidenceHash", "outcome", "verifiedAt"].includes(k)) &&
+    typeof v.requestId === "string" && /^[A-Za-z0-9_-]{1,160}$/.test(v.requestId) &&
+    typeof v.evidenceHash === "string" && /^[a-f0-9]{64}$/.test(v.evidenceHash) && v.outcome === "applied" &&
+    typeof v.verifiedAt === "string" && v.verifiedAt.length <= 32 && Number.isFinite(Date.parse(v.verifiedAt))));
 }
 
 function validSafeDispatcherDiagnostics(value: unknown): boolean {
@@ -1316,6 +1329,7 @@ function assertOperationRecord(value: unknown): asserts value is OperationLedger
       typeof item.partialWrite !== "boolean" ||
       !isFiniteNonnegativeInteger(item.retryCount) ||
       !validDispatcherReceipt(item.dispatcherReceipt) ||
+      !validDispatcherReceiptHistory(item.dispatcherReceiptHistory) ||
       (item.recoveryRetryCount !== undefined && !isFiniteNonnegativeInteger(item.recoveryRetryCount)) ||
       (item.reconciliationPass !== undefined && !isFiniteNonnegativeInteger(item.reconciliationPass)) ||
       (item.reconciliationPassReadAttempts !== undefined && !isFiniteNonnegativeInteger(item.reconciliationPassReadAttempts)) ||
@@ -2142,7 +2156,7 @@ function applyItemPatch(
   // Terminal checkpoints still prevent replay, and receipt IDs remain in the
   // dispatcher/audit trail. Never prune pending/ambiguous/partial evidence.
   if (isTerminalSuccessfulItem(item) && item.verificationState === "Verified" &&
-      !item.partialWrite && item.dispatcherReceipt?.state === "succeeded") {
+      !item.partialWrite && item.dispatcherReceipt?.state === "succeeded" && !item.dispatcherReceipt.verification) {
     delete item.dispatcherReceipt;
   }
   if (isTerminalSuccessfulItem(item) && item.ambiguityEncountered !== true) {
@@ -3216,6 +3230,8 @@ function operationItemTelemetry(record: OperationLedgerRecord): Record<string, u
       stage: item?.stage ?? "Unattempted",
       dispatcherRequestId: item?.dispatcherReceipt?.requestId,
       dispatcherState: item?.dispatcherReceipt?.state,
+      dispatcherVerification: item?.dispatcherReceipt?.verification,
+      dispatcherReceiptHistory: item?.dispatcherReceiptHistory,
       ...(receiptDiagnostics && "category" in receiptDiagnostics
         ? {dispatcherDiagnosticRetrieval: receiptDiagnostics}
         : receiptDiagnostics ? {dispatcherDiagnostics: receiptDiagnostics} : {}),

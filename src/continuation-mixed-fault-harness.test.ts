@@ -514,11 +514,10 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       expect(mutationCounts.get(String(noteCandidate.ticketNumber))).toBe(1);
       expect(mutationCounts.get(String(rateLimitCandidate.ticketNumber))).toBe(2);
       expect(mutationCounts.get(String(graphQlThrottleCandidate.ticketNumber))).toBe(2);
-      // State-setting writes with a fully unchanged immutable-ID window receive
-      // one controlled recovery mutation; the initial attempt plus recovery is
-      // the durable maximum for this mutation stage.
-      expect(mutationCounts.get(String(fiveHundredCandidate.ticketNumber))).toBe(2);
-      expect(mutationCounts.get(String(networkCandidate.ticketNumber))).toBe(2);
+      // Unchanged state cannot prove nonexecution. These ambiguous writes remain
+      // held for reconciliation without a second physical attempt.
+      expect(mutationCounts.get(String(fiveHundredCandidate.ticketNumber))).toBe(1);
+      expect(mutationCounts.get(String(networkCandidate.ticketNumber))).toBe(1);
       const itemFor = (action: Record<string, unknown>) => finalRecord.itemStates[String(action.ticketNumber)];
       for (const action of [
         updateCandidate, resolveCandidate, noteCandidate, rateLimitCandidate,
@@ -534,10 +533,10 @@ describe("fixed-seed mixed-fault 250-item apply-triage continuation harness", ()
       expect(itemFor(graphQlThrottleCandidate).retryCount).toBe(1);
       expect(itemFor(rateLimitCandidate).rateLimit?.attempts).toBe(1);
       expect(itemFor(graphQlThrottleCandidate).rateLimit?.attempts).toBe(1);
-      expect(itemFor(fiveHundredCandidate).verificationState).toBe("Verified");
-      expect(itemFor(fiveHundredCandidate).recoveryRetryCount).toBe(1);
-      expect(itemFor(networkCandidate).verificationState).toBe("Verified");
-      expect(itemFor(networkCandidate).recoveryRetryCount).toBe(1);
+      expect(itemFor(fiveHundredCandidate).stage).toBe("AmbiguousWriteUnresolved");
+      expect(itemFor(fiveHundredCandidate).recoveryRetryCount).toBe(0);
+      expect(itemFor(networkCandidate).stage).toBe("AmbiguousWriteUnresolved");
+      expect(itemFor(networkCandidate).recoveryRetryCount).toBe(0);
       expect(itemFor(staleDuringWaitCandidate).stage).toBe("Stale");
       expect(mutationCounts.get(String(staleDuringWaitCandidate.ticketNumber))).toBeUndefined();
       expect(tickets.get(String(noteCandidate.ticketNumber))?.notes).toHaveLength(1);

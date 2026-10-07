@@ -35,7 +35,7 @@ async function exercise(fault: Fault, unassigned = false) {
     headers: { "X-Dispatcher-Status": "succeeded", "X-Dispatcher-Request-Id": requestId },
   });
   const uncertain = (requestId: string) => Response.json({
-    requestId, status: "uncertain", source: "superops-mcp", httpStatus: 200,
+    requestId, status: "uncertain", source: "superops-mcp", type: "mutation", fingerprint: "f".repeat(64), attemptCount: 1, uncertain: true, httpStatus: 200,
     errorClassification: "GRAPHQL_ERROR", response: {
       data: { updateTicket: null }, errors: [{ message: "Internal server error", extensions: { code: "INTERNAL_SERVER_ERROR" } }],
     },
@@ -53,6 +53,17 @@ async function exercise(fault: Fault, unassigned = false) {
     if (method === "GET") {
       expect(url).toBe(`${DISPATCHER_ORIGIN}/v1/requests/original-update`);
       return uncertain("original-update");
+    }
+    if (url.endsWith("/verify")) {
+      const applied = fault === "alreadyApplied";
+      const requestId = url.split("/").at(-2)!;
+      const evidenceHash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(parsed)))), byte => byte.toString(16).padStart(2, "0")).join("");
+      return Response.json({requestId, source: "superops-mcp", fingerprint: parsed.mutationFingerprint, attemptCount: 1,
+        status: applied ? "succeeded" : "uncertain", uncertain: !applied,
+        verification: {schemaVersion: 1, requestId, mutationFingerprint: parsed.mutationFingerprint, attemptCount: 1,
+          evidenceHash, outcome: applied ? "applied" : "not_observed", reasonCode: applied ? "complete_target_observed" : "target_not_observed",
+          partial: false, checkedFields: Object.keys(TARGET), readRequestIds: parsed.readRequestIds, replayAllowed: false, verifiedAt: new Date().toISOString()},
+      });
     }
     if (query.includes("getTicketList")) {
       const value = String((input.condition as { value: unknown }).value);
@@ -158,27 +169,19 @@ async function exercise(fault: Fault, unassigned = false) {
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("dispatcher uncertain triage recovery", () => {
-  it.each([false, true])("reconciles then retries once, keeps other tickets moving and preserves client assignment (unassigned=%s)", async unassigned => {
+  it.each([false, true])("retains uncertainty after unchanged reads, with no recovery write (unassigned=%s)", async unassigned => {
     const result = await exercise("notApplied", unassigned);
-    expect(result.initialRecord.completedItems).toContain("71002");
-    expect(result.initialRecord.pendingItems).toContain("71001");
-    expect(result.initialRecord.failedItems).toEqual([]);
-    expect(result.record.state, JSON.stringify(result.record.itemStates["71001"])).toBe("Completed");
+    expect(result.record.completedItems).toContain("71002");
+    expect(result.record.failedItems).toContain("71001");
+    expect(result.record.itemStates["71001"]).toMatchObject({stage: "AmbiguousWriteUnresolved", recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
     const attempts = result.updateAttempts.filter(call => call.ticketId === "synthetic-71001");
-    expect(attempts).toHaveLength(2);
-    expect(attempts[1].key).not.toBe(attempts[0].key);
-    expect(attempts[1].at - attempts[0].at).toBeGreaterThanOrEqual(30000);
-    expect(result.firstRecoveryCheckpoint?.itemStates["71001"]).toMatchObject({
-      stage: "RecoveryWriteStarted", recoveryRetryCount: 1, recoveryWriteStarted: true,
-    });
-    expect(result.primaryReadsAfterWrite).toBeGreaterThanOrEqual(5);
-    for (const attempt of attempts) {
-      if (unassigned) expect(attempt.input.client).toEqual({ accountId: "synthetic-client" });
-      else expect(attempt.input).not.toHaveProperty("client");
-    }
-    expect(result.tickets[0].client?.accountId).toBe("synthetic-client");
-    expect(result.tickets[0].status).toBe("New Calls");
-    expect(result.notes.get("synthetic-71001")).toHaveLength(1);
+    expect(attempts).toHaveLength(1);
+    expect(result.firstRecoveryCheckpoint).toBeUndefined();
+    expect(result.primaryReadsAfterWrite).toBeGreaterThanOrEqual(4);
+    expect(result.notes.get("synthetic-71001")).toBeUndefined();
+    if (unassigned) expect(attempts[0].input.client).toEqual({accountId: "synthetic-client"});
+    else expect(attempts[0].input).not.toHaveProperty("client");
+    expect(result.record.itemStates["71001"].dispatcherReceipt?.verification?.outcome).toBe("not_observed");
   });
 
   it("does not resend a mutation that actually applied despite its uncertain response", async () => {
@@ -191,16 +194,16 @@ describe("dispatcher uncertain triage recovery", () => {
   it("polls an accepted receipt before reconciling uncertain, preserving its mutation checkpoint", async () => {
     const result = await exercise("queued");
     expect(result.initialRecord.itemStates["71001"].stage).not.toBe("RateLimitedRescheduled");
-    expect(result.calls.filter(call => call.method === "GET" && !call.url.endsWith("/diagnostics"))).toHaveLength(1);
-    expect(result.record.state).toBe("Completed");
-    expect(result.updateAttempts.filter(call => call.ticketId === "synthetic-71001")).toHaveLength(2);
+    expect(result.calls.filter(call => call.method === "GET" && !call.url.endsWith("/diagnostics")).length).toBeGreaterThanOrEqual(1);
+    expect(result.record.state).toBe("CompletedWithFailures");
+    expect(result.updateAttempts.filter(call => call.ticketId === "synthetic-71001")).toHaveLength(1);
   });
 
-  it("never issues a third update if the single recovery also remains uncertain", async () => {
+  it("never submits a recovery mutation while the original remains uncertain", async () => {
     const result = await exercise("recoveryUncertain");
     expect(result.record.itemStates["71001"].stage).toBe("AmbiguousWriteUnresolved");
     expect(result.record.completedItems).toContain("71002");
-    expect(result.updateAttempts.filter(call => call.ticketId === "synthetic-71001")).toHaveLength(2);
+    expect(result.updateAttempts.filter(call => call.ticketId === "synthetic-71001")).toHaveLength(1);
   });
 
   it("does not retry over a concurrent engineer change", async () => {

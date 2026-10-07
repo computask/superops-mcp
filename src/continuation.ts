@@ -16,7 +16,7 @@ import {
   type OperationItemState,
   type OperationLedgerRecord,
 } from "./operation-store.js";
-import { withDispatcherOperation, dispatcherFetch, DispatcherPendingError, type DispatcherReceipt } from "./dispatcher.js";
+import { withDispatcherOperation, dispatcherFetch, DispatcherPendingError, reconcileCurrentDispatcherReceipt, type DispatcherReceipt } from "./dispatcher.js";
 
 export interface ContinuationItemContext {
   record: OperationLedgerRecord;
@@ -320,9 +320,18 @@ export async function runOperationContinuation(
       let latestDurableItem = claim.item;
       const saveReceipt = async (receipt: DispatcherReceipt) => {
         if (JSON.stringify(latestDurableItem.dispatcherReceipt) === JSON.stringify(receipt)) return;
+        const prior = latestDurableItem.dispatcherReceipt;
+        const history = [...(latestDurableItem.dispatcherReceiptHistory ?? [])];
+        if (prior && prior.requestId !== receipt.requestId) {
+          if (!["succeeded", "failed", "cancelled"].includes(prior.state)) throw new Error("An unresolved mutation receipt cannot be replaced.");
+          if (prior.verification?.outcome === "applied" && !history.some(r => r.requestId === prior.requestId)) {
+            if (history.length >= 8) throw new Error("Mutation receipt history capacity reached; no later write permitted.");
+            history.push({requestId: prior.requestId, evidenceHash: prior.verification.evidenceHash, outcome: "applied", verifiedAt: prior.verification.verifiedAt});
+          }
+        }
         const saved = await store.checkpointItem({operationId: params.operationId, ownerHash: params.ownerHash,
           itemKey: claim.itemKey, leaseId: claim.lease.leaseId,
-          patch: {stage: latestDurableItem.stage, dispatcherReceipt: receipt}});
+          patch: {stage: latestDurableItem.stage, dispatcherReceipt: receipt, ...(history.length ? {dispatcherReceiptHistory: history} : {})}});
         latestDurableItem = saved.itemStates[claim.itemKey];
       };
       const receiptOutcome = (): ContinuationItemOutcome | undefined => {
@@ -348,12 +357,12 @@ export async function runOperationContinuation(
         const prior = latestDurableItem.dispatcherReceipt;
         if (prior && !["succeeded", "failed", "cancelled", "uncertain"].includes(prior.state)) {
           try {
-            const response = await dispatcherFetch("", {requestId: prior.requestId, idempotencyKey: prior.idempotencyKey});
+            const response = await dispatcherFetch("", {requestId: prior.requestId, idempotencyKey: prior.idempotencyKey, mutation: true});
             await response.body?.cancel();
             await saveReceipt({...prior, state: response.headers.get("X-Dispatcher-Status") ?? "uncertain"});
           } catch (error) {
             if (!(error instanceof DispatcherPendingError)) throw error;
-            await saveReceipt({...prior, state: ["failed", "cancelled", "uncertain"].includes(error.state) ? error.state : prior.state,
+            await saveReceipt({...latestDurableItem.dispatcherReceipt!, state: error.state === "reconciled_applied" ? "succeeded" : ["failed", "cancelled", "uncertain"].includes(error.state) ? error.state : prior.state,
               retryAfter: error.retryAfter ?? prior.retryAfter});
           }
         }
@@ -374,8 +383,12 @@ export async function runOperationContinuation(
             return checkpointed;
           },
         });
+        if (processed.stage === "AmbiguousWriteUnresolved" && latestDurableItem.dispatcherReceipt?.state === "uncertain") {
+          try { await reconcileCurrentDispatcherReceipt(); }
+          catch (error) { if (!(error instanceof DispatcherPendingError)) throw error; }
+        }
         return receiptOutcome() ?? processed;
-      }, saveReceipt);
+      }, saveReceipt, latestDurableItem.dispatcherReceipt);
       const config = getExecutionConfig();
       const priorRate = claim.item.rateLimit;
       const rateAttempts = outcome.rateLimited ? (priorRate?.attempts ?? 0) + 1 : 0;

@@ -7586,7 +7586,7 @@ describe("Tickets Domain", () => {
     });
   });
 
-  it("retains the original snapshot while advancing the checkpoint through partial recovery and a rate-limited note continuation", async () => {
+  it("retains the original snapshot while advancing the checkpoint through eventual visibility and a rate-limited note continuation", async () => {
     const operationId = "operation-owned-updated-time-checkpoint";
     const originalUpdatedTime = "2026-08-21T10:24:53.353";
     const recoveryUpdatedTime = "2026-08-21T10:46:20.482";
@@ -7643,7 +7643,7 @@ describe("Tickets Domain", () => {
       ticketReads += 1;
       const ticket = ticketReads === 1
         ? original
-        : ticketReads <= 6
+        : ticketReads <= 3
           ? partial
           : noteCreated
             ? postNote
@@ -7700,17 +7700,17 @@ describe("Tickets Domain", () => {
 
       const final = await getOperationStore().get(operationId);
       if (!final) throw new Error("missing final checkpointed operation");
-      expect(final.state).toBe("Completed");
-      expect(ticketReads).toBeGreaterThanOrEqual(8);
+      expect(final.state, JSON.stringify(final.itemStates[original.displayId])).toBe("Completed");
+      expect(ticketReads).toBeGreaterThanOrEqual(4);
       expect(noteReads).toBeGreaterThanOrEqual(4);
-      expect(mockClient.mutate.mock.calls.filter(([, variables]) => !variables.input.ticket)).toHaveLength(2);
+      expect(mockClient.mutate.mock.calls.filter(([, variables]) => !variables.input.ticket)).toHaveLength(1);
       expect(mockClient.mutate.mock.calls.filter(([, variables]) => Boolean(variables.input.ticket))).toHaveLength(1);
       expect(final.itemStates[original.displayId]).toMatchObject({
         stage: "Completed",
         outcome: "Updated",
         verificationState: "Verified",
         updatedTimeExpectation: postNoteUpdatedTime,
-        recoveryRetryOutcome: "Accepted",
+        recoveryRetryCount: 0,
         humanReconciliationRequired: false,
         replaySafe: false,
       });
@@ -7742,7 +7742,6 @@ describe("Tickets Domain", () => {
     const updated = { ...original, ...target, updatedTime: operationUpdatedTime };
     let ticketReads = 0;
     let firstUpdate = true;
-    let updateAccepted = false;
     let externalChange = false;
     let noteThrottleIssued = false;
     mockClient.query.mockImplementation(async (query: string) => {
@@ -7756,7 +7755,7 @@ describe("Tickets Domain", () => {
       }
       if (query.includes("getFields")) return { getFields: RESOLVED_OPTION_FIELDS };
       if (query.includes("getTicketNoteList")) {
-        if (updateAccepted && !noteThrottleIssued) {
+        if (!firstUpdate && !noteThrottleIssued) {
           noteThrottleIssued = true;
           throw new SuperOpsError("note dedupe throttled", "THROTTLED", 0);
         }
@@ -7768,7 +7767,7 @@ describe("Tickets Domain", () => {
           ? { ...updated, updatedTime: externalUpdatedTime }
           : ticketReads === 1
             ? original
-            : ticketReads <= 6
+            : ticketReads <= 3
               ? partial
               : updated,
       };
@@ -7779,7 +7778,6 @@ describe("Tickets Domain", () => {
         firstUpdate = false;
         throw new Error("classification response lost after the upstream update");
       }
-      updateAccepted = true;
       return { updateTicket: { ticketId: original.ticketId } };
     });
 
@@ -7851,11 +7849,11 @@ describe("Tickets Domain", () => {
         noteAdded: false,
         verified: false,
       });
-      expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+      expect(mockClient.mutate).toHaveBeenCalledTimes(1);
     });
   });
 
-  it("does not advance the active checkpoint when an accepted recovery fails read-back verification", async () => {
+  it("does not advance the active checkpoint when an ambiguous mutation leaves a partial target", async () => {
     const operationId = "operation-owned-updated-time-recovery-verification-failure";
     const originalUpdatedTime = "2026-08-21T10:24:53.353";
     const target = { ...TRIAGE_TEST_CLASSIFICATION, status: "Awaiting Engineer" };
@@ -7937,18 +7935,18 @@ describe("Tickets Domain", () => {
 
       const final = await getOperationStore().get(operationId);
       if (!final) throw new Error("missing failed-recovery final checkpoint");
-      expect(recoveryAccepted).toBe(true);
+      expect(recoveryAccepted).toBe(false);
       expect(final.state).toBe("CompletedWithFailures");
       expect(final.itemStates[original.displayId]).toMatchObject({
         updatedTimeExpectation: originalUpdatedTime,
-        recoveryRetryOutcome: "Accepted",
+        recoveryRetryCount: 0,
         partialWrite: true,
         replaySafe: false,
         humanReconciliationRequired: true,
       });
       expect(final.itemStates[original.displayId]?.stage).toMatch(/Failed|Unresolved/);
       expect(JSON.stringify(final.operationRequest)).toContain(originalUpdatedTime);
-      expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+      expect(mockClient.mutate).toHaveBeenCalledTimes(1);
     });
   });
 

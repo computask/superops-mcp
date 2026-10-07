@@ -809,7 +809,7 @@ class TriageHarness {
     });
   }
 
-  assertGlobalInvariants(record?: OperationLedgerRecord, limits: { classifications?: number; notes?: number; statuses?: number } = {}): void {
+  assertGlobalInvariants(record?: OperationLedgerRecord, limits: { classifications?: number; notes?: number; statuses?: number; ordinaryUpdate?: boolean } = {}): void {
     const writes = this.history.events.filter((event) => event.kind.startsWith("superops.write."));
     const classifications = writes.filter((event) => event.kind === "superops.write.classification");
     const notes = writes.filter((event) => event.kind === "superops.write.note");
@@ -822,7 +822,7 @@ class TriageHarness {
     for (const event of classifications) {
       const input = event.details?.input as Record<string, unknown>;
       expect(input).not.toHaveProperty("priority");
-      expect(input).not.toHaveProperty("status");
+      if (!limits.ordinaryUpdate) expect(input).not.toHaveProperty("status");
       expect(input).not.toHaveProperty("technician");
       expect(input).not.toHaveProperty("techGroup");
       expect(input).not.toHaveProperty("suppressCloseNotification");
@@ -1545,49 +1545,32 @@ describe("deterministic end-to-end apply-triage harness", () => {
     harness.assertGlobalInvariants(record);
   });
 
-  it("I: staged classification partial effects are checkpointed and only missing fields are recovered", async () => {
-    const harness = new TriageHarness("classification-partial", {
-      classificationFaults: ["timeoutPartialApply", "accepted"],
-    });
-    await harness.invoke();
-    const record = await harness.resumeUntilTerminal(12);
-    const result = itemResult(record);
-
-    expect(record.state).toBe("Completed");
-    expect(result).toMatchObject({
-      finalOutcome: "Resolved",
-      reconciliationDisposition: "VerifiedSuccess",
-      recoveryRetryCount: 1,
-      partialWrite: false,
-    });
-    const writes = harness.history.events.filter((event) => event.kind === "superops.write.classification");
-    expect(writes).toHaveLength(2);
-    expect(writes[1]?.details?.input).not.toHaveProperty("impact");
-    expect(harness.history.count("superops.write.note")).toBe(1);
-    expect(harness.history.count("superops.write.status")).toBe(1);
-    harness.assertGlobalInvariants(record, { classifications: 2 });
+  it("I: partial staged classification remains unresolved without a missing-only mutation", async () => {
+    const harness = new TriageHarness("synthetic-no-replay", {classificationFaults: ["timeoutPartialApply", "accepted"]});
+    await harness.invoke({});
+    const terminal = await harness.resumeUntilTerminal(12);
+    expect(terminal.state).toBe("CompletedWithFailures");
+    expect(terminal.itemStates[TICKET_NUMBER]).toMatchObject({stage: "AmbiguousWriteUnresolved", recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
+    expect(itemResult(terminal)).toMatchObject({finalOutcome: "Failed", reconciliationDisposition: "AmbiguousUnresolved", partialWrite: true, recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(0);
+    expect(harness.history.count("superops.write.status")).toBe(0);
+    harness.assertGlobalInvariants(terminal);
   });
 
-  it("I2: staged classification with no observed effect receives one controlled recovery", async () => {
-    const harness = new TriageHarness("classification-not-applied", {
-      classificationFaults: ["timeoutNoApply", "accepted"],
-    });
-    await harness.invoke();
-
-    const record = await harness.resumeUntilTerminal(12);
-    expect(record.state).toBe("Completed");
-    expect(itemResult(record)).toMatchObject({
-      finalOutcome: "Resolved",
-      reconciliationDisposition: "VerifiedSuccess",
-      recoveryRetryCount: 1,
-      recoveryRetryOutcome: "Accepted",
-      partialWrite: false,
-    });
-    expect(harness.history.count("superops.write.classification")).toBe(2);
-    expect(harness.history.count("superops.write.note")).toBe(1);
-    expect(harness.history.count("superops.write.status")).toBe(1);
-    harness.assertGlobalInvariants(record, { classifications: 2 });
+  it("I2: unobserved staged classification remains uncertain without replay", async () => {
+    const harness = new TriageHarness("synthetic-no-replay", {classificationFaults: ["timeoutNoApply", "accepted"]});
+    await harness.invoke({});
+    const terminal = await harness.resumeUntilTerminal(12);
+    expect(terminal.state).toBe("CompletedWithFailures");
+    expect(terminal.itemStates[TICKET_NUMBER]).toMatchObject({stage: "AmbiguousWriteUnresolved", recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
+    expect(itemResult(terminal)).toMatchObject({finalOutcome: "Failed", reconciliationDisposition: "AmbiguousUnresolved", partialWrite: false, recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(0);
+    expect(harness.history.count("superops.write.status")).toBe(0);
+    harness.assertGlobalInvariants(terminal);
   });
+
   it("J: ambiguous note write is read before any later action and is never replayed", async () => {
     const harness = new TriageHarness("ambiguous-note", { classified: true, noteFault: "timeoutApply" });
     const { parsed } = await harness.invoke();
@@ -1704,94 +1687,45 @@ describe("deterministic end-to-end apply-triage harness", () => {
     harness.assertGlobalInvariants(terminal);
   });
 
-  it("recovers a 59389-equivalent unchanged update exactly once and then adds its private note once", async () => {
-    const harness = new TriageHarness("confirmed-not-applied-update-recovery", {
-      classificationFaults: ["timeoutNoApply", "accepted"],
-    });
-    await harness.invoke({ actions: [updateAction()] });
-
+  it("unchanged state does not prove rejection and cannot authorize another write or note", async () => {
+    const harness = new TriageHarness("synthetic-no-replay", {classificationFaults: ["timeoutNoApply", "accepted"]});
+    await harness.invoke({actions: [updateAction()]});
     const terminal = await harness.resumeUntilTerminal(12);
-    const result = itemResult(terminal);
-    const state = terminal.itemStates[TICKET_NUMBER];
-    expect(terminal.state).toBe("Completed");
-    expect(state).toMatchObject({
-      stage: "CompletedAfterRetry",
-      partialWrite: false,
-      recoveryRetryCount: 1,
-      reconciliationDisposition: "VerifiedSuccess",
-      humanReconciliationRequired: false,
-    });
-    expect(result).toMatchObject({
-      finalOutcome: "Updated",
-      verified: true,
-      partialWrite: false,
-      ambiguityEncountered: true,
-      reconciliationDisposition: "VerifiedSuccess",
-      recoveryRetryCount: 1,
-      recoveryRetryAttempted: true,
-      recoveryRetryOutcome: "Accepted",
-      acceptedPhysicalWrites: [expect.objectContaining({ outcome: "Accepted", recovery: true })],
-      initialFailure: expect.objectContaining({ errorClass: "DispatcherPendingError" }),
-      recoveryHistory: expect.arrayContaining([
-        expect.objectContaining({ event: "OriginalMutationAttempt" }),
-        expect.objectContaining({ event: "RecoveryWriteStarted" }),
-        expect.objectContaining({ event: "RecoveryVerified" }),
-      ]),
-      observedRequestedEffects: expect.arrayContaining(["status", "impact", "clientId"]),
-      missingRequestedEffects: [],
-    });
-    expect(harness.history.count("superops.write.classification")).toBe(2);
-    const recoveryWrite = harness.history.events.filter((event) => event.kind === "superops.write.classification")[1];
-    expect(recoveryWrite?.details?.input).not.toHaveProperty("priority");
-    expect(harness.history.count("superops.write.note")).toBe(1);
-    expect(terminal.partialWriteCount).toBe(0);
-    expect(terminal.ambiguousWriteCount).toBe(0);
+    expect(terminal.state).toBe("CompletedWithFailures");
+    expect(terminal.itemStates[TICKET_NUMBER]).toMatchObject({stage: "AmbiguousWriteUnresolved", recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
+    expect(itemResult(terminal)).toMatchObject({finalOutcome: "Failed", reconciliationDisposition: "AmbiguousUnresolved", partialWrite: false, recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(0);
+    expect(harness.history.count("superops.write.status")).toBe(0);
+    harness.assertGlobalInvariants(terminal, {ordinaryUpdate: true});
   });
 
-  it("recovers only missing fields after a partial ambiguous update", async () => {
-    const harness = new TriageHarness("partial-update-recovery", {
-      classificationFaults: ["timeoutPartialApply", "accepted"],
-    });
+  it("partial ambiguous updates retain their original intent without a missing-only replay", async () => {
+    const harness = new TriageHarness("synthetic-no-replay", {classificationFaults: ["timeoutPartialApply", "accepted"]});
     await harness.invoke({ actions: [updateAction("")] });
-
     const terminal = await harness.resumeUntilTerminal(12);
-    const result = itemResult(terminal);
-
-    expect(terminal.state).toBe("Completed");
-    expect(result).toMatchObject({
-      finalOutcome: "Updated",
-      reconciliationDisposition: "VerifiedSuccess",
-      recoveryRetryCount: 1,
-      partialWrite: false,
-    });
-    const writes = harness.history.events.filter((event) => event.kind === "superops.write.classification");
-    expect(writes).toHaveLength(2);
-    expect(writes[1]?.details?.input).not.toHaveProperty("impact");
-    expect(writes[1]?.details?.input).toMatchObject({ status: "Awaiting Engineer" });
+    expect(terminal.state).toBe("CompletedWithFailures");
+    expect(terminal.itemStates[TICKET_NUMBER]).toMatchObject({stage: "AmbiguousWriteUnresolved", recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
+    expect(itemResult(terminal)).toMatchObject({finalOutcome: "Failed", reconciliationDisposition: "AmbiguousUnresolved", partialWrite: true, recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(0);
+    expect(harness.history.count("superops.write.status")).toBe(0);
+    harness.assertGlobalInvariants(terminal, {ordinaryUpdate: true});
   });
 
-  it("re-adds an already matching category only as the schema dependency for missing subcategory", async () => {
-    const harness = new TriageHarness("partial-update-schema-dependency", {
-      classificationFaults: ["timeoutCategoryOnly", "accepted"],
-    });
+  it("an observed category cannot authorize replay of its missing subcategory", async () => {
+    const harness = new TriageHarness("synthetic-no-replay", {classificationFaults: ["timeoutCategoryOnly", "accepted"]});
     await harness.invoke({ actions: [updateAction("")] });
-
     const terminal = await harness.resumeUntilTerminal(12);
-    expect(terminal.state).toBe("Completed");
-    expect(itemResult(terminal)).toMatchObject({
-      finalOutcome: "Updated",
-      reconciliationDisposition: "VerifiedSuccess",
-      recoveryRetryCount: 1,
-      schemaDependencyFields: ["category"],
-      partialWrite: false,
-    });
-    const writes = harness.history.events.filter((event) => event.kind === "superops.write.classification");
-    expect(writes).toHaveLength(2);
-    expect(writes[1]?.details?.input).toMatchObject({
-      category: "7. Sales call",
-      subcategory: "No Action Needed",
-    });
+    expect(terminal.state).toBe("CompletedWithFailures");
+    expect(terminal.itemStates[TICKET_NUMBER]).toMatchObject({stage: "AmbiguousWriteUnresolved", recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
+    expect(itemResult(terminal)).toMatchObject({finalOutcome: "Failed", reconciliationDisposition: "AmbiguousUnresolved", partialWrite: true, recoveryRetryCount: 0, replaySafe: false, humanReconciliationRequired: true});
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(0);
+    expect(harness.history.count("superops.write.status")).toBe(0);
+    harness.assertGlobalInvariants(terminal, {ordinaryUpdate: true});
   });
+
   it("terminalises an unobserved ambiguous leave update only after the bounded read ceiling", async () => {
     const harness = new TriageHarness("ambiguous-update-unresolved", {
       classificationFault: "timeoutNoApply",
@@ -1803,17 +1737,17 @@ describe("deterministic end-to-end apply-triage harness", () => {
     expect(terminal.itemStates[TICKET_NUMBER]).toMatchObject({
       stage: "AmbiguousWriteUnresolved",
       partialWrite: false,
-      recoveryRetryCount: 1,
+      recoveryRetryCount: 0,
       reconciliationDisposition: "AmbiguousUnresolved",
       replaySafe: false,
       humanReconciliationRequired: true,
     });
     expect(itemResult(terminal)).toMatchObject({
       terminalReason: "AmbiguousWriteUnresolved",
-      reconciliationPasses: 2,
+      reconciliationPasses: 1,
       reconciliationPassReadAttempts: 4,
-      recoveryRetryCount: 1,
-      recoveryRetryOutcome: "Ambiguous",
+      recoveryRetryCount: 0,
+      recoveryRetryAttempted: false,
       partialWrite: false,
       acceptedPhysicalWrites: [],
       observedRequestedEffects: [],
@@ -1821,28 +1755,16 @@ describe("deterministic end-to-end apply-triage harness", () => {
       humanReconciliationRequired: true,
       terminalFailure: expect.objectContaining({ errorClass: "AmbiguousWrite" }),
     });
-    expect(harness.history.count("superops.write.classification")).toBe(2);
-    harness.assertGlobalInvariants(terminal, { classifications: 2 });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    harness.assertGlobalInvariants(terminal, { classifications: 1 });
   });
-  it("completes when the recovery retry is ambiguous and the target appears during the second pass", async () => {
-    const harness = new TriageHarness("recovery-ambiguous-eventually-visible", {
-      classificationFaults: ["timeoutNoApply", "timeoutNoApply"],
-      updateApplyOnTicketRead: 8,
-    });
-    await harness.invoke({ actions: [updateAction("")] });
-
+  it("completes when the original ambiguous target becomes visible within the bounded window", async () => {
+    const harness = new TriageHarness("eventually-visible-original", {classificationFault: "timeoutNoApply", updateApplyOnTicketRead: 4});
+    await harness.invoke({actions: [updateAction("")]});
     const terminal = await harness.resumeUntilTerminal(12);
     expect(terminal.state).toBe("Completed");
-    expect(itemResult(terminal)).toMatchObject({
-      finalOutcome: "Updated",
-      reconciliationDisposition: "VerifiedSuccess",
-      reconciliationPasses: 2,
-      recoveryRetryCount: 1,
-      recoveryRetryOutcome: "Ambiguous",
-      partialWrite: false,
-      humanReconciliationRequired: false,
-    });
-    expect(harness.history.count("superops.write.classification")).toBe(2);
+    expect(itemResult(terminal)).toMatchObject({finalOutcome: "Updated", reconciliationDisposition: "VerifiedSuccess", recoveryRetryCount: 0, partialWrite: false, humanReconciliationRequired: false});
+    expect(harness.history.count("superops.write.classification")).toBe(1);
   });
 
   it("distinguishes immutable-ticket disappearance during reconciliation from ConfirmedNotApplied", async () => {
@@ -1886,72 +1808,27 @@ describe("deterministic end-to-end apply-triage harness", () => {
     expect(harness.history.count("superops.write.classification")).toBe(1);
   });
 
-  it("retains first-pass read progress across a rate-limit wait without consuming recovery", async () => {
-    const harness = new TriageHarness("first-reconciliation-rate-limit", {
-      classificationFaults: ["timeoutNoApply", "accepted"],
-      canonicalTicketReadRateLimitReads: [3, 4, 5],
-    });
-    await harness.invoke({ actions: [updateAction("")] }, {
-      SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "3",
-    });
-    await harness.resume();
-
-    const waiting = await harness.record();
-    expect(waiting.state).toBe("Rescheduled");
-    expect(waiting.itemStates[TICKET_NUMBER]).toMatchObject({
-      reconciliationPass: 1,
-      reconciliationPassReadAttempts: 1,
-      reconciliationReadAttempts: 1,
-    });
-    expect(waiting.itemStates[TICKET_NUMBER]?.recoveryRetryCount ?? 0).toBe(0);
-    expect(harness.history.count("superops.write.classification")).toBe(1);
-
-    const terminal = await harness.resumeUntilTerminal(12);
-    expect(terminal.state).toBe("Completed");
-    expect(itemResult(terminal)).toMatchObject({
-      recoveryRetryCount: 1,
-      reconciliationDisposition: "VerifiedSuccess",
-    });
-    expect(harness.history.count("superops.write.classification")).toBe(2);
-  });
-
-  it("resumes the second reconciliation pass after a rate limit without another recovery mutation", async () => {
-    const harness = new TriageHarness("second-reconciliation-rate-limit", {
-      classificationFaults: ["timeoutNoApply", "timeoutNoApply"],
-      canonicalTicketReadRateLimitReads: [7, 8, 9],
-    });
-    await harness.invoke({ actions: [updateAction("")] }, {
-      SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "3",
-    });
-
-    let waiting: OperationLedgerRecord | undefined;
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const record = await harness.record();
-      if (record.state === "Rescheduled" && record.itemStates[TICKET_NUMBER]?.recoveryRetryCount === 1) {
-        waiting = record;
-        break;
-      }
-      if (record.nextEligibleTime) harness.clock.advanceTo(record.nextEligibleTime);
-      await harness.resume(record.nextEligibleTime);
-    }
-    expect(waiting).toBeDefined();
-    expect(waiting?.itemStates[TICKET_NUMBER]).toMatchObject({
-      reconciliationPass: 2,
-      recoveryRetryCount: 1,
-    });
-    expect(harness.history.count("superops.write.classification")).toBe(2);
-
+  it("retains uncertainty and successful-read progress across throttle schedule [3, 4, 5]", async () => {
+    const harness = new TriageHarness("read-throttle-no-replay", {classificationFault: "timeoutNoApply", canonicalTicketReadRateLimitReads: [3, 4, 5]});
+    await harness.invoke({actions: [updateAction("")]}, {SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "3"});
     const terminal = await harness.resumeUntilTerminal(12);
     expect(terminal.state).toBe("CompletedWithFailures");
-    expect(itemResult(terminal)).toMatchObject({
-      reconciliationDisposition: "AmbiguousUnresolved",
-      recoveryRetryCount: 1,
-      replaySafe: false,
-    });
-    expect(harness.history.count("superops.write.classification")).toBe(2);
+    expect(itemResult(terminal)).toMatchObject({reconciliationDisposition: "AmbiguousUnresolved", recoveryRetryCount: 0, reconciliationPassReadAttempts: 4, replaySafe: false, humanReconciliationRequired: true});
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.read.ticket")).toBeGreaterThanOrEqual(4);
   });
 
-  it("allows only one duplicate continuation delivery to cross the recovery boundary", async () => {
+  it("retains uncertainty and successful-read progress across throttle schedule [4, 5, 6]", async () => {
+    const harness = new TriageHarness("read-throttle-no-replay", {classificationFault: "timeoutNoApply", canonicalTicketReadRateLimitReads: [4, 5, 6]});
+    await harness.invoke({actions: [updateAction("")]}, {SUPEROPS_EXECUTION_MAX_READ_RETRY_ATTEMPTS: "3"});
+    const terminal = await harness.resumeUntilTerminal(12);
+    expect(terminal.state).toBe("CompletedWithFailures");
+    expect(itemResult(terminal)).toMatchObject({reconciliationDisposition: "AmbiguousUnresolved", recoveryRetryCount: 0, reconciliationPassReadAttempts: 4, replaySafe: false, humanReconciliationRequired: true});
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.read.ticket")).toBeGreaterThanOrEqual(4);
+  });
+
+  it("duplicate continuation deliveries cannot create a recovery mutation", async () => {
     const harness = new TriageHarness("duplicate-recovery-delivery", {
       classificationFaults: ["timeoutNoApply", "accepted"],
     });
@@ -1974,9 +1851,9 @@ describe("deterministic end-to-end apply-triage harness", () => {
     ]);
 
     const terminal = await harness.resumeUntilTerminal(12);
-    expect(terminal.state).toBe("Completed");
-    expect(itemResult(terminal)).toMatchObject({ recoveryRetryCount: 1 });
-    expect(harness.history.count("superops.write.classification")).toBe(2);
+    expect(terminal.state).toBe("CompletedWithFailures");
+    expect(itemResult(terminal)).toMatchObject({ recoveryRetryCount: 0 });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
   });
 
   it("treats a crash after RecoveryWriteStarted as a possibly issued retry and never sends another", async () => {
@@ -2103,7 +1980,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
     harness.assertGlobalInvariants(record);
   });
 
-  it("K2: unresolved ambiguous status exhausts one controlled recovery and the second read pass", async () => {
+  it("K2: unresolved ambiguous status ends after bounded reads without a second status mutation", async () => {
     const harness = new TriageHarness("ambiguous-status-unresolved", {
       classified: true,
       initialNotes: [{ ...CANONICAL_PRIVATE_JUNK }],
@@ -2126,9 +2003,9 @@ describe("deterministic end-to-end apply-triage harness", () => {
       finalOutcome: "Failed",
       terminalReason: "AmbiguousWriteUnresolved",
       ambiguousVerificationAttempts: 4,
-      reconciliationPasses: 2,
-      recoveryRetryCount: 1,
-      recoveryRetryOutcome: "Ambiguous",
+      reconciliationPasses: 1,
+      recoveryRetryCount: 0,
+      recoveryRetryAttempted: false,
       partialWrite: true,
       acceptedPhysicalWrites: [],
       replaySafe: false,
@@ -2136,14 +2013,14 @@ describe("deterministic end-to-end apply-triage harness", () => {
     });
     expect(record.itemStates[TICKET_NUMBER]).toMatchObject({
       stage: "AmbiguousWriteUnresolved",
-      retryCount: 8,
-      recoveryRetryCount: 1,
+      retryCount: 4,
+      recoveryRetryCount: 0,
       partialWrite: true,
     });
     expect(harness.history.count("superops.write.note")).toBe(0);
     expect(harness.history.count("superops.read.notes")).toBeGreaterThanOrEqual(4);
-    expect(harness.history.count("superops.write.status")).toBe(2);
-    harness.assertGlobalInvariants(record, { statuses: 2 });
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(record, { statuses: 1 });
   });
 
   it("L1: workflow-owned updatedTime changes do not look like concurrent modification", async () => {

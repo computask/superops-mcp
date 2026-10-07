@@ -1,5 +1,14 @@
 # SuperOps MCP Execution Safety Verification
 
+## Original-receipt mutation reconciliation — 7 October 2026
+
+The [current reconciliation contract](mutation-reconciliation.md) supersedes
+earlier controlled-recovery guidance. Unchanged or partial reads cannot authorize
+another mutation. Dispatcher status/verification calls consume the execution
+budget but submit no SuperOps GraphQL. Existing verification reads supply the
+owned receipt evidence; the dispatcher evaluates it without additional upstream
+calls. Settlement does not fabricate a mutation response or rewrite attempts.
+
 ## Private GraphQL exchange capture — 27 September 2026
 
 The authorized [private capture](graphql-private-capture.md) observes the existing

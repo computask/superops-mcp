@@ -1,6 +1,6 @@
 import { paginatedClient } from "../pagination.js";
 import { assertTriageRunWriteLease } from "../triage-run-lease.js";
-import { DispatcherPendingError, withDispatcherRecoveryAttempt } from "../dispatcher.js";
+import { DispatcherPendingError, reconcileCurrentDispatcherReceipt } from "../dispatcher.js";
 /**
  * SuperOps.ai Tickets Domain
  *
@@ -5877,14 +5877,14 @@ async function applyStagedResolveAction(params: {
         return markAmbiguousWritePending({
           result,
           attempts: 1,
-          reason: "Only part of the ambiguous classification/client target was observed; delayed reconciliation will classify and recover only missing effects.",
+          reason: "Only part of the ambiguous classification/client target was observed; delayed read-only reconciliation is required. No replay.",
         });
       }
       if (!isSynchronousMutationFailure(error) && result.updatedTimeChanged === false) {
         return markAmbiguousWritePending({
           result,
           attempts: 1,
-          reason: "Ambiguous classification/client state was not observed on the immediate read; delayed reconciliation is required before any controlled recovery.",
+          reason: "Ambiguous classification/client state was not observed on the immediate read; delayed read-only reconciliation is required. No replay.",
         });
       }
       const verification = verifyFinalTargetState(classificationAction, reread);
@@ -6229,7 +6229,7 @@ async function applyStagedResolveAction(params: {
         finalOutcome: "SkippedChangedSinceSnapshot",
       });
     }
-    const reason = "Ambiguous status-only close remains unobserved after a read-only reconciliation attempt; bounded evidence is required before controlled recovery.";
+    const reason = "Ambiguous status-only close remains unobserved after a read-only reconciliation attempt; bounded read-only verification is required. No replay.";
     return attempts >= AMBIGUOUS_WRITE_RECONCILIATION_MAX_ATTEMPTS
       ? markAmbiguousWriteUnresolved({ result, attempts, reason })
       : markAmbiguousWritePending({ result, attempts, reason });
@@ -6299,7 +6299,7 @@ async function applyStagedResolveAction(params: {
         }
         result.reconciliationUpdatedTimes = statusReread.updatedTime ? [statusReread.updatedTime] : [];
         const attempts = (params.noteVisibilityPriorAttempts ?? 0) + 1;
-        const reason = "Ambiguous status-only close was not observed on the immediate read; delayed read-only reconciliation is required before controlled recovery.";
+        const reason = "Ambiguous status-only close was not observed on the immediate read; delayed read-only verification is required. No replay.";
         return attempts >= AMBIGUOUS_WRITE_RECONCILIATION_MAX_ATTEMPTS
           ? markAmbiguousWriteUnresolved({ result, attempts, reason })
           : markAmbiguousWritePending({ result, attempts, reason });
@@ -6679,7 +6679,7 @@ function markNoChangeObserved(params: {
     markAmbiguousWritePending({
       result: params.result,
       attempts: 1,
-      reason: "The ambiguous state-setting mutation was not observed on the immediate read; delayed reconciliation is required before any controlled recovery.",
+      reason: "The ambiguous state-setting mutation was not observed on the immediate read; delayed read-only reconciliation is required. No replay.",
     });
     return true;
   }
@@ -6749,7 +6749,7 @@ function compactApplyResult(
     ["Resolved", "Updated", "Left"].includes(result.finalOutcome) &&
     result.verified === true &&
     result.partialWrite !== true;
-  return {
+  const compact: Record<string, unknown> = {
     ticketNumber: result.ticketNumber,
     ticketId: result.ticketId,
     requestedAction: result.requestedAction,
@@ -6859,6 +6859,12 @@ function compactApplyResult(
     replaySafe: result.replaySafe,
     humanReconciliationRequired: result.humanReconciliationRequired,
   };
+  // Large verified batches omit empty presentation fields so unresolved
+  // receipts and their evidence fit in the unchanged 512-KiB ledger bound.
+  if (trimmedVerifiedSuccess) {
+    for (const [key, value] of Object.entries(compact)) if (value === null) delete compact[key];
+  }
+  return compact;
 }
 function serializableApplyTriageRequest(
   request: ApplyTriagePlanParams,
@@ -7840,7 +7846,7 @@ async function applyApprovedTriageAction(params: {
                 return markAmbiguousWritePending({
                   result,
                   attempts: 1,
-                  reason: "Only part of the ambiguous update target was observed; delayed reconciliation will classify and recover only missing effects.",
+                  reason: "Only part of the ambiguous update target was observed; delayed read-only reconciliation is required. No replay.",
                 });
               }
               if (updatedTimeChanged(ticket, immediateReread)) {
@@ -7857,7 +7863,7 @@ async function applyApprovedTriageAction(params: {
               return markAmbiguousWritePending({
                 result,
                 attempts: 1,
-                reason: "Ambiguous update was not observed on the immediate read; delayed read-only reconciliation is required before controlled recovery.",
+                reason: "Ambiguous update was not observed on the immediate read; delayed read-only verification is required. No replay.",
               });
             }
           }
@@ -8351,66 +8357,6 @@ function reconciliationObservation(
   };
 }
 
-function recoveryInputFieldAlreadyMatches(
-  field: string,
-  observedEffects: Set<string>,
-  action: TriagePlanAction
-): boolean {
-  if (field === "client") {
-    const requestedClientFields = ["clientName", "clientId"]
-      .filter((name) => (action.target as Record<string, unknown> | undefined)?.[name] !== undefined);
-    return requestedClientFields.length > 0 && requestedClientFields.every((name) => observedEffects.has(name));
-  }
-  if (field === "techGroup") return observedEffects.has("techGroupName");
-  return observedEffects.has(field);
-}
-
-async function buildMissingOnlyRecoveryInput(params: {
-  client: SuperOpsClientInstance;
-  ticketId: string;
-  action: TriagePlanAction;
-  mutationType: DurableMutationType;
-  ticket: Ticket;
-  optionFieldsProvider?: TicketOptionFieldsProvider;
-}): Promise<{ input?: Record<string, unknown>; schemaDependencyFields: string[]; error?: string }> {
-  const stageAction = reconciliationActionForMutation(params.action, params.mutationType);
-  const fullInput = params.mutationType === "classification"
-    ? await buildStagedResolveClassificationInput(
-        params.client,
-        params.ticketId,
-        params.action,
-        params.optionFieldsProvider,
-        params.ticket
-      )
-    : params.mutationType === "status" || params.mutationType === "resolveFallback"
-      ? buildStagedResolveStatusInput(params.ticketId, params.action.target?.status)
-      : await buildApprovedUpdateInput(
-          params.client,
-          params.ticketId,
-          params.action,
-          undefined,
-          params.optionFieldsProvider,
-          params.ticket
-        );
-  const error = (fullInput as { error?: unknown }).error;
-  if (typeof error === "string") return { error, schemaDependencyFields: [] };
-
-  const observed = new Set(requestedFieldsMatchingTarget(stageAction, params.ticket));
-  const input = { ...(fullInput as Record<string, unknown>) };
-  for (const field of Object.keys(input)) {
-    if (field === "ticketId" || field === "suppressCloseNotification") continue;
-    if (recoveryInputFieldAlreadyMatches(field, observed, stageAction)) delete input[field];
-  }
-
-  const schemaDependencyFields: string[] = [];
-  if (input.subcategory !== undefined && input.category === undefined && params.action.target?.category) {
-    input.category = params.action.target.category;
-    schemaDependencyFields.push("category");
-  }
-  if (input.status === undefined) delete input.suppressCloseNotification;
-  return { input, schemaDependencyFields };
-}
-
 function seedReconciliationResultFromItem(
   result: ApplyTriagePlanResult,
   item: OperationItemState,
@@ -8538,19 +8484,6 @@ async function ambiguityCheckedTriageResult(params: {
     updatedTimeExpectation?: string,
     baselineTicket?: Ticket
   ) => Promise<void>;
-  beforeRecoveryMutation: (params: {
-    mutationType: DurableMutationType;
-    disposition: ReconciliationDisposition;
-    pass: number;
-    passReadAttempts: number;
-    totalReadAttempts: number;
-    observedEffects: string[];
-    missingEffects: string[];
-    conflictingEffects: string[];
-    schemaDependencyFields: string[];
-    updatedTimes: string[];
-    replaySafetyReason: string;
-  }) => Promise<void>;
   afterMutation?: (
     mutationType: DurableMutationType,
     observed: { ticketId?: string; noteId?: string }
@@ -9127,262 +9060,23 @@ async function ambiguityCheckedTriageResult(params: {
     };
   }
 
-  if (pass === 2 || currentRecoveryCount >= 1) {
-    const disposition: ReconciliationDisposition = observation.observedEffects.length > 0
-      ? "ConfirmedPartialWrite"
-      : "AmbiguousUnresolved";
-    result.recoveryRetryCount = 1;
-    result.recoveryRetryAttempted = true;
-    result.recoveryRetryOutcome ??= "AmbiguousUnresolved";
-    result.reconciliationDisposition = disposition;
-    return {
-      result: terminalUnresolved(
-        result,
-        "The one permitted recovery retry is exhausted and the second bounded reconciliation pass did not verify the complete target.",
-        disposition
-      ),
-      stage: "AmbiguousWriteUnresolved",
-      retryCount: nextTotalAttempts,
-    };
-  }
-
-  const currentMutationReadbackFields = new Set<string>(requestedReadbackFields(stageAction));
-  const previouslyObservedCurrentMutationEffects = (result.observedRequestedEffects ?? [])
-    .filter((effect) => currentMutationReadbackFields.has(effect));
-  const acceptedForCurrentMutation = (itemState.acceptedPhysicalWrites ?? [])
-    .some((write) => write.mutationType === mutationType);
-  const originalEvidence = itemState.originalMutationEvidence;
-  const currentPassUpdatedTimes = updatedTimes.slice(-nextPassAttempts);
-  const unchangedAcrossSuccessfulReadWindow = Boolean(itemState.preMutationUpdatedTime) &&
-    currentPassUpdatedTimes.length === nextPassAttempts &&
-    currentPassUpdatedTimes.every((value) => value === itemState.preMutationUpdatedTime);
-  const strongNotAppliedEvidence = observation.observedEffects.length === 0 &&
-    previouslyObservedCurrentMutationEffects.length === 0 &&
-    observation.missingEffects.length === requestedReadbackFields(stageAction).length &&
-    observation.updatedTimeChanged === false &&
-    unchangedAcrossSuccessfulReadWindow &&
-    observation.conflictingEffects.length === 0 &&
-    observation.unrelatedChanges.length === 0 &&
-    Boolean(itemState.preMutationState) &&
-    approvedLookup.immutableIdentityRecovered &&
-    !acceptedForCurrentMutation &&
-    originalEvidence?.reliableResponseReceived === false &&
-    originalEvidence.mutationResult === "Ambiguous" &&
-    originalEvidence.responseHadMutationPayload !== true &&
-    currentRecoveryCount === 0;
   const disposition: ReconciliationDisposition = observation.observedEffects.length > 0
     ? "ConfirmedPartialWrite"
-    : strongNotAppliedEvidence
-      ? "ConfirmedNotApplied"
-      : "AmbiguousUnresolved";
+    : "AmbiguousUnresolved";
   result.reconciliationDisposition = disposition;
   result.recoveryHistory = [
     ...(result.recoveryHistory ?? []),
-    { pass: 1, event: "Disposition", outcome: disposition },
+    { pass, event: "RecoverySuppressed", outcome: disposition },
   ];
-
-  if (disposition === "AmbiguousUnresolved") {
-    return {
-      result: terminalUnresolved(
-        result,
-        "The bounded reads did not meet every ConfirmedNotApplied eligibility condition."
-      ),
-      stage: "AmbiguousWriteUnresolved",
-      retryCount: nextTotalAttempts,
-    };
-  }
-
-  let freshTicket: Ticket;
-  try {
-    freshTicket = await getTicketByInternalId(client, expectedTicketId ?? approvedLookup.ticketId);
-  } catch (error) {
-    if (isExecutionStopError(error)) throw error;
-    if (isRateLimitError(error)) {
-      return {
-        result: markRateLimitedReadResult(result, error, "getTicket.preRecoveryIdentity"),
-        stage: params.ambiguityStage,
-      };
-    }
-    return {
-      result: terminalUnresolved(result, "The mandatory immutable-ID pre-recovery read was unavailable."),
-      stage: "AmbiguousWriteUnresolved",
-    };
-  }
-  if (freshTicket.ticketId !== (expectedTicketId ?? approvedLookup.ticketId)) {
-    return {
-      result: terminalUnresolved(result, "Immutable ticket identity changed before recovery."),
-      stage: "AmbiguousWriteUnresolved",
-    };
-  }
-
-  const freshObservation = reconciliationObservation(stageAction, freshTicket, itemState);
-  if (freshObservation.fullTargetApplied) {
-    result.observedRequestedEffects = freshObservation.observedEffects;
-    result.missingRequestedEffects = [];
-    result.reconciliationDisposition = "VerifiedSuccess";
-    return completeObservedTarget(result, freshTicket);
-  }
-  if (freshObservation.conflictingEffects.length > 0 || freshObservation.unrelatedChanges.length > 0 ||
-      freshObservation.observedEffects.length === 0 && freshObservation.updatedTimeChanged !== false) {
-    result.conflictingEffects = [...new Set([
-      ...freshObservation.conflictingEffects,
-      ...freshObservation.unrelatedChanges.map((field) => `unrelated:${field}`),
-    ])];
-    return {
-      result: terminalUnresolved(result, "Ticket state changed between reconciliation and the mandatory pre-recovery read."),
-      stage: "AmbiguousWriteUnresolved",
-    };
-  }
-
-  const recoveryInput = await buildMissingOnlyRecoveryInput({
-    client,
-    ticketId: freshTicket.ticketId,
-    action,
-    mutationType,
-    ticket: freshTicket,
-    optionFieldsProvider: params.optionFieldsProvider,
-  });
-  if (recoveryInput.error || !recoveryInput.input) {
-    return {
-      result: terminalUnresolved(result, recoveryInput.error ?? "A safe recovery input could not be constructed."),
-      stage: "AmbiguousWriteUnresolved",
-    };
-  }
-  if (!classificationInputHasWritableFields(recoveryInput.input)) {
-    return completeObservedTarget(result, freshTicket);
-  }
-
-  result.observedRequestedEffects = freshObservation.observedEffects;
-  result.missingRequestedEffects = freshObservation.missingEffects;
-  result.schemaDependencyFields = recoveryInput.schemaDependencyFields;
-  result.attemptedState = recoveryInput.input;
-  result.replaySafe = true;
-  result.replaySafetyReason = disposition === "ConfirmedNotApplied"
-    ? "Four successful immutable-ID reads and the immediate pre-recovery read showed unchanged baseline state and no requested effects."
-    : "Only missing requested effects are included; observed effects are checkpointed and excluded.";
-  await params.beforeRecoveryMutation({
-    mutationType,
-    disposition,
-    pass: 1,
-    passReadAttempts: nextPassAttempts,
-    totalReadAttempts: nextTotalAttempts,
-    observedEffects: freshObservation.observedEffects,
-    missingEffects: freshObservation.missingEffects,
-    conflictingEffects: result.conflictingEffects ?? [],
-    schemaDependencyFields: recoveryInput.schemaDependencyFields,
-    updatedTimes,
-    replaySafetyReason: result.replaySafetyReason,
-  });
-  result.recoveryRetryCount = 1;
-  result.recoveryRetryAttempted = true;
-  result.reconciliationPasses = 2;
-  result.reconciliationPassReadAttempts = 0;
-  result.recoveryHistory = [
-    ...(result.recoveryHistory ?? []),
-    { pass: 2, event: "RecoveryWriteStarted", outcome: mutationType },
-  ];
-
-  try {
-    const recoveryMutationInput = recoveryInput.input;
-    const recovered = await withDispatcherRecoveryAttempt(mutationType,
-      () => mutateTicketUpdate(client, recoveryMutationInput));
-    result.recoveryRetryOutcome = "Accepted";
-    result.physicalWrites = [
-      ...(result.physicalWrites ?? []),
-      { method: mutationType === "classification" ? "updateTicket.classification" : mutationType === "status" || mutationType === "resolveFallback" ? "updateTicket.statusOnly" : "updateTicket", outcome: "Accepted" },
-    ];
-    result.acceptedPhysicalWrites = [
-      ...(result.acceptedPhysicalWrites ?? []),
-      {
-        mutationType,
-        method: mutationType === "classification" ? "updateTicket.classification" : mutationType === "status" || mutationType === "resolveFallback" ? "updateTicket.statusOnly" : "updateTicket",
-        outcome: "Accepted",
-        recovery: true,
-      },
-    ];
-    result.partialWrite = applyResultHasProvenPartialWrite(result);
-    await params.afterMutation?.(mutationType, { ticketId: recovered.ticketId });
-  } catch (error) {
-    if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
-    const rejected = isReliableSynchronousMutationRejection(error);
-    result.recoveryRetryOutcome = rejected ? "Rejected" : "Ambiguous";
-    result.recoveryHistory = [
-      ...(result.recoveryHistory ?? []),
-      { pass: 2, event: "RecoveryResponse", outcome: result.recoveryRetryOutcome },
-    ];
-    recordPhysicalWrite(
+  return {
+    result: terminalUnresolved(
       result,
-      mutationType === "classification" ? "updateTicket.classification" : mutationType === "status" || mutationType === "resolveFallback" ? "updateTicket.statusOnly" : "updateTicket",
-      result.recoveryRetryOutcome
-    );
-    if (rejected) {
-      return {
-        result: terminalUnresolved(
-          result,
-          "The controlled recovery retry returned a reliable rejection; no further retry is allowed."
-        ),
-        stage: "AmbiguousWriteUnresolved",
-        retryCount: nextTotalAttempts,
-      };
-    }
-    result.reconciliationDisposition = "AmbiguousUnresolved";
-    result.replaySafe = false;
-    result.replaySafetyReason = "RecoveryWriteStarted is durable; the recovery call may have run and cannot be issued again.";
-    result.humanReconciliationRequired = false;
-    const pending = markAmbiguousWritePending({
-      result,
-      attempts: 0,
-      reason: "The controlled recovery retry was ambiguous; a second bounded read-only reconciliation pass is required.",
-    });
-    pending.reconciliationPasses = 2;
-    pending.reconciliationPassReadAttempts = 0;
-    pending.reconciliationReadAttempts = nextTotalAttempts;
-    pending.recoveryRetryCount = 1;
-    pending.recoveryRetryAttempted = true;
-    pending.recoveryRetryOutcome = "Ambiguous";
-    return { result: pending, stage: "RecoveryWriteAmbiguous", retryCount: nextTotalAttempts };
-  }
-
-  let verifiedRecovery: Ticket;
-  try {
-    verifiedRecovery = await getTicketByInternalId(client, freshTicket.ticketId);
-  } catch (error) {
-    if (isExecutionStopError(error)) throw error;
-    if (isRateLimitError(error)) {
-      return {
-        result: markRateLimitedReadResult(result, error, "getTicket.recoveryVerification"),
-        stage: mutationType === "classification" ? "ClassificationWriteSucceeded" : mutationType === "status" || mutationType === "resolveFallback" ? "StatusWriteSucceeded" : "FieldsUpdated",
-      };
-    }
-    return {
-      result: terminalUnresolved(result, "The accepted recovery retry could not be verified."),
-      stage: "AmbiguousWriteUnresolved",
-    };
-  }
-  const verifiedObservation = reconciliationObservation(stageAction, verifiedRecovery, itemState);
-  result.observedRequestedEffects = verifiedObservation.observedEffects;
-  result.missingRequestedEffects = verifiedObservation.missingEffects;
-  result.conflictingEffects = [...new Set([
-    ...verifiedObservation.conflictingEffects,
-    ...verifiedObservation.unrelatedChanges.map((field) => `unrelated:${field}`),
-  ])];
-  if (!verifiedObservation.fullTargetApplied) {
-    result.reconciliationDisposition = "ConfirmedPartialWrite";
-    result.partialWrite = applyResultHasProvenPartialWrite(result);
-    return {
-      result: terminalUnresolved(
-        result,
-        "The accepted recovery retry did not verify every requested effect; no second recovery retry is allowed.",
-        "ConfirmedPartialWrite"
-      ),
-      stage: "FailedAfterPartialWrite",
-    };
-  }
-  result.recoveryHistory = [
-    ...(result.recoveryHistory ?? []),
-    { pass: 2, event: "RecoveryVerified", outcome: mutationType },
-  ];
-  return completeObservedTarget(result, verifiedRecovery, "CompletedAfterRetry");
+      "Target unverified after bounded reads; original mutation remains uncertain. No replay.",
+      disposition
+    ),
+    stage: "AmbiguousWriteUnresolved",
+    retryCount: nextTotalAttempts,
+  };
 }
 const TRIAGE_AMBIGUOUS_WRITE_STAGES = new Set<OperationItemState["stage"]>([
   "WriteStarted", "WriteAmbiguous", "FieldsUpdated",
@@ -9552,7 +9246,6 @@ function createApplyTriageContinuationAdapter(
       let durablePartialWrite = claim.item.partialWrite === true;
       let durableAttemptCount = claim.item.attemptCount ?? 0;
       let acceptedPhysicalWrites = [...(claim.item.acceptedPhysicalWrites ?? [])];
-      let recoveryRetryCounts = { ...(claim.item.recoveryRetryCounts ?? {}) };
       let fallbackAttempted = claim.item.fallbackAttempted === true;
       let fallbackApplied = claim.item.fallbackApplied === true;
       const originalSnapshotUpdatedTime = originalSnapshotUpdatedTimeForItem(claim.item, action);
@@ -9620,86 +9313,6 @@ function createApplyTriageContinuationAdapter(
           throw new DurableCheckpointError(error);
         }
       };
-      const beforeRecoveryMutation = async (params: {
-        mutationType: DurableMutationType;
-        disposition: ReconciliationDisposition;
-        pass: number;
-        passReadAttempts: number;
-        totalReadAttempts: number;
-        observedEffects: string[];
-        missingEffects: string[];
-        conflictingEffects: string[];
-        schemaDependencyFields: string[];
-        updatedTimes: string[];
-        replaySafetyReason: string;
-      }) => {
-        assertExecutionBudget(5);
-        const priorCount = params.mutationType === "note"
-          ? (claim.item.recoveryRetryCount ?? 0)
-          : recoveryRetryCounts[params.mutationType] ?? 0;
-        if (priorCount >= 1 || claim.item.recoveryWriteStarted === true &&
-            claim.item.recoveryMutationStage === params.mutationType) {
-          throw new Error(`Recovery retry already exhausted for ${params.mutationType}.`);
-        }
-        const nextCount = priorCount + 1;
-        // Operation metadata must never contain a field named `note`: the
-        // ledger rejects that key to prevent accidental persistence of note
-        // bodies. The scalar recoveryRetryCount is the durable note counter;
-        // the per-mutation map remains for classification/status/resolution.
-        recoveryRetryCounts = params.mutationType === "note"
-          ? { ...recoveryRetryCounts }
-          : { ...recoveryRetryCounts, [params.mutationType]: nextCount };
-        try {
-          await checkpoint({
-            stage: "RecoveryWriteStarted",
-            mutationType: params.mutationType,
-            writeAttempted: true,
-            writeMayHaveSucceeded: true,
-            reliableResponseReceived: false,
-            observedMutationResult: "Ambiguous",
-            canonicalTargetHash,
-            noteFingerprint: action?.noteFingerprint ?? normalizedNoteFingerprint(action?.note),
-            partialWrite: durablePartialWrite,
-            verificationState: "Pending",
-            expectedTicketId: action?.expectedTicketId ?? claim.item.expectedTicketId,
-            reconciliationMutationType: params.mutationType,
-            reconciliationPass: 2,
-            reconciliationPassReadAttempts: 0,
-            reconciliationReadAttempts: params.totalReadAttempts,
-            reconciliationDisposition: params.disposition,
-            reconciliationUpdatedTimes: params.updatedTimes,
-            attemptCount: durableAttemptCount + 1,
-            recoveryRetryCount: nextCount,
-            recoveryRetryCounts,
-            recoveryMutationStage: params.mutationType,
-            recoveryWriteStarted: true,
-            observedRequestedEffects: params.observedEffects,
-            missingRequestedEffects: params.missingEffects,
-            conflictingEffects: params.conflictingEffects,
-            schemaDependencyFields: params.schemaDependencyFields,
-            replaySafe: false,
-            replaySafetyReason: params.replaySafetyReason,
-            humanReconciliationRequired: false,
-            expectedCurrentUpdatedTime: explicitUpdatedTimeCheckpoint && expectedCurrentUpdatedTime !== originalSnapshotUpdatedTime
-              ? expectedCurrentUpdatedTime
-              : undefined,
-            recoveryHistory: [
-              ...(claim.item.recoveryHistory ?? []),
-              { pass: params.pass, event: "Disposition", outcome: params.disposition },
-              { pass: 2, event: "RecoveryWriteStarted", outcome: params.mutationType },
-            ],
-          });
-          checkpointStage = "RecoveryWriteStarted";
-          durableWriteAttempted = true;
-          durableWriteMayHaveSucceeded = true;
-          reliableResponseReceived = false;
-          observedMutationResult = "Ambiguous";
-          durableAttemptCount += 1;
-        } catch (error) {
-          throw new DurableCheckpointError(error);
-        }
-      };
-
       const beforeMutation = async (
         mutationType: DurableMutationType,
         updatedTimeExpectation?: string,
@@ -9925,6 +9538,9 @@ function createApplyTriageContinuationAdapter(
             ? "NoteVerified"
           : "Verifying";
         try {
+          // Read-back must settle the original dispatcher receipt before a
+          // later mutation stage can begin. No caller-supplied attestation.
+          await reconcileCurrentDispatcherReceipt(true);
           // Verification after a dedupe proves the approved target exists, but
           // it does not change a reliably rejected mutation into an applied one.
           // A genuine retry first advances Rejected -> Ambiguous -> Accepted.
@@ -10130,7 +9746,9 @@ function createApplyTriageContinuationAdapter(
         (claim.item.verificationState === "Verified" ||
           claim.item.stage === "NoteChecked" ||
           claim.item.stage === "NoteDedupeChecked") &&
-        (claim.item.acceptedPhysicalWrites ?? []).some((write) => write.mutationType !== "note");
+        ((claim.item.acceptedPhysicalWrites ?? []).some((write) => write.mutationType !== "note") ||
+          (claim.item.observedMutationResult === "VerifiedApplied" &&
+            claim.item.reconciliationMutationType !== undefined && claim.item.reconciliationMutationType !== "note"));
       const noteOnlyContinuation = Boolean(
         action &&
         (action.action === "update" || action.action === "leave") &&
@@ -10164,7 +9782,6 @@ function createApplyTriageContinuationAdapter(
             beforeNoteCheck,
             afterPreflightValidation,
             beforeMutation,
-            beforeRecoveryMutation,
             afterMutation,
             afterConclusiveRejection,
             afterVerification,
