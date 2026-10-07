@@ -1,5 +1,6 @@
 import { SuperOpsError, SuperOpsHttpError } from "./client.js";
 import { DispatcherPendingError } from "./dispatcher.js";
+import { dispatcherReadRecoveryState } from "./dispatcher-read-journal.js";
 import type { ToolResult } from "./audit.js";
 
 const SAFE_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
@@ -24,6 +25,14 @@ export interface SafeToolErrorMetadata extends Record<string, unknown> {
   responseOmitted?: boolean;
   bytes?: number;
   maxBytes?: number;
+  dispatcherRequestId?: string;
+  dispatcherState?: string;
+  dispatcherPending?: boolean;
+  dispatcherTerminal?: boolean;
+  resumeSameRequest?: boolean;
+  readRecoveryDurable?: boolean;
+  nextEligibleAt?: string;
+  readRecoveryDeadlineAt?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -93,8 +102,15 @@ export function createSafeToolErrorMetadata(
     "cacheReadFailed",
     "nativeCacheAvailable",
     "responseOmitted",
+    "dispatcherPending", "dispatcherTerminal", "resumeSameRequest", "readRecoveryDurable",
   ] as const) {
     if (typeof input[key] === "boolean") output[key] = input[key];
+  }
+
+  if (typeof input.dispatcherRequestId === "string" && /^[A-Za-z0-9_-]{1,160}$/.test(input.dispatcherRequestId)) output.dispatcherRequestId = input.dispatcherRequestId;
+  if (typeof input.dispatcherState === "string" && /^[a-z_]{1,64}$/.test(input.dispatcherState)) output.dispatcherState = input.dispatcherState;
+  for (const key of ["nextEligibleAt", "readRecoveryDeadlineAt"] as const) {
+    if (typeof input[key] === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(input[key]) && Number.isFinite(Date.parse(input[key]))) output[key] = input[key];
   }
 
   return output;
@@ -150,6 +166,16 @@ export function safeSuperOpsErrorMetadata(
   allowReadRetry: boolean
 ): SafeToolErrorMetadata | undefined {
   if (error instanceof DispatcherPendingError) {
+    if (allowReadRetry && error.readRecovery?.durable) {
+      const {pending, terminal} = dispatcherReadRecoveryState(error.state);
+      return createSafeToolErrorMetadata({errorClass: pending ? "DispatcherReadPending" : terminal ? "DispatcherReadTerminal" : "DispatcherReadRecoveryError", retryable: pending,
+        retryScope: pending ? "read" : "none", reasonCode: error.errorClassification === "READ_RECOVERY_EXPIRED" ? "dispatcher_read_recovery_expired"
+          : terminal ? "dispatcher_read_terminal" : pending ? "dispatcher_read_pending" : "dispatcher_read_recovery_requires_review",
+        rateLimited: error.rateLimited, retryAfterSeconds: safeRetryAfterSeconds(error.retryAfter),
+        dispatcherRequestId: error.requestId, dispatcherState: error.state, dispatcherPending: pending,
+        dispatcherTerminal: terminal, resumeSameRequest: pending, readRecoveryDurable: true,
+        nextEligibleAt: error.readRecovery.nextEligibleAt, readRecoveryDeadlineAt: error.readRecovery.deadlineAt});
+    }
     return createSafeToolErrorMetadata({ errorClass: "DispatcherPending", retryable: false,
       retryScope: "none", reasonCode: "dispatcher_receipt_requires_same_request", rateLimited: false });
   }

@@ -10,6 +10,7 @@ import { beginApiAttempt, endApiAttempt } from "./api-attempt-audit.js";
 import { assertPageBounds } from "./pagination.js";
 import { checkpointDispatcherDiagnostics, dispatcherDiagnostics, dispatcherIdempotencyKey } from "./dispatcher.js";
 import { DISPATCHER_ORIGIN, DispatcherPendingError, dispatcherFetch, runWithDispatcher, dispatcherEnvironment, boundedJson } from "./dispatcher.js";
+import { dispatcherReadRecoveryState, prepareDispatcherRead, recordDispatcherReadFailure, type DispatcherReadSession } from "./dispatcher-read-journal.js";
 import {
   classifyGraphQLRequest,
   getExecutionConfig,
@@ -49,6 +50,7 @@ export class SuperOpsClient {
     query: string,
     variables?: Record<string, unknown>
   ): Promise<T> {
+    recordDispatcherReadFailure(undefined);
     const operation = classifyGraphQLRequest(query);
     const isWrite = operation.operationType === "mutation";
     if (!isWrite) assertPageBounds(query, variables);
@@ -59,13 +61,49 @@ export class SuperOpsClient {
     const startedMs = Date.now();
     let attempt = 0;
     let lastError: unknown;
-    const idempotencyKey = await dispatcherIdempotencyKey(JSON.stringify({query, variables}), isWrite);
+    const body = JSON.stringify({query, variables});
+    let readSession = isWrite ? undefined : await prepareDispatcherRead(body);
+    let idempotencyKey = readSession?.record.idempotencyKey ?? await dispatcherIdempotencyKey(body, isWrite);
 
     while (attempt < maxAttempts) {
       attempt += 1;
       try {
-        return await this.requestOnce<T>(query, variables, attempt - 1, idempotencyKey);
-      } catch (error) {
+        const nextReadPoll = readSession?.record.nextEligibleAt ? Math.min(Date.parse(readSession.record.nextEligibleAt),
+          Date.parse(readSession.record.recoveryDeadlineAt ?? "") || Infinity) : undefined;
+        if (readSession && nextReadPoll !== undefined && Date.now() < nextReadPoll) {
+          throw new DispatcherPendingError(readSession.record.requestId, idempotencyKey, readSession.record.state,
+            Math.ceil((nextReadPoll - Date.now()) / 1000),
+            readSession.record.upstreamHttpStatus, readSession.record.errorClassification);
+        }
+        let value = await this.requestOnce<T>(query, variables, attempt - 1, idempotencyKey, body, readSession);
+        await readSession?.delivered();
+        if (readSession?.refreshBeforeUse) {
+          // Recover the original read first, then take a fresh authoritative read
+          // before stale checks, note dedupe or mutation settlement use its data.
+          readSession = await prepareDispatcherRead(body);
+          if (!readSession || readSession.refreshBeforeUse) throw new Error("Fresh dispatcher verification read could not be established.");
+          idempotencyKey = readSession.record.idempotencyKey;
+          value = await this.requestOnce<T>(query, variables, attempt - 1, idempotencyKey, body, readSession);
+          await readSession.delivered();
+        }
+        recordDispatcherReadFailure(undefined);
+        return value;
+      } catch (cause) {
+        let error = cause;
+        if (readSession && ["failed", "cancelled", "uncertain"].includes(readSession.record.state) && !(error instanceof DispatcherPendingError)) {
+          error = new DispatcherPendingError(readSession.record.requestId, idempotencyKey, readSession.record.state,
+            undefined, readSession.record.upstreamHttpStatus, readSession.record.errorClassification);
+        }
+        if (error instanceof DispatcherPendingError && readSession) {
+          error.readRecovery = {durable: true,
+            nextEligibleAt: readSession.record.nextEligibleAt, deadlineAt: readSession.record.recoveryDeadlineAt};
+          const state = dispatcherReadRecoveryState(error.state);
+          error.message = state.pending
+            ? "Dispatcher read remains pending; resume the original receipt after its saved retry time."
+            : state.terminal ? "Dispatcher read reached a terminal outcome; inspect the original receipt."
+              : "Dispatcher read recovery requires review; inspect the original receipt.";
+          recordDispatcherReadFailure(error);
+        }
         lastError = error;
         const retryable = shouldRetrySuperOpsRequest(error, isWrite);
         if (!retryable || attempt >= maxAttempts) {
@@ -101,14 +139,15 @@ export class SuperOpsClient {
     query: string,
     variables: Record<string, unknown> | undefined,
     retryCount: number,
-    idempotencyKey: string
+    idempotencyKey: string,
+    body: string,
+    readSession?: DispatcherReadSession
   ): Promise<T> {
     const subrequest = recordSubrequestStart(query, retryCount, this.endpoint);
     // Serialize before recording dispatch: invalid input has made no API call.
-    const body = JSON.stringify({ query, variables });
     const audit = beginApiAttempt(query, variables, this.subdomain, this.endpoint, retryCount + 1, subrequest.index);
     try {
-      const result = await this.performRequest<T>(body, subrequest, idempotencyKey, classifyGraphQLRequest(query).operationType === "mutation");
+      const result = await this.performRequest<T>(body, subrequest, idempotencyKey, classifyGraphQLRequest(query).operationType === "mutation", readSession);
       endApiAttempt(audit, subrequest.record, true, undefined, result);
       return result;
     } catch (error) {
@@ -122,7 +161,8 @@ export class SuperOpsClient {
     body: string,
     subrequest: ReturnType<typeof recordSubrequestStart>,
     idempotencyKey: string,
-    mutation: boolean
+    mutation: boolean,
+    readSession?: DispatcherReadSession
   ): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(
@@ -132,6 +172,8 @@ export class SuperOpsClient {
     let response: Response;
     try {
       response = await dispatcherFetch(body, { idempotencyKey, signal: controller.signal, env: this.dispatcher, mutation,
+        requestId: readSession?.record.requestId,
+        checkpointReadReceipt: readSession ? receipt => readSession.checkpoint(receipt) : undefined,
         onReceipt: receipt => { if (subrequest.record) {
           subrequest.record.dispatcherRequestId = receipt.requestId;
           subrequest.record.dispatcherState = receipt.state;

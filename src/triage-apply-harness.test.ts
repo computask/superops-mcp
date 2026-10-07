@@ -197,6 +197,17 @@ class FakeDurableLedger {
       setAlarm: async (_scheduledTime: number | Date) => undefined,
       getAlarm: async () => null,
     };
+    // The real operation-ledger storage provides atomic transactions for read receipts.
+    let transactionTail: Promise<unknown> = Promise.resolve();
+    Object.assign(storage, {transaction: <T>(fn: (txn: Pick<typeof storage, "get" | "put">) => Promise<T>) => {
+      const result = transactionTail.then(async () => {
+        const before = new Map(values);
+        try { return await fn(storage); }
+        catch (error) { values.clear(); for (const entry of before) values.set(...entry); throw error; }
+      });
+      transactionTail = result.catch(() => undefined);
+      return result;
+    }});
     ledger = new SuperOpsOperationLedger({ storage } as never, {
       SUPEROPS_PRIVATE_NOTE_ENCRYPTION_KEY: PRIVATE_NOTE_KEY,
       SUPEROPS_CONTINUATION_ENABLED: "true",
@@ -291,7 +302,9 @@ type FakeTicket = {
 };
 
 function graphQlData(data: unknown): Response {
-  return new Response(JSON.stringify({ data }), { status: 200, headers: { "Content-Type": "application/json" } });
+  return new Response(JSON.stringify({ data }), { status: 200, headers: {
+    "Content-Type": "application/json", "X-Dispatcher-Status": "succeeded", "X-Dispatcher-Request-Id": crypto.randomUUID(),
+  } });
 }
 
 function graphQlError(operation: string, code = "VALIDATION_ERROR"): Response {

@@ -10,7 +10,7 @@ const SAFE_RECEIPT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f
 const SAFE_DISPATCHER_STATES = new Set(["queued", "running", "retry_wait", "succeeded", "failed", "cancelled", "uncertain"]);
 const SAFE_RESPONSE_STATES = new Set(["no_response", "unparseable", "invalid_shape", "missing_data", "null_data", "data", "partial_data", "no_data", "unknown"]);
 const SAFE_RETRY_DECISIONS = new Set(["scheduled", "not_scheduled", "unknown"]);
-const SAFE_RETRY_REASONS = new Set(["success", "retryable_read", "configured_safe_mutation", "verified_rate_limit_rejection", "attempt_limit_reached", "ambiguous_mutation_requires_reconciliation", "non_retryable"]);
+const SAFE_RETRY_REASONS = new Set(["success", "retryable_read", "read_throttle_recovery", "read_recovery_expired", "configured_safe_mutation", "verified_rate_limit_rejection", "attempt_limit_reached", "ambiguous_mutation_requires_reconciliation", "non_retryable"]);
 
 export interface SafeDispatcherDiagnostics {
   schemaVersion: 1;

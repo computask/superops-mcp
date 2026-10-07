@@ -21,6 +21,7 @@ import {
 import type { Domain, DomainTools, ToolDefinition } from "./types.js";
 import { getCredentials, getClient } from "./client.js";
 import { dispatcherDiagnostics, dispatcherEnvironment } from "./dispatcher.js";
+import { dispatcherReadFailure, withDispatcherReadScope } from "./dispatcher-read-journal.js";
 import { setServerRef } from "./utils/server-ref.js";
 import {
   auditToolCall,
@@ -1042,7 +1043,9 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
     const captureContext = parseTriageAgentCaptureContext(rawArgs.triageCapture);
     const args = stripTriageAgentCaptureContext(rawArgs);
 
-    return runWithTriageRunContext(captureContext, () => runWithExecutionContext(name, async () => {
+    return runWithTriageRunContext(captureContext, () => runWithExecutionContext(name, () => withDispatcherReadScope({
+      workflow: JSON.stringify(["tool", captureContext?.triggerId ?? "manual", name]), automatic: Boolean(captureContext),
+    }, async () => {
       const started = Date.now();
       const timing = beginTriageTiming(name, rawArgs, getExecutionState()?.invocationId);
       let timingOutcome: "success" | "error" = "error";
@@ -1076,13 +1079,17 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           if (rawArgs.triageCapture !== undefined && !captureContext) throw new Error("Invalid automatic triage correlation; no apply permitted.");
           await assertTriageRunWriteLease({operationId: typeof args.batchId === "string" ? args.batchId : undefined});
         }
-        const result = boundedToolResult(
+        let result = boundedToolResult(
           sanitizeToolResult(
               blockedToolNames.has(name)
               ? errorResult(`${name} is disabled by this MCP server configuration.`)
               : await executeToolCall(name, args, options.rateLimitProbe)
           )
         );
+        if (result.isError && ["read", "custom_query"].includes(classifyTool(name).category)) {
+          const readFailure = safeSuperOpsErrorMetadata(dispatcherReadFailure(), true);
+          if (readFailure) result = {...result, structuredContent: readFailure};
+        }
         metadata = enrichAuditMetadataFromResult(name, result, metadata);
         const errorSummary = errorSummaryFromResult(result);
         finishExecution(result.isError ? "toolError" : "completed");
@@ -1124,7 +1131,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
         // This is not proof that the remote Agent has received the response.
         timing("response_ready", timingOutcome);
       }
-    }));
+    })));
   });
 
   return server;

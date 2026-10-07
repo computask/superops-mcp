@@ -12,6 +12,7 @@ import { canonicalizeNoteText } from "./utils/note-canonicalization.js";
 import type { TriageAgentMcpCapture } from "./triage-agent-capture.js";
 import { GraphqlCaptureStore } from "./graphql-capture-store.js";
 import { validDispatcherVerification } from "./dispatcher-verification.js";
+import { DispatcherReadJournal, runWithDispatcherReadEnvironment } from "./dispatcher-read-journal.js";
 
 export type OperationState =
   | "Running"
@@ -1101,7 +1102,7 @@ function validSafeDispatcherDiagnostics(value: unknown): boolean {
   const states = new Set(["queued", "running", "retry_wait", "succeeded", "failed", "cancelled", "uncertain"]);
   const responseStates = new Set(["no_response", "unparseable", "invalid_shape", "missing_data", "null_data", "data", "partial_data", "no_data", "unknown"]);
   const retryDecisions = new Set(["scheduled", "not_scheduled", "unknown"]);
-  const retryReasons = new Set(["success", "retryable_read", "configured_safe_mutation", "verified_rate_limit_rejection", "attempt_limit_reached", "ambiguous_mutation_requires_reconciliation", "non_retryable"]);
+  const retryReasons = new Set(["success", "retryable_read", "read_throttle_recovery", "read_recovery_expired", "configured_safe_mutation", "verified_rate_limit_rejection", "attempt_limit_reached", "ambiguous_mutation_requires_reconciliation", "non_retryable"]);
   if (!Object.keys(value).every(key => ["schemaVersion", "status", "attemptCount", "upstreamHttpStatus", "errorClassification", "uncertain", "attempts", "attemptsTruncated"].includes(key)) ||
       value.schemaVersion !== 1 || typeof value.status !== "string" || !states.has(value.status) ||
       !isFiniteNonnegativeInteger(value.attemptCount) || (value.attemptCount as number) > 1000 ||
@@ -2827,7 +2828,7 @@ export function runWithOperationStore<T>(
   const store = isDurableObjectNamespace(env.SUPEROPS_OPERATION_LEDGER)
     ? new DurableObjectOperationStore(env.SUPEROPS_OPERATION_LEDGER)
     : new MemoryOperationStore();
-  return STORE_CONTEXT.run(store, fn);
+  return STORE_CONTEXT.run(store, () => runWithDispatcherReadEnvironment(env, currentOwnerHash, fn));
 }
 
 export function getOperationStore(): OperationStore {
@@ -3783,6 +3784,7 @@ export class SuperOpsOperationLedger {
   }
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/dispatcher-reads/")) return new DispatcherReadJournal(this.state.storage).fetch(request);
     if (url.pathname === "/graphql-captures") return this.graphqlCaptures.fetch(request);
     const pathParts = url.pathname.split("/").filter(Boolean);
     const approvedPrivateNoteMatch = pathParts.length === 4 &&

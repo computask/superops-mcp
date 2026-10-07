@@ -4,6 +4,7 @@ import { capturedDispatcherFetch } from "./graphql-capture.js";
 import { getExecutionConfig, hasExecutionBudgetFor, recordSubrequestFinish, recordTypedSubrequestStart, withExecutionItem } from "./execution.js";
 import { fetchSafeDispatcherDiagnostics, type DispatcherDiagnosticResult, type DispatcherDiagnosticRetrieval, type SafeDispatcherDiagnostics } from "./dispatcher-diagnostics.js";
 import { validDispatcherVerification, type DispatcherVerification } from "./dispatcher-verification.js";
+import { withDispatcherReadScope, type DispatcherReadCheckpoint } from "./dispatcher-read-journal.js";
 
 export const DISPATCHER_ORIGIN = "https://superops-api-dispatcher.taskgroup.co.uk";
 export interface DispatcherEnvironment {
@@ -25,7 +26,11 @@ export interface DispatcherReceipt {
 const operation = new AsyncLocalStorage<{operationId: string; itemKey: string; checkpoint?: (receipt: DispatcherReceipt) => Promise<void>; receipt?: DispatcherReceipt; readRequestIds: string[]}>();
 export function withDispatcherOperation<T>(operationId: string, itemKey: string, fn: () => T,
   checkpoint?: (receipt: DispatcherReceipt) => Promise<void>, receipt?: DispatcherReceipt): T {
-  return operation.run({operationId, itemKey, checkpoint, receipt, readRequestIds: []}, () => withExecutionItem(itemKey, fn));
+  const ownerHash = operationId.split(":")[0];
+  return operation.run({operationId, itemKey, checkpoint, receipt, readRequestIds: []}, () => withDispatcherReadScope({
+    workflow: JSON.stringify(["operation", operationId, itemKey]), automatic: true, strictFresh: true,
+    ...(/^[a-f0-9]{8,64}$/.test(ownerHash) ? {ownerHash} : {}),
+  }, () => withExecutionItem(itemKey, fn)));
 }
 export async function dispatcherIdempotencyKey(body: string, mutation: boolean): Promise<string> {
   const scope = mutation ? operation.getStore() : undefined;
@@ -53,6 +58,7 @@ export function dispatcherConfigured(env = dispatcherEnvironment()): boolean {
 
 /** A receipt represents live or uncertain work, NOT permission to replay it. */
 export class DispatcherPendingError extends Error {
+  readRecovery?: {durable: boolean; nextEligibleAt?: string; deadlineAt?: string};
   constructor(readonly requestId: string | undefined, readonly idempotencyKey: string,
     readonly state: string, readonly retryAfter?: number,
     readonly upstreamHttpStatus?: number, readonly errorClassification?: string,
@@ -195,6 +201,7 @@ export async function dispatcherFetch(body: string, options: {
   env?: DispatcherEnvironment;
   mutation?: boolean;
   onReceipt?: (receipt: DispatcherReceipt) => void;
+  checkpointReadReceipt?: (receipt: DispatcherReadCheckpoint) => Promise<void>;
 }): Promise<Response> {
   const env = options.env ?? dispatcherEnvironment();
   if (!dispatcherConfigured(env)) throw new Error("Dispatcher producer credentials are not configured; direct SuperOps access is disabled.");
@@ -253,6 +260,7 @@ export async function dispatcherFetch(body: string, options: {
       if (!polling && (response.status === 202 || response.status === 504) && headerReceipt && /^[A-Za-z0-9_-]{1,160}$/.test(headerReceipt)) {
         requestId = headerReceipt;
         const receipt = {requestId, idempotencyKey: options.idempotencyKey, state: "queued"};
+        if (!options.mutation) await options.checkpointReadReceipt?.(receipt);
         publishReceipt(receipt, options, body);
         if (options.mutation) await operation.getStore()?.checkpoint?.(receipt);
       }
@@ -263,6 +271,7 @@ export async function dispatcherFetch(body: string, options: {
         const syncId = response.headers.get("X-Dispatcher-Request-Id");
         if (syncId && /^[A-Za-z0-9_-]{1,160}$/.test(syncId)) {
           const receipt = {requestId: syncId, idempotencyKey: options.idempotencyKey, state: response.headers.get("X-Dispatcher-Status") ?? "unknown"};
+          if (!options.mutation) await options.checkpointReadReceipt?.(receipt);
           publishReceipt(receipt, options, body);
           if (options.mutation) await operation.getStore()?.checkpoint?.(receipt);
         }
@@ -307,6 +316,14 @@ export async function dispatcherFetch(body: string, options: {
         state: state || "queued",
         ...(pending.has(state) ? {retryAfter: seconds} : {}),
       });
+      if (!options.mutation) {
+        const readRecovery = object(value.readRecovery);
+        await options.checkpointReadReceipt?.({...parsedReceipt,
+          nextEligibleAt: pending.has(state) ? new Date(Date.now() + seconds * 1000).toISOString() : undefined,
+          recoveryStartedAt: typeof readRecovery.startedAt === "string" ? readRecovery.startedAt : undefined,
+          recoveryDeadlineAt: typeof readRecovery.deadlineAt === "string" ? readRecovery.deadlineAt : undefined,
+          upstreamHttpStatus: observedHttpStatus, errorClassification: observedErrorClassification});
+      }
       publishReceipt(parsedReceipt, options, body);
       if (options.mutation) await operation.getStore()?.checkpoint?.({...parsedReceipt, retryAfter: seconds});
     }

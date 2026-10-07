@@ -147,8 +147,7 @@ function createOperationLedgerNamespace() {
           values = new Map<string, unknown>();
           valuesByName.set(name, values);
         }
-        ledger = new SuperOpsOperationLedger({
-          storage: {
+        const storage = {
             get: async <T = unknown>(key: string) => values!.get(key) as T | undefined,
             put: async (key: string | Record<string, unknown>, value?: unknown) => {
               const entries = typeof key === "string" ? [[key, value] as const] : Object.entries(key);
@@ -158,8 +157,18 @@ function createOperationLedgerNamespace() {
             list: async <T = unknown>(options?: { prefix?: string }) => new Map(
               [...values!.entries()].filter(([key]) => !options?.prefix || key.startsWith(options.prefix))
             ) as Map<string, T>,
-          },
-        });
+        };
+        let transactionTail: Promise<unknown> = Promise.resolve();
+        Object.assign(storage, {transaction: <T>(fn: (txn: Pick<typeof storage, "get" | "put">) => Promise<T>) => {
+          const result = transactionTail.then(async () => {
+            const before = new Map(values!);
+            try { return await fn(storage); }
+            catch (error) { values!.clear(); for (const entry of before) values!.set(...entry); throw error; }
+          });
+          transactionTail = result.catch(() => undefined);
+          return result;
+        }});
+        ledger = new SuperOpsOperationLedger({storage});
         ledgers.set(name, ledger);
       }
       return { fetch: (request: Request) => ledger!.fetch(request) };
@@ -678,14 +687,16 @@ describe("Cloudflare Worker entrypoint", () => {
     const before = globalThis.fetch;
     const dispatcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       if (String(input).startsWith("https://superops-api-dispatcher.taskgroup.co.uk/")) {
-        return Response.json({data: {getClientList: {clients: [], listInfo: {page: 1, pageSize: 100, hasMore: false, totalCount: 0}}}});
+        return Response.json({data: {getClientList: {clients: [], listInfo: {page: 1, pageSize: 100, hasMore: false, totalCount: 0}}}},
+          {headers: {"X-Dispatcher-Status": "succeeded", "X-Dispatcher-Request-Id": crypto.randomUUID()}});
       }
       return before(input, init);
     });
     try {
       const result = await mcp({jsonrpc: "2.0", id: 43, method: "tools/call", params: {name: "superops_clients_list", arguments: {}}}, env);
       expect(result.status).toBe(200);
-      await result.text();
+      const resultBody = await result.text();
+      expect(resultBody).not.toContain('"isError":true');
       const adminUrl = `https://${DIRECT_HOST}/admin/graphql-captures?date=${new Date().toISOString().slice(0, 10)}`;
       expect((await worker.fetch(new Request(adminUrl), env)).status).toBe(403);
       expect((await worker.fetch(new Request(adminUrl, {headers: {"CF-Access-Jwt-Assertion": await cloudflareAccessJwt(ADDITIONAL_ALLOWED_EMAIL)}}), env)).status).toBe(403);
