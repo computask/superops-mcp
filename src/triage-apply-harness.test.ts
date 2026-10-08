@@ -259,7 +259,7 @@ class FakeDurableLedger {
     return response;
   }
 }
-type MutationFault = "accepted" | "graphqlReject" | "graphqlPartial" | "timeoutApply" | "timeoutNoApply" | "timeoutPartialApply" | "timeoutCategoryOnly" | "rateLimit";
+type MutationFault = "accepted" | "graphqlReject" | "graphqlInternal" | "graphqlPartial" | "timeoutApply" | "timeoutNoApply" | "timeoutPartialApply" | "timeoutCategoryOnly" | "rateLimit";
 
 type FakeSuperOpsOptions = {
   classified?: boolean;
@@ -516,6 +516,10 @@ class FakeSuperOps {
       if (!isStatusOnly) this.lastClassificationInput = structuredClone(input);
       if (fault === "rateLimit") return this.rateLimitResponse();
       if (fault === "graphqlReject") return graphQlError("updateTicket");
+      if (fault === "graphqlInternal") return new Response(JSON.stringify({
+        errors: [{ message: "Internal Server Error(s) while executing query" }],
+        data: { updateTicket: null },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
       if (fault === "graphqlPartial") {
         this.ticket.impact = String(input.impact ?? "Low");
         this.ticket.updatedTime = this.nextUpdatedTime();
@@ -2174,6 +2178,42 @@ describe("deterministic end-to-end apply-triage harness", () => {
     expect(harness.history.count("superops.read.notes")).toBeGreaterThanOrEqual(4);
     expect(harness.history.count("superops.write.status")).toBe(1);
     harness.assertGlobalInvariants(record, { statuses: 1 });
+  });
+
+  it("retains the status checkpoint after an internal error and budget-stopped read-back", async () => {
+    const harness = new TriageHarness("status-internal-budget-readback", { statusFault: "graphqlInternal" });
+    await harness.seedCheckpoint("NoteVerified");
+    const query = SuperOpsClient.prototype.query;
+    let stopped = false;
+    const spy = vi.spyOn(SuperOpsClient.prototype, "query").mockImplementation(async function (this: SuperOpsClient, ...args: Parameters<typeof query>) {
+      if (!stopped && harness.history.count("superops.write.status") === 1 && args[0].includes("getTicket")) {
+        stopped = true;
+        const state = getExecutionState();
+        if (!state) throw new Error("missing execution state");
+        throw new ExecutionBudgetExceededError(state, 1);
+      }
+      return query.apply(this, args);
+    });
+    try {
+      await harness.resume(undefined, { SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "45", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8" });
+      const waiting = await harness.record();
+      expect(stopped).toBe(true);
+      expect(waiting.pendingItems).toEqual([TICKET_NUMBER]);
+      expect(waiting.failedItems).toEqual([]);
+      expect(waiting.itemStates[TICKET_NUMBER]).toMatchObject({ stage: "StatusWriteStarted",
+        writeAttempted: true, writeMayHaveSucceeded: true, partialWrite: true });
+      expect(waiting.itemStates[TICKET_NUMBER].lease).toBeUndefined();
+      const terminal = await harness.resumeUntilTerminal(8);
+      expect(terminal.state).toBe("CompletedWithFailures");
+      expect(itemResult(terminal)).toMatchObject({ terminalReason: "AmbiguousWriteUnresolved",
+        replaySafe: false, humanReconciliationRequired: true });
+      expect(harness.history.count("superops.write.status")).toBe(1);
+      expect(harness.history.count("superops.write.classification")).toBe(0);
+      expect(harness.history.count("superops.write.note")).toBe(0);
+      harness.assertGlobalInvariants(terminal, { statuses: 1 });
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("L1: workflow-owned updatedTime changes do not look like concurrent modification", async () => {

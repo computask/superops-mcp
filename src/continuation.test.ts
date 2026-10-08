@@ -776,6 +776,69 @@ describe("durable continuation runner", () => {
     expect(resumedItems).toBe(1);
   });
 
+  it.each([
+    ["ClassificationWriteStarted", "during-item"],
+    ["StatusWriteStarted", "during-item"],
+    ["ClassificationWriteStarted", "before-resumed-item"],
+    ["StatusWriteStarted", "before-resumed-item"],
+  ] as const)("retains %s for read-only reconciliation when budget stops %s", async (stage, stopAt) => {
+    const ownerHash = stableHash("staged-checkpoint-owner");
+    const operationId = `op-staged-${stage}-${stopAt}`;
+    let processed = 0;
+    let reconciled = 0;
+    const stop: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      estimateItemSubrequests: () => stopAt === "before-resumed-item" ? 38 : 1,
+      async processItem({ checkpoint }) {
+        processed += 1;
+        await checkpoint({ stage, writeAttempted: true, writeMayHaveSucceeded: true,
+          partialWrite: true, verificationState: "Pending" });
+        const state = getExecutionState();
+        if (!state) throw new Error("missing execution state");
+        throw new ExecutionBudgetExceededError(state, 1);
+      },
+    };
+    const reconcile: OperationContinuationAdapter = {
+      toolName: "test_batch_tool",
+      estimateItemSubrequests: () => 1,
+      async processItem({ claim }) {
+        reconciled += 1;
+        expect(claim.item).toMatchObject({ stage, writeAttempted: true,
+          writeMayHaveSucceeded: true, partialWrite: true });
+        return { stage: "AmbiguousWriteUnresolved", outcome: "AmbiguousWriteRequiresReconciliation",
+          writeAttempted: true, writeMayHaveSucceeded: true, partialWrite: true };
+      },
+    };
+    await runWithOperationStore({}, async () => {
+      const store = getOperationStore();
+      const record = ledgerRecord({ operationId, ownerHash, itemKeys: ["staged-ticket"] });
+      if (stopAt === "before-resumed-item") Object.assign(record.itemStates["staged-ticket"], {
+        stage, writeAttempted: true, writeMayHaveSucceeded: true, partialWrite: true,
+      });
+      await store.put(record);
+      const invoke = (adapter: OperationContinuationAdapter) => runWithExecutionConfig({
+        SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "45",
+        SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8",
+        SUPEROPS_EXECUTION_SAFE_REMAINING_TIME_MS: "0",
+      }, () => runWithExecutionContext("test_batch_tool", () => runOperationContinuation({
+        operationId, ownerHash, adapter, leaseOwner: "staged-invocation",
+      })));
+      await invoke(stop);
+      await expect(store.get(operationId)).resolves.toMatchObject({
+        state: "ContinuationRequired", pendingItems: ["staged-ticket"], failedItems: [],
+        itemStates: { "staged-ticket": { stage, writeAttempted: true,
+          writeMayHaveSucceeded: true, partialWrite: true } },
+      });
+      expect((await store.get(operationId))?.itemStates["staged-ticket"].lease).toBeUndefined();
+      await invoke(reconcile);
+      await expect(store.get(operationId)).resolves.toMatchObject({
+        state: "CompletedWithFailures", pendingItems: [], failedItems: ["staged-ticket"],
+      });
+    });
+    expect(processed).toBe(stopAt === "during-item" ? 1 : 0);
+    expect(reconciled).toBe(1);
+  });
+
   it("terminates repeated durable throttling as RateLimitExceeded at the configured ceiling", async () => {
     const ownerHash = stableHash("rate-limit-owner");
     let attempts = 0;

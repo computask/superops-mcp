@@ -273,7 +273,12 @@ export async function runOperationContinuation(
             ? "NoteWriteAmbiguous"
             : resolutionWrite
               ? "ResolutionWriteAmbiguous"
-              : "WriteAmbiguous"
+              : stagedWrite
+                // These stages identify the exact state-setting mutation for
+                // read-only reconciliation. Generic WriteAmbiguous is neither
+                // a valid successor nor a replacement for that identity.
+                ? claim.item.stage
+                : "WriteAmbiguous"
         : claim.item.stage === "Pending" || claim.item.stage === "Unattempted"
           ? "Rescheduled"
           : claim.item.stage;
@@ -640,7 +645,9 @@ export async function runOperationContinuation(
                   ? "NoteWriteAmbiguous"
                   : resolutionWrite
                     ? "ResolutionWriteAmbiguous"
-                    : "WriteAmbiguous"
+                    : stagedWrite
+                      ? preservedStage
+                      : "WriteAmbiguous"
               : preservedStage === "Pending" || preservedStage === "Unattempted"
                 ? "Rescheduled"
                 : preservedStage,
