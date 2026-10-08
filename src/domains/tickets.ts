@@ -5911,7 +5911,11 @@ async function applyStagedResolveAction(params: {
 
   let verifiedClassification: Ticket;
   try {
-    verifiedClassification = !classificationWriteRequired && !params.resumeStage
+    // applyApprovedTriageAction has already obtained a fresh authoritative
+    // ticket for this invocation. Once classification has a verified durable
+    // checkpoint, validate that fresh ticket instead of reading it twice.
+    verifiedClassification = !classificationWriteRequired &&
+      (!params.resumeStage || stagedResolveResumeHasVerifiedClassification(params.resumeStage))
       ? params.ticket
       : await getTicketByInternalId(client, params.resolvedTicketId);
   } catch (error) {
@@ -5954,7 +5958,10 @@ async function applyStagedResolveAction(params: {
   }
 
   const noteRequired = noteBodyForPlan(action.note) !== undefined;
-  if (noteRequired) {
+  // A verified note checkpoint must not restart dedupe/create/visibility on
+  // every wake. Final verification below still reads the private note again;
+  // pre-status concurrency checks still run before any close mutation.
+  if (noteRequired && !stagedResolveResumeHasVerifiedNote(params.resumeStage)) {
     let notePlan: "none" | "deduped" | "pending";
     try {
       notePlan = await checkNoteForPlan({
@@ -6068,7 +6075,9 @@ async function applyStagedResolveAction(params: {
     const fingerprint = action.noteFingerprint ?? normalizedNoteFingerprint(action.note);
     let noteVerified: boolean;
     try {
-      noteVerified = await existingNoteMatchesFingerprint(client, trustedTicket.ticketId, fingerprint, {
+      // Dedupe just observed this exact private note in this invocation.
+      // Only a newly created note needs a separate visibility read here.
+      noteVerified = notePlan === "deduped" || await existingNoteMatchesFingerprint(client, trustedTicket.ticketId, fingerprint, {
         ticketNumber: params.ticketNumber,
         additionalTicketIds: stagedNoteTicketIds(),
         expectedNoteContent: action.note,
@@ -6114,6 +6123,12 @@ async function applyStagedResolveAction(params: {
     if (!stagedResolveResumeHasVerifiedNote(params.resumeStage)) {
       await params.afterVerification?.("note", trustedTicket);
     }
+  }
+
+  if (noteRequired && stagedResolveResumeHasVerifiedNote(params.resumeStage)) {
+    result.noteDedupeChecked = true;
+    result.noteWriteOutcome = "VerifiedExistingPrivateNote";
+    markWorkflowStage(result, "NoteVerified");
   }
 
   let preStatusTicket: Ticket;

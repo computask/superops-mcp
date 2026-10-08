@@ -1,5 +1,24 @@
 # SuperOps MCP Execution Safety Verification
 
+## Verified-checkpoint budget progress — 8 October 2026
+
+A resumed staged resolve used to repeat classification and private-note reads
+after their durable verification checkpoints. With the production 45-call
+budget and 8-call reserve, receipt bookkeeping could exhaust every invocation
+before the next mutation, leaving the item at the same stage indefinitely.
+
+Recovery now validates already-verified classification against the fresh ticket
+read at invocation entry, resumes past a verified private-note checkpoint, and
+uses a successful same-invocation dedupe read as note visibility evidence.
+The separate pre-close concurrency read and final ticket/private-note verification
+remain mandatory. Unverified and ambiguous writes retain their existing recovery
+paths; no mutation is replayed by this change.
+
+The deterministic harness reproduces the previous loop with cold field metadata,
+three additional queued-read bookkeeping calls, and a 45/8 budget on every wake.
+It covers both a verified-note checkpoint and the full classification/note/close
+workflow, plus changed classification and a missing final private note.
+
 ## Original-receipt mutation reconciliation — 7 October 2026
 
 The [current reconciliation contract](mutation-reconciliation.md) supersedes

@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SuperOpsClient, runWithCredentials } from "./client.js";
 import { DispatcherPendingError } from "./dispatcher.js";
-import { ExecutionBudgetExceededError, getExecutionState, runWithExecutionConfig, runWithExecutionContext, type ExecutionConfigInput } from "./execution.js";
+import { ExecutionBudgetExceededError, getExecutionState, recordTypedSubrequestStart, runWithExecutionConfig, runWithExecutionContext, type ExecutionConfigInput } from "./execution.js";
 import {
   currentOwnerHash,
   getOperationStore,
@@ -733,7 +733,7 @@ class TriageHarness {
     ));
   }
 
-  async resume(now?: string): Promise<void> {
+  async resume(now?: string, config: ExecutionConfigInput = {}): Promise<void> {
     const resumeNumber = this.history.count("continuation.resume") + 1;
     this.history.add("continuation.resume", { now, resumeNumber });
     await this.runContext(() => resumeApplyTriageOperation({
@@ -742,7 +742,7 @@ class TriageHarness {
       leaseOwner: `harness-resume-${resumeNumber}`,
       leaseMs: 1000,
       now,
-    }));
+    }), config);
   }
 
   async resumeUntilTerminal(maxContinuations = 6): Promise<OperationLedgerRecord> {
@@ -886,6 +886,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.clearAllMocks();
     vi.unstubAllGlobals();
     vi.useRealTimers();
@@ -1073,7 +1074,6 @@ describe("deterministic end-to-end apply-triage harness", () => {
       "superops.read.fields",
       "superops.read.ticket",
       "superops.read.notes",
-      "superops.read.notes",
       "superops.read.ticket",
       "superops.write.status",
       "superops.read.ticket",
@@ -1083,7 +1083,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
     const noteReadTicketIds = harness.history.events
       .filter((event) => event.kind === "superops.read.notes")
       .map((event) => event.details?.ticketId);
-    expect(noteReadTicketIds).toEqual([TICKET_ID, TICKET_ID, TICKET_ID]);
+    expect(noteReadTicketIds).toEqual([TICKET_ID, TICKET_ID]);
     expect(harness.history.count("superops.write.note")).toBe(0);
     expect(harness.history.count("superops.write.status")).toBe(1);
     expect(harness.superops.ticket.status).toBe("Resolved");
@@ -1659,6 +1659,83 @@ describe("deterministic end-to-end apply-triage harness", () => {
     expect(harness.history.count("superops.write.classification")).toBe(1);
     expect(harness.history.count("superops.write.note")).toBe(1);
     expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
+  });
+
+  it("finishes a verified-note checkpoint with the production budget on every continuation", async () => {
+    const harness = new TriageHarness("production-budget-note-verified");
+    await harness.seedCheckpoint("NoteVerified");
+    const query = SuperOpsClient.prototype.query;
+    vi.spyOn(SuperOpsClient.prototype, "query").mockImplementation(async function (this: SuperOpsClient, ...args: Parameters<typeof query>) {
+      // The transport returns immediately; production queued reads also use
+      // a status poll and two additional receipt checkpoints.
+      for (let count = 0; count < 3; count += 1) {
+        recordTypedSubrequestStart({ type: "custom", operationName: "harness.queuedReadOverhead" });
+      }
+      return query.apply(this, args);
+    });
+    const config = { SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "45", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8" };
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const record = await harness.record();
+      if (record.state === "Completed") break;
+      if (record.nextEligibleTime) harness.clock.advanceTo(record.nextEligibleTime);
+      resetTicketFieldOptionsCacheForTests();
+      await harness.resume(record.nextEligibleTime, config);
+    }
+    const terminal = await harness.record();
+    expect(terminal.state).toBe("Completed");
+    expect(itemResult(terminal)).toMatchObject({ finalOutcome: "Resolved", finalVerificationState: "Verified" });
+    expect(harness.history.count("superops.write.classification")).toBe(0);
+    expect(harness.history.count("superops.write.note")).toBe(0);
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
+  });
+
+  it("still rejects changed classification on a verified-note continuation", async () => {
+    const harness = new TriageHarness("verified-note-concurrent-classification");
+    await harness.seedCheckpoint("NoteVerified");
+    harness.superops.ticket.cause = "User Request";
+    await harness.resume();
+    const terminal = await harness.record();
+    expect(itemResult(terminal)).toMatchObject({ finalOutcome: "Failed", failureStage: "classificationVerification" });
+    expect(harness.history.count("superops.write.status")).toBe(0);
+    expect(harness.history.count("superops.write.note")).toBe(0);
+  });
+
+  it("completes the whole staged resolve with cold metadata and production budgets", async () => {
+    const harness = new TriageHarness("production-budget-full-resolve");
+    const config = { SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "45", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8" };
+    const query = SuperOpsClient.prototype.query;
+    vi.spyOn(SuperOpsClient.prototype, "query").mockImplementation(async function (this: SuperOpsClient, ...args: Parameters<typeof query>) {
+      for (let count = 0; count < 3; count += 1) {
+        recordTypedSubrequestStart({ type: "custom", operationName: "harness.queuedReadOverhead" });
+      }
+      return query.apply(this, args);
+    });
+    await harness.invoke({}, config);
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const record = await harness.record();
+      if (record.state === "Completed") break;
+      if (record.nextEligibleTime) harness.clock.advanceTo(record.nextEligibleTime);
+      resetTicketFieldOptionsCacheForTests();
+      await harness.resume(record.nextEligibleTime, config);
+    }
+    const terminal = await harness.record();
+    expect(terminal.state, JSON.stringify(terminal.itemStates[TICKET_NUMBER])).toBe("Completed");
+    expect(itemResult(terminal)).toMatchObject({ finalOutcome: "Resolved", finalVerificationState: "Verified" });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(1);
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
+  });
+
+  it("still requires the checkpointed private note during final verification without recreating it", async () => {
+    const harness = new TriageHarness("verified-note-removed");
+    await harness.seedCheckpoint("NoteVerified");
+    harness.superops.visibleNotes.splice(0);
+    const terminal = await harness.resumeUntilTerminal();
+    expect(itemResult(terminal)).toMatchObject({ finalOutcome: "Failed", failureStage: "finalVerification", verified: false });
+    expect(harness.history.count("superops.write.note")).toBe(0);
     harness.assertGlobalInvariants(terminal);
   });
 
