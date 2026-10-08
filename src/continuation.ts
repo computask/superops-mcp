@@ -17,6 +17,7 @@ import {
   type OperationLedgerRecord,
 } from "./operation-store.js";
 import { withDispatcherOperation, dispatcherFetch, DispatcherPendingError, reconcileCurrentDispatcherReceipt, type DispatcherReceipt } from "./dispatcher.js";
+import { dispatcherReadRecoveryState } from "./dispatcher-read-journal.js";
 
 export interface ContinuationItemContext {
   record: OperationLedgerRecord;
@@ -594,7 +595,14 @@ export async function runOperationContinuation(
         );
       }
       const platformLimit = classifyCloudflarePlatformLimit(caughtError);
+      const pendingRead = caughtError instanceof DispatcherPendingError && caughtError.readRecovery?.durable === true &&
+        dispatcherReadRecoveryState(caughtError.state).pending;
+      const readEligibleAt = pendingRead
+        ? new Date(Math.max(Date.now() + Math.max(1, caughtError.retryAfter ?? 1) * 1000,
+            Date.parse(caughtError.readRecovery?.nextEligibleAt ?? "") || 0)).toISOString()
+        : undefined;
       if (
+        pendingRead ||
         caughtError instanceof ExecutionBudgetExceededError ||
         caughtError instanceof ExecutionTimeoutBudgetExceededError ||
         caughtError instanceof ExecutionCpuBudgetExceededError ||
@@ -638,6 +646,7 @@ export async function runOperationContinuation(
                 : preservedStage,
             outcome: mutationBoundary
               ? "AmbiguousWriteRequiresVerification"
+              : pendingRead ? "DispatcherReadPending"
               : caughtError instanceof ExecutionBudgetExceededError
                 ? "CloudflareSubrequestBudgetReached"
                 : caughtError instanceof ExecutionCpuBudgetExceededError
@@ -647,7 +656,8 @@ export async function runOperationContinuation(
             writeMayHaveSucceeded: currentItem?.writeMayHaveSucceeded === true,
             partialWrite: currentItem?.partialWrite === true,
             verificationState: "Pending",
-            errorClass: caughtError instanceof ExecutionBudgetExceededError
+            nextEligibleTime: readEligibleAt,
+            errorClass: pendingRead ? "DispatcherReadPending" : caughtError instanceof ExecutionBudgetExceededError
               ? "CloudflareConfiguredBudgetReached"
               : caughtError instanceof ExecutionCpuBudgetExceededError
                 ? "CloudflareCpuLimit"
@@ -669,6 +679,7 @@ export async function runOperationContinuation(
           operationId: params.operationId,
           ownerHash: params.ownerHash,
           reason: caughtError.name,
+          nextEligibleTime: readEligibleAt,
         });
         return continuationResult(record, true, caughtError.name);
       }

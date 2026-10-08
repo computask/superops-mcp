@@ -70,6 +70,7 @@ export type OperationItemStage =
   | "Unattempted";
 
 export type OperationErrorClass =
+  | "DispatcherReadPending"
   | "SuperOpsRateLimit"
   | "CloudflareSubrequestBudget"
   | "CloudflareConfiguredBudgetReached"

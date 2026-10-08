@@ -1,6 +1,7 @@
 import { paginatedClient } from "../pagination.js";
 import { assertTriageRunWriteLease } from "../triage-run-lease.js";
 import { DispatcherPendingError, reconcileCurrentDispatcherReceipt } from "../dispatcher.js";
+import { dispatcherReadRecoveryState } from "../dispatcher-read-journal.js";
 /**
  * SuperOps.ai Tickets Domain
  *
@@ -6423,7 +6424,9 @@ class DurableCheckpointError extends Error {
 }
 
 function isExecutionStopError(error: unknown): boolean {
-  return error instanceof ExecutionBudgetExceededError ||
+  return (error instanceof DispatcherPendingError && error.readRecovery?.durable === true &&
+      dispatcherReadRecoveryState(error.state).pending) ||
+    error instanceof ExecutionBudgetExceededError ||
     error instanceof ExecutionTimeoutBudgetExceededError ||
     error instanceof ExecutionCpuBudgetExceededError ||
     classifyCloudflarePlatformLimit(error) !== undefined;

@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SuperOpsClient, runWithCredentials } from "./client.js";
+import { DispatcherPendingError } from "./dispatcher.js";
 import { ExecutionBudgetExceededError, getExecutionState, runWithExecutionConfig, runWithExecutionContext, type ExecutionConfigInput } from "./execution.js";
 import {
   currentOwnerHash,
@@ -1601,11 +1602,19 @@ describe("deterministic end-to-end apply-triage harness", () => {
     harness.assertGlobalInvariants(record);
   });
 
-  it.each([1, 2])("continues when note collection propagates a budget stop on read %s", async (stopOnRead) => {
+  it.each([
+    { stopOnRead: 1, kind: "budget" }, { stopOnRead: 2, kind: "budget" },
+    { stopOnRead: 1, kind: "pending" }, { stopOnRead: 2, kind: "pending" },
+  ])("continues when note collection propagates $kind on read $stopOnRead", async ({ stopOnRead, kind }) => {
     const originalQuery = SuperOpsClient.prototype.query;
     let noteReads = 0;
     const spy = vi.spyOn(SuperOpsClient.prototype, "query").mockImplementation(async function(this: SuperOpsClient, query, variables) {
       if (query.includes("getTicketNoteList") && ++noteReads === stopOnRead) {
+        if (kind === "pending") {
+          const error = new DispatcherPendingError("saved-read-receipt", "saved-read-key", "running", 1);
+          error.readRecovery = { durable: true, nextEligibleAt: new Date(Date.now() + 1000).toISOString() };
+          throw error;
+        }
         const state = getExecutionState();
         if (!state) throw new Error("Expected execution state.");
         throw new ExecutionBudgetExceededError(state, 1);
@@ -1616,7 +1625,7 @@ describe("deterministic end-to-end apply-triage harness", () => {
       const harness = new TriageHarness(`note-collector-stop-${stopOnRead}`);
       await harness.invoke();
       const waiting = await harness.record();
-      expect(waiting.state).toBe("ContinuationRequired");
+      expect(waiting.state).toBe(kind === "pending" ? "Rescheduled" : "ContinuationRequired");
       expect(waiting.failedItems).toEqual([]);
       expect(waiting.pendingItems).toEqual([TICKET_NUMBER]);
       expect(harness.history.count("superops.write.classification")).toBe(1);
