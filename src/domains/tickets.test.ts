@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { DispatcherPendingError } from "../dispatcher.js";
 
 vi.mock("../client.js", () => ({
   getClient: vi.fn(() => ({
@@ -7270,6 +7271,69 @@ describe("Tickets Domain", () => {
       verification: { verified: true },
     });
   });
+  it.each(["ticket", "notes"])("retains the exact pending %s verification receipt after both resolve writes", async (readStage) => {
+    const pending = new DispatcherPendingError("synthetic-read-receipt", "private-test-idempotency-key", "retry_wait", 60, 200, "RATE_LIMITED");
+    pending.readRecovery = { durable: true, nextEligibleAt: "2026-10-08T10:01:00.000Z", deadlineAt: "2026-10-08T10:15:00.000Z" };
+    mockClient.query.mockResolvedValueOnce({ getFields: RESOLVED_OPTION_FIELDS });
+    if (readStage === "notes") {
+      mockClient.query.mockResolvedValueOnce({ getTicket: { ticketId: "ticket-synthetic", status: "Resolved", ...RESOLVED_CLASSIFICATION } });
+    }
+    mockClient.query.mockRejectedValueOnce(pending);
+    mockClient.mutate
+      .mockResolvedValueOnce({ createTicketNote: { noteId: "synthetic-note", content: "Synthetic private note", privacyType: "PRIVATE" } })
+      .mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-synthetic", status: "Resolved" } });
+
+    const result = await getTicketsTools().handleCall("superops_tickets_resolve_full", {
+      ticketId: "ticket-synthetic", ...RESOLVED_CLASSIFICATION, note: "Synthetic private note",
+    });
+    const body = JSON.parse(result.content[0].text);
+    expect(result.isError).toBe(true);
+    expect(body).toMatchObject({
+      finalOutcome: "VerificationPending", verificationPending: true,
+      writeAttempted: true, writeMayHaveSucceeded: true, acceptedPhysicalWrites: 2,
+      writeCount: { attempted: 2, maximum: 2, exact: true }, replaySafe: false,
+      classification: "AcceptedSynchronousWriteFollowupFailed",
+      verification: { performed: true, possible: true, verified: null },
+      readFailure: { errorClass: "DispatcherReadPending", dispatcherRequestId: "synthetic-read-receipt", dispatcherState: "retry_wait", resumeSameRequest: true, readRecoveryDurable: true },
+    });
+    expect(result.structuredContent).toMatchObject({
+      errorClass: "DispatcherReadPending", dispatcherRequestId: "synthetic-read-receipt",
+      retryable: false, retryScope: "none", resumeSameRequest: true,
+    });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(result)).not.toContain("private-test-idempotency-key");
+  });
+
+  it("keeps a terminal verification receipt separate from an accepted direct write", async () => {
+    const terminal = new DispatcherPendingError("terminal-read-receipt", "private-terminal-key", "failed", undefined, 200, "READ_RECOVERY_EXPIRED");
+    terminal.readRecovery = { durable: true, deadlineAt: "2026-10-08T10:15:00.000Z" };
+    mockClient.mutate.mockResolvedValueOnce({ updateTicket: { ticketId: "ticket-synthetic", status: "Awaiting Engineer" } });
+    mockClient.query.mockRejectedValueOnce(terminal);
+    const result = await getTicketsTools().handleCall("superops_tickets_update", { ticketId: "ticket-synthetic", status: "Awaiting Engineer" });
+    const body = JSON.parse(result.content[0].text);
+    expect(result.isError).toBe(true);
+    expect(body).toMatchObject({
+      finalOutcome: "VerificationUnavailable", verificationPending: false,
+      acceptedPhysicalWrites: 1, writeCount: { attempted: 1, maximum: 1, exact: true },
+      replaySafe: false, verification: { verified: null },
+      readFailure: { errorClass: "DispatcherReadTerminal", dispatcherRequestId: "terminal-read-receipt", dispatcherTerminal: true, resumeSameRequest: false },
+    });
+    expect(result.structuredContent).toMatchObject({ retryable: false, retryScope: "none" });
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not turn an uncertain direct mutation into a pending verification read", async () => {
+    mockClient.mutate.mockRejectedValueOnce(new DispatcherPendingError("uncertain-write-receipt", "private-write-key", "uncertain"));
+    const result = await getTicketsTools().handleCall("superops_tickets_update", { ticketId: "ticket-synthetic", status: "Awaiting Engineer" });
+    const body = JSON.parse(result.content[0].text);
+    expect(result.isError).toBe(true);
+    expect(body).toMatchObject({ acceptedPhysicalWrites: 0, writeMayHaveSucceeded: true, replaySafe: false, classification: "AmbiguousSynchronousWrite" });
+    expect(body.readFailure).toBeUndefined();
+    expect(body.verificationPending).toBeUndefined();
+    expect(mockClient.mutate).toHaveBeenCalledTimes(1);
+    expect(mockClient.query).not.toHaveBeenCalled();
+  });
+
   it("returns a conservative ambiguity contract for failed synchronous ticket writes", async () => {
     mockClient.mutate.mockRejectedValueOnce(new Error("network response lost"));
     const result = await getTicketsTools().handleCall("superops_tickets_update", {

@@ -10731,8 +10731,8 @@ export function getTicketsTools(): DomainTools {
 
     async handleCall(name, args) {
       const client = getClient();
-      let synchronousWriteAttempted = false;
-      let synchronousWriteAccepted = false;
+      let synchronousWriteAttempts = 0;
+      let synchronousAcceptedWrites = 0;
 
       try {
         switch (name) {
@@ -11890,12 +11890,12 @@ export function getTicketsTools(): DomainTools {
             // TODO: Map requesterEmail and techGroupName only after IDs can be
             // resolved safely to ClientUserIdentifierInput and TechnicianGroupIdentifierInput.
 
-            synchronousWriteAttempted = true;
+            synchronousWriteAttempts++;
             const response = await client.mutate<CreateTicketResponse>(
               CREATE_TICKET_MUTATION,
               { input }
             );
-            synchronousWriteAccepted = true;
+            synchronousAcceptedWrites++;
             const createdTicket = response.createTicket;
             const createdTicketId = typeof createdTicket?.ticketId === "string"
               ? createdTicket.ticketId
@@ -12098,24 +12098,24 @@ export function getTicketsTools(): DomainTools {
 
             let createdNote: TicketNote | undefined;
             if (typeof params.note === "string" && params.note.trim().length > 0) {
-              synchronousWriteAttempted = true;
+              synchronousWriteAttempts++;
               createdNote = await createTicketNote(
                 client,
                 resolvedTicket.ticketId,
                 params.note,
                 params.isPublicNote ?? false
               );
-              synchronousWriteAccepted = true;
+              synchronousAcceptedWrites++;
             }
 
             let updateResponse: UpdateTicketResponse;
             try {
-              synchronousWriteAttempted = true;
+              synchronousWriteAttempts++;
               updateResponse = await client.mutate<UpdateTicketResponse>(
                 UPDATE_TICKET_MUTATION,
                 { input: updateInput }
               );
-              synchronousWriteAccepted = true;
+              synchronousAcceptedWrites++;
             } catch (error) {
               const requiredFields = mandatoryValidationFields(error);
               const message = requiredFields.length > 0
@@ -12321,12 +12321,12 @@ export function getTicketsTools(): DomainTools {
             // TODO: Map techGroupName and resolution only after a documented
             // name-to-ID lookup or resolution-code workflow is available.
 
-            synchronousWriteAttempted = true;
+            synchronousWriteAttempts++;
             const response = await client.mutate<UpdateTicketResponse>(
               UPDATE_TICKET_MUTATION,
               { input }
             );
-            synchronousWriteAccepted = true;
+            synchronousAcceptedWrites++;
             const verification = params.verify === false
               ? { performed: false, possible: true, verified: null, reason: "verify=false" }
               : verifyDirectTicketUpdate(input, await getTicketByInternalId(client, params.ticketId));
@@ -12364,7 +12364,7 @@ export function getTicketsTools(): DomainTools {
               verify?: boolean;
             };
 
-            synchronousWriteAttempted = true;
+            synchronousWriteAttempts++;
             const response = await client.mutate<AddNoteResponse>(ADD_TICKET_NOTE_MUTATION, {
               input: {
                 ticket: { ticketId: params.ticketId },
@@ -12372,7 +12372,7 @@ export function getTicketsTools(): DomainTools {
                 privacyType: params.isPublic ? "PUBLIC" : "PRIVATE",
               },
             });
-            synchronousWriteAccepted = true;
+            synchronousAcceptedWrites++;
             const verification = params.verify === false
               ? { performed: false, possible: Boolean(response.createTicketNote.noteId), verified: null, reason: "verify=false" }
               : noteVerificationResult(
@@ -12420,7 +12420,7 @@ export function getTicketsTools(): DomainTools {
               billable?: boolean;
             };
 
-            synchronousWriteAttempted = true;
+            synchronousWriteAttempts++;
             const response = await client.mutate<AddTimeEntryResponse>(
               ADD_TIME_ENTRY_MUTATION,
               {
@@ -12438,7 +12438,7 @@ export function getTicketsTools(): DomainTools {
                 ],
               }
             );
-            synchronousWriteAccepted = true;
+            synchronousAcceptedWrites++;
 
             return {
               content: [
@@ -12478,18 +12478,25 @@ export function getTicketsTools(): DomainTools {
           "superops_tickets_update", "superops_tickets_add_note", "superops_tickets_log_time",
         ]);
         if (synchronousWriteTools.has(name)) {
+          const synchronousWriteAttempted = synchronousWriteAttempts > 0;
+          const synchronousWriteAccepted = synchronousAcceptedWrites > 0;
           const reliablyRejected = synchronousWriteAttempted &&
             !synchronousWriteAccepted && isReliableSynchronousMutationRejection(error);
+          const readFailure = synchronousWriteAccepted && error instanceof DispatcherPendingError && error.readRecovery?.durable
+            ? safeSuperOpsErrorMetadata(error, true)
+            : undefined;
+          const verificationPending = readFailure?.dispatcherPending === true;
           return {
             content: [{ type: "text", text: JSON.stringify({
-              error: message,
+              error: readFailure
+                ? verificationPending
+                  ? "Verification read remains pending; recover the original receipt without repeating accepted writes."
+                  : "Verification read is unavailable; review the original receipt without repeating accepted writes."
+                : message,
               writeAttempted: synchronousWriteAttempted,
               writeMayHaveSucceeded: synchronousWriteAttempted && !reliablyRejected,
-              writeCount: {
-                attempted: synchronousWriteAttempted ? 1 : 0,
-                maximum: name === "superops_tickets_resolve_full" ? 2 : 1,
-                exact: name !== "superops_tickets_resolve_full",
-              },
+              writeCount: synchronousWriteCount(synchronousWriteAttempts, synchronousWriteAttempts),
+              acceptedPhysicalWrites: synchronousAcceptedWrites,
               reliableResponseReceived: synchronousWriteAccepted || reliablyRejected,
               replaySafe: reliablyRejected || !synchronousWriteAttempted,
               classification: synchronousWriteAccepted
@@ -12497,7 +12504,18 @@ export function getTicketsTools(): DomainTools {
                 : reliablyRejected
                   ? "RejectedSynchronousWrite"
                   : synchronousWriteAttempted ? "AmbiguousSynchronousWrite" : "FailedBeforeWrite",
+              ...(readFailure ? {
+                finalOutcome: verificationPending ? "VerificationPending" : "VerificationUnavailable",
+                verificationPending,
+                verification: { performed: true, possible: true, verified: null },
+                readFailure,
+              } : {}),
             }, null, 2) }],
+            // The pending receipt belongs to the read. Retrying the enclosing
+            // tool would repeat accepted writes, so only same-receipt GET recovery is safe.
+            structuredContent: readFailure
+              ? safeStructuredErrorMetadata({ ...readFailure, retryable: false, retryScope: "none" })
+              : undefined,
             isError: true,
           };
         }

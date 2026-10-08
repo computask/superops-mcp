@@ -5,6 +5,7 @@
  */
 
 import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
+import type { ToolResult } from "./audit.js";
 
 export interface SuperOpsCredentials {
   /** Legacy identity fields only; never forwarded to the dispatcher/upstream. */
@@ -338,5 +339,5 @@ export interface DomainTools {
   handleCall: (
     name: string,
     args: Record<string, unknown>
-  ) => Promise<{ content: { type: string; text: string }[]; isError?: boolean }>;
+  ) => Promise<ToolResult>;
 }
