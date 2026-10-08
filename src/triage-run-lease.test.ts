@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertTriageRunWriteLease, runWithTriageLeaseEnvironment, runWithTriageRunContext, triageLeaseCapability } from "./triage-run-lease.js";
+import { assertTriageRunWriteLease, recordTriageRunQuery, runWithTriageLeaseEnvironment, runWithTriageRunContext, triageLeaseCapability } from "./triage-run-lease.js";
 import { dispatcherFetch, withDispatcherOperation } from "./dispatcher.js";
 import { runWithExecutionContext, executionDiagnostics } from "./execution.js";
 
@@ -40,6 +40,22 @@ describe("automatic triage write leases", () => {
     expect(triageLeaseCapability(env).enforced).toBe(true);
     expect(triageLeaseCapability({TRIAGE_RUN_WRITE_GUARD_ENABLED: "true"}).enforced).toBe(false);
   });
+  it("records only complete exact-window query numbers and associates server-owned operation identity", async () => {
+    const {env, fetcher} = environment();
+    const args = {createdFrom: "2026-10-08T09:00:00.000Z", createdTo: "2026-10-08T09:02:00.000Z",
+      status: ["New Calls"], sources: ["EMAIL"], fieldProfile: "minimal"};
+    const result = {records: [{displayId: "90007", subject: "private synthetic text"}], pagination: {complete: true}, errors: []};
+    await runWithTriageLeaseEnvironment(env, () => runWithTriageRunContext({triggerId, attempt: 1}, async () => {
+      await recordTriageRunQuery(args, {...result, pagination: {complete: false}});
+      await recordTriageRunQuery({...args, clientId: "filtered"}, result);
+      expect(fetcher).not.toHaveBeenCalled();
+      await recordTriageRunQuery(args, result);
+      await assertTriageRunWriteLease({operationId: triggerId});
+    }));
+    expect(await fetcher.mock.calls[0][0].json()).toEqual({triggerId, attempt: 1,
+      createdFrom: args.createdFrom, createdTo: args.createdTo, ticketNumbers: ["90007"]});
+    expect(await fetcher.mock.calls[1][0].json()).toMatchObject({operationReference: {operationId: triggerId, ownerHash: expect.stringMatching(/^[a-f0-9]{8}$/)}});
+  });
   it("blocks a continuation's new POST after expiry while permitting same-receipt GET reconciliation", async () => {
     const {env, fetcher: guard} = environment(false);
     const upstream = vi.fn(async (_url: string, _init: RequestInit) => Response.json({source: "superops-mcp", status: "succeeded", requestId: "synthetic-receipt", httpStatus: 200, response: {data: {ok: true}}}));
@@ -51,5 +67,10 @@ describe("automatic triage write leases", () => {
     }));
     expect(guard).toHaveBeenCalledTimes(1);
     expect(upstream.mock.calls.map(call => call[1].method)).toEqual(["GET"]);
+  });
+  it("uses the approved record owner during internal continuation without an interactive audit identity", async () => {
+    const {env,fetcher} = environment();
+    await runWithTriageLeaseEnvironment(env, () => assertTriageRunWriteLease({operationId:triggerId,ownerHash:'12345678',itemKey:'90007'}));
+    expect(await fetcher.mock.calls[0][0].json()).toMatchObject({operationReference:{operationId:triggerId,ownerHash:'12345678'}});
   });
 });

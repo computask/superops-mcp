@@ -4915,6 +4915,16 @@ function validateExpectedTicket(
       reason: `Expected ticketId ${action.expectedTicketId}, got ${ticket.ticketId}.`,
     };
   }
+  // A staff edit of this same immutable ticket is an expected protected skip.
+  // Check its timestamp before mutable subject/client/status comparisons so a
+  // changed ticket is not misreported as a defective approved identity.
+  if (action.expectedUpdatedTime && ticket.updatedTime !== action.expectedUpdatedTime && !allowChanged) {
+    return {
+      stage: "validateUpdatedTime",
+      reason: `Ticket changed since snapshot. Expected updatedTime ${action.expectedUpdatedTime}, got ${ticket.updatedTime}.`,
+      outcome: "SkippedChangedSinceSnapshot",
+    };
+  }
   if (
     (action.expectedSubject && ticket.subject !== action.expectedSubject) ||
     (action.expectedSubjectHash && stableHash(ticket.subject) !== action.expectedSubjectHash)
@@ -4953,16 +4963,6 @@ function validateExpectedTicket(
     return {
       stage: "validateStatus",
       reason: `Expected status ${JSON.stringify(action.expectedStatus)}, got ${JSON.stringify(ticket.status)}.`,
-    };
-  }
-  if (
-    action.expectedUpdatedTime &&
-    ticket.updatedTime !== action.expectedUpdatedTime &&
-    !allowChanged
-  ) {
-    return {
-      stage: "validateUpdatedTime",
-      reason: `Ticket changed since snapshot. Expected updatedTime ${action.expectedUpdatedTime}, got ${ticket.updatedTime}.`,
       outcome: "SkippedChangedSinceSnapshot",
     };
   }
@@ -9339,7 +9339,7 @@ function createApplyTriageContinuationAdapter(
         updatedTimeExpectation?: string,
         baselineTicket?: Ticket
       ) => {
-        await assertTriageRunWriteLease({ operationId: record.operationId,
+        await assertTriageRunWriteLease({ operationId: record.operationId, ownerHash: record.ownerHash,
           itemKey: claim.itemKey, ticketCreatedTime: baselineTicket?.createdTime, ticketSource: baselineTicket?.source });
         const checkpointCount = mutationType === "note" ? 2 : mutationType === "resolveFallback" || mutationType === "status" ? 1 : mutationType === "classification" ? 2 : 3;
         const verificationReserve = mutationType === "note"
@@ -9938,7 +9938,7 @@ async function prepareTriagePlan(client: SuperOpsClientInstance, proposal: Apply
   const policyError = validateScheduledNewCallsPolicy(proposal, expected, actions);
   if (policyError) return invalid(policyError);
   const plan: ApplyTriagePlanParams = { ...proposal, actions,
-    expectedCandidateTicketNumbers: expected, verify: true, dedupeNotes: true,
+    expectedCandidateTicketNumbers: expected, dryRun: false, verify: true, dedupeNotes: true,
     stopOnFirstFailure: false,
     allowResolveFullFallbackToUpdate: proposal.allowResolveFullFallbackToUpdate ?? false,
     allowWriteIfUpdatedTimeChanged: proposal.allowWriteIfUpdatedTimeChanged ?? false,
@@ -10000,6 +10000,8 @@ async function prepareTriagePlan(client: SuperOpsClientInstance, proposal: Apply
   if (complete) plan.preparationFingerprint = triagePreparationFingerprint(plan);
   return { content: [{ type: "text", text: JSON.stringify({ ok: complete, complete,
     preparationOnly: true, operationCreated: false, policyContractVersion: TRIAGE_POLICY_CONTRACT_VERSION,
+    eligibleCandidateTicketNumbers: results.filter(result => result.writeMethod === "dryRun").map(result => result.ticketNumber),
+    deferredCandidateTicketNumbers: results.filter(result => result.writeMethod !== "dryRun").map(result => result.ticketNumber),
     corrections, results, ...(complete ? { preparedPlan: plan } : {}) }) }], ...(!complete ? { isError: true } : {}) };
 }
 
@@ -11768,13 +11770,9 @@ export function getTicketsTools(): DomainTools {
 
             const results = completeApplyResultsFromLedger(finalRecord, expected, actionByTicket);
             const summary = summarizeApplyResults(results);
-            try {
-              if (!finalRecordReadFailed) {
-                finalRecord = await store.update(operationId, ownerHash, (record) => ({ ...record, summary }));
-              }
-            } catch (error) {
-              continuationError ??= safeErrorMessage(error);
-            }
+            // Status summaries are derived from item checkpoints. Persisting a
+            // second copy here consumed the budget-stop reserve and could turn
+            // an acknowledged durable handoff into an outer tool error.
             const complete = !finalRecordReadFailed && (
               finalRecord.state === "Completed" ||
               finalRecord.state === "CompletedWithFailures" ||
@@ -11812,6 +11810,12 @@ export function getTicketsTools(): DomainTools {
                   errorClass: durableFinalErrorClass ?? (continuationError ? "OperationStoreFailure" : undefined),
                   finalReason: conservativeFinalReason,
                   items: operationView.items,
+                  pendingCount: operationView.pendingCount, failedCount: operationView.failedCount,
+                  completedCount: operationView.completedCount, partialWriteCount: operationView.partialWriteCount,
+                  ambiguousWriteCount: operationView.ambiguousWriteCount,
+                  waitingForRateLimitCount: operationView.waitingForRateLimitCount,
+                  continuationCount: finalRecord.continuationCount, schedulingSucceeded: finalRecord.schedulingSucceeded,
+                  humanReconciliationRequired: durableItems.some(item => item.humanReconciliationRequired === true),
                   partialWrite: conservativePartialWrite,
                   verificationState: conservativeVerificationState,
                   writeAttempted: conservativeWriteAttempted,

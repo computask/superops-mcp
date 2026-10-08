@@ -199,7 +199,8 @@ function loadConfig(env) {
     workspaceAgentAccessToken: get(env, "WORKSPACE_AGENT_ACCESS_TOKEN"),
     historyResetToken: get(env, "TRIAGE_HISTORY_RESET_TOKEN"),
     replayAdminToken: get(env, "TRIAGE_REPLAY_ADMIN_TOKEN"),
-    triageCaptureReadToken: get(env, "TRIAGE_CAPTURE_READ_TOKEN")
+    triageCaptureReadToken: get(env, "TRIAGE_CAPTURE_READ_TOKEN"),
+    operationLedger: env.SUPEROPS_OPERATION_LEDGER
   };
 }
 __name(loadConfig, "loadConfig");
@@ -1067,6 +1068,7 @@ var DISPATCH_HISTORY_EVENTS = /* @__PURE__ */ new Set([
   "agent_accepted",
   "agent_run_status_checked",
   "result_callback_received",
+  "operation_status_recovered",
   "batch_completed",
   "batch_failed",
   "orphan_recovered",
@@ -1120,7 +1122,7 @@ function isFailureKind(value) {
 }
 __name(isFailureKind, "isFailureKind");
 function isResultStatus(value) {
-  return value === "complete" || value === "retryable_rate_limit" || value === "terminal_failure";
+  return value === "complete" || value === "retryable_rate_limit" || value === "retryable_read_pending" || value === "terminal_failure";
 }
 __name(isResultStatus, "isResultStatus");
 function isAgentRunStatus(value) {
@@ -1984,7 +1986,7 @@ __name(isExplicitChannelUnavailableResponse, "isExplicitChannelUnavailableRespon
 function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = false, captureEnabled = true) {
   const preparationInstructions = [
     "",
-    "Policy contract version: 2026-10-04.1. Before any intent report or apply, call the read-only superops_tickets_prepare_triage_plan with the complete frozen proposal and batchId equal to this Trigger ID. Require ok:true, complete:true, operationCreated:false and this policyContractVersion. Copy the entire preparedPlan unchanged, including preparationFingerprint, into the intent and the ONE reviewed apply call. Do not add dryRun or change defaults afterward. A checksum and preparation result never grant approval. Correct a construction error at most once by repeating read-only preparation using supported evidence, before any apply exists. After ANY actual apply response, even zero-call validation, do not resubmit or repair under the same operation ID. Terminal ledger status stops regardless of callback stage or replaySafe. Any observed platform denial remains terminal. Missing preparation action or contract mismatch is configuration failure before writes."
+    "Policy contract version: 2026-10-04.1. Before any intent report or apply, call the read-only superops_tickets_prepare_triage_plan with the complete frozen eligible proposal and batchId equal to this Trigger ID. Require ok:true, complete:true, operationCreated:false and this policyContractVersion. Copy the entire preparedPlan unchanged, including preparationFingerprint and the returned dryRun:false, into the intent and the ONE reviewed apply call. Do not add dryRun or change defaults afterward. A checksum and preparation result never grant approval. Correct a construction error at most once by repeating read-only preparation using supported evidence, before any apply exists. This single allowance also permits ONE new complete preparation of eligibleCandidateTicketNumbers after a partial preparation; retain deferredCandidateTicketNumbers as explicit callback deferrals and copy the original frozen fences. Never apply a partial prepared plan or repair an immutable identity mismatch. After ANY actual apply response, even zero-call validation, do not resubmit or repair under the same operation ID. Terminal ledger status stops regardless of callback stage or replaySafe. Any observed platform denial remains terminal. Missing preparation action or contract mismatch is configuration failure before writes."
   ];
   const captureInstructions = captureEnabled ? [
     "",
@@ -1998,14 +2000,14 @@ function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = 
     "Result callback required: true",
     `Dispatch attempt: ${attempt}`,
     "Callback contract preflight (before any SuperOps action, no network call required): check the exposed triage_result_report input schema supports metadata.operationStatus, metadata.ticketOutcomes, and metadata.mcpExecution. If one is absent, report terminal_failure with failureStage=configuration and safe errorCode=callback_schema_stale using only supported fields, then stop without any SuperOps read or write. Do not test this by making an invalid callback or bypass a denied action. If the callback action itself is unavailable, stop and explicitly identify that configuration error. Otherwise proceed with the bounded query; the connector's display version alone is not a failure.",
-    "Before ending, call triage_result_report exactly once with this Trigger ID and dispatch attempt.",
+    "Before ending, call triage_result_report exactly once with this Trigger ID and dispatch attempt. It is the NEXT action on every exit, before final prose, including failures, denials, empty queries and scheduled continuation handoffs.",
     "Failure explanation (required, safe metadata only): apply_not_attempted describes an outcome, not a cause. When apply was not called, include failureDiagnostics using the existing stage/errorType/errorCode fields. Use the observed cause: missing_required_evidence, missing_client_identity, missing_field_options, plan_validation_failed, tool_unavailable, permission_denied, unacceptable_risk, or reason_unavailable if the cause genuinely cannot be established. Never guess a permission/risk denial. Keep any observed denial terminal; do not retry or bypass it. For a tool failure, copy its safe mcpExecution.failureDiagnostics and requestTrace exactly, retaining dispatcherRequestId, dispatcherState and errorClass. Do not substitute the last successful read as the failing call. A local timeout with no httpStatus must remain without httpStatus: never invent HTTP 400/429/502 or claim an upstream rate limit. In the Agent conversation, explain the missing prerequisite without reproducing customer content or secrets. Do not put free-text customer details in callback metadata.",
     "ZERO-CANDIDATE SHORT-CIRCUIT (mandatory immediately after the first query): if superops_tickets_query returns pagination.complete=true, pagination.truncated=false, errors=[], and records=[], call triage_result_report immediately with status=complete, failureStage=bounded_query, ticketsConsidered=0, ticketsCompleted=0, ticketsDeferred=0, and ticketOutcomes=[]; call no evidence recovery, history, field-options, apply, operation, or other action, do not invent mcpExecution, and stop. This conclusive empty result is still followed only by the Worker's single bounded ingestion recovery; do not widen the window or queue.",
-    "Use complete only after the bounded run is complete with verified final effects or after a pending durable continuation is confirmed by its safe operation state; use retryable_rate_limit only when a SuperOps read rate limit prevents completion before apply; use terminal_failure for a terminal durable failure, ambiguity, or other non-retryable failure.",
+    "Use complete only after the bounded run is complete with verified final effects or protected no-write skips, or after a scheduled pending durable continuation is confirmed by its safe operation state. Before apply, an unusable server-owned readRecoveryDurable:true, dispatcherPending:true result uses retryable_read_pending with its returned bounded retry time: the coordinator resumes the SAME durable read receipt for the SAME exact query in a fresh invocation, never a replacement read or widened window. Otherwise use retryable_rate_limit only when a SuperOps read rate limit prevents completion before apply; use terminal_failure for a terminal durable failure, unscheduled continuation, ambiguity, or other non-retryable failure. Never invent an upstream HTTP status or throttle from a pending dispatcher receipt.",
     "Include only the tool's bounded safe metadata; safe ticket display numbers are allowed only in ticketOutcomes and operationStatus.ticketNumbers, never ticket, email, note, or customer content.",
     "Correlation rule: pass this exact Trigger ID as batchId to the single superops_tickets_apply_triage_plan call. This is a correlation key only; it does not widen the fixed candidate set or authorize another apply.",
     "Ticket outcome telemetry: include metadata.ticketOutcomes with exactly one entry for every candidate from the bounded snapshot. Use only the safe display ticketNumber plus outcome completed, skipped, deferred, failed, or not_attempted; add the coarse stage and reasonCode enums when known. Include an entry for a verified existing-note skip, a deferred evidence result, a stale/validation failure, and every item that was not reached. Use an empty array only when the bounded query conclusively returned no candidates. Never include subject, requester, company, email text, note text, or a free-text reason.",
-    "Durable operation telemetry: when superops_tickets_apply_triage_plan returns an operation object, copy only its safe outcome into metadata.operationStatus: state, continuationRequired, pendingCount, failedCount, partialWriteCount, ambiguousWriteCount, waitingForRateLimitCount, continuationCount, terminalFailureClass from operation.errorClass when present, replaySafe, humanReconciliationRequired, and ticketNumbers only from operation.items[*].itemId. Copy operationId/resultReference from the returned safe references. A state of Running, ContinuationRequired, or Rescheduled with no humanReconciliationRequired flag is a pending handoff: report complete and stop without another apply. A state of CompletedWithFailures, Failed, or Cancelled, any ambiguousWriteCount greater than zero, or humanReconciliationRequired=true is terminal failure/human reconciliation: report terminal_failure and never replay the window or mutation. Do not invent missing operation fields.",
+    "Durable operation telemetry: when superops_tickets_apply_triage_plan returns an operation object, copy only its safe outcome into metadata.operationStatus: state, continuationRequired, pendingCount, failedCount, partialWriteCount, ambiguousWriteCount, waitingForRateLimitCount, continuationCount, terminalFailureClass from operation.errorClass when present, replaySafe, humanReconciliationRequired, and ticketNumbers only from operation.items[*].itemId. Copy operationId/resultReference from the returned safe references. A state of Running, ContinuationRequired, or Rescheduled with schedulingSucceeded:true, ambiguousWriteCount:0 and no humanReconciliationRequired flag is a pending handoff: report complete with pending items explicitly deferred and stop without another apply. partialWriteCount>0 during this acknowledged handoff is saved progress, not a terminal failure. Read the returned state and counts before interpreting an outer error or old summary. A state of CompletedWithFailures, Failed, or Cancelled, an unscheduled continuation, any ambiguousWriteCount greater than zero, or humanReconciliationRequired=true is terminal failure/human reconciliation: report terminal_failure and never replay the window or mutation. Do not invent missing operation fields.",
     "MCP execution telemetry: whenever any triage MCP response contains a safe mcpExecution block, copy the entire block into callback metadata, including executionTraceId, invocationId, operationId, toolName, durationMs, subrequestsUsed, retryCount, requestsByType, requestTrace, retryTrace, requestTraceTruncated, and failureDiagnostics when present. This applies to validation, rate-limit, partial, and terminal responses; never omit the block because the run failed. Copy failureDiagnostics exactly, including the short sanitized message when present. Do not copy raw failureReason, terminalFailureReason, request bodies, GraphQL, headers, tokens, ticket/customer content, or free-text explanations into the callback. If a response genuinely contains no safe mcpExecution block, omit mcpExecution only then and report the bounded failure stage.",
     "Live v6 telemetry compatibility: the apply response may expose the safe execution object under the top-level key execution, not mcpExecution. When execution is present, normalize only these fields into metadata.mcpExecution: executionTraceId, invocationId, operationId, toolName, durationMs; execution.subrequests.used/budget/safetyMargin to subrequestsUsed/subrequestBudget/subrequestSafetyMargin; execution.retries.count to retryCount; and execution.requestsByType to requestsByType. Omit absent requestTrace, retryTrace, or failureDiagnostics fields; do not pass the raw execution wrapper or invent values. If an Agent/app risk gate rejects apply before SuperOps execution, no mcpExecution or operationId may exist: report terminal_failure with failureStage triage_apply, exact candidate counts/outcomes, and any safe failureDiagnostics, never complete or replay."
   ] : [];
@@ -2019,7 +2021,7 @@ function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = 
       "Concurrent engineer-edit rule: expectedUpdatedTime is the hard concurrency fence. If a candidate's updatedTime changed after the bounded snapshot, classify that candidate as skipped with reasonCode stale, do not overwrite its status/fields, do not add a duplicate note, and do not retry that candidate; continue processing the other fixed candidates. This is a per-ticket safety outcome, not permission to widen the window or queue.",
       "Strict note-enum gate: when an optional history section is included, its text must contain the exact matching enum token, not a loose synonym: Historical issue uses issueRecurrence=recurrent; Historical solution uses solutionHistory=prior_solution_found; Post-solution recurrence uses postSolutionRecurrence=observed_recurrence; Cross-client signal uses crossClientSignal=watch or crossClientSignal=credible; Emerging issue uses emergingIssueSignal=watch or emergingIssueSignal=credible; Current script recommendation uses currentScriptRecommendation=<non-empty value>. Omit optional sections whose state is not positive.",
       `Overlap/idempotency rule: the bounded lookback can show a ticket that an earlier email-triggered run already handled. After successful evidence recovery, if a private/internal note's HTML-stripped canonical text begins with "TRIAGE SUMMARY", treat that ticket as already handled by this workflow: do not include it in the apply plan and do not add a second note. Count it as completed for the safe callback. Only apply this skip when notes were requested and successfully recovered; unavailable notes are not proof of prior triage.`,
-      "Partial evidence rule: triage_evidence_recover returns an individual result for each requested ticket. If the top-level result is incomplete but a result has ok:true with evidence, retain and process that ticket (including the verified existing-note skip) instead of discarding it. Defer only the individual results that are unavailable, rate-limited, or otherwise unsuccessful; never invent an action for a failed result, widen the window, or repeat successful evidence in the same run. Do not treat retry telemetry alone as a failure: a successful tool result with ok:true, complete:true, or usable evidence remains usable even when its execution metadata reports internal retries. Only report retryable_rate_limit when the returned result is unusable and explicitly reports a rate limit (for example rateLimited:true or errorClass SuperOpsRateLimit). If any deferred result is a SuperOps rate limit, report retryable_rate_limit with completed/deferred counts that add up to considered; otherwise report the bounded terminal failure after applying the successful results if safe.",
+      "Partial evidence rule: triage_evidence_recover returns an individual result for each requested ticket. If the top-level result is incomplete but a result has ok:true with evidence, retain and process that ticket (including the verified existing-note skip) instead of discarding it. Freeze the original query candidates and partition them into eligible candidates, proven skips and explicit deferrals. One ticket's missing client identity, evidence or required options must not prevent a separately complete, normally reviewed plan for eligible tickets. Defer only the individual results that are unavailable, rate-limited, or otherwise unsuccessful; never invent an action for a failed result, widen the window, or repeat successful evidence in the same run. Account for every original candidate in the one callback; deferrals outside a successful subset keep the overall batch terminal_failure unless the before-apply durable-read/rate-limit recovery rule applies. Do not treat retry telemetry alone as a failure: a successful tool result with ok:true, complete:true, or usable evidence remains usable even when its execution metadata reports internal retries. Only report retryable_rate_limit when the returned result is unusable and explicitly reports a rate limit (for example rateLimited:true or errorClass SuperOpsRateLimit); the before-apply server-owned durable pending-read rule instead uses retryable_read_pending. If any deferred result is a SuperOps rate limit, report retryable_rate_limit with completed/deferred counts that add up to considered; otherwise report the bounded terminal failure after applying the successful results if safe.",
       "Latency and rate-limit rule: reuse non-empty classification values from successful evidence. Do not call field-options merely to prefetch or revalidate values; the apply action performs authoritative live validation. Call field-options at most once, only for genuinely missing or ambiguous values, and request only the needed fields. If a SuperOps read is rate-limited before apply, report retryable_rate_limit immediately and let the coordinator retry the same exact window; do not sleep or perform local retries.",
       "Current classification evidence rule: a successful canonical evidence-recovery item that explicitly returns a classification field as null has already established that the field is unassigned. Do not call get_safe just to confirm that same null field; use the one bounded field-options lookup for missing values. A field omitted or undefined, an unsuccessful read, unknown client data, or conflicting identity still requires the existing bounded recovery or deferral; never infer null from absence. Preserve the frozen expectedUpdatedTime and the MCP's mandatory live pre-write stale check. Classify meaningful controlled-test issues by their described technical issue exactly as real requests; a test label never justifies General Admin. Use the conservative General Admin manual-intake fallback only for genuinely empty or ambiguous intake, not a meaningful technical request.",
     "Plan the single field-options lookup after establishing each candidate's evidence-supported disposition and required action fields. If resolve_no_action is warranted or still under consideration, include any missing cause and resolutionCode in that same lookup, alongside the other missing required fields. Do not consume the one lookup on leave-only fields and then switch to resolve with unqueried closure fields. For customer_request, manual_intake or engineer_review with action leave, missing closure-only cause/resolutionCode is not a reason to stop; preserve New Calls and use the existing apply contract. Never invent option values, resolve an actionable ticket to avoid this check, or bypass required validation. If a required option remains unavailable, report missing_field_options with the exact missing field names in the Agent conversation and no write.",
@@ -3012,6 +3014,9 @@ function createPendingTriggerScope(state, config, now) {
     } else {
       state.pendingNotificationWindowEndedAt ??= windowStart + config.debounceMs + config.cooldownMs + config.maxDebounceMs;
     }
+    const scopeStart = Math.max(0, windowStart - (state.pendingNotificationLookbackMs ?? config.newEmailLookbackMs));
+    if (!Number.isFinite(scopeStart) || !Number.isFinite(state.pendingNotificationWindowEndedAt) ||
+        scopeStart >= state.pendingNotificationWindowEndedAt) return null;
     return {
       mode: "new-email-tickets",
       createdFrom: new Date(Math.max(
@@ -3444,12 +3449,20 @@ function ensureAcceptedWriteLease(state, config) {
     revokedAt: null, authorizedItems: []});
   state.runWriteLeases = state.runWriteLeases.slice(-256);
 }
-function checkRunWriteLease(state, config, body, now) {
+function checkRunWriteLease(state, config, body, now, validatedContinuationLeaseUntil) {
   ensureAcceptedWriteLease(state, config);
   const lease = [...state.runWriteLeases].reverse().find(value => value.triggerId === body.triggerId);
   const denied = {protocol: RUN_LEASE_PROTOCOL, allowed: false, reason: "expired_revoked_or_unknown"};
-  if (!lease || lease.revokedAt !== null || now >= lease.expiresAt ||
+  if (!lease || lease.revokedAt !== null || now >= (validatedContinuationLeaseUntil ?? lease.expiresAt) ||
       body.attempt !== undefined && body.attempt !== lease.attempt) return denied;
+  if (body.operationReference !== undefined) {
+    const reference = body.operationReference;
+    if (!isRecord(reference) || reference.operationId !== body.triggerId ||
+        typeof reference.ownerHash !== "string" || !/^[a-f0-9]{8}(?:[a-f0-9]{56})?$/.test(reference.ownerHash) ||
+        lease.operationReference && (lease.operationReference.operationId !== reference.operationId ||
+          lease.operationReference.ownerHash !== reference.ownerHash)) return {...denied, reason: "operation_correlation_mismatch"};
+    lease.operationReference = {operationId: reference.operationId, ownerHash: reference.ownerHash};
+  }
   if (body.itemKey !== undefined) {
     if (typeof body.itemKey !== "string" || !/^\d{1,24}$/.test(body.itemKey)) return denied;
     if (body.ticketCreatedTime !== undefined || body.ticketSource !== undefined) {
@@ -3467,7 +3480,7 @@ function checkRunWriteLease(state, config, body, now) {
       }
     } else if (!lease.authorizedItems.includes(body.itemKey)) return {...denied, reason: "live_scope_check_required"};
   }
-  return {protocol: RUN_LEASE_PROTOCOL, allowed: true, expiresAt: lease.expiresAt};
+  return {protocol: RUN_LEASE_PROTOCOL, allowed: true, expiresAt: validatedContinuationLeaseUntil ?? lease.expiresAt};
 }
 async function recoverExpiredWriteLease(engine, state, now) {
   const config = engine.deps.config;
@@ -3609,6 +3622,68 @@ function operationContinuationDisposition(report) {
   return "human_reconciliation";
 }
 __name(operationContinuationDisposition, "operationContinuationDisposition");
+// Read only the MCP ledger associated by the MCP's own write-lease check. No
+// Agent-supplied operation ID or owner identity can select another ledger.
+async function readCorrelatedOperation(lease, config) {
+  const reference = lease?.operationReference;
+  if (!reference || !config.operationLedger || reference.operationId !== lease.triggerId) return null;
+  try {
+    const stub = config.operationLedger.get(config.operationLedger.idFromName("owner:" + reference.ownerHash));
+    const response = await stub.fetch(new Request("https://operation.local/operations/" + reference.operationId, {signal: AbortSignal.timeout(5000)}));
+    if (!response.ok) return null;
+    const record = await response.json();
+    if (record.operationId !== reference.operationId || record.ownerHash !== reference.ownerHash ||
+        record.toolName !== "superops_tickets_apply_triage_plan" || !Array.isArray(record.expectedItems) ||
+        record.expectedItems.length > 50 || !record.expectedItems.every(id => typeof id === "string" && /^\d{1,24}$/.test(id)) ||
+        !isRecord(record.itemStates)) return null;
+    return record;
+  } catch { return null; }
+}
+async function correlatedOperationReport(state, config, suppliedReport) {
+  const lease = state.runWriteLeases.find(item => item.triggerId === state.pendingTriggerId && item.attempt === state.dispatchAttempt);
+  const reference = lease?.operationReference;
+  const record = await readCorrelatedOperation(lease, config);
+  if (!record) return null;
+  try {
+    const terminalStages = new Set(["Completed", "CompletedAfterRetry", "CompletedAfterAmbiguousWriteVerification", "Skipped", "Stale", "StaleAfterRateLimitWait", "FailedBeforeWrite", "FailedAfterPartialWrite", "AmbiguousWriteUnresolved", "RateLimitExceeded"]);
+    const items = record.expectedItems.map(id => record.itemStates[id]);
+    if (items.some(item => !isRecord(item))) return null;
+    const pendingCount = items.filter(item => !terminalStages.has(item.stage)).length;
+    const ambiguousWriteCount = items.filter(item => item.ambiguousWrite === true || /Ambiguous/.test(item.stage) && !item.stage.startsWith("CompletedAfter")).length;
+    const partialWriteCount = items.filter(item => item.partialWrite === true).length;
+    const humanReconciliationRequired = items.some(item => item.humanReconciliationRequired === true);
+    const successful = item => item.verificationState === "Verified" && item.stage.startsWith("Completed") ||
+      ["Skipped", "Stale", "StaleAfterRateLimitWait"].includes(item.stage) && !item.writeAttempted && !item.writeMayHaveSucceeded && !item.partialWrite;
+    const failedCount = items.filter(item => terminalStages.has(item.stage) && !successful(item)).length;
+    const complete = record.state === "Completed" && pendingCount === 0 && failedCount === 0 && partialWriteCount === 0 && ambiguousWriteCount === 0 && !humanReconciliationRequired;
+    const handoff = PENDING_OPERATION_STATES.has(record.state) && pendingCount > 0 && record.schedulingSucceeded === true && !ambiguousWriteCount && !humanReconciliationRequired;
+    const terminal = TERMINAL_OPERATION_STATES.has(record.state) || humanReconciliationRequired || ambiguousWriteCount > 0 ||
+      PENDING_OPERATION_STATES.has(record.state) && pendingCount > 0 && record.schedulingSucceeded !== true;
+    if (!complete && !handoff && !terminal) return null;
+    const candidates = lease.queryTicketNumbers;
+    if (!Array.isArray(candidates) || record.expectedItems.some(id => !candidates.includes(id))) return null;
+    const previous = suppliedReport?.metadata?.ticketOutcomes ?? [];
+    // An operation may be a prepared eligible subset. Missing candidates need
+    // their own proven skip; never silently turn deferred/unseen work into success.
+    if (candidates.some(id => !record.expectedItems.includes(id) && !previous.some(item => item.ticketNumber === id && item.outcome === "skipped" && ["already_handled", "stale"].includes(item.reasonCode)))) return null;
+    const ticketOutcomes = candidates.map(ticketNumber => {
+      const item = record.itemStates[ticketNumber];
+      if (!item) return previous.find(entry => entry.ticketNumber === ticketNumber);
+      const protectedSkip = ["Skipped", "Stale", "StaleAfterRateLimitWait"].includes(item.stage) && successful(item);
+      return {ticketNumber, outcome: protectedSkip ? "skipped" : successful(item) ? "completed" : terminalStages.has(item.stage) ? "failed" : "deferred",
+        stage: "operation_continuation", reasonCode: protectedSkip ? "stale" : "unknown"};
+    });
+    const ticketsCompleted = ticketOutcomes.filter(item => ["completed", "skipped"].includes(item.outcome)).length;
+    return {triggerId: state.pendingTriggerId, attempt: state.dispatchAttempt, status: complete || handoff ? "complete" : "terminal_failure", metadata: {
+      ...(suppliedReport?.metadata?.mcpExecution ? {mcpExecution: suppliedReport.metadata.mcpExecution} : {}),
+      operationId: reference.operationId, resultReference: reference.operationId,
+      failureStage: "operation_continuation", ticketsConsidered: candidates.length, ticketsCompleted,
+      ticketsDeferred: candidates.length - ticketsCompleted, ticketOutcomes,
+      operationStatus: {state: record.state, continuationRequired: handoff, pendingCount, failedCount, partialWriteCount,
+        ambiguousWriteCount, humanReconciliationRequired, continuationCount: record.continuationCount, ticketNumbers: record.expectedItems},
+    }};
+  } catch { return null; }
+}
 function completionReportIsConsistent(report) {
   if (report.status !== "complete" || !report.metadata) return true;
   const metadata = report.metadata;
@@ -3970,6 +4045,17 @@ var CoordinatorEngine = class {
         }, state.pendingTriggerScope);
         this.deps.logger?.info("agent_run_status_checked", { status: runStatus });
         if (runStatus === "completed" || runStatus === "failed") {
+          const recovered = await correlatedOperationReport(state, this.deps.config);
+          if (recovered?.status === "complete") {
+            recordDispatchHistory(state, now, {event: "operation_status_recovered", ...resultHistoryDetails(recovered),
+              agentRunStatus: runStatus, agentRunIdPresent: true, waitReason: "result_watchdog"}, state.pendingTriggerScope);
+            state.lastResultReport = {...recovered, recordedAt: new Date(now).toISOString()};
+            recordDispatchHistory(state, now, {event: "batch_completed", ...resultHistoryDetails(recovered)}, state.pendingTriggerScope);
+            const nextAt = this.finishCurrent(state, now);
+            await this.deps.store.save(state);
+            if (nextAt !== void 0) await this.deps.store.setAlarm(nextAt);
+            return {status: "complete", triggerId: recovered.triggerId, nextAt};
+          }
           recordDispatchHistory(state, now, {
             event: "orphan_recovered",
             failureKind: "ambiguous",
@@ -4300,6 +4386,20 @@ var CoordinatorEngine = class {
       await this.deps.store.save(state);
     }
     const scope = state.pendingTriggerScope;
+    // Old persisted scopes and attention tails can have an empty/reversed
+    // interval. Such a scope contains no approved work and must never reach
+    // the Agent or enter its retry loop. Preserve the independent queued tail.
+    if (scope.mode === "new-email-tickets" && finiteScopeBounds(scope) === null) {
+      recordDispatchHistory(state, now, {
+        event: "batch_failed", failureKind: "configuration", errorCode: "invalid_created_window",
+        failureDiagnostics: [{stage: "bounded_query", errorType: "configuration", errorCode: "invalid_created_window"}]
+      }, scope);
+      markFailure(state, "configuration", now);
+      const nextAt = this.finishCurrent(state, now);
+      await this.deps.store.save(state);
+      if (nextAt !== void 0) await this.deps.store.setAlarm(nextAt);
+      return {status: "terminal_failure", triggerId, nextAt};
+    }
     const dispatchAttempt = state.dispatchAttempt + 1;
     const dispatchWasQueued = state.pendingDispatchWasQueued === true;
     const dispatchWaitReason = queuedDispatchWaitReason(state, dispatchWasQueued);
@@ -4347,6 +4447,12 @@ var CoordinatorEngine = class {
       return { status: "stale_or_unauthorized" };
     }
     let effectiveReport = report;
+    const authoritative = await correlatedOperationReport(state, this.deps.config, report);
+    if (authoritative) {
+      recordDispatchHistory(state, now, {event: "operation_status_recovered", ...resultHistoryDetails(authoritative)}, state.pendingTriggerScope);
+      report = authoritative;
+      effectiveReport = authoritative;
+    }
     if (report.status !== "complete" && state.lastAcceptedTrigger?.runId) {
       const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId, state.lastAcceptedTrigger.triggerUrl);
       const runFailureDiagnostics = report.status === "terminal_failure" ? agentRunFailureDiagnostics(diagnostics) : [];
@@ -4417,6 +4523,7 @@ var CoordinatorEngine = class {
         ...resultHistoryDetails(effectiveReport),
         failureKind: "ambiguous"
       }, state.pendingTriggerScope);
+      if (state.pendingTriggerScope !== null) recordReconciliationNeedsAttention(state, state.pendingTriggerScope, now, state.retryCount);
       markFailure(state, "ambiguous", now);
       const nextAt2 = this.finishCurrent(state, now);
       await this.deps.store.save(state);
@@ -4589,6 +4696,9 @@ var CoordinatorEngine = class {
         failureKind: continuationDisposition === "human_reconciliation" ? "ambiguous" : "permanent"
       }, state.pendingTriggerScope);
       const failureKind = continuationDisposition === "human_reconciliation" ? "ambiguous" : "permanent";
+      if (continuationDisposition === "human_reconciliation" && state.pendingTriggerScope !== null) {
+        recordReconciliationNeedsAttention(state, state.pendingTriggerScope, now, state.retryCount);
+      }
       markFailure(state, failureKind, now);
       const nextAt2 = this.finishCurrent(state, now);
       await this.deps.store.save(state);
@@ -4964,6 +5074,7 @@ var PRIVATE_CAPTURE_SECRET_VALUE_PATTERN = /\b(?:Bearer\s+[A-Za-z0-9._~+/=-]{16,
 var RESULT_STATUSES = /* @__PURE__ */ new Set([
   "complete",
   "retryable_rate_limit",
+  "retryable_read_pending",
   "terminal_failure"
 ]);
 var FAILURE_STAGES = /* @__PURE__ */ new Set([
@@ -5079,7 +5190,7 @@ function parseTriageResultReport(value) {
     return null;
   }
   if (value.retryAfterSeconds !== void 0 && (!Number.isInteger(value.retryAfterSeconds) || Number(value.retryAfterSeconds) < 1 || Number(value.retryAfterSeconds) > 86400)) return null;
-  if (value.status !== "retryable_rate_limit" && value.retryAfterSeconds !== void 0) return null;
+  if (!["retryable_rate_limit", "retryable_read_pending"].includes(value.status) && value.retryAfterSeconds !== void 0) return null;
   const metadata = parseSafeMetadata(value.metadata);
   if (metadata === null) return null;
   return {
@@ -5196,13 +5307,13 @@ function toolDefinition() {
         },
         status: {
           type: "string",
-          enum: ["complete", "retryable_rate_limit", "terminal_failure"]
+          enum: ["complete", "retryable_rate_limit", "retryable_read_pending", "terminal_failure"]
         },
         retryAfterSeconds: {
           type: "integer",
           minimum: 1,
           maximum: 86400,
-          description: "Use only for retryable_rate_limit and only when SuperOps supplied Retry-After."
+          description: "Use the returned bounded retry time for retryable_read_pending; use SuperOps Retry-After for retryable_rate_limit."
         },
         metadata: {
           type: "object",
@@ -6038,7 +6149,7 @@ function asScopeMode(value) {
 }
 __name(asScopeMode, "asScopeMode");
 function asResultStatus(value) {
-  return value === "complete" || value === "retryable_rate_limit" || value === "terminal_failure" ? value : void 0;
+  return value === "complete" || value === "retryable_rate_limit" || value === "retryable_read_pending" || value === "terminal_failure" ? value : void 0;
 }
 __name(asResultStatus, "asResultStatus");
 function asOptionalNumber(value) {
@@ -6836,9 +6947,43 @@ var TriageCoordinator = class {
       try { body = await request.json(); } catch { return json({error: "invalid_payload"}, 400); }
       if (!isRecord(body) || typeof body.triggerId !== "string" || body.triggerId.length > 160) return json({error: "invalid_payload"}, 400);
       const state = normalizeState(await store.load());
-      const result = checkRunWriteLease(state, config, body, Date.now());
+      const now = Date.now();
+      const lease = [...state.runWriteLeases].reverse().find(item => item.triggerId === body.triggerId);
+      let continuationLeaseUntil;
+      if (lease && lease.revokedAt === null && now >= lease.expiresAt && body.attempt === undefined &&
+          body.operationReference?.operationId === lease.triggerId &&
+          /^[a-f0-9]{8}(?:[a-f0-9]{56})?$/.test(body.operationReference?.ownerHash ?? "") &&
+          (!lease.operationReference || body.operationReference.ownerHash === lease.operationReference.ownerHash) &&
+          typeof body.itemKey === "string") {
+        const operation = await readCorrelatedOperation({...lease, operationReference: lease.operationReference ?? body.operationReference}, config);
+        const item = operation?.itemStates[body.itemKey];
+        // Only a currently leased item of the exact existing approved operation
+        // may continue after the Agent deadline. The Agent lease is not renewed.
+        if (operation && PENDING_OPERATION_STATES.has(operation.state) && operation.operationRequest &&
+            Date.parse(operation.maxOperationLifetimeAt ?? "") > now && operation.expectedItems.includes(body.itemKey) &&
+            item?.humanReconciliationRequired !== true && Date.parse(item?.lease?.expiresAt ?? "") > now) {
+          continuationLeaseUntil = Math.min(now + 30_000, Date.parse(item.lease.expiresAt), Date.parse(operation.maxOperationLifetimeAt));
+        }
+      }
+      const result = checkRunWriteLease(state, config, body, now, continuationLeaseUntil);
       await store.save(state);
       return json(result, result.allowed ? 200 : 409);
+    }
+    if (request.method === "POST" && path === "/internal/run-query/observe") {
+      let body;
+      try { body = await request.json(); } catch { return json({error: "invalid_payload"}, 400); }
+      const state = normalizeState(await store.load());
+      ensureAcceptedWriteLease(state, config);
+      const lease = state.runWriteLeases.find(item => item.triggerId === body?.triggerId && item.attempt === body?.attempt);
+      if (!lease || lease.revokedAt !== null || Date.now() >= lease.expiresAt || lease.scope?.mode !== "new-email-tickets" ||
+          lease.scope.createdFrom !== body.createdFrom || lease.scope.createdTo !== body.createdTo ||
+          !Array.isArray(body.ticketNumbers) || body.ticketNumbers.length > 50 ||
+          !body.ticketNumbers.every(id => typeof id === "string" && /^\d{1,24}$/.test(id)) ||
+          new Set(body.ticketNumbers).size !== body.ticketNumbers.length ||
+          lease.queryTicketNumbers && JSON.stringify(lease.queryTicketNumbers) !== JSON.stringify(body.ticketNumbers)) return json({error: "query_correlation_mismatch"}, 409);
+      lease.queryTicketNumbers = body.ticketNumbers;
+      await store.save(state);
+      return json({observed: true});
     }
     if (request.method === "POST" && path === "/internal/admin/run/recover") {
       let body;

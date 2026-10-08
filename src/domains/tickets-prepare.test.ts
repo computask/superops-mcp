@@ -48,7 +48,7 @@ describe("read-only complete triage preparation", () => {
     expect(data.complete).toBe(true);
     expect(data.preparedPlan.actions[0].expectedClientHash).toBe(stableHash(original.client.name));
     expect(data.preparedPlan.preparationFingerprint).toMatch(/^[a-f0-9]{64}$/);
-    expect(data.preparedPlan).toMatchObject({ stopOnFirstFailure: false,
+    expect(data.preparedPlan).toMatchObject({ dryRun: false, stopOnFirstFailure: false,
       allowResolveFullFallbackToUpdate: false, allowWriteIfUpdatedTimeChanged: false,
       allowWriteWithoutVerifiedContent: false });
     expect(mutate).not.toHaveBeenCalled();
@@ -98,6 +98,20 @@ describe("read-only complete triage preparation", () => {
     expect(data.complete).toBe(false); expect(data.results[0].failureReason).toContain("belongs under category");
     expect(data.preparedPlan).toBeUndefined(); expect(mutate).not.toHaveBeenCalled();
   });
+  it("accounts for a bad candidate separately and requires a new complete preparation for the eligible subset", async () => {
+    const input = proposal();
+    input.expectedCandidateTicketNumbers.push("90102");
+    input.actions.push({...structuredClone(input.actions[0]), ticketNumber: "90102", expectedTicketId: "synthetic-ticket-90102"});
+    query.mockImplementation(async (document: string, variables: {ticketId?: string}) => document.includes("getFields") ? {getFields: fields()} :
+      {getTicket: variables?.ticketId === "synthetic-ticket-90102" ? {...original, ticketId: "synthetic-ticket-90102", displayId: "90102", client: undefined} : structuredClone(original)});
+    const {data} = await prepare(input);
+    expect(data.complete).toBe(false); expect(data.operationCreated).toBe(false); expect(data.preparedPlan).toBeUndefined();
+    expect(data.eligibleCandidateTicketNumbers).toEqual(["90101"]);
+    expect(data.deferredCandidateTicketNumbers).toEqual(["90102"]);
+    const preparedSubset = await prepare(proposal());
+    expect(preparedSubset.data.complete).toBe(true); expect(preparedSubset.data.preparedPlan.expectedCandidateTicketNumbers).toEqual(["90101"]);
+    expect(mutate).not.toHaveBeenCalled();
+  });
   it("rejects unsafe policy overrides and public notes before reads", async () => {
     const input = proposal(); input.actions[0].isPublicNote = true;
     expect((await prepare(input)).response.isError).toBe(true); expect(query).not.toHaveBeenCalled();
@@ -128,6 +142,20 @@ describe("read-only complete triage preparation", () => {
       expect(response.content[0].text).not.toContain("checksum does not match");
       expect(JSON.parse(response.content[0].text).results[0]).toMatchObject({ finalOutcome: "SkippedChangedSinceSnapshot" });
       expect(query).toHaveBeenCalled(); expect(mutate).not.toHaveBeenCalled();
+    });
+  });
+  for (const change of [
+    { status: "Awaiting Engineer", updatedTime: "2026-10-04T09:01:00Z" },
+    { client: { accountId: "other", name: "Other" }, updatedTime: "2026-10-04T09:01:00Z" },
+    { subject: "An engineer changed the subject", updatedTime: "2026-10-04T09:01:00Z" },
+  ]) it("accounts for a staff edit as a protected stale skip before any write", async () => {
+    await runWithOperationStore({}, async () => {
+      const { data } = await prepare({ ...proposal(), batchId: "synthetic-prepared-staff-change" });
+      query.mockResolvedValue({ getTicket: { ...original, ...change } });
+      const response = await getTicketsTools().handleCall("superops_tickets_apply_triage_plan", data.preparedPlan);
+      const result = JSON.parse(response.content[0].text).results[0];
+      expect(result).toMatchObject({ finalOutcome: "SkippedChangedSinceSnapshot", writeAttempted: false });
+      expect(mutate).not.toHaveBeenCalled();
     });
   });
   it("applies one complete prepared proposal and returns the stored result for duplicate calls", async () => {

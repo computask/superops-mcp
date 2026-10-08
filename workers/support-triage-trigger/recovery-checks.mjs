@@ -330,7 +330,7 @@ test('relevant history filters routine rows before LIMIT and resumes a frozen cu
   oldest=80;
   assert.equal(listRelevantDispatchHistory({sql},0,10,103).coverage.complete,false,'retention gap is never complete coverage');
 });
-function replayCoordinator(seed, archivedEvents=seed.dispatchHistory??[]) {
+function replayCoordinator(seed, archivedEvents=seed.dispatchHistory??[], envOverrides={}) {
   const storage={value:structuredClone(seed),alarm:null,
     async get(){return structuredClone(this.value);},
     async put(_key,value){this.value=structuredClone(value);},
@@ -342,7 +342,7 @@ function replayCoordinator(seed, archivedEvents=seed.dispatchHistory??[]) {
       return {toArray(){return rows;},one(){return {event_id:0};}};
     }}
   };
-  return {storage,coordinator:new TriageCoordinator({storage},vars)};
+  return {storage,coordinator:new TriageCoordinator({storage},{...vars,...envOverrides})};
 }
 const replaySourceScope={mode:'new-email-tickets',source:'EMAIL',createdFrom:'2026-09-25T10:17:01.406Z',createdTo:'2026-09-25T10:18:17.407Z'};
 const replayFailureEvent={eventId:41,at:'2026-09-25T10:18:47.407Z',event:'orphan_recovered',batchSequence:24,
@@ -470,6 +470,83 @@ function fixture(status, age = 120000, configOverrides = {}) {
   return {engine,calls,alarms,scope,config,get state(){return state;},seed:patch=>{state={...state,...patch};},setNow:value=>{now=Date.parse(value);},setRunStatus:value=>{agentStatus=value;},advance:()=>{now=state.dueAt ?? now+40000;},expire:()=>{now+=40000;}};
 }
 
+test('a zero-width tail never becomes a dispatchable Agent scope', () => {
+  const f = fixture('completed');
+  const now = Date.parse('2026-09-24T06:00:00Z');
+  f.seed({ pendingNotificationWindowStartedAt: now, pendingNotificationWindowEndedAt: now,
+    pendingNotificationLookbackMs: 0 });
+  assert.equal(createPendingTriggerScope(f.state, f.config, now), null);
+});
+
+function withCorrelatedOperation(f, recordOverrides = {}, candidates = ['90101']) {
+  const ownerHash = '12345678';
+  const operationId = f.state.pendingTriggerId;
+  const record = {operationId, ownerHash, toolName:'superops_tickets_apply_triage_plan', state:'Completed', expectedItems:['90101'],
+    continuationCount:2, itemStates:{'90101':{stage:'Completed',verificationState:'Verified',partialWrite:false}}, ...recordOverrides};
+  f.seed({runWriteLeases:[{triggerId:operationId,attempt:1,issuedAt:0,expiresAt:Date.parse('2026-09-25T06:00:00Z'),revokedAt:null,scope:f.scope,
+    authorizedItems:['90101'],queryTicketNumbers:candidates,operationReference:{operationId,ownerHash}}]});
+  const reads=[];
+  f.config.operationLedger={idFromName:name=>{assert.equal(name,'owner:'+ownerHash);return name;},get:()=>({fetch:async request=>{
+    reads.push(request); assert.equal(request.method,'GET'); return Response.json(record);
+  }})};
+  return {reads,record};
+}
+test('a missing callback recovers verified durable success without another Agent or write', async()=>{
+  const f=fixture('completed'); const {reads}=withCorrelatedOperation(f); f.expire();
+  assert.equal((await f.engine.processAlarm()).status,'complete');
+  assert.equal(reads.length,1); assert.equal(f.calls.length,0);
+  assert(f.state.dispatchHistory.some(event=>event.event==='operation_status_recovered'));
+  assert(!f.state.dispatchHistory.some(event=>event.event==='orphan_recovered'));
+});
+test('a contradictory failure callback hands off an acknowledged partial continuation', async()=>{
+  const f=fixture('in_progress');withCorrelatedOperation(f,{state:'Rescheduled',schedulingSucceeded:true,
+    itemStates:{'90101':{stage:'NoteAdded',verificationState:'Pending',partialWrite:true}}});
+  assert.equal((await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',
+    metadata:{operationId:f.state.pendingTriggerId,operationStatus:{state:'CompletedWithFailures'},failureStage:'triage_apply'}})).status,'complete');
+  assert.equal(f.state.lastResultReport.metadata.operationStatus.pendingCount,1);
+  assert.equal(f.calls.length,0);
+});
+
+test('a claimed completion cannot hide an unscheduled or terminal durable failure',async()=>{
+  for(const state of ['ContinuationRequired','CompletedWithFailures']) {
+    const f=fixture('completed');withCorrelatedOperation(f,{state,schedulingSucceeded:false,
+      itemStates:{'90101':{stage:state==='ContinuationRequired'?'NoteAdded':'FailedAfterPartialWrite',
+        verificationState:'Pending',partialWrite:true}}});
+    const result=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'complete',
+      metadata:{failureStage:'operation_continuation',operationId:f.state.pendingTriggerId,
+        ticketsConsidered:1,ticketsCompleted:1,ticketsDeferred:0,
+        operationStatus:{state:'Completed',pendingCount:0,failedCount:0}}});
+    assert.equal(result.status,'terminal_failure',state);
+    assert.equal(f.calls.length,0);assert.equal(f.state.needsAttentionScopes.length,1);
+    assert.equal(f.state.lastResultReport.metadata.operationStatus.state,state);
+  }
+});
+test('unresolved ambiguity and an unaccounted subset remain quarantined', async()=>{
+  for(const variant of ['ambiguous','subset','owner']) {
+    const f=fixture('completed');const {record}=withCorrelatedOperation(f,{},variant==='subset'?['90101','90102']:['90101']);
+    if(variant==='ambiguous') record.itemStates['90101']={stage:'AmbiguousWriteUnresolved',humanReconciliationRequired:true,partialWrite:true};
+    if(variant==='owner')record.ownerHash='87654321';
+    f.expire();await f.engine.processAlarm();
+    assert(f.state.dispatchHistory.some(event=>event.event==='orphan_recovered'));
+    assert.equal(f.calls.length,0);
+  }
+});
+
+test('an invalid persisted targeted window stops before any Agent dispatch or retry', async () => {
+  const f = fixture('completed');
+  const now = Date.parse('2026-09-24T06:00:00Z');
+  f.seed({ executionPhase: null, lastAcceptedTrigger: null, lastResultReport: null,
+    resultDeadlineAt: null, dueAt: now, cooldownUntil: 0,
+    pendingTriggerScope: {...f.scope, createdFrom: f.scope.createdTo},
+    pendingNotificationWindowStartedAt: now, pendingNotificationWindowEndedAt: now,
+    pendingNotificationLookbackMs: 0 });
+  await f.engine.processAlarm();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.state.pending, false);
+  assert(!f.state.dispatchHistory.some(e => e.event === 'retry_scheduled'));
+  assert(f.state.dispatchHistory.some(e => e.errorCode === 'invalid_created_window'));
+});
+
 test('write lease binds the live ticket to its exact half-open window and cannot be renewed by checking it',()=>{
   const f=fixture('in_progress');
   const state=normalizeState(f.state), now=Date.parse('2026-09-24T06:00:00Z');
@@ -486,6 +563,57 @@ test('write lease binds the live ticket to its exact half-open window and cannot
   const restored=normalizeState(JSON.parse(JSON.stringify(state)));
   assert.equal(checkRunWriteLease(restored,f.config,input,deadline+1).allowed,false);
   assert.equal(restored.runWriteLeases[0].expiresAt,deadline);
+});
+
+test('an expired Agent lease permits only a claimed item in its existing approved continuation',async()=>{
+  for(const previouslyCorrelated of [false,true]) {
+    const now=Date.now(), triggerId='triage-91-00000000-0000-4000-8000-000000000091', ownerHash='12345678';
+    const reference={operationId:triggerId,ownerHash};
+    const lease={triggerId,attempt:1,issuedAt:now-600000,expiresAt:now-300000,revokedAt:null,
+      scope:replaySourceScope,authorizedItems:['90101'],...(previouslyCorrelated?{operationReference:reference}:{})};
+    const record={...reference,toolName:'superops_tickets_apply_triage_plan',state:'Running',
+      expectedItems:['90101'],operationRequest:{approved:true},maxOperationLifetimeAt:new Date(now+600000).toISOString(),
+      itemStates:{'90101':{stage:'NoteDedupeChecked',lease:{expiresAt:new Date(now+60000).toISOString()}}}};
+    let reads=0;
+    const ledger={idFromName:name=>{assert.equal(name,'owner:'+ownerHash);return name;},get:()=>({fetch:async request=>{
+      reads++;assert.equal(request.method,'GET');return Response.json(record);
+    }})};
+    const {storage,coordinator}=replayCoordinator({...createInitialState(),runWriteLeases:[lease]},[],{SUPEROPS_OPERATION_LEDGER:ledger});
+    const response=await coordinator.fetch(new Request('https://coordinator.internal/internal/run-lease/check',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({triggerId,itemKey:'90101',operationReference:reference})}));
+    const result=await response.json();
+    assert.equal(response.status,200,JSON.stringify(result));assert.equal(result.allowed,true);assert.equal(reads,1);
+    assert(result.expiresAt>now&&result.expiresAt<=Date.now()+30000);
+    assert.equal(storage.value.runWriteLeases[0].expiresAt,lease.expiresAt,'the expired Agent permission is never renewed');
+    assert.deepEqual(storage.value.runWriteLeases[0].operationReference,reference);
+  }
+});
+
+test('expired continuation permission fails closed for unapproved, unclaimed or revoked work',async()=>{
+  for(const variant of ['agent_attempt','revoked','wrong_owner','unclaimed','unknown_item','expired_operation','unapproved','terminal','forged_deadline']) {
+    const now=Date.now(),triggerId='triage-92-00000000-0000-4000-8000-000000000092',ownerHash='12345678';
+    const reference={operationId:triggerId,ownerHash};
+    const lease={triggerId,attempt:1,issuedAt:now-600000,expiresAt:now-300000,revokedAt:null,
+      scope:replaySourceScope,authorizedItems:['90101'],operationReference:reference};
+    const record={...reference,toolName:'superops_tickets_apply_triage_plan',state:'Running',expectedItems:['90101'],
+      operationRequest:{approved:true},maxOperationLifetimeAt:new Date(now+600000).toISOString(),
+      itemStates:{'90101':{stage:'NoteDedupeChecked',lease:{expiresAt:new Date(now+60000).toISOString()}}}};
+    const body={triggerId,itemKey:'90101',operationReference:reference};
+    if(variant==='agent_attempt')body.attempt=1;
+    if(variant==='revoked')lease.revokedAt=now-1000;
+    if(variant==='wrong_owner')body.operationReference={...reference,ownerHash:'87654321'};
+    if(variant==='unclaimed')delete record.itemStates['90101'].lease;
+    if(variant==='unknown_item')record.expectedItems=['90102'];
+    if(variant==='expired_operation')record.maxOperationLifetimeAt=new Date(now-1000).toISOString();
+    if(variant==='unapproved')delete record.operationRequest;
+    if(variant==='terminal')record.state='Completed';
+    if(variant==='forged_deadline'){body.validatedContinuationLeaseUntil=now+60000;record.itemStates['90101'].lease.expiresAt=new Date(now-1000).toISOString();}
+    const ledger={idFromName:name=>name,get:()=>({fetch:async()=>Response.json(record)})};
+    const {coordinator}=replayCoordinator({...createInitialState(),runWriteLeases:[lease]},[],{SUPEROPS_OPERATION_LEDGER:ledger});
+    const response=await coordinator.fetch(new Request('https://coordinator.internal/internal/run-lease/check',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}));
+    assert.equal(response.status,409,variant);assert.equal((await response.json()).allowed,false,variant);
+  }
 });
 
 for(const status of ['in_progress','queued','suspended','unavailable']) {
@@ -749,6 +877,18 @@ test('rate-limit callback respects its delay then retries the same window',async
   await f.engine.processAlarm(); assert.equal(f.calls.length,0);
   f.advance(); assert.equal((await f.engine.processAlarm()).status,'accepted');
   assert.deepEqual(f.calls[0][1],f.scope);
+});
+
+test('a pending durable read retries its exact window without creating a shared throttle gate',async()=>{
+  const f=fixture('completed');
+  assert(toolDefinition().inputSchema.properties.status.enum.includes('retryable_read_pending'));
+  const result=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,
+    status:'retryable_read_pending',retryAfterSeconds:15,metadata});
+  assert.equal(result.status,'retry_scheduled');
+  assert.equal(f.state.sharedRateLimitUntil,null);
+  f.advance();assert.equal((await f.engine.processAlarm()).status,'accepted');
+  assert.deepEqual(f.calls[0][1],f.scope);
+  assert.equal(f.state.dispatchHistory.find(e=>e.event==='retry_scheduled').resultStatus,'retryable_read_pending');
 });
 test('unclassified possible-write failure is not retried',async()=>{
   const f=fixture('completed');

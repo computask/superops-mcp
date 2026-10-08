@@ -1625,7 +1625,8 @@ describe("deterministic end-to-end apply-triage harness", () => {
       const harness = new TriageHarness(`note-collector-stop-${stopOnRead}`);
       await harness.invoke();
       const waiting = await harness.record();
-      expect(waiting.state).toBe(kind === "pending" ? "Rescheduled" : "ContinuationRequired");
+      expect(waiting.state).toBe("Rescheduled");
+      expect(waiting.schedulingSucceeded).toBe(true);
       expect(waiting.failedItems).toEqual([]);
       expect(waiting.pendingItems).toEqual([TICKET_NUMBER]);
       expect(harness.history.count("superops.write.classification")).toBe(1);
@@ -1646,7 +1647,8 @@ describe("deterministic end-to-end apply-triage harness", () => {
     const harness = new TriageHarness(`note-read-budget-${budget}`);
     await harness.invoke({}, { SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: String(budget), SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8" });
     const waiting = await harness.record();
-    expect(waiting.state).toBe("ContinuationRequired");
+    expect(waiting.state).toBe("Rescheduled");
+    expect(waiting.schedulingSucceeded).toBe(true);
     expect(waiting.pendingItems).toEqual([TICKET_NUMBER]);
     expect(waiting.failedItems).toEqual([]);
     expect(waiting.itemStates[TICKET_NUMBER].writeAttempted).toBe(true);

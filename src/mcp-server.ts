@@ -11,7 +11,7 @@
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { assertTriageRunWriteLease, runWithTriageRunContext } from "./triage-run-lease.js";
+import { assertTriageRunWriteLease, recordTriageRunQuery, runWithTriageRunContext } from "./triage-run-lease.js";
 import { attachSafeErrorContract, safeSuperOpsErrorMetadata } from "./error-contract.js";
 import {
   CallToolRequestSchema,
@@ -1086,6 +1086,10 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
               : await executeToolCall(name, args, options.rateLimitProbe)
           )
         );
+        if (name === "superops_tickets_query" && !result.isError) {
+          try { await recordTriageRunQuery(args, JSON.parse(result.content.find(item => item.type === "text")?.text ?? "{}")); }
+          catch { /* An unavailable observation must not discard usable read evidence. */ }
+        }
         if (result.isError && ["read", "custom_query"].includes(classifyTool(name).category)) {
           const readFailure = safeSuperOpsErrorMetadata(dispatcherReadFailure(), true);
           if (readFailure) result = {...result, structuredContent: readFailure};

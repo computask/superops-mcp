@@ -7,14 +7,15 @@ const require=createRequire(import.meta.url);
 const wranglerRequire=createRequire(require.resolve('wrangler/package.json'));
 const {Miniflare}=wranglerRequire('miniflare');
 const code=readFileSync(new URL('./src/index.js',import.meta.url));
-assert.equal(createHash('sha256').update(code).digest('hex'),'d49abbdcb76026cd05a1f70764c56ce7077fb3aff0620babdc01aa1d2084599c','Reviewed production module must match the provenance record');
+assert.equal(createHash('sha256').update(code).digest('hex'),'34de299f63d8fa6af38a3528bf1ea9f02700c69b6ebadb074b4ac968dbdbf41b','Reviewed production module must match the provenance record');
 const config=JSON.parse(readFileSync(new URL('./wrangler.jsonc',import.meta.url),'utf8'));
 assert.equal(config.name,'support-triage-trigger');
 assert.equal(config.no_bundle,true);
 assert.equal(config.vars.TRIAGE_TRIGGER_SCOPE_MODE,'new-email-tickets');
 assert.equal(config.vars.TRIAGE_RECONCILIATION_ELIGIBILITY_SEPARATION_ENABLED,'true');
 assert.equal(config.vars.TRIAGE_ATTENTION_TAIL_ISOLATION_ENABLED,'true');
-assert.deepEqual(config.durable_objects.bindings,[{name:'TRIAGE_COORDINATOR',class_name:'TriageCoordinator'}]);
+assert.deepEqual(config.durable_objects.bindings,[{name:'TRIAGE_COORDINATOR',class_name:'TriageCoordinator'},
+  {name:'SUPEROPS_OPERATION_LEDGER',class_name:'SuperOpsOperationLedger',script_name:'superops-mcp'}]);
 assert.deepEqual(config.migrations,[{tag:'v1',new_sqlite_classes:['TriageCoordinator']}]);
 assert.equal(config.compatibility_date,'2026-08-14');
 assert(!/https:\/\/(?:eu)?api\.superops\.ai/.test(code.toString()));
@@ -36,6 +37,7 @@ try {
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST'})).status,401);
   assert.equal((await mf.dispatchFetch('http://local/admin/run/recover',{method:'POST'})).status,401);
   assert.equal((await mf.dispatchFetch('http://local/internal/run-lease/check',{method:'POST',body:'{}'})).status,404);
+  assert.equal((await mf.dispatchFetch('http://local/internal/run-query/observe',{method:'POST',body:'{}'})).status,404);
   assert.equal((await mf.dispatchFetch('http://local/admin/run/recover',{method:'POST',headers:{Authorization:'Bearer synthetic-replay-admin-token','Content-Type':'application/json'},body:'{}'})).status,409);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST',headers:{Authorization:'Bearer wrong-token'},body:'{}'})).status,401);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST',headers:{Authorization:'Bearer synthetic-replay-admin-token','Content-Type':'application/json'},body:'{}'})).status,400);

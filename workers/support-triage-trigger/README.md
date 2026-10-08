@@ -1,5 +1,23 @@
 # Email triage trigger — Git deployment
 
+8 October 2026: the MCP records content-free exact-window query candidates and
+associates the approved operation owner through its existing internal write-lease
+check. The coordinator reads only that owner's correlated operation through the
+existing `SUPEROPS_OPERATION_LEDGER` namespace. Verified durable completion can
+recover a missing callback; an acknowledged scheduled continuation is a handoff,
+not final ticket completion. Unseen/deferred candidates, unscheduled operations
+and ambiguous writes cannot be converted into success or replayed. No public
+internal endpoint, new namespace or migration is introduced.
+
+An expired Agent cannot renew its write permission. An internal MCP continuation
+may finish only a currently claimed item of the same approved, unrevoked,
+unexpired operation; the original Agent deadline remains unchanged. Empty or
+reversed created-time windows stop before dispatch. The additive callback status
+`retryable_read_pending` resumes a server-owned durable read without asserting a
+SuperOps throttle or setting the shared throttle gate. Refresh the Reporter's
+action catalogue and publish the canonical Agent instructions with this release.
+See `../../docs/triage-recovery-release-2026-10-08.md` for the eleven-issue record.
+
 5 October 2026: accepted runs persist their original trigger URL and every
 status-poll branch uses it. `WORKSPACE_AGENT_LEGACY_TRIGGER_URL` identifies the
 old channel for accepted records written before URL persistence existed. Fresh
@@ -62,7 +80,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-d49abbdcb76026cd05a1f70764c56ce7077fb3aff0620babdc01aa1d2084599c.
+34de299f63d8fa6af38a3528bf1ea9f02700c69b6ebadb074b4ac968dbdbf41b.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

@@ -15,6 +15,11 @@
       {
         "name": "TRIAGE_COORDINATOR",
         "class_name": "TriageCoordinator"
+      },
+      {
+        "name": "SUPEROPS_OPERATION_LEDGER",
+        "class_name": "SuperOpsOperationLedger",
+        "script_name": "superops-mcp"
       }
     ]
   },

@@ -652,6 +652,15 @@ describe("operation store", () => {
     });
   });
 
+  it("refreshes the public summary after continuation completes instead of retaining initial pending counts", () => {
+    const completed = record({ state: "Completed", expectedItems: ["57400"],
+      completedItems: ["57400"], pendingItems: [], unattemptedItems: [],
+      summary: { pending: 1, partialWrites: 1, verified: 0 },
+      compactResults: [{ ticketNumber: "57400", finalOutcome: "Left", verified: true }],
+      itemStates: { "57400": { ...record().itemStates["57400"], outcome: "Left" } } });
+    expect(operationResultView(completed).summary).toMatchObject({ left: 1, pending: 0, partialWrites: 0, verified: 1 });
+  });
+
   it("clears stale continuation failure text only after clean completion", async () => {
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();
@@ -2137,6 +2146,48 @@ describe("operation store", () => {
     expect(batches).toHaveLength(1);
   });
 
+  it("acknowledges an immediate budget-stop wake in the same durable scheduling request", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-18T00:08:00.000Z"));
+    const values = new Map<string, unknown>();
+    const batches: Array<Array<{ id: string; params: Record<string, unknown> }>> = [];
+    const alarms: number[] = [];
+    const durableObject = new SuperOpsOperationLedger({ storage: {
+      get: async <T = unknown>(key: string) => values.get(key) as T | undefined,
+      put: async (key: string, value: unknown) => { values.set(key, value); },
+      delete: async (key: string) => values.delete(key),
+      list: async <T = unknown>() => values as Map<string, T>,
+      setAlarm: async (time: number | Date) => { alarms.push(Number(time)); },
+    } }, {
+      SUPEROPS_CONTINUATION_ENABLED: "true", SUPEROPS_DURABLE_RETRY_ENABLED: "true",
+      SUPEROPS_CONTINUATION_WORKFLOW: { createBatch: async (batch) => {
+        batches.push(batch); return batch.map(({ id }) => ({ id }));
+      } },
+    });
+    const original = record({ operationId: "budget-wake", maxOperationLifetimeAt: "2026-07-18T01:00:00.000Z",
+      operationRequest: { expectedCandidateTicketNumbers: ["57400", "57401"], actions: [], batchId: "budget-wake" } });
+    original.itemStates["57401"] = { ...original.itemStates["57401"], stage: "NoteDedupeChecked",
+      writeAttempted: true, writeMayHaveSucceeded: true, partialWrite: true };
+    values.set("op:budget-wake", original);
+    const scheduled = await durableObject.fetch(new Request("https://operation.local/operations/budget-wake/schedule-continuation", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operationId: "budget-wake", ownerHash: original.ownerHash, reason: "ExecutionBudgetExceededError" }),
+    }));
+    await expect(scheduled.json()).resolves.toMatchObject({ state: "Rescheduled", schedulingSucceeded: true,
+      continuationMechanism: "workflow", nextEligibleTime: "2026-07-18T00:08:00.000Z",
+      itemStates: { "57401": { stage: "NoteDedupeChecked", writeAttempted: true, partialWrite: true } } });
+    expect(batches).toHaveLength(1);
+
+    // The pre-fix record had no nextEligibleTime or acknowledged wake. A status
+    // read repairs its alarm; the existing watchdog resumes that exact record.
+    values.set("op:budget-wake", original);
+    await durableObject.fetch(new Request("https://operation.local/operations/budget-wake"));
+    expect(alarms.at(-1)).toBeLessThanOrEqual(Date.now());
+    await durableObject.alarm();
+    expect(values.get("op:budget-wake")).toMatchObject({ state: "Rescheduled", schedulingSucceeded: true, watchdogWakeCount: 1 });
+    expect(batches).toHaveLength(2);
+  });
+
   it("retries Workflow creation with bounded backoff and one deterministic identity", async () => {
     const values = new Map<string, unknown>();
     const identities: string[] = [];
@@ -2410,19 +2461,22 @@ describe("operation store", () => {
       );
     });
   });
-  it("marks terminal stale and partial-write outcomes as completed with failures", async () => {
+  it.each([false, true])("distinguishes protected stale skips from stale writes (writeAttempted=%s)", async (writeAttempted) => {
     await runWithOperationStore({}, async () => {
       const store = getOperationStore();
       const staleItem = {
         ...record().itemStates["57401"],
         stage: "Stale" as const,
         outcome: "SkippedChangedSinceSnapshot",
+        writeAttempted,
+        writeMayHaveSucceeded: writeAttempted,
+        partialWrite: writeAttempted,
       };
       await store.put(record({
         itemStates: { "57400": record().itemStates["57400"], "57401": staleItem },
       }));
       await expect(store.get("op-1")).resolves.toMatchObject({
-        state: "CompletedWithFailures",
+        state: writeAttempted ? "CompletedWithFailures" : "Completed",
         staleItems: ["57401"],
       });
     });

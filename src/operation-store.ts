@@ -1976,7 +1976,11 @@ function normalizeOperationRecord(record: OperationLedgerRecord): OperationLedge
       // A terminal ledger is successful only when every item ended without a
       // failure-class outcome. Scheduling/wake completion alone is never a
       // success signal.
-      const hasFailureClassOutcome = failed.length > 0 || stale.length > 0 ||
+      const unsafeStale = stale.some((key) => {
+        const item = next.itemStates[key];
+        return item.writeAttempted || item.writeMayHaveSucceeded || item.partialWrite;
+      });
+      const hasFailureClassOutcome = failed.length > 0 || unsafeStale ||
         partialWriteCount > 0 || ambiguousWriteCount > 0;
       next.state = hasFailureClassOutcome ? "CompletedWithFailures" : "Completed";
       delete next.nextEligibleTime;
@@ -2813,6 +2817,7 @@ function recordWorkflowSchedulingSubrequest() {
     type: "custom",
     operationType: "workflow",
     operationName: "continuationCreateBatch",
+    allowSafetyMargin: true,
   });
 }
 
@@ -3197,7 +3202,7 @@ export function operationResultView(record: OperationLedgerRecord): Record<strin
     cancellationReason: record.cancellationReason,
     lastInvocationId: record.lastInvocationId,
     totals: operationTotals(record),
-    summary: record.summary,
+    summary: operationCurrentSummary(record),
     items: operationItemTelemetry(record),
     results: record.compactResults.map((value) => {
       if (!isRecordObject(value)) return value;
@@ -3205,6 +3210,31 @@ export function operationResultView(record: OperationLedgerRecord): Record<strin
       return diagnostic ? { ...value, clientIdentityDiagnostic: diagnostic } : value;
     }),
   }) as Record<string, unknown>;
+}
+
+function operationCurrentSummary(record: OperationLedgerRecord): Record<string, unknown> {
+  if (record.toolName !== "superops_tickets_apply_triage_plan") return record.summary;
+  const totals = operationTotals(record);
+  const items = record.expectedItems.map(key => record.itemStates[key]).filter(Boolean);
+  const outcomeCount = (outcomes: string[]) => items.filter(item => outcomes.includes(item.outcome ?? "")).length;
+  return {
+    ...record.summary,
+    resolved: totals.resolved,
+    updated: totals.updated,
+    left: outcomeCount(["Left"]),
+    skipped: totals.skipped + totals.stale,
+    blocked: outcomeCount(["Blocked"]),
+    failed: totals.failed,
+    pending: totals.pending,
+    rateLimitedPending: totals.waitingForRateLimit,
+    notFound: outcomeCount(["NotFound"]),
+    notAttempted: totals.unattempted,
+    unattempted: totals.unattempted,
+    attemptedWithoutAcceptedWrite: items.filter(item => item.writeAttempted &&
+      (item.acceptedPhysicalWrites?.length ?? 0) === 0 && item.verificationState !== "Verified").length,
+    partialWrites: totals.partialWrite,
+    verified: totals.successfulVerified,
+  };
 }
 
 function operationItemTelemetry(record: OperationLedgerRecord): Record<string, unknown>[] {
@@ -3229,6 +3259,7 @@ function operationItemTelemetry(record: OperationLedgerRecord): Record<string, u
       operationId: record.operationId,
       invocationId: record.lastInvocationId,
       itemId: itemKey,
+      expectedTicketId: item?.expectedTicketId,
       stage: item?.stage ?? "Unattempted",
       dispatcherRequestId: item?.dispatcherReceipt?.requestId,
       dispatcherState: item?.dispatcherReceipt?.state,
@@ -3481,6 +3512,19 @@ export class SuperOpsOperationLedger {
   }
 
   private watchdogAlarmAt(record: OperationLedgerRecord): number {
+    // Older budget stops could persist progress but exhaust the caller's
+    // remaining budget before its separate immediate-wake request. Recover the
+    // same approved operation, with the existing bounded watchdog and leases.
+    if (record.state === "ContinuationRequired" && record.pendingItems.length > 0 &&
+        record.continuationCount > 0 && record.operationRequest &&
+        record.toolName === "superops_tickets_apply_triage_plan" &&
+        this.env.SUPEROPS_CONTINUATION_ENABLED === "true" &&
+        this.env.SUPEROPS_DURABLE_RETRY_ENABLED === "true") {
+      const leaseExpiry = Math.max(0, ...Object.values(record.itemStates)
+        .map((item) => Date.parse(item.lease?.expiresAt ?? ""))
+        .filter(Number.isFinite));
+      return Math.max(Date.parse(record.updatedAt) + RESCHEDULED_STALL_GRACE_MS, leaseExpiry + 1_000);
+    }
     if (record.state !== "Rescheduled" || !record.nextEligibleTime ||
         record.continuationMechanism !== "workflow" || record.schedulingSucceeded !== true) {
       return Number.NaN;
@@ -4062,6 +4106,7 @@ export class SuperOpsOperationLedger {
         await this.deleteApprovedPrivateNotes(this.state.storage, record.operationId);
         return json({ error: "Not found" }, 404);
       }
+      if (record && Number.isFinite(this.watchdogAlarmAt(record))) await this.setRecordAlarm(record);
       return record ? json(record) : json({ error: "Not found" }, 404);
     }
 
@@ -4149,18 +4194,26 @@ export class SuperOpsOperationLedger {
       if (action === "schedule-continuation") {
         const params = (await request.json()) as OperationScheduleContinuationParams;
         assertRecordOwner(record, params.ownerHash);
-        const alreadyScheduledFor = record.nextEligibleTime === params.nextEligibleTime &&
-          record.schedulingSucceeded === true;
         const scheduledAt = nowIso();
+        // Persist and acknowledge an immediate Workflow wake in this Durable
+        // Object invocation, rather than requiring another caller subrequest
+        // after the budget-stop cleanup has consumed its reserved margin.
+        const nextEligibleTime = params.nextEligibleTime ?? (
+          record.toolName === "superops_tickets_apply_triage_plan" &&
+          this.env.SUPEROPS_CONTINUATION_ENABLED === "true" &&
+          this.env.SUPEROPS_DURABLE_RETRY_ENABLED === "true" ? scheduledAt : undefined
+        );
+        const alreadyScheduledFor = record.nextEligibleTime === nextEligibleTime &&
+          record.schedulingSucceeded === true;
         const creditedRecord = creditDurableWaitToOperationLifetime(
           cloneRecord(record),
-          params.nextEligibleTime,
+          nextEligibleTime,
           scheduledAt
         );
         const updated = normalizeOperationRecord({
           ...creditedRecord,
-          state: params.nextEligibleTime ? "Rescheduled" : "ContinuationRequired",
-          nextEligibleTime: params.nextEligibleTime,
+          state: nextEligibleTime ? "Rescheduled" : "ContinuationRequired",
+          nextEligibleTime,
           workflowId: params.workflowId ?? record.workflowId,
           currentPauseReason: params.reason,
           terminalFailureReason: undefined,

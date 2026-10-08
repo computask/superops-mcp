@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
+import { currentOwnerHash } from "./operation-store.js";
 
 export const TRIAGE_RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
 export interface TriageLeaseEnvironment {
@@ -24,12 +25,38 @@ export function triageLeaseCapability(env: TriageLeaseEnvironment) {
     typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function" };
 }
 
+/** Content-free proof of a complete first query. Losing this optional
+ * observation leaves the coordinator conservative; it never grants writes. */
+export async function recordTriageRunQuery(args: Record<string, unknown>, result: unknown): Promise<void> {
+  const env = environments.getStore(), run = runs.getStore();
+  if (!run || !triageLeaseCapability(env ?? {}).enforced || !result || typeof result !== "object") return;
+  const value = result as {records?: Array<{displayId?: unknown}>; pagination?: {complete?: boolean}; errors?: unknown[]};
+  const single = (value: unknown, expected: string) => value === expected || Array.isArray(value) && value.length === 1 && value[0] === expected;
+  const permitted = new Set(["createdFrom", "createdTo", "status", "sources", "fieldProfile", "sortOrder", "timeField", "page", "pageOffset", "maxPages", "maxRecords", "fields"]);
+  if (value.pagination?.complete !== true || !Array.isArray(value.records) || value.records.length > 50 ||
+      value.errors?.length || args.fieldProfile !== "minimal" || !single(args.status, "New Calls") || !single(args.sources, "EMAIL") ||
+      args.page !== undefined && args.page !== 1 || args.pageOffset !== undefined && args.pageOffset !== 0 ||
+      Object.keys(args).some(key => !permitted.has(key)) || args.sortOrder && args.sortOrder !== "DESC") return;
+  const ticketNumbers = value.records.map(item => item.displayId);
+  if (!ticketNumbers.every((id): id is string => typeof id === "string" && /^\d{1,24}$/.test(id)) || new Set(ticketNumbers).size !== ticketNumbers.length) return;
+  let counted: ReturnType<typeof recordTypedSubrequestStart> | undefined;
+  try {
+    counted = recordTypedSubrequestStart({type: "custom", operationType: "durableObject", operationName: "triageRunQueryObservation", allowSafetyMargin: true});
+    const stub = env!.TRIAGE_RUN_COORDINATOR!.get(env!.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
+    const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-query/observe", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({...run, createdFrom: args.createdFrom, createdTo: args.createdTo, ticketNumbers}), signal: AbortSignal.timeout(5000),
+    }));
+    recordSubrequestFinish(counted, response.status, response.ok);
+  } catch { if (counted) recordSubrequestFinish(counted, "observationUnavailable", false); }
+}
+
 /** Permission to continue a correlated automatic run, never approval of a plan.
  * Call with live ticket metadata before mutation-start checkpoints, and again
  * without metadata immediately before every new dispatcher mutation POST.
  * Receipt GETs remain available for reconciliation after expiry. */
 export async function assertTriageRunWriteLease(input: {
-  operationId?: string; itemKey?: string; ticketCreatedTime?: string; ticketSource?: string;
+  operationId?: string; ownerHash?: string; itemKey?: string; ticketCreatedTime?: string; ticketSource?: string;
 } = {}): Promise<void> {
   const env = environments.getStore();
   if (env?.TRIAGE_RUN_WRITE_GUARD_ENABLED !== "true") return;
@@ -39,13 +66,18 @@ export async function assertTriageRunWriteLease(input: {
   if (run && operationTrigger && run.triggerId !== operationTrigger) throw new Error("Triage run correlation mismatch; no new mutation permitted.");
   if (run && input.operationId && !operationTrigger) throw new Error("Automatic triage requires its exact Trigger ID as batchId.");
   const triggerId = operationTrigger ?? run!.triggerId;
+  const ownerPrefix = operationTrigger && input.operationId?.endsWith(`:${operationTrigger}`)
+    ? input.operationId.slice(0, -(operationTrigger.length + 1)) : undefined;
+  const ownerHash = input.ownerHash ?? (ownerPrefix && /^[a-f0-9]{8}(?:[a-f0-9]{56})?$/.test(ownerPrefix)
+    ? ownerPrefix : currentOwnerHash());
   if (!triageLeaseCapability(env).enforced) throw new Error("Triage run write guard unavailable; no new mutation permitted.");
   const counted = recordTypedSubrequestStart({ type: "custom", operationType: "durableObject", operationName: "triageRunLeaseCheck" });
   try {
     const stub = env.TRIAGE_RUN_COORDINATOR!.get(env.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-lease/check", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ triggerId, ...(run ? {attempt: run.attempt} : {}), ...input }),
+      body: JSON.stringify({ triggerId, ...(run ? {attempt: run.attempt} : {}), ...input,
+        ...(operationTrigger ? {operationReference: {operationId: operationTrigger, ownerHash}} : {}) }),
       signal: AbortSignal.timeout(5000),
     }));
     const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number};
