@@ -470,6 +470,50 @@ function fixture(status, age = 120000, configOverrides = {}) {
   return {engine,calls,alarms,scope,config,get state(){return state;},seed:patch=>{state={...state,...patch};},setNow:value=>{now=Date.parse(value);},setRunStatus:value=>{agentStatus=value;},advance:()=>{now=state.dueAt ?? now+40000;},expire:()=>{now+=40000;}};
 }
 
+function existingNoteCompletion(outcome = 'skipped') {
+  return {failureStage:'evidence_recovery',ticketsConsidered:1,ticketsCompleted:1,ticketsDeferred:0,
+    ticketOutcomes:[{ticketNumber:'90101',outcome,stage:'evidence_recovery',reasonCode:'already_handled'}],
+    mcpExecution:{executionTraceId:'synthetic-existing-note',invocationId:'synthetic-existing-note-invocation',
+      operationId:'synthetic-existing-note',toolName:'superops_tickets_triage_evidence_recover',
+      durationMs:5000,subrequestsUsed:24,subrequestBudget:45,subrequestSafetyMargin:8,retryCount:0,
+      requestTraceTruncated:false,requestsByType:{duplicateNoteCheck:1,verificationRead:2,dispatcherPoll:4,custom:17}}};
+}
+
+test('verified existing-note completion accepts both callback outcome labels without another run',async()=>{
+  for(const outcome of ['skipped','completed']) {
+    const f=fixture('completed');
+    f.seed({retryCount:2,emptyTargetedRecoveryPending:true});
+    const scopeBefore=structuredClone(f.scope);
+    const result=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'complete',
+      metadata:existingNoteCompletion(outcome)});
+    assert.equal(result.status,'complete',outcome);
+    assert.equal(f.state.pending,false);
+    assert.deepEqual(f.state.dispatchHistory.find(e=>e.event==='batch_completed').scopeCreatedFrom,scopeBefore.createdFrom);
+    assert.equal(f.calls.length,0);
+    assert(!f.state.dispatchHistory.some(e=>e.event==='retry_scheduled'));
+  }
+});
+
+test('an already-handled label cannot replace existing-note verification proof',async()=>{
+  for(const outcome of ['skipped','completed']) {
+    for(const missing of ['telemetry','noteCheck','verificationRead','wrongTool','diagnostics','terminalOperation','reason']) {
+      const f=fixture('completed');
+      const metadata=existingNoteCompletion(outcome);
+      if(missing==='telemetry') delete metadata.mcpExecution;
+      if(missing==='noteCheck') metadata.mcpExecution.requestsByType.duplicateNoteCheck=0;
+      if(missing==='verificationRead') metadata.mcpExecution.requestsByType.verificationRead=0;
+      if(missing==='wrongTool') metadata.mcpExecution.toolName='superops_tickets_query';
+      if(missing==='diagnostics') metadata.mcpExecution.failureDiagnostics=[{stage:'evidence_recovery',errorCode:'private_note_check_unavailable'}];
+      if(missing==='terminalOperation') metadata.operationStatus={state:'CompletedWithFailures',failedCount:1};
+      if(missing==='reason') metadata.ticketOutcomes[0].reasonCode='unknown';
+      const result=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'complete',metadata});
+      assert.notEqual(result.status,'complete',outcome+':'+missing);
+      assert(!f.state.dispatchHistory.some(e=>e.event==='batch_completed'));
+      assert.equal(f.calls.length,0);
+    }
+  }
+});
+
 test('a zero-width tail never becomes a dispatchable Agent scope', () => {
   const f = fixture('completed');
   const now = Date.parse('2026-09-24T06:00:00Z');

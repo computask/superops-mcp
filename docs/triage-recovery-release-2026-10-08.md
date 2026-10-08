@@ -13,9 +13,9 @@ same-ID edits are expected protected skips. The recurring monitor remains paused
 | 2 | Note collection hides an execution stop | Existing note collectors propagate execution stops instead of returning incomplete notes | Prior deployed fix retained; budget and note-read harness coverage. |
 | 3 | Pending dispatcher reads become terminal failures | Existing durable read journal resumes the same receipt; Agent and coordinator use `retryable_read_pending` before apply | Live read-back of 63826 first returned pending, then resumed the same receipt `a1b96e17-6218-4e18-96d6-3926cf8ae7ac` successfully by GET. The Reporter catalogue includes the new status. Automatic Agent recovery of this particular pending-read case still needs runtime observation. |
 | 4 | Invalid ledger stage transitions | Preserve progressed checkpoints, including exact `ClassificationWriteStarted` and `StatusWriteStarted` identity when execution stops or a reconciliation unit cannot fit | Cloudflare Workflow attempts for 63877 proved `StatusWriteStarted -> WriteAmbiguous` was rejected twice, with seven intervening no-progress wakes. Five new regressions reproduce this gap and verify lease release, bounded read-only reconciliation and no duplicate mutation or note. |
-| 5 | Agent terminates without its callback | Server-owned query/operation correlation and read-only authoritative ledger recovery in the trigger | Synthetic actual-module tests recover verified completion without another Agent run or write; unknown subsets, owner mismatch and ambiguity remain fenced. Provider runs with no approved operation still require attention. |
+| 5 | Agent terminates without its callback | Server-owned query/operation correlation and read-only authoritative ledger recovery in the trigger | Natural automatic batch 3570 recovered verified durable completion of 63883 at 17:30:41 UTC without another Agent write. Actual-module tests retain fences for unknown subsets, owner mismatch and ambiguity. Provider runs with no approved operation still require attention. |
 | 6 | Empty/reversed scopes reach the Agent repeatedly | Reject invalid scope construction and persisted windows before dispatch | Actual-module tests verify zero Agent calls and no retry loop, preserving the independent queued tail. |
-| 7 | Callback or saved summary conflicts with durable results | Derive summaries from item checkpoints, expose authoritative counts and use the correlated ledger for callback reconciliation | Tests cover stale summary values, false completion, terminal failures and scheduled partial progress. A handoff is distinguished from final completion. |
+| 7 | Callback or saved summary conflicts with durable results | Derive summaries from item checkpoints, expose authoritative counts and use the correlated ledger for callback reconciliation; recognize both already-handled outcome labels only with unchanged evidence proof | Automatic overlap batch 3571 reported 63883 as completed/already_handled, with valid current evidence-recovery telemetry, but the classifier expected skipped and retried. The new actual-module regression reproduced this failure before the correction; missing note checks, verification, telemetry, reason or non-failing operation state still cannot establish completion. |
 | 8 | Ambiguous upstream writes | Preserve no-replay quarantine and expose retained immutable IDs for authoritative read-back | Stored upstream replies for 63806, 63826, 63862 and 63877 contain an internal execution error with `updateTicket:null`. Fresh reads show the first three classification targets remain unapplied; 63877 has a verified classification and one private note but remains New Calls. SuperOps' underlying error remains unresolved. See the separate content-free incident record. |
 | 9 | Mutable client/status/subject edits are treated as identity defects | Compare immutable ID first, then the timestamp fence before mutable metadata; preparation derives canonical client-name hashes | Same-ID staff-edit regressions skip safely with zero writes. Immutable mismatch and unknown client identity remain blocked. |
 | 10 | Prepared arguments change between prepare, intent and apply | Preparation returns explicit `dryRun:false`; Agent reuses one unchanged complete object and checksum | Checksum/review safeguards remain strict. The exact changed fields of historical failures were not established; the release prevents reconstruction/default drift. |
@@ -23,7 +23,7 @@ same-ID edits are expected protected skips. The recurring monitor remains paused
 
 ## Validation and publication
 
-Local release checks: 796 Vitest tests, three policy text checks, 91 trigger
+Local release checks: 796 Vitest tests, three policy text checks, 93 trigger
 recovery tests, trigger workerd boundary/provenance checks, both builds and
 `git diff --check`. None of these tests mutates live SuperOps data.
 
@@ -43,6 +43,12 @@ verified against the committed policy by the contract checker. `Triage Result
 Reporter v2` was refreshed and its live schema includes `retryable_read_pending`.
 No action-review constraints were weakened.
 
+The callback clarification was subsequently published to this same Agent and
+read back with no pending changes. Its normalized policy SHA-256 is
+`20e1ed2626b693257699555533a2d89eea5924a0bac0980d162d75b8fe6e5c0f`,
+again verified against the canonical source. The enabled API channel retains its
+existing identity; no Agent, channel, credentials or access policy was recreated.
+
 After publication, natural automatic callbacks completed at 16:46:43 and
 16:48:42 UTC for batch 3569, both reporting zero ticket outcomes. This establishes
 that dispatch and callbacks are working, but does not validate writes on a new
@@ -50,11 +56,29 @@ candidate, the exact API-run instruction version, or every recovery branch.
 The Workspace Agents management plugin is not currently exposed in this session;
 its absence did not prevent publication through the Agent editor.
 
-The remaining closure work is a fresh candidate-bearing automatic run with
-verified effects or protected staff skips, and resolution/reconciliation of the
-four upstream write incidents. Historical unknown/orphan scopes remain fenced;
-they are not silently declared successful or replayed. The paused monitor has
-not been restarted.
+The later candidate-bearing automatic run processed 63883 in operation
+`triage-3570-992a052a-3993-4772-93df-df4fc2b5c45f`, created at 17:30:08 UTC and
+completed at 17:30:38. Its item reached CompletedAfterAmbiguousWriteVerification
+with two accepted physical writes and no pending, failed, partial or ambiguous
+items. The coordinator recovered that success at 17:30:41 UTC. A fresh read
+confirmed all four approved classification fields, New Calls as required by the
+leave action, and exactly one private triage note with complete note availability.
+
+Overlap batch 3571 exposed the callback label mismatch described in issue 7.
+Its third attempt retained the required evidence-recovery telemetry, yet the
+strict skipped-only classifier retried. The follow-up accepts the equivalent
+completed/already_handled label only when all existing evidence checks pass and
+clarifies the canonical Agent and per-dispatch instructions. An earlier callback
+without telemetry remains unproven. The later pending-read callback omitted its
+failure diagnostics; the instructions now explicitly retain diagnostics from
+all returned text blocks. A pending read is never reported as an empty success.
+
+Remaining closure work includes fresh runtime observation of this overlap
+correction and pending-read callback branch, and resolution/reconciliation of the
+four upstream write incidents. The visible API channel is enabled on the same
+published Agent; the provider's exact version ID for batch 3570 has not been
+retrieved. Historical unknown/orphan scopes remain fenced; they are not silently
+declared successful or replayed. The paused monitor has not been restarted.
 
 The complete stored response bodies and release backups remain only in private
 ignored `.wrangler/` storage. No customer text, credentials or real note bodies

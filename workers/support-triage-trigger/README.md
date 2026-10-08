@@ -1,5 +1,17 @@
 # Email triage trigger — Git deployment
 
+8 October automatic-run validation: ticket 63883 completed through the original
+durable operation, and a fresh read confirmed all four approved classification
+fields and exactly one private triage note. A later overlap run reported that
+verified existing-note skip as `completed` instead of `skipped`, so the strict
+callback classifier scheduled unnecessary retries. The classifier now accepts
+either label only with the same evidence-recovery tool, current note check,
+verification-read counts, complete accounting and absence of failure/ambiguity.
+Missing proof still cannot complete. The Agent prompt explicitly separates the
+`ticketsCompleted` count from the `skipped` outcome and retains pending-read
+diagnostics from every returned text block. Two actual-module regressions cover
+the observed shape and the rejected missing-proof variants.
+
 8 October 2026: the MCP records content-free exact-window query candidates and
 associates the approved operation owner through its existing internal write-lease
 check. The coordinator reads only that owner's correlated operation through the
@@ -80,7 +92,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-34de299f63d8fa6af38a3528bf1ea9f02700c69b6ebadb074b4ac968dbdbf41b.
+ed090a4351be71c3fa5de2dbbeb405108a34696c2fe6856495eeae43bec128d8.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
