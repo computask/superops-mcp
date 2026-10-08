@@ -1689,6 +1689,9 @@ async function collectCanonicalTicketNotes(params: {
       }
       return true;
     } catch (error) {
+      // Execution stops must reach the durable continuation runner. Treating
+      // them as unavailable notes terminalizes a partially applied ticket.
+      if (error instanceof DurableCheckpointError || isExecutionStopError(error)) throw error;
       if (isRateLimitError(error)) rateLimitError = error;
       errors.push(`Notes could not be fetched for ticketId ${normalized}: ${safeErrorMessage(error)}`);
       return false;

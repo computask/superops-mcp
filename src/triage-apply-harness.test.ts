@@ -6,8 +6,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { runWithCredentials } from "./client.js";
-import { runWithExecutionConfig, runWithExecutionContext, type ExecutionConfigInput } from "./execution.js";
+import { SuperOpsClient, runWithCredentials } from "./client.js";
+import { ExecutionBudgetExceededError, getExecutionState, runWithExecutionConfig, runWithExecutionContext, type ExecutionConfigInput } from "./execution.js";
 import {
   currentOwnerHash,
   getOperationStore,
@@ -1599,6 +1599,58 @@ describe("deterministic end-to-end apply-triage harness", () => {
     );
     expect(noteReadAfterWrite?.sequence).toBeLessThan(harness.history.first("superops.write.status"));
     harness.assertGlobalInvariants(record);
+  });
+
+  it.each([1, 2])("continues when note collection propagates a budget stop on read %s", async (stopOnRead) => {
+    const originalQuery = SuperOpsClient.prototype.query;
+    let noteReads = 0;
+    const spy = vi.spyOn(SuperOpsClient.prototype, "query").mockImplementation(async function(this: SuperOpsClient, query, variables) {
+      if (query.includes("getTicketNoteList") && ++noteReads === stopOnRead) {
+        const state = getExecutionState();
+        if (!state) throw new Error("Expected execution state.");
+        throw new ExecutionBudgetExceededError(state, 1);
+      }
+      return originalQuery.call(this, query, variables);
+    });
+    try {
+      const harness = new TriageHarness(`note-collector-stop-${stopOnRead}`);
+      await harness.invoke();
+      const waiting = await harness.record();
+      expect(waiting.state).toBe("ContinuationRequired");
+      expect(waiting.failedItems).toEqual([]);
+      expect(waiting.pendingItems).toEqual([TICKET_NUMBER]);
+      expect(harness.history.count("superops.write.classification")).toBe(1);
+      expect(harness.history.count("superops.write.note")).toBe(stopOnRead - 1);
+      const terminal = await harness.resumeUntilTerminal();
+      expect(terminal.state).toBe("Completed");
+      expect(itemResult(terminal)).toMatchObject({ finalOutcome: "Resolved", finalVerificationState: "Verified" });
+      expect(harness.history.count("superops.write.classification")).toBe(1);
+      expect(harness.history.count("superops.write.note")).toBe(1);
+      expect(harness.history.count("superops.write.status")).toBe(1);
+      harness.assertGlobalInvariants(terminal);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it.each([{ budget: 35, notes: 0 }, { budget: 45, notes: 1 }])("resumes budget-stopped note reads at budget $budget without replaying successful writes", async ({ budget, notes }) => {
+    const harness = new TriageHarness(`note-read-budget-${budget}`);
+    await harness.invoke({}, { SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: String(budget), SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8" });
+    const waiting = await harness.record();
+    expect(waiting.state).toBe("ContinuationRequired");
+    expect(waiting.pendingItems).toEqual([TICKET_NUMBER]);
+    expect(waiting.failedItems).toEqual([]);
+    expect(waiting.itemStates[TICKET_NUMBER].writeAttempted).toBe(true);
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(notes);
+    expect(harness.history.count("superops.write.status")).toBe(0);
+    const terminal = await harness.resumeUntilTerminal();
+    expect(terminal.state).toBe("Completed");
+    expect(itemResult(terminal)).toMatchObject({ finalOutcome: "Resolved", finalVerificationState: "Verified" });
+    expect(harness.history.count("superops.write.classification")).toBe(1);
+    expect(harness.history.count("superops.write.note")).toBe(1);
+    expect(harness.history.count("superops.write.status")).toBe(1);
+    harness.assertGlobalInvariants(terminal);
   });
 
   it("resumes a rate-limited note check after verified classification without replay", async () => {
