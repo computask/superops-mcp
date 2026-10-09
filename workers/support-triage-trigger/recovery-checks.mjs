@@ -945,6 +945,13 @@ test('pending first-read recovery stops at the configured retry cap',async()=>{
   const f=fixture('completed');f.seed({runWriteLeases:[firstReadLease(f)],retryCount:f.config.resultMaxRetries});f.expire();
   await f.engine.processAlarm();assert.equal(f.calls.length,0);assert.equal(f.state.needsAttentionScopes.length,1);
 });
+test('an accepted pending-read callback cannot dispatch again after the fixed journal deadline',async()=>{
+  const f=fixture('completed');f.seed({runWriteLeases:[firstReadLease(f)]});
+  await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'retryable_read_pending',metadata:{failureStage:'bounded_query'}});
+  f.setNow('2026-09-24T06:10:00.001Z');
+  await f.engine.processAlarm();assert.equal(f.calls.length,0);assert.equal(f.state.needsAttentionScopes.length,1);
+  assert(f.state.dispatchHistory.some(event=>event.event==='batch_failed'&&event.failureDiagnostics?.some(d=>d.errorCode==='dispatcher_read_recovery_expired')));
+});
 for(const status of ['in_progress','queued','suspended','failed','unavailable']) test('pending-read proof cannot replay a '+status+' run',async()=>{
   const f=fixture(status);f.seed({runWriteLeases:[firstReadLease(f)]});f.expire();await f.engine.processAlarm();
   assert.equal(f.calls.length,0);assert(!f.state.dispatchHistory.some(event=>event.event==='read_pending_recovered'));

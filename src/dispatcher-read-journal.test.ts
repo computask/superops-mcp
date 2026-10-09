@@ -72,8 +72,7 @@ describe("durable dispatcher read receipts", () => {
         const payload = JSON.parse(String(init.body));
         expect(payload.variables.input.pageSize).toBe(100);
         return Response.json({requestId: ID, source: "superops-mcp", status: "queued",
-          nextRetryAt: new Date(START + delay).toISOString(), readRecovery: {
-            startedAt: new Date(START).toISOString(), deadlineAt: new Date(START + 900_000).toISOString(), throttleCount: 0}},
+          nextRetryAt: new Date(START + delay).toISOString()},
           {status: 202, headers: {"X-Dispatcher-Request-Id": ID, "X-Dispatcher-Status": "queued"}});
       }
       expect(url.endsWith(`/v1/requests/${ID}`)).toBe(true);
@@ -301,6 +300,10 @@ describe("durable dispatcher read receipts", () => {
     invalid.readRecovery = {durable: true};
     expect(safeSuperOpsErrorMetadata(invalid, true)).toMatchObject({dispatcherTerminal: false, dispatcherPending: false, retryable: false, resumeSameRequest: false});
     expect(safeSuperOpsErrorMetadata(new DispatcherPendingError(ID, "synthetic-private-key", "queued"), true)).toMatchObject({retryable: false});
+    const expiredPending = new DispatcherPendingError(ID,"synthetic-private-key","queued",undefined,undefined,"READ_RECOVERY_EXPIRED");
+    expiredPending.readRecovery={durable:true,deadlineAt:new Date(START+900_000).toISOString()};
+    expect(safeSuperOpsErrorMetadata(expiredPending,true)).toMatchObject({errorClass:"DispatcherReadRecoveryExpired",
+      dispatcherPending:true,dispatcherTerminal:false,retryable:false,retryScope:"none",resumeSameRequest:true});
   });
 
   it("keeps a failed synchronous acknowledgement terminal on the first call and later automatic execution", async () => {

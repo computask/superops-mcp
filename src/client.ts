@@ -95,14 +95,24 @@ export class SuperOpsClient {
             undefined, readSession.record.upstreamHttpStatus, readSession.record.errorClassification);
         }
         if (error instanceof DispatcherPendingError && readSession) {
-          error.readRecovery = {durable: true,
-            nextEligibleAt: readSession.record.nextEligibleAt, deadlineAt: readSession.record.recoveryDeadlineAt};
-          const state = dispatcherReadRecoveryState(error.state);
-          error.message = state.pending
+          // A newly queued receipt may lack an upstream recovery deadline.
+          // Its persisted creation time supplies a fixed local bound; a later
+          // upstream deadline may shorten it, never extend it.
+          const deadlineMs = Math.min(Date.parse(readSession.record.createdAt) + 900_000,
+            Date.parse(readSession.record.recoveryDeadlineAt ?? "") || Infinity);
+          const pendingError = dispatcherReadRecoveryState(error.state).pending && Date.now() >= deadlineMs
+            ? new DispatcherPendingError(error.requestId,error.idempotencyKey,error.state,error.retryAfter,
+              error.upstreamHttpStatus,"READ_RECOVERY_EXPIRED",error.dispatcherHttpStatus)
+            : error;
+          pendingError.readRecovery = {durable: true,
+            nextEligibleAt: readSession.record.nextEligibleAt, deadlineAt: new Date(deadlineMs).toISOString()};
+          const state = dispatcherReadRecoveryState(pendingError.state);
+          pendingError.message = state.pending
             ? "Dispatcher read remains pending; resume the original receipt after its saved retry time."
             : state.terminal ? "Dispatcher read reached a terminal outcome; inspect the original receipt."
               : "Dispatcher read recovery requires review; inspect the original receipt.";
-          recordDispatcherReadFailure(error);
+          recordDispatcherReadFailure(pendingError);
+          error = pendingError;
         }
         lastError = error;
         const retryable = shouldRetrySuperOpsRequest(error, isWrite);

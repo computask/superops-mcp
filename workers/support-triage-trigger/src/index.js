@@ -3980,6 +3980,13 @@ var CoordinatorEngine = class {
     const state = normalizeState(await this.deps.store.load());
     const leaseRecovery = await recoverExpiredWriteLease(this, state, now);
     if (leaseRecovery) return leaseRecovery;
+    const readLease = state.runWriteLeases.find(lease => lease.triggerId === state.pendingTriggerId && lease.attempt === state.dispatchAttempt);
+    if (state.executionPhase === "retry_wait" && readLease?.pendingRead && !readLease.queryCompleted &&
+        !readLease.operationReference && !readLease.applyIntentObserved && !readLease.writeCheckObserved &&
+        Date.parse(readLease.pendingRead.deadlineAt) <= now) {
+      return await this.stopAutomaticRetry(state,{triggerId:state.pendingTriggerId,attempt:state.dispatchAttempt,status:"terminal_failure",
+        metadata:{failureStage:"bounded_query",failureDiagnostics:[{stage:"bounded_query",errorCode:"dispatcher_read_recovery_expired"}]}},now);
+    }
     migrateLegacyAttentionBlockedQueue(state);
     clearExpiredSharedRateLimit(state, now);
     const scheduledAt = nextScheduledAt(state, now, this.deps.config);

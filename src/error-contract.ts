@@ -168,8 +168,9 @@ export function safeSuperOpsErrorMetadata(
   if (error instanceof DispatcherPendingError) {
     if (allowReadRetry && error.readRecovery?.durable) {
       const {pending, terminal} = dispatcherReadRecoveryState(error.state);
-      return createSafeToolErrorMetadata({errorClass: pending ? "DispatcherReadPending" : terminal ? "DispatcherReadTerminal" : "DispatcherReadRecoveryError", retryable: pending,
-        retryScope: pending ? "read" : "none", reasonCode: error.errorClassification === "READ_RECOVERY_EXPIRED" ? "dispatcher_read_recovery_expired"
+      const expired = error.errorClassification === "READ_RECOVERY_EXPIRED";
+      return createSafeToolErrorMetadata({errorClass: expired && pending ? "DispatcherReadRecoveryExpired" : pending ? "DispatcherReadPending" : terminal ? "DispatcherReadTerminal" : "DispatcherReadRecoveryError", retryable: pending && !expired,
+        retryScope: pending && !expired ? "read" : "none", reasonCode: expired ? "dispatcher_read_recovery_expired"
           : terminal ? "dispatcher_read_terminal" : pending ? "dispatcher_read_pending" : "dispatcher_read_recovery_requires_review",
         rateLimited: error.rateLimited, retryAfterSeconds: safeRetryAfterSeconds(error.retryAfter),
         dispatcherRequestId: error.requestId, dispatcherState: error.state, dispatcherPending: pending,

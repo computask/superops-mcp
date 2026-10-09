@@ -24,6 +24,11 @@ It atomically revokes the old write lease before scheduling a new attempt.
 Successful query observation, apply intent, any write check, operation identity,
 authorized items or an unsafe rejected callback disables this fallback. Pending
 reads do not assert an upstream throttle or set the shared rate-limit gate.
+Newly queued reads without an upstream deadline use the journal's persisted
+creation time plus fifteen minutes. A later upstream deadline can shorten this
+bound but cannot extend it. An expired pending receipt is explicitly
+non-retryable; it remains available for receipt-only inspection. Accepted
+pending-read callbacks also stop automatically at the fixed deadline.
 
 For an already quarantined historical run, Sam-only Cloudflare Access protects
 `POST /admin/triage-read-recovery` on the MCP. Supply the exact trigger, attempt,
