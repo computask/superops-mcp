@@ -56,6 +56,26 @@ describe("automatic triage write leases", () => {
       createdFrom: args.createdFrom, createdTo: args.createdTo, ticketNumbers: ["90007"]});
     expect(await fetcher.mock.calls[1][0].json()).toMatchObject({operationReference: {operationId: triggerId, ownerHash: expect.stringMatching(/^[a-f0-9]{8}$/)}});
   });
+  it("observes only a server-owned durable pending first read and retains no result body", async () => {
+    const {env,fetcher} = environment();
+    const args = {createdFrom: "2026-10-09T10:00:00.000Z", createdTo: "2026-10-09T10:02:00.000Z",
+      status: ["New Calls"], sources: ["EMAIL"], fieldProfile: "minimal"};
+    const result = {records: [], pagination: {complete: false}, errors: [{message: "synthetic private body"}]};
+    const failure = {errorClass: "DispatcherReadPending", dispatcherPending: true, readRecoveryDurable: true,
+      resumeSameRequest: true, dispatcherRequestId: "synthetic-read", nextEligibleAt: "2026-10-09T10:01:00.000Z",
+      readRecoveryDeadlineAt: "2026-10-09T10:15:00.000Z", idempotencyKey: "synthetic-private-key"};
+    await runWithTriageLeaseEnvironment(env, () => runWithTriageRunContext({triggerId, attempt: 1}, async () => {
+      for (const change of [{readRecoveryDurable: false}, {dispatcherPending: false}, {resumeSameRequest: false}, {errorClass: "NetworkError"}]) {
+        await recordTriageRunQuery(args,result,{...failure,...change});
+      }
+      await recordTriageRunQuery(args,{...result,records:[{displayId:"90007"}]},failure);
+      expect(fetcher).not.toHaveBeenCalled();
+      await recordTriageRunQuery(args,result,failure);
+    }));
+    const observed = await fetcher.mock.calls[0][0].json();
+    expect(observed).toMatchObject({triggerId, attempt: 1, pendingRead: {requestId: "synthetic-read", ownerHash: expect.stringMatching(/^[a-f0-9]{8}$/)}});
+    expect(JSON.stringify(observed)).not.toMatch(/private|message|errorClass|idempotencyKey/);
+  });
   it("blocks a continuation's new POST after expiry while permitting same-receipt GET reconciliation", async () => {
     const {env, fetcher: guard} = environment(false);
     const upstream = vi.fn(async (_url: string, _init: RequestInit) => Response.json({source: "superops-mcp", status: "succeeded", requestId: "synthetic-receipt", httpStatus: 200, response: {data: {ok: true}}}));

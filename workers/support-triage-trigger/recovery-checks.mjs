@@ -303,7 +303,7 @@ test('email trigger directs the Agent to the email policy, never the scheduled p
 function historyRow(entry) {
   const row={event_id:entry.eventId,occurred_at:entry.at,batch_sequence:entry.batchSequence??null,event_name:entry.event,
     scope_mode:entry.scopeMode??null,scope_created_from:entry.scopeCreatedFrom??null,scope_created_to:entry.scopeCreatedTo??null,
-    failure_kind:entry.failureKind??null,error_type:entry.errorType??null,error_code:entry.errorCode??null,
+    failure_kind:entry.failureKind??null,error_type:entry.errorType??null,error_code:entry.errorCode??null,attempt:entry.attempt??null,
     agent_run_status:entry.agentRunStatus??null,agent_run_id_present:entry.agentRunIdPresent?1:0,
     failure_diagnostics_json:entry.failureDiagnostics?JSON.stringify(entry.failureDiagnostics):null,
     replay_of_event_id:entry.replayOfEventId??null,ticket_number:entry.ticketNumber??null,
@@ -905,6 +905,122 @@ test('a genuinely missing callback stays fenced, never blindly replayed',async()
   assert.equal(f.calls.length,0);
   assert.equal(f.state.needsAttentionScopes.length,1);
   assert(f.state.dispatchHistory.some(e=>e.event==='orphan_recovered'));
+});
+
+function firstReadLease(f, change = {}) {
+  const accepted=f.state.lastAcceptedTrigger, issuedAt=Date.parse(accepted.acceptedAt);
+  return {triggerId:accepted.triggerId,attempt:1,runId:accepted.runId,scope:f.scope,
+    issuedAt,expiresAt:issuedAt+f.config.acceptedRunMaxAgeMs,revokedAt:null,authorizedItems:[],
+    pendingRead:{requestId:'synthetic-first-read',ownerHash:'12345678',
+      nextEligibleAt:'2026-09-24T06:01:00.000Z',deadlineAt:'2026-09-24T06:10:00.000Z'},...change};
+}
+test('a missing callback after a trusted pending first read resumes the same exact window after revocation',async()=>{
+  const f=fixture('completed');f.seed({runWriteLeases:[firstReadLease(f)],lastResultReport:{triggerId:'prior-unrelated-run',attempt:1,status:'terminal_failure',
+    metadata:{operationId:'prior-operation',operationStatus:{state:'Failed'}}}});f.expire();
+  assert.equal((await f.engine.processAlarm()).status,'retry_scheduled');
+  assert.equal(f.calls.length,0);
+  assert.equal(f.state.runWriteLeases[0].revokedAt!==null,true);
+  assert.equal(f.state.sharedRateLimitUntil,null,'a queued read is not an account rate-limit assertion');
+  assert.deepEqual(f.state.pendingTriggerScope,f.scope);
+  assert.equal(f.state.needsAttentionScopes.length,0);
+  assert(f.state.dispatchHistory.some(event=>event.event==='read_pending_recovered'));
+  f.advance();assert.equal((await f.engine.processAlarm()).status,'accepted');
+  assert.deepEqual(f.calls[0].slice(0,3),['email-triage:9001',f.scope,2]);
+  const latest=f.state.runWriteLeases.at(-1);
+  assert.equal(latest.pendingRead.requestId,'synthetic-first-read');
+  assert.equal(latest.pendingRead.deadlineAt,'2026-09-24T06:10:00.000Z');
+  const state=structuredClone(f.state);
+  assert.equal(checkRunWriteLease(state,f.config,{triggerId:'email-triage:9001',attempt:1},Date.parse('2026-09-24T06:02:00Z')).allowed,false);
+});
+for(const blocker of [
+  {queryCompleted:true}, {applyIntentObserved:true}, {writeCheckObserved:true}, {rejectedCallbackUnsafe:true},
+  {operationReference:{operationId:'email-triage:9001',ownerHash:'12345678'}}, {authorizedItems:['90101']},
+  {pendingRead:{requestId:'synthetic-first-read',ownerHash:'12345678',nextEligibleAt:'2026-09-24T06:01:00.000Z',deadlineAt:'2026-09-24T05:59:00.000Z'}}
+]) test('missing-callback read recovery refuses '+Object.keys(blocker)[0],async()=>{
+  const f=fixture('completed');f.seed({runWriteLeases:[firstReadLease(f,blocker)]});f.expire();
+  await f.engine.processAlarm();assert.equal(f.calls.length,0);assert.equal(f.state.needsAttentionScopes.length,1);
+  assert(!f.state.dispatchHistory.some(event=>event.event==='read_pending_recovered'));
+});
+test('pending first-read recovery stops at the configured retry cap',async()=>{
+  const f=fixture('completed');f.seed({runWriteLeases:[firstReadLease(f)],retryCount:f.config.resultMaxRetries});f.expire();
+  await f.engine.processAlarm();assert.equal(f.calls.length,0);assert.equal(f.state.needsAttentionScopes.length,1);
+});
+for(const status of ['in_progress','queued','suspended','failed','unavailable']) test('pending-read proof cannot replay a '+status+' run',async()=>{
+  const f=fixture(status);f.seed({runWriteLeases:[firstReadLease(f)]});f.expire();await f.engine.processAlarm();
+  assert.equal(f.calls.length,0);assert(!f.state.dispatchHistory.some(event=>event.event==='read_pending_recovered'));
+});
+test('pending observations are exact-scope, owner/receipt/deadline stable, and successful queries permanently end first-read recovery',async()=>{
+  const now=Date.now(),scope={mode:'new-email-tickets',source:'EMAIL',createdFrom:new Date(now-60000).toISOString(),createdTo:new Date(now).toISOString()};
+  const triggerId='triage-44-00000000-0000-4000-8000-000000000044';
+  const lease={triggerId,attempt:1,scope,issuedAt:now-30000,expiresAt:now+270000,revokedAt:null,authorizedItems:[]};
+  const seed={...createInitialState(),pending:true,executionPhase:'awaiting_result',pendingTriggerId:triggerId,pendingTriggerScope:scope,dispatchAttempt:1,runWriteLeases:[lease]};
+  const {coordinator,storage}=replayCoordinator(seed);
+  const pendingRead={requestId:'synthetic-pending',ownerHash:'12345678',nextEligibleAt:new Date(now+60000).toISOString(),deadlineAt:new Date(now+900000).toISOString()};
+  const observe=body=>coordinator.fetch(new Request('https://coordinator.internal/internal/run-query/observe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({triggerId,attempt:1,createdFrom:scope.createdFrom,createdTo:scope.createdTo,...body})}));
+  assert.equal((await observe({pendingRead})).status,200);
+  for(const changes of [{requestId:'other'},{ownerHash:'87654321'},{deadlineAt:new Date(now+800000).toISOString()}]){
+    assert.equal((await observe({pendingRead:{...pendingRead,...changes}})).status,409);
+  }
+  assert.equal((await observe({createdTo:new Date(now+1).toISOString(),pendingRead})).status,409);
+  assert.equal((await observe({ticketNumbers:['90101']})).status,200);
+  assert.equal(storage.value.runWriteLeases[0].queryCompleted,true);
+  assert.equal((await observe({pendingRead})).status,409);
+});
+test('fixed journal labels and all emitted internal statuses satisfy the same callback schema and parser',()=>{
+  const schema=toolDefinition().inputSchema.properties.metadata.properties.mcpExecution.properties.requestTrace.items;
+  const statuses=schema.properties.status.oneOf[1].enum;
+  for(const operationName of ['dispatcherRead.open','dispatcherRead.checkpoint','dispatcherRead.delivered']) {
+    assert(new RegExp(schema.properties.operationName.pattern).test(operationName));
+    for(const status of statuses) assert(parseSafeMcpExecution({requestTrace:[{index:1,type:'custom',operationType:'durableObject',operationName,status,ok:false}]}));
+  }
+  for(const operationName of ['dispatcherRead.customer-body','unbounded.other','dispatcherRead.open.secret']) {
+    assert.equal(parseSafeMcpExecution({requestTrace:[{index:1,type:'custom',operationName}]}),null);
+  }
+});
+test('rejected callback diagnostics retain only fixed field paths and never raw arguments',async()=>{
+  const observations=[];
+  const result=await handleTriageResultMcp(new Request('http://local/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'triage_result_report',arguments:{triggerId:'synthetic-trigger',attempt:1,status:'retryable_read_pending',metadata:{mcpExecution:{requestTrace:[{index:1,type:'custom',operationName:'private customer body'}]}}}}})}),{reportRejected:async value=>observations.push(value),report:async()=>{throw Error('Invalid callback must never reach report');}});
+  assert.equal((await result.json()).result.isError,true);
+  assert.deepEqual(observations[0].validationFields,['metadata.mcpExecution.requestTrace[0]']);
+  assert(!JSON.stringify(observations).includes('private customer body'));
+});
+function operatorReadRecovery(change={}) {
+  const triggerId='triage-24-00000000-0000-4000-8000-000000000024';
+  const source={...replayFailureEvent,agentRunStatus:'completed',attempt:1};
+  const lease={triggerId,attempt:1,runId:'apirun_old',scope:replaySourceScope,issuedAt:1,expiresAt:2,revokedAt:null,authorizedItems:[],...change};
+  const seed={...createInitialState(),dispatchHistorySequence:41,dispatchHistory:[source],runWriteLeases:[lease],
+    needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true};
+  const f=replayCoordinator(seed,[source],{TRIAGE_WRITE_GUARD_SERVICE:{fetch:async()=>Response.json({protocol:'triage-run-lease-v1',enforced:true})}});
+  const body={triggerId,attempt:1,sourceEventId:41,ticketNumber:'90101',dryRun:true,proof:{requestId:'synthetic-read',
+    createdFrom:replaySourceScope.createdFrom,createdTo:replaySourceScope.createdTo,captureIds:['00000000-0000-4000-8000-000000000024']}};
+  const request=patch=>f.coordinator.fetch(new Request('https://coordinator.internal/internal/admin/read-recovery',{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,...patch})}));
+  return {...f,body,request};
+}
+test('authenticated operator recovery previews without dispatch and schedules one exact ticket using the original read identity',async()=>{
+  const f=operatorReadRecovery();const before=structuredClone(f.storage.value);
+  const preview=await f.request({});const previewBody=await preview.json();
+  assert.equal(preview.status,200,JSON.stringify(previewBody));
+  assert.deepEqual(f.storage.value,before);
+  const response=await f.request({dryRun:false});assert.equal(response.status,200);
+  assert.equal((await response.json()).originalReadIdentityPreserved,true);
+  assert.equal(f.storage.value.pendingTriggerId,f.body.triggerId);
+  assert.equal(f.storage.value.dispatchAttempt,1,'next dispatch increments the attempt instead of resetting it');
+  assert.deepEqual(f.storage.value.pendingTriggerScope,{...replaySourceScope,targetTicketNumbers:['90101'],replayOfEventId:41});
+  assert.deepEqual(f.storage.value.needsAttentionScopes,[replaySourceScope]);
+  assert(f.storage.value.runWriteLeases[0].revokedAt!==null);
+  assert.equal((await f.request({dryRun:false})).status,409);
+});
+for(const blocker of [{queryCompleted:true},{queryTicketNumbers:[]},{authorizedItems:['90101']},{operationReference:{operationId:'old'}},
+  {applyIntentObserved:true},{writeCheckObserved:true},{rejectedCallbackUnsafe:true},{manualReadRecoveryRequested:true}]) {
+  test('operator recovery refuses '+Object.keys(blocker)[0],async()=>{
+    const f=operatorReadRecovery(blocker);assert.equal((await f.request({dryRun:false})).status,409);assert.equal(f.storage.value.pending,false);
+  });
+}
+test('operator recovery refuses a changed scope or missing live guard',async()=>{
+  const f=operatorReadRecovery();assert.equal((await f.request({proof:{...f.body.proof,createdTo:'2026-09-25T11:00:00.000Z'}})).status,409);
+  f.coordinator.env.TRIAGE_WRITE_GUARD_SERVICE=undefined;
+  assert.equal((await f.request({dryRun:false})).status,409);
 });
 test('triage apply-not-attempted callback with complete diagnostics retries',async()=>{
   const f=fixture('completed');

@@ -25,27 +25,40 @@ export function triageLeaseCapability(env: TriageLeaseEnvironment) {
     typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function" };
 }
 
-/** Content-free proof of a complete first query. Losing this optional
+/** Content-free proof of a complete or durably pending first query. Losing this optional
  * observation leaves the coordinator conservative; it never grants writes. */
-export async function recordTriageRunQuery(args: Record<string, unknown>, result: unknown): Promise<void> {
+export async function recordTriageRunQuery(args: Record<string, unknown>, result: unknown, readFailure?: unknown): Promise<void> {
   const env = environments.getStore(), run = runs.getStore();
   if (!run || !triageLeaseCapability(env ?? {}).enforced || !result || typeof result !== "object") return;
   const value = result as {records?: Array<{displayId?: unknown}>; pagination?: {complete?: boolean}; errors?: unknown[]};
   const single = (value: unknown, expected: string) => value === expected || Array.isArray(value) && value.length === 1 && value[0] === expected;
   const permitted = new Set(["createdFrom", "createdTo", "status", "sources", "fieldProfile", "sortOrder", "timeField", "page", "pageOffset", "maxPages", "maxRecords", "fields"]);
-  if (value.pagination?.complete !== true || !Array.isArray(value.records) || value.records.length > 50 ||
-      value.errors?.length || args.fieldProfile !== "minimal" || !single(args.status, "New Calls") || !single(args.sources, "EMAIL") ||
+  if (!Array.isArray(value.records) || value.records.length > 50 ||
+      args.fieldProfile !== "minimal" || !single(args.status, "New Calls") || !single(args.sources, "EMAIL") ||
       args.page !== undefined && args.page !== 1 || args.pageOffset !== undefined && args.pageOffset !== 0 ||
       Object.keys(args).some(key => !permitted.has(key)) || args.sortOrder && args.sortOrder !== "DESC") return;
   const ticketNumbers = value.records.map(item => item.displayId);
   if (!ticketNumbers.every((id): id is string => typeof id === "string" && /^\d{1,24}$/.test(id)) || new Set(ticketNumbers).size !== ticketNumbers.length) return;
+  const complete = value.pagination?.complete === true && !value.errors?.length;
+  const failure = readFailure as Record<string, unknown> | undefined;
+  const timestamp = (value: unknown): value is string => typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && Number.isFinite(Date.parse(value));
+  const pending = !complete && value.pagination?.complete === false && ticketNumbers.length === 0 &&
+    failure?.errorClass === "DispatcherReadPending" && failure.dispatcherPending === true &&
+    failure.readRecoveryDurable === true && failure.resumeSameRequest === true &&
+    typeof failure.dispatcherRequestId === "string" && /^[A-Za-z0-9_-]{1,160}$/.test(failure.dispatcherRequestId) &&
+    timestamp(failure.nextEligibleAt) && timestamp(failure.readRecoveryDeadlineAt);
+  if (!complete && !pending) return;
+  const pendingRead = pending ? {requestId: failure!.dispatcherRequestId, ownerHash: currentOwnerHash(),
+    nextEligibleAt: failure!.nextEligibleAt, deadlineAt: failure!.readRecoveryDeadlineAt} : undefined;
   let counted: ReturnType<typeof recordTypedSubrequestStart> | undefined;
   try {
     counted = recordTypedSubrequestStart({type: "custom", operationType: "durableObject", operationName: "triageRunQueryObservation", allowSafetyMargin: true});
     const stub = env!.TRIAGE_RUN_COORDINATOR!.get(env!.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-query/observe", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({...run, createdFrom: args.createdFrom, createdTo: args.createdTo, ticketNumbers}), signal: AbortSignal.timeout(5000),
+      body: JSON.stringify({...run, createdFrom: args.createdFrom, createdTo: args.createdTo,
+        ...(pendingRead ? {pendingRead} : {ticketNumbers})}), signal: AbortSignal.timeout(5000),
     }));
     recordSubrequestFinish(counted, response.status, response.ok);
   } catch { if (counted) recordSubrequestFinish(counted, "observationUnavailable", false); }

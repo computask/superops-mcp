@@ -819,7 +819,7 @@ function safeFailureDiagnosticMessage(value: unknown): string | undefined {
     .replace(/[A-Za-z]:\\[^\s)"']+/g, "[redacted-path]")
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]")
     .replace(/\b(subject|description|content|note|requester|client|company|customer)\s*[:=]\s*[^;]+/gi, "$1: [redacted]");
-  return message.length > 512 ? `${message.slice(0, 512)}...` : message;
+  return message.length > 512 ? `${message.slice(0, 509)}...` : message;
 }
 
 function triageFailureDiagnostics(
@@ -846,7 +846,9 @@ function triageFailureDiagnostics(
       stage: "mcp_tool",
       errorType: "McpToolError",
       errorCode: "tool_error_without_failed_request",
-      message: safeFailureDiagnosticMessage(errorSummaryFromResult(result)),
+      message: result.structuredContent?.readRecoveryDurable === true
+        ? safeFailureDiagnosticMessage(`${result.structuredContent.errorClass}: ${result.structuredContent.reasonCode}`)
+        : safeFailureDiagnosticMessage(errorSummaryFromResult(result)),
     };
     if (failedRequest) {
       diagnostic.errorType = safeFailureDiagnosticToken(failedRequest.errorClass);
@@ -1086,16 +1088,28 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
               : await executeToolCall(name, args, options.rateLimitProbe)
           )
         );
-        if (name === "superops_tickets_query" && !result.isError) {
-          try { await recordTriageRunQuery(args, JSON.parse(result.content.find(item => item.type === "text")?.text ?? "{}")); }
+        if (["read", "custom_query"].includes(classifyTool(name).category)) {
+          // Reporting retains partial records instead of throwing. Its failed
+          // first page must still expose the server-owned durable receipt.
+          const readFailure = safeSuperOpsErrorMetadata(dispatcherReadFailure(), true);
+          if (readFailure) {
+            let unusableQuery = false;
+            if (name === "superops_tickets_query") {
+              try {
+                const query = JSON.parse(result.content.find(item => item.type === "text")?.text ?? "{}");
+                unusableQuery = query.pagination?.complete === false && Array.isArray(query.records) && query.records.length === 0;
+              } catch { /* Keep the existing error classification for non-JSON results. */ }
+            }
+            result = {...result, ...(unusableQuery ? {isError: true} : {}), structuredContent: readFailure};
+          }
+        }
+        if (name === "superops_tickets_query") {
+          try { await recordTriageRunQuery(args, JSON.parse(result.content.find(item => item.type === "text")?.text ?? "{}"), result.structuredContent); }
           catch { /* An unavailable observation must not discard usable read evidence. */ }
         }
-        if (result.isError && ["read", "custom_query"].includes(classifyTool(name).category)) {
-          const readFailure = safeSuperOpsErrorMetadata(dispatcherReadFailure(), true);
-          if (readFailure) result = {...result, structuredContent: readFailure};
-        }
         metadata = enrichAuditMetadataFromResult(name, result, metadata);
-        const errorSummary = errorSummaryFromResult(result);
+        const errorSummary = result.structuredContent?.readRecoveryDurable === true
+          ? `Dispatcher read recovery: ${result.structuredContent.reasonCode}` : errorSummaryFromResult(result);
         finishExecution(result.isError ? "toolError" : "completed");
         auditToolCall({
           toolName: name,

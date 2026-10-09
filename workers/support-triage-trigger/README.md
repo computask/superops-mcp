@@ -1,5 +1,14 @@
 # Email triage trigger — Git deployment
 
+9 October 2026: pending first-query recovery now receives independent,
+content-free MCP observations. A missing callback can resume only the exact
+read-only window after provider completion and old-lease revocation, before the
+fixed deadline/retry cap, with no apply intent, write check or operation. The
+Reporter schema/parser share the bounded internal journal-label/status contract.
+Rejected callbacks retain fixed validation field paths only. Sam-only MCP admin
+recovery of historical first-read-only runs preserves receipt identity and all
+attention fences. See `../../docs/triage-pending-read-release-2026-10-09.md`.
+
 8 October automatic-run validation: ticket 63883 completed through the original
 durable operation, and a fresh read confirmed all four approved classification
 fields and exactly one private triage note. A later overlap run reported that
@@ -92,7 +101,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-ed090a4351be71c3fa5de2dbbeb405108a34696c2fe6856495eeae43bec128d8.
+722f61db91968fd98023710a3936922853a128d6168cc334428b3e7b68e6ea00.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

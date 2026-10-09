@@ -9,6 +9,10 @@ import { safeSuperOpsErrorMetadata } from "./error-contract.js";
 import { createMcpServer } from "./mcp-server.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
+import { createRequire } from "node:module";
+import { runWithTriageLeaseEnvironment } from "./triage-run-lease.js";
 
 const START = Date.parse("2026-10-07T12:00:00.000Z");
 const ID = "9714f5f6-e9c5-4e03-95b8-de82d37b7bac";
@@ -56,6 +60,68 @@ function call(ns: ReturnType<typeof namespace>, owner = "synthetic-reader", auto
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("durable dispatcher read receipts", () => {
+  it.each([194_012, 91_207])("hands a partial first query through the real Reporter contract and resumes after %i ms", async delay => {
+    vi.useFakeTimers(); vi.setSystemTime(START);
+    const ns = namespace(), methods: string[] = [], observations: Record<string, unknown>[] = [];
+    const triggerId = "triage-9-00000000-0000-4000-8000-000000000009";
+    const args = {createdFrom: new Date(START - 60_000).toISOString(), createdTo: new Date(START + 60_000).toISOString(),
+      status: ["New Calls"], sources: ["EMAIL"], fieldProfile: "minimal", maxPages: 1, maxRecords: 50};
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      methods.push(init?.method ?? "GET");
+      if (init?.method === "POST") {
+        const payload = JSON.parse(String(init.body));
+        expect(payload.variables.input.pageSize).toBe(100);
+        return Response.json({requestId: ID, source: "superops-mcp", status: "queued",
+          nextRetryAt: new Date(START + delay).toISOString(), readRecovery: {
+            startedAt: new Date(START).toISOString(), deadlineAt: new Date(START + 900_000).toISOString(), throttleCount: 0}},
+          {status: 202, headers: {"X-Dispatcher-Request-Id": ID, "X-Dispatcher-Status": "queued"}});
+      }
+      expect(url.endsWith(`/v1/requests/${ID}`)).toBe(true);
+      return Response.json({requestId: ID, source: "superops-mcp", status: "succeeded", httpStatus: 200,
+        response: {data: {getTicketList: {tickets: [{ticketId: "900000000000001", displayId: "90101", status: "New Calls",
+          createdTime: new Date(START).toISOString(), updatedTime: new Date(START).toISOString(), source: "EMAIL"}],
+          listInfo: {page: 1, pageSize: 100, hasMore: false, totalCount: 1}}}}});
+    }));
+    const env = {TRIAGE_RUN_WRITE_GUARD_ENABLED: "true", TRIAGE_RUN_COORDINATOR: {
+      idFromName: (name: string) => name, get: () => ({fetch: async (request: Request) => {
+        observations.push(await request.json() as Record<string, unknown>); return Response.json({observed: true});
+      }}),
+    }};
+    async function rpc(attempt: number) {
+      const server = createMcpServer(), client = new Client({name: "pending-query-regression", version: "1"});
+      const [a,b] = InMemoryTransport.createLinkedPair(); await server.connect(a); await client.connect(b);
+      try { return await runWithTriageLeaseEnvironment(env, () => call(ns, "synthetic-reader", true, "outer", () =>
+        client.callTool({name: "superops_tickets_query", arguments: {...args, triageCapture: {triggerId, attempt}}})));
+      } finally {await client.close(); await server.close();}
+    }
+    const first = await rpc(1) as {isError?: boolean; structuredContent?: unknown; content: Array<{text: string}>};
+    expect(first.isError).toBe(true);
+    const primary = JSON.parse(first.content[0].text);
+    expect(primary).toMatchObject({records: [], pagination: {complete: false, truncated: true}, errorClass: "DispatcherReadPending",
+      readRecoveryDurable: true, dispatcherPending: true, resumeSameRequest: true, dispatcherRequestId: ID, rateLimited: false});
+    expect(first.structuredContent).toMatchObject({dispatcherRequestId: ID, retryScope: "read"});
+    expect(primary.mcpExecution.failureDiagnostics.length).toBeGreaterThan(0);
+    expect(observations[0]).toMatchObject({triggerId, attempt: 1, pendingRead: {requestId: ID, deadlineAt: new Date(START + 900_000).toISOString()}});
+    const source = readFileSync("workers/support-triage-trigger/src/index.js", "utf8");
+    const executable = source.replace(/\nexport \{[\s\S]*$/, "");
+    const reporter = runInNewContext(executable + ";({parseSafeMcpExecution,toolDefinition})", {crypto, Request, Response, URL, Date, TextEncoder, TextDecoder, console});
+    const accepted = reporter.parseSafeMcpExecution(primary.mcpExecution);
+    expect(accepted).not.toBeNull();
+    expect(JSON.parse(JSON.stringify(accepted))).toEqual(primary.mcpExecution);
+    const require = createRequire(import.meta.url), Ajv = require("ajv");
+    const validate = new Ajv({strict: false, validateFormats: false}).compile(reporter.toolDefinition().inputSchema);
+    const callback = {triggerId, attempt: 1, status: "retryable_read_pending", metadata: {
+      failureStage: "bounded_query", ticketsConsidered: 0, ticketsCompleted: 0, ticketsDeferred: 0, mcpExecution: primary.mcpExecution}};
+    expect(validate(callback), JSON.stringify(validate.errors)).toBe(true);
+    expect(JSON.stringify(first)).not.toContain(records(ns)[0].idempotencyKey);
+    vi.advanceTimersByTime(delay + 1000);
+    const second = await rpc(2) as {isError?: boolean; content: Array<{text: string}>};
+    expect(second.isError).not.toBe(true);
+    expect(JSON.parse(second.content[0].text)).toMatchObject({records: [{displayId: "90101"}], pagination: {complete: true}});
+    expect(methods).toEqual(["POST", "GET"]);
+    expect(observations[1]).toMatchObject({triggerId, attempt: 2, ticketNumbers: ["90101"]});
+    expect(records(ns)[0]).toMatchObject({generation: 1, requestId: ID, delivered: true});
+  });
   it("resumes one receipt through six throttles and fresh execution/object instances without another POST", async () => {
     vi.useFakeTimers(); vi.setSystemTime(START);
     const ns = namespace(), network: Array<{method: string; body?: string; key: string; url: string}> = [];

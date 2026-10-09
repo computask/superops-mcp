@@ -212,8 +212,18 @@ export function safeStructuredErrorMetadata(value: unknown): SafeToolErrorMetada
 
 /** Preserve existing per-item results; expose identical bounded metadata to clients using either channel. */
 export function attachSafeErrorContract(result: ToolResult): ToolResult {
-  if (!result.isError) return result;
+  if (!result.isError && !isRecord(result.structuredContent)) return result;
+  if (!result.isError && typeof result.structuredContent?.errorClass !== "string") return result;
   const metadata = safeStructuredErrorMetadata(result.structuredContent);
+  // Clients which expose only the first text block must see the same recovery
+  // contract, without losing any retained partial records or execution trace.
+  const content = result.content.map((item, index) => {
+    if (index !== 0 || item.type !== "text") return item;
+    try {
+      const primary = JSON.parse(item.text) as unknown;
+      return isRecord(primary) ? {...item, text: JSON.stringify({...primary, ...metadata})} : item;
+    } catch { return item; }
+  });
   return { ...result, structuredContent: metadata,
-    content: [...result.content, { type: "text", text: JSON.stringify(metadata) }] };
+    content: [...content, { type: "text", text: JSON.stringify(metadata) }] };
 }

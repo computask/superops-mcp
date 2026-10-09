@@ -31,6 +31,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { runWithCredentials } from "./client.js";
 import { runWithTriageLeaseEnvironment, triageLeaseCapability, type TriageLeaseEnvironment } from "./triage-run-lease.js";
+import { firstReadRecoveryProof } from "./triage-read-recovery.js";
 import {
   blockedToolNamesByCategory,
   chatGptDirectBlockedToolNames,
@@ -1204,6 +1205,38 @@ async function handleBaseWorkerFetch(
       headers.set("Cache-Control", "no-store, private");
       return new Response(stored.body, {status: stored.status, headers});
     } catch { return json({error: "GraphQL capture storage unavailable"}, 503, privateHeaders); }
+  }
+
+  if (url.pathname === "/admin/triage-read-recovery") {
+    const privateHeaders = {"Cache-Control": "no-store, private"};
+    if (request.method !== "POST") return json({error: "Method not allowed"},405,{...privateHeaders,Allow:"POST"});
+    const access = await requireAllowedAccessUser(request,env,new Set([TRIAGE_CAPTURE_ADMIN_EMAIL]));
+    if (access instanceof Response) return new Response(access.body,{status:access.status,headers:privateHeaders});
+    let body: Record<string,unknown>;
+    try {
+      const text = await request.text();
+      if (text.length > 2048) throw Error("oversized");
+      body = JSON.parse(text);
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw Error("shape");
+    } catch { return json({error:"invalid_recovery_request"},400,privateHeaders); }
+    if (Object.keys(body).some(key=>!["triggerId","attempt","sourceEventId","ticketNumber","dryRun"].includes(key)) ||
+        typeof body.triggerId !== "string" || !TRIAGE_CAPTURE_TRIGGER_ID_PATTERN.test(body.triggerId) ||
+        !Number.isInteger(body.attempt) || Number(body.attempt)<1 || Number(body.attempt)>99 ||
+        !Number.isSafeInteger(body.sourceEventId) || Number(body.sourceEventId)<1 ||
+        typeof body.ticketNumber !== "string" || !/^\d{1,24}$/.test(body.ticketNumber) || typeof body.dryRun !== "boolean") {
+      return json({error:"invalid_recovery_request"},400,privateHeaders);
+    }
+    if (!triageLeaseCapability(env).enforced) return json({error:"coordinator_guard_unavailable"},503,privateHeaders);
+    try {
+      const captures = await readTriageAgentMcpCaptures(env,body.triggerId,Number(body.attempt),5,0);
+      const proof = captures.ok ? firstReadRecoveryProof(await captures.json()) : undefined;
+      if (!proof) return json({error:"complete_pending_first_read_proof_required"},409,privateHeaders);
+      const coordinator = env.TRIAGE_RUN_COORDINATOR!.get(env.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
+      const response = await coordinator.fetch(new Request("https://coordinator.internal/internal/admin/read-recovery",{
+        method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...body,proof}),signal:AbortSignal.timeout(5000)
+      }));
+      return new Response(response.body,{status:response.status,headers:{...privateHeaders,"Content-Type":"application/json"}});
+    } catch { return json({error:"recovery_dependency_unavailable"},503,privateHeaders); }
   }
 
   if (url.pathname === "/admin/triage-agent-captures") {

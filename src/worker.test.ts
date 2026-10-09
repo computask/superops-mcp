@@ -679,6 +679,17 @@ describe("Cloudflare Worker entrypoint", () => {
       attempt: 2,
     });
   });
+  it("keeps first-read recovery behind Sam Access and fails closed without a live coordinator guard",async()=>{
+    const url=`https://${DIRECT_HOST}/admin/triage-read-recovery`,env=chatGptEnv();
+    const body=JSON.stringify({triggerId:`triage-2-${crypto.randomUUID()}`,attempt:1,sourceEventId:9,ticketNumber:"90101",dryRun:true});
+    const request=(jwt?:string)=>new Request(url,{method:"POST",headers:{"Content-Type":"application/json",...(jwt?{"CF-Access-Jwt-Assertion":jwt}:{})},body});
+    expect((await worker.fetch(request(),env)).status).toBe(403);
+    expect((await worker.fetch(request(await cloudflareAccessJwt(ADDITIONAL_ALLOWED_EMAIL)),env)).status).toBe(403);
+    const allowed=await worker.fetch(request(await cloudflareAccessJwt(ALLOWED_EMAIL)),env);
+    expect(allowed.status).toBe(503);
+    expect(allowed.headers.get("Cache-Control")).toBe("no-store, private");
+    expect((await worker.fetch(new Request(url),env)).status).toBe(405);
+  });
 
   it("captures live MCP dispatcher exchanges and restricts raw GraphQL retrieval to Sam", async () => {
     const namespace = createOperationLedgerNamespace();

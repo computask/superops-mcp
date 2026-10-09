@@ -1,9 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { SuperOpsError, SuperOpsHttpError } from "./client.js";
-import { createSafeToolErrorMetadata, safeSuperOpsErrorMetadata } from "./error-contract.js";
+import { attachSafeErrorContract, createSafeToolErrorMetadata, safeSuperOpsErrorMetadata } from "./error-contract.js";
 import { boundedToolResult } from "./utils/tool-result.js";
 
 describe("safe read error contract", () => {
+  it("preserves usable partial records and exposes recovery in both client channels", () => {
+    const result = attachSafeErrorContract({content: [{type: "text", text: JSON.stringify({records: [{displayId: "90101"}], pagination: {complete: false}})}],
+      structuredContent: {errorClass: "DispatcherReadPending", retryScope: "read", retryable: true, dispatcherPending: true,
+        readRecoveryDurable: true, dispatcherRequestId: "synthetic-read", secret: "synthetic-private"}});
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(result.content[0].text!)).toMatchObject({records: [{displayId: "90101"}], dispatcherPending: true});
+    expect(result.structuredContent).toMatchObject({dispatcherRequestId: "synthetic-read"});
+    expect(JSON.stringify(result)).not.toMatch(/synthetic-private|secret/);
+  });
   it("projects metadata without copying provider reasons, bodies or credentials", () => {
     const safe = createSafeToolErrorMetadata({ errorClass: "SuperOpsRateLimit", rateLimited: true,
       retryable: true, retryScope: "read", retryAfterSeconds: 999999, attempts: 3,
