@@ -867,7 +867,7 @@ function triageFailureDiagnostics(
     }
   }
 
-  if (toolName === "superops_tickets_apply_triage_plan") {
+  if (toolName === "superops_tickets_apply_triage_plan" || toolName === "superops_tickets_prepare_triage_plan") {
     const text = result.content.find((item) => item.type === "text")?.text;
     if (text) {
       try {

@@ -30,6 +30,13 @@ bound but cannot extend it. An expired pending receipt is explicitly
 non-retryable; it remains available for receipt-only inspection. Accepted
 pending-read callbacks also stop automatically at the fixed deadline.
 
+The production recovery test also exposed structured preparation errors being
+truncated as a single 800-character string. Error responses now redact and bound
+individual values while retaining valid JSON and every candidate's failure.
+Routine error summaries use classifications only; they do not serialize ticket
+subjects, client details, notes or other result content into audit records.
+Preparation telemetry includes the retained per-item validation diagnostics.
+
 For an already quarantined historical run, Sam-only Cloudflare Access protects
 `POST /admin/triage-read-recovery` on the MCP. Supply the exact trigger, attempt,
 missing-callback history event and target ticket, with `dryRun:true` first. The

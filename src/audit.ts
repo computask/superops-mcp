@@ -517,9 +517,31 @@ export function sanitizeToolResult(result: ToolResult): ToolResult {
     ...result,
     ...(result.structuredContent ? { structuredContent: safeStructuredErrorMetadata(result.structuredContent) } : {}),
     content: result.content.map((item) =>
-      item.type === "text" ? { ...item, text: sanitizeText(item.text) } : item
+      item.type === "text" ? { ...item, text: sanitizeErrorContent(item.text) } : item
     ),
   };
+}
+
+function sanitizeErrorContent(text: string): string {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (typeof value !== "object" || value === null) return sanitizeText(text);
+    // Truncating the serialized object loses later validation failures and
+    // produces invalid JSON. Bound/redact individual strings instead; the
+    // MCP result-size guard still bounds the complete response.
+    const visit = (item: unknown, depth = 0): unknown => {
+      if (typeof item === "string") return sanitizeText(item);
+      if (typeof item !== "object" || item === null) return item;
+      if (depth >= 24) return "[truncated]";
+      if (Array.isArray(item)) return item.map(child => visit(child, depth + 1));
+      return Object.fromEntries(Object.entries(item).map(([key, child]) => [key,
+        /^(?:accesstoken|refreshtoken|clientsecret|authorization|cookie|cfaccessjwtassertion|cfaccessclientsecret|xsuperopsapitoken|apitoken|apikey|password|secret)$/.test(key.replace(/[^a-z0-9]/gi, "").toLowerCase())
+          ? "[redacted]" : visit(child, depth + 1)]));
+    };
+    return JSON.stringify(visit(value));
+  } catch {
+    return sanitizeText(text);
+  }
 }
 
 export function errorSummaryFromResult(result: ToolResult): string | undefined {
@@ -527,12 +549,33 @@ export function errorSummaryFromResult(result: ToolResult): string | undefined {
     return undefined;
   }
 
-  return sanitizeText(
-    result.content
-      .map((item) => item.text)
-      .filter(Boolean)
-      .join(" ")
-  );
+  return sanitizeText(result.content.map(item => {
+    try {
+      const value: unknown = JSON.parse(item.text);
+      if (typeof value !== "object" || value === null) return "Structured tool error";
+      const root = value as Record<string, unknown>;
+      const codes = new Set<string>();
+      const stages = new Set<string>();
+      const collect = (item: Record<string, unknown>) => {
+        for (const key of ["errorClass", "reasonCode", "errorCode", "errorType", "terminalFailureClass", "terminalReason"]) {
+          const code = item[key];
+          if (typeof code === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(code)) codes.add(code);
+        }
+        if (typeof item.failureStage === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(item.failureStage)) stages.add(item.failureStage);
+      };
+      collect(root);
+      if (Array.isArray(root.results)) for (const child of root.results.slice(0, 50)) {
+        if (typeof child === "object" && child !== null && !Array.isArray(child)) collect(child as Record<string, unknown>);
+      }
+      return JSON.stringify({ structuredToolError: true, codes: [...codes].slice(0, 32), stages: [...stages].slice(0, 32),
+        ...(typeof root.preparationOnly === "boolean" ? { preparationOnly: root.preparationOnly } : {}),
+        ...(typeof root.operationCreated === "boolean" ? { operationCreated: root.operationCreated } : {}) });
+    } catch {
+      // Even a malformed/truncated JSON result must not become a customer
+      // payload in routine audit records or callback diagnostic messages.
+      return /^\s*[\[{]/.test(item.text) ? "Structured tool error (details omitted)" : sanitizeText(item.text);
+    }
+  }).filter(Boolean).join(" "));
 }
 
 export function auditToolCall(args: {
