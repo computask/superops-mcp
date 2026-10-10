@@ -1,5 +1,5 @@
 import { paginatedClient } from "../pagination.js";
-import { assertTriageRunWriteLease } from "../triage-run-lease.js";
+import { assertTriageRunWriteLease, automaticTriageRunActive } from "../triage-run-lease.js";
 import { DispatcherPendingError, reconcileCurrentDispatcherReceipt } from "../dispatcher.js";
 import { dispatcherReadRecoveryState } from "../dispatcher-read-journal.js";
 /**
@@ -10460,7 +10460,7 @@ export function getTicketsTools(): DomainTools {
                 enum: [...VALIDATED_TICKET_OPTION_FIELDS],
               },
               description:
-                "Optional subset of fields to fetch. Defaults to priority, impact, urgency, resolutionCode, cause, and subcategory.",
+                "Optional subset of fields to fetch. Defaults to priority, impact, urgency, resolutionCode, cause, and subcategory. Correlated automatic triage also includes resolutionCode and cause in the same lookup so a later resolve disposition has its closure prerequisites.",
             },
           },
         },
@@ -10941,7 +10941,7 @@ export function getTicketsTools(): DomainTools {
 
           case "superops_tickets_field_options": {
             const params = args as { fields?: ValidatedTicketOptionField[] };
-            const requestedFields =
+            let requestedFields =
               params.fields && params.fields.length > 0
                 ? params.fields
                 : [...VALIDATED_TICKET_OPTION_FIELDS];
@@ -10956,6 +10956,18 @@ export function getTicketsTools(): DomainTools {
               return errorResult(
                 `Invalid field option field(s): ${invalidFields.join(", ")}`
               );
+            }
+
+            // An automatic run has one bounded options lookup before preparing
+            // its plan. Include closure prerequisites even if the Agent omitted
+            // them, so a later resolve disposition cannot exhaust that lookup
+            // with cause/resolutionCode still unknown. This is the same single
+            // metadata query; absent upstream options remain absent.
+            const additionalFields: ValidatedTicketOptionField[] = automaticTriageRunActive()
+              ? (["resolutionCode", "cause"] as const).filter(field => !requestedFields.includes(field))
+              : [];
+            if (additionalFields.length > 0) {
+              requestedFields = [...new Set([...requestedFields, ...additionalFields])];
             }
 
             let retrieval: TicketOptionFieldsRetrieval;
@@ -10992,7 +11004,12 @@ export function getTicketsTools(): DomainTools {
                 ];
               })
             );
-            result._metadata = { retrieval: retrieval.metadata };
+            result._metadata = { retrieval: retrieval.metadata,
+              ...(additionalFields.length > 0 ? {
+                additionalFields,
+                additionalFieldsReason: "automatic_triage_closure_prerequisites",
+              } : {}),
+            };
             return {
               content: [
                 {

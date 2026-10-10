@@ -22,6 +22,9 @@ export function runWithTriageLeaseEnvironment<T>(env: TriageLeaseEnvironment, fn
 export function runWithTriageRunContext<T>(run: { triggerId: string; attempt: number } | undefined, fn: () => T): T {
   return runs.run(run, fn);
 }
+export function automaticTriageRunActive(): boolean {
+  return runs.getStore() !== undefined;
+}
 export function triageLeaseCapability(env: TriageLeaseEnvironment) {
   return { protocol: TRIAGE_RUN_LEASE_PROTOCOL, enforced: env.TRIAGE_RUN_WRITE_GUARD_ENABLED === "true" &&
     typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function",

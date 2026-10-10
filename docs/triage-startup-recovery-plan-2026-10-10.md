@@ -79,3 +79,19 @@ Rollback is a normal Git revert/push disabling the new recovery flags first;
 never reset coordinator/ledger state or replay outstanding writes. A successful
 test proves the recovery path, not that provider errors or unrelated failure
 patterns have been eliminated.
+
+## Closure-option omission found during the live recovery
+
+The inspected recovery reached MCP tools in batch 3693. Attempts 1 and 2
+returned successful field metadata, but the Agent omitted `cause` in the first
+lookup and both `cause` and `resolutionCode` in the second. Both stopped before
+prepare or apply with `missing_field_options`. Complete private captures had no
+gaps. Attempt 3 requested both closure fields and reached the reviewed durable
+apply operation.
+
+For correlated automatic triage, include `cause` and `resolutionCode` alongside
+the requested fields in the same bounded metadata query. Manual subset lookups
+retain their behavior. Missing upstream options remain empty; prepare/apply
+validation still refuses invalid or unavailable values. Regressions cover the
+two observed omissions, manual context isolation, missing upstream options and
+invalid input without any mutation.

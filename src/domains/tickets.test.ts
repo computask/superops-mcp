@@ -6,6 +6,7 @@
 
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 import { DispatcherPendingError } from "../dispatcher.js";
+import { runWithTriageRunContext } from "../triage-run-lease.js";
 
 vi.mock("../client.js", () => ({
   getClient: vi.fn(() => ({
@@ -1204,6 +1205,72 @@ describe("Tickets Domain", () => {
     });
     expect(parsed.urgency.options[0].value).toBe("Low");
     expect(parsed._metadata.retrieval).toMatchObject({ source: "fresh", attempts: 1, retried: false, rateLimited: false });
+  });
+
+  it.each([
+    ["impact", "urgency", "resolutionCode", "subcategory"],
+    ["impact", "urgency", "subcategory"],
+  ])("includes omitted closure prerequisites in the one automatic lookup: %j", async (...fields) => {
+    mockClient.query.mockResolvedValue({ getFields: [
+      ticketField("impact", ["Low"]), ticketField("urgency", ["Low"]),
+      ticketField("subcategory", ["Example"]),
+      ticketField("resolutionCode", ["Permanent Fix"]), ticketField("cause", ["Example cause"]),
+    ] });
+    const domain = getTicketsTools();
+    const result = await runWithTriageRunContext({
+      triggerId: "triage-9999-00000000-0000-4000-8000-000000000000", attempt: 1,
+    }, () => domain.handleCall("superops_tickets_field_options", { fields }));
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.cause.options[0].value).toBe("Example cause");
+    expect(parsed.resolutionCode.options[0].value).toBe("Permanent Fix");
+    const expectedFields = [...new Set([...fields, "resolutionCode", "cause"])];
+    expect(mockClient.query).toHaveBeenCalledTimes(1);
+    expect(mockClient.query).toHaveBeenCalledWith(expect.stringContaining("getFields"), {
+      input: expectedFields.map(columnName => ({ module: "TICKET", columnName })),
+    });
+    expect(parsed._metadata.additionalFieldsReason).toBe("automatic_triage_closure_prerequisites");
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("retains a manual subset after an automatic closure lookup", async () => {
+    mockClient.query.mockResolvedValue({ getFields: [
+      ticketField("impact", ["Low"]), ticketField("resolutionCode", ["Permanent Fix"]),
+      ticketField("cause", ["Example cause"]),
+    ] });
+    const domain = getTicketsTools();
+    await runWithTriageRunContext({
+      triggerId: "triage-9999-00000000-0000-4000-8000-000000000000", attempt: 1,
+    }, () => domain.handleCall("superops_tickets_field_options", { fields: ["impact"] }));
+    const manual = await domain.handleCall("superops_tickets_field_options", { fields: ["impact"] });
+    const parsed = JSON.parse(manual.content[0].text);
+    expect(parsed.cause).toBeUndefined();
+    expect(parsed.resolutionCode).toBeUndefined();
+    expect(parsed._metadata.additionalFields).toBeUndefined();
+    expect(mockClient.query).toHaveBeenLastCalledWith(expect.stringContaining("getFields"), {
+      input: [{ module: "TICKET", columnName: "impact" }],
+    });
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("does not invent absent closure options during automatic discovery", async () => {
+    mockClient.query.mockResolvedValue({ getFields: [ticketField("impact", ["Low"])] });
+    const result = await runWithTriageRunContext({
+      triggerId: "triage-9999-00000000-0000-4000-8000-000000000000", attempt: 1,
+    }, () => getTicketsTools().handleCall("superops_tickets_field_options", { fields: ["impact"] }));
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.cause.options).toEqual([]);
+    expect(parsed.resolutionCode.options).toEqual([]);
+    expect(mockClient.query).toHaveBeenCalledTimes(1);
+    expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid automatic field subset before fetching closure options", async () => {
+    const result = await runWithTriageRunContext({
+      triggerId: "triage-9999-00000000-0000-4000-8000-000000000000", attempt: 1,
+    }, () => getTicketsTools().handleCall("superops_tickets_field_options", { fields: ["invalid"] }));
+    expect(result.isError).toBe(true);
+    expect(mockClient.query).not.toHaveBeenCalled();
+    expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
   it("does not multiply a rate-limited field-options response after client retries", async () => {
