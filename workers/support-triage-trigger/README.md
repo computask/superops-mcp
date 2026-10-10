@@ -5,7 +5,9 @@
 60s) under the original ten-minute deadline. Each correlated MCP call persists
 an independent work-start marker before execution. Generic failures need a
 complete inspected workflow, Sam-only recovery preview, independent capture and
-lease checks, and one exact-ticket run through normal action review. Denials and
+lease checks, and one exact-ticket run through normal action review. Legacy
+accepted records without attempt numbers use only the same stored provider run
+ID to recover their original URLs; new records persist the attempt. Denials and
 possible writes stay fenced. The paused monitor stays paused. See
 `../../docs/triage-startup-recovery-plan-2026-10-10.md`.
 
@@ -110,7 +112,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-ce233232d6266ffd2cd4eb0c9d2ad3b0aac20548dd6d6bac1e4834faa067b48c.
+4e790e0fde632c22f38f72eab99676c026d6bdbfcd21ca21376b29db9d12a325.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

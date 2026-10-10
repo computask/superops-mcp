@@ -1896,6 +1896,7 @@ function markAcceptedAwaitingResult(state, now, record, cooldownMs, watchdogMs) 
   state.cooldownUntil = now + cooldownMs;
   state.lastAcceptedTrigger = {
     triggerId: record.triggerId,
+    attempt: record.attempt,
     acceptedAt: new Date(now).toISOString(),
     scopeMode: record.scopeMode,
     conversationUrl: record.conversationUrl,
@@ -7226,7 +7227,10 @@ var TriageCoordinator = class {
       if (state.pending || state.queuedPending || state.unavailableRetryWindow || state.reconciliationHold || state.sharedRateLimitUntil>Date.now()) return json({error:"coordinator_not_idle"},409);
       const source = store.getDispatchHistoryEvent(body.sourceEventId);
       const lease = state.runWriteLeases.find(item=>item.triggerId===body.triggerId && item.attempt===body.attempt);
-      const accepted = state.lastAcceptedTrigger?.triggerId===body.triggerId && state.lastAcceptedTrigger?.attempt===body.attempt ? state.lastAcceptedTrigger : undefined;
+      // Older accepted records omitted attempt. The immutable provider run ID
+      // must match this exact stored attempt lease before using its URLs.
+      const accepted = state.lastAcceptedTrigger?.triggerId===body.triggerId && state.lastAcceptedTrigger?.runId===lease?.runId
+        ? state.lastAcceptedTrigger : undefined;
       const conversationUrl = lease?.conversationUrl ?? accepted?.conversationUrl;
       const triggerUrl = lease?.triggerUrl ?? accepted?.triggerUrl;
       if (!source || source.event!=="orphan_recovered" || source.agentRunStatus!=="failed" || source.failureKind!=="ambiguous" ||

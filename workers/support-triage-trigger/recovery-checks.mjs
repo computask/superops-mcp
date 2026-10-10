@@ -1115,6 +1115,16 @@ test('inspected historical startup failure previews without writes and schedules
   f.storage.value.pending=false;
   assert.equal((await f.request({dryRun:false})).status,409,'repeat recovery stays blocked even after a later idle restart');
 });
+test('legacy accepted record without attempt correlates only by the exact stored provider run ID',async()=>{
+  const f=operatorStartupRecovery({triggerUrl:undefined,conversationUrl:undefined});
+  f.storage.value.lastAcceptedTrigger={triggerId:f.body.triggerId,runId:'apirun_synthetic',
+    triggerUrl:'https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic/trigger',
+    conversationUrl:`https://chatgpt.com/c/${f.body.proof.conversationId}`};
+  assert.equal((await f.request()).status,200);
+  f.storage.value.lastAcceptedTrigger.runId='apirun_other_attempt';
+  assert.equal((await f.request({dryRun:false})).status,409);
+  assert.equal(f.storage.value.pending,false);
+});
 for(const blocker of [{mcpWorkStartedAt:1},{pendingRead:{}},{queryCompleted:true},{queryTicketNumbers:[]},{authorizedItems:['90101']},
   {operationReference:{}},{applyIntentObserved:true},{writeCheckObserved:true},{rejectedCallbackUnsafe:true},{manualStartupRecoveryRequested:true}]) {
   test('inspected startup recovery refuses '+Object.keys(blocker)[0],async()=>{
