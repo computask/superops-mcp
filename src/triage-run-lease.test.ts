@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertTriageRunWriteLease, recordTriageRunQuery, runWithTriageLeaseEnvironment, runWithTriageRunContext, triageLeaseCapability } from "./triage-run-lease.js";
+import { assertTriageRunStart, assertTriageRunWriteLease, recordTriageRunQuery, runWithTriageLeaseEnvironment, runWithTriageRunContext, triageLeaseCapability } from "./triage-run-lease.js";
 import { dispatcherFetch, withDispatcherOperation } from "./dispatcher.js";
 import { runWithExecutionContext, executionDiagnostics } from "./execution.js";
 
@@ -13,6 +13,37 @@ function environment(allowed = true, expiresAt = Date.now() + 60000) {
 }
 afterEach(() => { vi.unstubAllGlobals(); });
 describe("automatic triage write leases", () => {
+  it("persists independent work-start acknowledgement before executing a correlated tool", async () => {
+    const {env,fetcher} = environment();
+    fetcher.mockImplementation(async()=>Response.json({protocol:"triage-run-start-v1",allowed:true,expiresAt:Date.now()+60000}));
+    let executed = false;
+    await runWithTriageLeaseEnvironment({...env,TRIAGE_RUN_START_GUARD_ENABLED:"true"}, () =>
+      runWithTriageRunContext({triggerId,attempt:2}, () => runWithExecutionContext("test",async()=>{
+        await assertTriageRunStart();
+        executed = true;
+        expect(executionDiagnostics()?.subrequests).toMatchObject({used:1});
+      })));
+    expect(executed).toBe(true);
+    expect(await fetcher.mock.calls[0][0].json()).toEqual({triggerId,attempt:2});
+    expect(fetcher.mock.calls[0][0].url).toContain("/internal/run-work/start");
+  });
+  it.each(["missing","revoked","network","wrong_protocol","expired"])("never executes work when the start guard is %s",async kind=>{
+    const {env,fetcher} = environment();
+    fetcher.mockImplementation(async()=>Response.json({protocol:kind==="wrong_protocol"?"unknown":"triage-run-start-v1",
+      allowed:kind!=="revoked",expiresAt:Date.now()+(kind==="expired"?-1:60000)}));
+    if (kind==="network") fetcher.mockRejectedValue(Error("synthetic private dependency body"));
+    let executed = false;
+    const selected = kind==="missing"?{TRIAGE_RUN_START_GUARD_ENABLED:"true"}:{...env,TRIAGE_RUN_START_GUARD_ENABLED:"true"};
+    await expect(runWithTriageLeaseEnvironment(selected,()=>runWithTriageRunContext({triggerId,attempt:1},async()=>{
+      await assertTriageRunStart();executed=true;
+    }))).rejects.toThrow("no tool executed");
+    expect(executed).toBe(false);
+  });
+  it("keeps manual tools independent of the automatic start guard",async()=>{
+    const {env,fetcher} = environment();
+    await runWithTriageLeaseEnvironment({...env,TRIAGE_RUN_START_GUARD_ENABLED:"true"},()=>assertTriageRunStart());
+    expect(fetcher).not.toHaveBeenCalled();
+  });
   it("counts the independent guard check and binds its request to the global coordinator and live ticket metadata", async () => {
     const {env, fetcher} = environment();
     await runWithTriageLeaseEnvironment(env, () => runWithExecutionContext("test", async () => {

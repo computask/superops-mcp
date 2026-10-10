@@ -691,6 +691,45 @@ describe("Cloudflare Worker entrypoint", () => {
     expect((await worker.fetch(new Request(url),env)).status).toBe(405);
   });
 
+  it("persists the independent automatic work marker before a tool and fails closed even without captures",async()=>{
+    const start=vi.fn(async()=>Response.json({protocol:"triage-run-start-v1",allowed:false},{status:409}));
+    const env=chatGptEnv({TRIAGE_RUN_START_GUARD_ENABLED:"true",TRIAGE_RUN_WRITE_GUARD_ENABLED:"true",
+      TRIAGE_RUN_COORDINATOR:{idFromName:name=>name,get:()=>({fetch:start})}});
+    const response=await mcp({jsonrpc:"2.0",id:49,method:"tools/call",params:{name:"superops_status",
+      arguments:{triageCapture:{triggerId:`triage-2-${crypto.randomUUID()}`,attempt:1}}}},env);
+    const result=await response.json() as {result:{isError?:boolean;content:Array<{text:string}>}};
+    expect(result.result.isError).toBe(true);
+    expect(result.result.content[0].text).toContain("no tool executed");
+    expect(start).toHaveBeenCalledOnce();
+  });
+
+  it("restricts inspected startup recovery to Sam, requires proof and independent complete captures, and privately forwards a preview",async()=>{
+    const url=`https://${DIRECT_HOST}/admin/triage-startup-recovery`;
+    const triggerId=`triage-2-${crypto.randomUUID()}`;
+    const body={triggerId,attempt:1,sourceEventId:9,ticketNumber:"90101",dryRun:true,
+      proof:{conversationId:crypto.randomUUID(),complete:true,workflowStepCount:0,toolCallCount:0,elicitationCount:0,
+        denialObserved:false,providerErrorCode:"hermes_gpt_run_failed",providerErrorSubcode:"failed_during_run",providerCanRetry:true}};
+    const forward=vi.fn(async(_request:Request)=>Response.json({status:"recovery_preview",ticketNumber:"90101"}));
+    const namespace=createOperationLedgerNamespace();
+    const env=chatGptEnv({SUPEROPS_OPERATION_LEDGER:namespace,TRIAGE_RUN_START_GUARD_ENABLED:"true",TRIAGE_RUN_WRITE_GUARD_ENABLED:"true",
+      TRIAGE_RUN_COORDINATOR:{idFromName:name=>name,get:()=>({fetch:forward})}});
+    const request=(jwt?:string,value:unknown=body)=>new Request(url,{method:"POST",headers:{"Content-Type":"application/json",
+      ...(jwt?{"CF-Access-Jwt-Assertion":jwt}:{})},body:JSON.stringify(value)});
+    expect((await worker.fetch(request(),env)).status).toBe(403);
+    expect((await worker.fetch(request(await cloudflareAccessJwt(ADDITIONAL_ALLOWED_EMAIL)),env)).status).toBe(403);
+    const sam=await cloudflareAccessJwt(ALLOWED_EMAIL);
+    expect((await worker.fetch(request(sam,{...body,proof:{...body.proof,denialObserved:true}}),env)).status).toBe(400);
+    expect(forward).not.toHaveBeenCalled();
+    const preview=await worker.fetch(request(sam),env);
+    expect(preview.status).toBe(200);expect(preview.headers.get("Cache-Control")).toBe("no-store, private");
+    expect(forward).toHaveBeenCalledOnce();
+    expect(await forward.mock.calls[0][0].json()).toEqual(body);
+    const noCaptures=chatGptEnv({TRIAGE_RUN_START_GUARD_ENABLED:"true",TRIAGE_RUN_WRITE_GUARD_ENABLED:"true",TRIAGE_RUN_COORDINATOR:env.TRIAGE_RUN_COORDINATOR});
+    expect((await worker.fetch(request(sam),noCaptures)).status).toBe(503);
+    expect(forward).toHaveBeenCalledOnce();
+    expect((await worker.fetch(new Request(url),env)).status).toBe(405);
+  });
+
   it("captures live MCP dispatcher exchanges and restricts raw GraphQL retrieval to Sam", async () => {
     const namespace = createOperationLedgerNamespace();
     const env = chatGptEnv({SUPEROPS_OPERATION_LEDGER: namespace, SUPEROPS_GRAPHQL_CAPTURE_ENABLED: "true",

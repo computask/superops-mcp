@@ -3,8 +3,10 @@ import { recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.
 import { currentOwnerHash } from "./operation-store.js";
 
 export const TRIAGE_RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
+export const TRIAGE_RUN_START_PROTOCOL = "triage-run-start-v1";
 export interface TriageLeaseEnvironment {
   TRIAGE_RUN_WRITE_GUARD_ENABLED?: string;
+  TRIAGE_RUN_START_GUARD_ENABLED?: string;
   TRIAGE_RUN_COORDINATOR?: {
     idFromName(name: string): unknown;
     get(id: unknown): { fetch(request: Request): Promise<Response> };
@@ -22,7 +24,32 @@ export function runWithTriageRunContext<T>(run: { triggerId: string; attempt: nu
 }
 export function triageLeaseCapability(env: TriageLeaseEnvironment) {
   return { protocol: TRIAGE_RUN_LEASE_PROTOCOL, enforced: env.TRIAGE_RUN_WRITE_GUARD_ENABLED === "true" &&
-    typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function" };
+    typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function",
+    startProtocol: TRIAGE_RUN_START_PROTOCOL, startGuardEnforced: env.TRIAGE_RUN_START_GUARD_ENABLED === "true" &&
+      env.TRIAGE_RUN_WRITE_GUARD_ENABLED === "true" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function" &&
+      typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function" };
+}
+
+/** Authoritative attempt activity, persisted before any correlated tool executes.
+ * Diagnostic capture availability never decides whether this check is required. */
+export async function assertTriageRunStart(): Promise<void> {
+  const env = environments.getStore(), run = runs.getStore();
+  if (!run || env?.TRIAGE_RUN_START_GUARD_ENABLED !== "true") return;
+  if (!triageLeaseCapability(env).startGuardEnforced) throw new Error("Triage run start guard unavailable; no tool executed.");
+  const counted = recordTypedSubrequestStart({type: "custom", operationType: "durableObject", operationName: "triageRunStartCheck"});
+  try {
+    const stub = env.TRIAGE_RUN_COORDINATOR!.get(env.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
+    const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-work/start", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(run), signal: AbortSignal.timeout(5000),
+    }));
+    const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number};
+    if (!response.ok || result.protocol !== TRIAGE_RUN_START_PROTOCOL || result.allowed !== true ||
+        typeof result.expiresAt !== "number" || result.expiresAt <= Date.now()) throw Error("rejected");
+    recordSubrequestFinish(counted, response.status, true);
+  } catch {
+    recordSubrequestFinish(counted, "triageStartRejected", false);
+    throw new Error("Triage run start guard rejected or unavailable; no tool executed.");
+  }
 }
 
 /** Content-free proof of a complete or durably pending first query. Losing this optional

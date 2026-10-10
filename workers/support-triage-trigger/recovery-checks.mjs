@@ -470,6 +470,80 @@ function fixture(status, age = 120000, configOverrides = {}) {
   return {engine,calls,alarms,scope,config,get state(){return state;},seed:patch=>{state={...state,...patch};},setNow:value=>{now=Date.parse(value);},setRunStatus:value=>{agentStatus=value;},advance:()=>{now=state.dueAt ?? now+40000;},expire:()=>{now+=40000;}};
 }
 
+const startCapability={protocol:'triage-run-lease-v1',enforced:true,startProtocol:'triage-run-start-v1',startGuardEnforced:true};
+function startupFixture(changes={},diagnostics={status:'failed',httpStatus:200,errorCode:'dispatch_failed'}) {
+  const f=fixture('failed',120000,{startupRecoveryEnabled:true,runLeaseGuardService:{fetch:async()=>Response.json(startCapability)}});
+  const triggerId='triage-9001-00000000-0000-4000-8000-000000009001';
+  f.seed({pendingTriggerId:triggerId,lastAcceptedTrigger:{...f.state.lastAcceptedTrigger,triggerId}});
+  const now=Date.parse('2026-09-24T06:00:00Z');
+  f.seed({runWriteLeases:[{triggerId:f.state.pendingTriggerId,attempt:1,runId:'apirun_synthetic',scope:f.scope,
+    issuedAt:now-120000,expiresAt:now+180000,revokedAt:null,authorizedItems:[],startGuardProtocol:'triage-run-start-v1',
+    startupDeadlineAt:now+480000,startupRetryCount:0,...changes}]});
+  f.engine.deps.agent.getRunDiagnostics=async()=>diagnostics;
+  return f;
+}
+test('positively classified provider dispatch failure retries the original guarded scope after revocation',async()=>{
+  const f=startupFixture();f.expire();
+  const result=await f.engine.processAlarm();
+  assert.equal(result.status,'retry_scheduled');assert.equal(f.calls.length,0);
+  assert.equal(f.state.runWriteLeases[0].revokedAt,Date.parse('2026-09-24T06:00:40Z'));
+  assert.equal(f.state.runWriteLeases[0].startupRetryCount,1);
+  assert.deepEqual(f.state.pendingTriggerScope,f.scope);
+  assert.equal(f.state.sharedRateLimitUntil,null);
+  assert.equal(f.state.dueAt,Date.parse('2026-09-24T06:01:10Z'));
+  f.advance();await f.engine.processAlarm();
+  assert.equal(f.calls.length,1);assert.equal(f.calls[0][2],2);
+  assert.deepEqual(f.calls[0][1],f.scope);
+  assert.equal(f.state.runWriteLeases.at(-1).startupRetryCount,1);
+  assert.equal(f.state.runWriteLeases.at(-1).startupDeadlineAt,Date.parse('2026-09-24T06:08:00Z'));
+});
+for(const blocker of [{mcpWorkStartedAt:0},{pendingRead:{}},{queryCompleted:true},{queryTicketNumbers:[]},
+  {applyIntentObserved:true},{writeCheckObserved:true},{operationReference:{}},{rejectedCallbackUnsafe:true},
+  {authorizedItems:['90101']},{startGuardProtocol:undefined},{revokedAt:1},{startupRetryCount:2},{startupDeadlineAt:1}]) {
+  test('startup retry refuses '+Object.keys(blocker)[0],async()=>{
+    const f=startupFixture(blocker);f.expire();await f.engine.processAlarm();
+    assert.equal(f.calls.length,0);assert.equal(f.state.pending,false);
+    assert(f.state.dispatchHistory.some(event=>event.event==='orphan_recovered'));
+  });
+}
+test('the observed generic run_failed is never automatically retried from absent tools',async()=>{
+  const f=startupFixture({}, {status:'failed',httpStatus:200,errorCode:'run_failed'});f.expire();await f.engine.processAlarm();
+  assert.equal(f.calls.length,0);assert.equal(f.state.pending,false);
+  assert(f.state.dispatchHistory.some(event=>event.event==='startup_recovery_blocked'&&event.failureDiagnostics[0].errorCode==='operator_startup_proof_required'));
+});
+test('startup retry refuses prior active execution and unavailable or disabled live guard',async()=>{
+  for(const kind of ['in_progress','suspended','unavailable_guard','disabled_guard','changed_scope']) {
+    const f=startupFixture();
+    if (['in_progress','suspended'].includes(kind)) f.seed({dispatchHistory:[{eventId:1,event:'agent_run_status_checked',at:'2026-09-24T05:59:00.000Z',
+      batchSequence:9001,attempt:1,agentRunStatus:kind}]});
+    if (kind==='unavailable_guard') f.engine.deps.config.runLeaseGuardService=undefined;
+    if (kind==='disabled_guard') f.engine.deps.config.runLeaseGuardService={fetch:async()=>Response.json({...startCapability,startGuardEnforced:false})};
+    if (kind==='changed_scope') f.seed({pendingTriggerScope:{...f.scope,createdTo:'2026-09-24T06:01:00.000Z'}});
+    f.expire();await f.engine.processAlarm();assert.equal(f.calls.length,0);assert.equal(f.state.pending,false,kind);
+  }
+});
+test('startup recovery cap and original deadline survive both fresh accepted runs',async()=>{
+  const f=startupFixture();
+  f.expire();await f.engine.processAlarm();f.advance();await f.engine.processAlarm();
+  f.expire();await f.engine.processAlarm();
+  assert.equal(f.state.runWriteLeases.at(-1).startupRetryCount,2);
+  assert.equal(f.state.dueAt,Date.parse('2026-09-24T06:02:50Z'));
+  f.advance();await f.engine.processAlarm();f.expire();await f.engine.processAlarm();
+  assert.equal(f.calls.length,2);assert.equal(f.state.pending,false);
+  assert.equal(f.state.runWriteLeases.at(-1).startupDeadlineAt,Date.parse('2026-09-24T06:08:00Z'));
+});
+test('startup deadline prevents a delayed retry from dispatching after restart',async()=>{
+  const f=startupFixture();f.expire();await f.engine.processAlarm();
+  f.seed(normalizeState(JSON.parse(JSON.stringify(f.state))));f.setNow('2026-09-24T06:09:00Z');
+  await f.engine.processAlarm();assert.equal(f.calls.length,0);assert.equal(f.state.pending,false);
+});
+test('startup deadline also protects a retry promoted from the fresh-work hold',async()=>{
+  const f=startupFixture();f.expire();await f.engine.processAlarm();
+  f.seed({executionPhase:'pending_dispatch',pendingDispatchWaitReason:'reconciliation_hold'});
+  f.setNow('2026-09-24T06:09:00Z');await f.engine.processAlarm();
+  assert.equal(f.calls.length,0);assert.equal(f.state.pending,false);
+});
+
 function existingNoteCompletion(outcome = 'skipped') {
   return {failureStage:'evidence_recovery',ticketsConsidered:1,ticketsCompleted:1,ticketsDeferred:0,
     ticketOutcomes:[{ticketNumber:'90101',outcome,stage:'evidence_recovery',reasonCode:'already_handled'}],
@@ -1004,6 +1078,73 @@ function operatorReadRecovery(change={}) {
     method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,...patch})}));
   return {...f,body,request};
 }
+
+function operatorStartupRecovery(change={}) {
+  const triggerId='triage-24-00000000-0000-4000-8000-000000000024';
+  const conversationId='00000000-0000-4000-8000-000000000024';
+  const triggerUrl='https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic/trigger';
+  const lease={triggerId,attempt:1,runId:'apirun_synthetic',triggerUrl,conversationUrl:`https://chatgpt.com/c/${conversationId}`,
+    scope:replaySourceScope,issuedAt:1,expiresAt:2,revokedAt:null,authorizedItems:[],...change};
+  const seed={...createInitialState(),triggerSequence:24,dispatchHistorySequence:41,dispatchHistory:[replayFailureEvent],runWriteLeases:[lease],
+    needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true};
+  const f=replayCoordinator(seed,[replayFailureEvent],{TRIAGE_STARTUP_RECOVERY_ENABLED:'true',WORKSPACE_AGENT_ACCESS_TOKEN:'synthetic-access-token',
+    TRIAGE_WRITE_GUARD_SERVICE:{fetch:async()=>Response.json(startCapability)}});
+  const proof={conversationId,complete:true,workflowStepCount:0,toolCallCount:0,elicitationCount:0,denialObserved:false,
+    providerErrorCode:'hermes_gpt_run_failed',providerErrorSubcode:'failed_during_run',providerCanRetry:true};
+  const body={triggerId,attempt:1,sourceEventId:41,ticketNumber:'90101',dryRun:true,proof};
+  const request=async(patch={})=>{
+    const original=globalThis.fetch;
+    globalThis.fetch=async()=>Response.json({status:'failed',conversation_url:`https://chatgpt.com/c/${conversationId}`,error:{code:'run_failed'}});
+    try { return await f.coordinator.fetch(new Request('https://coordinator.internal/internal/admin/startup-recovery',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,...patch})})); }
+    finally { globalThis.fetch=original; }
+  };
+  return {...f,body,request};
+}
+test('inspected historical startup failure previews without writes and schedules one reviewed exact ticket',async()=>{
+  const f=operatorStartupRecovery(),before=structuredClone(f.storage.value);
+  const preview=await f.request();assert.equal(preview.status,200,JSON.stringify(await preview.json()));
+  assert.deepEqual(f.storage.value,before);
+  const response=await f.request({dryRun:false});assert.equal(response.status,200,JSON.stringify(await response.json()));
+  assert.notEqual(f.storage.value.pendingTriggerId,f.body.triggerId);
+  assert.deepEqual(f.storage.value.pendingTriggerScope,{...replaySourceScope,targetTicketNumbers:['90101'],replayOfEventId:41});
+  assert.deepEqual(f.storage.value.needsAttentionScopes,[replaySourceScope]);
+  assert(f.storage.value.runWriteLeases[0].revokedAt!==null);
+  assert.equal(f.storage.value.runWriteLeases[0].manualStartupRecoveryRequested,true);
+  assert.equal((await f.request({dryRun:false})).status,409);
+  f.storage.value.pending=false;
+  assert.equal((await f.request({dryRun:false})).status,409,'repeat recovery stays blocked even after a later idle restart');
+});
+for(const blocker of [{mcpWorkStartedAt:1},{pendingRead:{}},{queryCompleted:true},{queryTicketNumbers:[]},{authorizedItems:['90101']},
+  {operationReference:{}},{applyIntentObserved:true},{writeCheckObserved:true},{rejectedCallbackUnsafe:true},{manualStartupRecoveryRequested:true}]) {
+  test('inspected startup recovery refuses '+Object.keys(blocker)[0],async()=>{
+    const f=operatorStartupRecovery(blocker);assert.equal((await f.request({dryRun:false})).status,409);assert.equal(f.storage.value.pending,false);
+  });
+}
+test('inspected startup recovery refuses denial, incomplete workflow, wrong conversation and missing guard',async()=>{
+  for(const proofChange of [{denialObserved:true},{complete:false},{workflowStepCount:1},{toolCallCount:1},{elicitationCount:1},
+    {providerCanRetry:false},{conversationId:'00000000-0000-4000-8000-000000000025'}]) {
+    const f=operatorStartupRecovery();assert([400,409].includes((await f.request({dryRun:false,proof:{...f.body.proof,...proofChange}})).status));
+    assert.equal(f.storage.value.pending,false);
+  }
+  const f=operatorStartupRecovery();f.coordinator.env.TRIAGE_WRITE_GUARD_SERVICE=undefined;
+  assert.equal((await f.request({dryRun:false})).status,409);
+});
+test('work-start acknowledgement persists before execution and rejects late revoked and wrong-attempt calls',async()=>{
+  const f=operatorStartupRecovery({issuedAt:Date.now()-1000,expiresAt:Date.now()+60000});
+  Object.assign(f.storage.value,{pending:true,pendingTriggerId:f.body.triggerId,pendingTriggerScope:replaySourceScope,
+    executionPhase:'awaiting_result',dispatchAttempt:1});
+  const request=body=>f.coordinator.fetch(new Request('https://coordinator.internal/internal/run-work/start',{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}));
+  assert.equal((await request({triggerId:f.body.triggerId,attempt:1})).status,200);
+  assert(Number.isFinite(f.storage.value.runWriteLeases[0].mcpWorkStartedAt));
+  assert.equal(f.storage.value.dispatchHistory.filter(event=>event.event==='run_work_started').length,1);
+  await request({triggerId:f.body.triggerId,attempt:1});
+  assert.equal(f.storage.value.dispatchHistory.filter(event=>event.event==='run_work_started').length,1);
+  assert.equal((await request({triggerId:f.body.triggerId,attempt:2})).status,409);
+  f.storage.value.runWriteLeases[0].revokedAt=Date.now();
+  assert.equal((await request({triggerId:f.body.triggerId,attempt:1})).status,409);
+});
 test('authenticated operator recovery previews without dispatch and schedules one exact ticket using the original read identity',async()=>{
   const f=operatorReadRecovery();const before=structuredClone(f.storage.value);
   const preview=await f.request({});const previewBody=await preview.json();

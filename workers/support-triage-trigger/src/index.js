@@ -150,6 +150,7 @@ function loadConfig(env) {
     ),
     attentionTailIsolationEnabled: parseBoolean(get(env, "TRIAGE_ATTENTION_TAIL_ISOLATION_ENABLED"), false),
     runLeaseExpiryEnabled: get(env, "TRIAGE_RUN_LEASE_EXPIRY_ENABLED") === "true",
+    startupRecoveryEnabled: get(env, "TRIAGE_STARTUP_RECOVERY_ENABLED") === "true",
     runLeaseGuardService: env.TRIAGE_WRITE_GUARD_SERVICE,
     acceptedRunMaxAgeMs: parsePositiveSeconds(
       get(env, "TRIAGE_ACCEPTED_RUN_MAX_AGE_SECONDS"),
@@ -598,7 +599,7 @@ var MCP_STATUSES = /* @__PURE__ */ new Set([
   "dispatcherError",
   "dispatcherTransportUnknown", "dispatcherVerificationUnknown", "dispatcherReadJournalError",
   "serviceBindingError", "operationStoreRateLimited", "operationStoreError",
-  "workflowCreated", "workflowCreateBatchError", "observationUnavailable", "triageLeaseRejected",
+  "workflowCreated", "workflowCreateBatchError", "observationUnavailable", "triageLeaseRejected", "triageStartRejected",
   "stored", "capture_failed"
 ]);
 var RETRY_SOURCES = /* @__PURE__ */ new Set(["retry-after", "backoff"]);
@@ -1095,7 +1096,11 @@ var DISPATCH_HISTORY_EVENTS = /* @__PURE__ */ new Set([
   "maintenance_completed",
   "maintenance_failed",
   "manual_replay_requested",
-  "manual_read_recovery_requested"
+  "manual_read_recovery_requested",
+  "run_work_started",
+  "startup_retry_scheduled",
+  "startup_recovery_blocked",
+  "manual_startup_recovery_requested"
 ]);
 var DISPATCH_HISTORY_WAIT_REASONS = /* @__PURE__ */ new Set([
   "active_agent_run",
@@ -2126,6 +2131,9 @@ var WorkspaceAgentTriggerClient = class {
       if (!isRecord4(body)) return { status: "unavailable" };
       const diagnostics = {
         status: safeRunStatus(body.status) ?? "unavailable",
+        httpStatus: response.status,
+        ...(typeof body.conversation_url === "string" && /^https:\/\/chatgpt\.com\/c\/[a-f0-9-]{36}$/.test(body.conversation_url)
+          ? {conversationId: body.conversation_url.split("/").at(-1)} : {}),
         ...errorMetadata
       };
       this.logger?.info("agent_run_diagnostics", {
@@ -3452,6 +3460,7 @@ __name(recoverStaleAcceptedRun, "recoverStaleAcceptedRun");
 // A write lease is independent of diagnostic captures and callback receipts.
 // It cannot authorize a plan; the MCP's existing approval/stale/dedupe gates remain.
 const RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
+const RUN_START_PROTOCOL = "triage-run-start-v1";
 function ensureAcceptedWriteLease(state, config) {
   const accepted = state.lastAcceptedTrigger;
   const issuedAt = Date.parse(accepted?.acceptedAt ?? "");
@@ -3460,11 +3469,13 @@ function ensureAcceptedWriteLease(state, config) {
   if (state.runWriteLeases.some(lease => lease.triggerId === accepted.triggerId && lease.attempt === attempt)) return;
   const previous = [...state.runWriteLeases].reverse().find(lease => lease.triggerId === accepted.triggerId);
   state.runWriteLeases.push({triggerId: accepted.triggerId, attempt, runId: accepted.runId,
+    triggerUrl: accepted.triggerUrl, conversationUrl: accepted.conversationUrl,
     scope: state.pendingTriggerScope, issuedAt, expiresAt: issuedAt + config.acceptedRunMaxAgeMs,
     revokedAt: null, authorizedItems: [],
     ...(previous ? {pendingRead: previous.pendingRead, queryCompleted: previous.queryCompleted,
       applyIntentObserved: previous.applyIntentObserved, writeCheckObserved: previous.writeCheckObserved,
-      rejectedCallbackUnsafe: previous.rejectedCallbackUnsafe} : {})});
+      rejectedCallbackUnsafe: previous.rejectedCallbackUnsafe,
+      startupRetryCount: previous.startupRetryCount, startupDeadlineAt: previous.startupDeadlineAt} : {})});
   state.runWriteLeases = state.runWriteLeases.slice(-256);
 }
 function checkRunWriteLease(state, config, body, now, validatedContinuationLeaseUntil) {
@@ -3746,6 +3757,48 @@ function schedulePendingFirstReadRecovery(state, config, now, diagnostics) {
   recordDispatchHistory(state, now, {event: "retry_scheduled", ...details}, state.pendingTriggerScope);
   return {status: "retry_scheduled", nextAt, triggerId: state.pendingTriggerId};
 }
+function startupLeaseUntouched(lease) {
+  return Boolean(lease && lease.mcpWorkStartedAt === undefined && !lease.queryCompleted && lease.queryTicketNumbers === undefined &&
+    !lease.pendingRead && !lease.applyIntentObserved && !lease.writeCheckObserved && !lease.operationReference &&
+    !lease.rejectedCallbackUnsafe && lease.authorizedItems.length === 0);
+}
+async function scheduleStartupRecovery(engine, state, now, diagnostics) {
+  const config = engine.deps.config;
+  const lease = state.runWriteLeases.find(item => item.triggerId === state.pendingTriggerId && item.attempt === state.dispatchAttempt);
+  if (!config.startupRecoveryEnabled || !config.enabled || !config.resultCallbackEnabled ||
+      config.scopeMode !== "new-email-tickets" || diagnostics.status !== "failed" || diagnostics.httpStatus !== 200 ||
+      diagnostics.errorCode !== "dispatch_failed" || state.executionPhase !== "awaiting_result" ||
+      !state.pending || !startupLeaseUntouched(lease) || lease.revokedAt !== null ||
+      lease.startGuardProtocol !== RUN_START_PROTOCOL || lease.scope?.mode !== "new-email-tickets" ||
+      JSON.stringify(lease.scope) !== JSON.stringify(state.pendingTriggerScope) || state.pendingTicketOutcomes?.length ||
+      state.lastResultReport?.triggerId === state.pendingTriggerId && state.lastResultReport.attempt === state.dispatchAttempt ||
+      state.dispatchHistory.some(event => event.batchSequence === batchSequenceFromTriggerId(state.pendingTriggerId) &&
+        event.attempt === state.dispatchAttempt && ["in_progress", "suspended"].includes(event.agentRunStatus))) return null;
+  const count = lease.startupRetryCount ?? 0, deadline = lease.startupDeadlineAt;
+  const nextAt = Math.max(now + 30_000 * 2 ** count, state.cooldownUntil);
+  if (!Number.isInteger(count) || count < 0 || count >= 2 || state.retryCount >= config.resultMaxRetries ||
+      !Number.isFinite(deadline) || deadline > lease.issuedAt + 600_000 || nextAt >= deadline) return null;
+  let capability;
+  try { const response = await config.runLeaseGuardService?.fetch(new Request("https://mcp.internal/internal/triage-run-lease-capability",{signal:AbortSignal.timeout(5000)}));
+    if (response?.ok) capability = await response.json(); } catch { }
+  if (capability?.protocol !== RUN_LEASE_PROTOCOL || capability.enforced !== true ||
+      capability.startProtocol !== RUN_START_PROTOCOL || capability.startGuardEnforced !== true) return null;
+  lease.revokedAt = now;
+  lease.startupRetryCount = count + 1;
+  state.retryCount += 1;
+  state.executionPhase = "retry_wait";
+  state.resultDeadlineAt = null;
+  state.dueAt = nextAt;
+  markFailure(state,"transient",now,nextAt);
+  state.lastResultReport = {triggerId:state.pendingTriggerId,attempt:state.dispatchAttempt,status:"terminal_failure",
+    recordedAt:new Date(now).toISOString(),metadata:{failureStage:"agent_callback",ticketsConsidered:0,ticketsCompleted:0,ticketsDeferred:0,
+      failureDiagnostics:[{stage:"agent_callback",errorCode:"provider_dispatch_failed_before_work"}]}};
+  recordDispatchHistory(state,now,{event:"startup_retry_scheduled",attempt:state.dispatchAttempt,retryCount:state.retryCount,
+    agentRunStatus:"failed",agentRunIdPresent:true,errorCode:"dispatch_failed",nextAt:new Date(nextAt).toISOString(),
+    waitMs:nextAt-now,waitReason:"bounded_recovery",
+    failureDiagnostics:[{stage:"agent_callback",errorCode:"provider_dispatch_failed_before_work"}]},state.pendingTriggerScope);
+  return {status:"retry_scheduled",nextAt,triggerId:state.pendingTriggerId};
+}
 function completionReportIsConsistent(report) {
   if (report.status !== "complete" || !report.metadata) return true;
   const metadata = report.metadata;
@@ -3981,6 +4034,10 @@ var CoordinatorEngine = class {
     const leaseRecovery = await recoverExpiredWriteLease(this, state, now);
     if (leaseRecovery) return leaseRecovery;
     const readLease = state.runWriteLeases.find(lease => lease.triggerId === state.pendingTriggerId && lease.attempt === state.dispatchAttempt);
+    if (state.executionPhase === "retry_wait" && readLease?.startupRetryCount > 0 && readLease.startupDeadlineAt <= now) {
+      return await this.stopAutomaticRetry(state,{triggerId:state.pendingTriggerId,attempt:state.dispatchAttempt,status:"terminal_failure",
+        metadata:{failureStage:"agent_callback",failureDiagnostics:[{stage:"agent_callback",errorCode:"startup_recovery_deadline_expired"}]}},now);
+    }
     if (state.executionPhase === "retry_wait" && readLease?.pendingRead && !readLease.queryCompleted &&
         !readLease.operationReference && !readLease.applyIntentObserved && !readLease.writeCheckObserved &&
         Date.parse(readLease.pendingRead.deadlineAt) <= now) {
@@ -4130,6 +4187,18 @@ var CoordinatorEngine = class {
             await this.deps.store.save(state);
             await this.deps.store.setAlarm(pendingReadRecovery.nextAt);
             return pendingReadRecovery;
+          }
+          const startupRecovery = await scheduleStartupRecovery(this,state,now,diagnostics);
+          if (startupRecovery) {
+            await this.deps.store.save(state);
+            await this.deps.store.setAlarm(startupRecovery.nextAt);
+            return startupRecovery;
+          }
+          if (this.deps.config.startupRecoveryEnabled && runStatus === "failed") {
+            recordDispatchHistory(state,now,{event:"startup_recovery_blocked",attempt:state.dispatchAttempt,retryCount:state.retryCount,
+              agentRunStatus:runStatus,errorCode:diagnostics.errorCode,
+              failureDiagnostics:[{stage:"agent_callback",errorCode:diagnostics.errorCode === "run_failed"
+                ? "operator_startup_proof_required" : "startup_recovery_ineligible_or_exhausted"}]},state.pendingTriggerScope);
           }
           recordDispatchHistory(state, now, {
             event: "orphan_recovered",
@@ -4474,6 +4543,13 @@ var CoordinatorEngine = class {
       await this.deps.store.save(state);
       if (nextAt !== void 0) await this.deps.store.setAlarm(nextAt);
       return {status: "terminal_failure", triggerId, nextAt};
+    }
+    // A held startup retry may have been promoted into pending_dispatch after
+    // fresh work. Its original deadline still applies immediately before POST.
+    const startupLease = [...state.runWriteLeases].reverse().find(lease => lease.triggerId === triggerId);
+    if (startupLease?.startupRetryCount > 0 && startupLease.startupDeadlineAt <= now) {
+      return await this.stopAutomaticRetry(state,{triggerId,attempt:state.dispatchAttempt,status:"terminal_failure",
+        metadata:{failureStage:"agent_callback",failureDiagnostics:[{stage:"agent_callback",errorCode:"startup_recovery_deadline_expired"}]}},now);
     }
     const dispatchAttempt = state.dispatchAttempt + 1;
     const dispatchWasQueued = state.pendingDispatchWasQueued === true;
@@ -4930,6 +5006,12 @@ var CoordinatorEngine = class {
         );
       }
       ensureAcceptedWriteLease(state, this.deps.config);
+      const acceptedLease = state.runWriteLeases.find(lease => lease.triggerId === triggerId && lease.attempt === dispatchAttempt);
+      if (acceptedLease && this.deps.config.startupRecoveryEnabled) {
+        acceptedLease.startGuardProtocol = RUN_START_PROTOCOL;
+        acceptedLease.startupDeadlineAt ??= now + 600_000;
+        acceptedLease.startupRetryCount ??= 0;
+      }
       await this.deps.store.save(state);
       if (nextAt2 !== void 0) await this.deps.store.setAlarm(nextAt2);
       return { status: "accepted", triggerId, nextAt: nextAt2 };
@@ -7106,6 +7188,98 @@ var TriageCoordinator = class {
       await store.save(state);
       return json({observed: true});
     }
+    if (request.method === "POST" && path === "/internal/run-work/start") {
+      let body;
+      try { body = await request.json(); } catch { return json({error:"invalid_payload"},400); }
+      if (!isRecord(body) || !keysAreBounded(body,["triggerId","attempt"]) || typeof body.triggerId !== "string" ||
+          !/^triage-\d+-[a-f0-9-]{36}$/i.test(body.triggerId) || !Number.isInteger(body.attempt) || body.attempt<1 || body.attempt>100) return json({error:"invalid_payload"},400);
+      const state = normalizeState(await store.load()), now = Date.now();
+      ensureAcceptedWriteLease(state,config);
+      const lease = state.runWriteLeases.find(item=>item.triggerId===body.triggerId && item.attempt===body.attempt);
+      if (!state.pending || state.executionPhase!=="awaiting_result" || state.pendingTriggerId!==body.triggerId ||
+          state.dispatchAttempt!==body.attempt || !lease || lease.revokedAt!==null || lease.expiresAt<=now) {
+        return json({protocol:RUN_START_PROTOCOL,allowed:false},409);
+      }
+      if (lease.mcpWorkStartedAt === undefined) {
+        lease.mcpWorkStartedAt = now;
+        recordDispatchHistory(state,now,{event:"run_work_started",attempt:body.attempt},lease.scope);
+      }
+      await store.save(state);
+      return json({protocol:RUN_START_PROTOCOL,allowed:true,expiresAt:lease.expiresAt});
+    }
+    if (request.method === "POST" && path === "/internal/admin/startup-recovery") {
+      let body;
+      try { body = await request.json(); } catch { return json({error:"invalid_payload"},400); }
+      const proof = body?.proof;
+      if (!isRecord(body) || !keysAreBounded(body,["triggerId","attempt","sourceEventId","ticketNumber","dryRun","proof"]) ||
+          typeof body.triggerId!=="string" || !/^triage-\d+-[a-f0-9-]{36}$/i.test(body.triggerId) ||
+          !Number.isInteger(body.attempt) || body.attempt<1 || body.attempt>99 ||
+          !Number.isSafeInteger(body.sourceEventId) || body.sourceEventId<1 || typeof body.ticketNumber!=="string" ||
+          !/^\d{1,24}$/.test(body.ticketNumber) || typeof body.dryRun!=="boolean" || !isRecord(proof) ||
+          !keysAreBounded(proof,["conversationId","complete","workflowStepCount","toolCallCount","elicitationCount","denialObserved","providerErrorCode","providerErrorSubcode","providerCanRetry"]) ||
+          !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(proof.conversationId ?? "") ||
+          proof.complete!==true || proof.workflowStepCount!==0 || proof.toolCallCount!==0 || proof.elicitationCount!==0 ||
+          proof.denialObserved!==false || proof.providerErrorCode!=="hermes_gpt_run_failed" ||
+          proof.providerErrorSubcode!=="failed_during_run" || proof.providerCanRetry!==true) return json({error:"invalid_recovery_request"},400);
+      if (!config.enabled || !config.startupRecoveryEnabled || config.scopeMode!=="new-email-tickets") return json({error:"startup_recovery_not_enabled"},409);
+      const state = normalizeState(await store.load());
+      if (state.pending || state.queuedPending || state.unavailableRetryWindow || state.reconciliationHold || state.sharedRateLimitUntil>Date.now()) return json({error:"coordinator_not_idle"},409);
+      const source = store.getDispatchHistoryEvent(body.sourceEventId);
+      const lease = state.runWriteLeases.find(item=>item.triggerId===body.triggerId && item.attempt===body.attempt);
+      const accepted = state.lastAcceptedTrigger?.triggerId===body.triggerId && state.lastAcceptedTrigger?.attempt===body.attempt ? state.lastAcceptedTrigger : undefined;
+      const conversationUrl = lease?.conversationUrl ?? accepted?.conversationUrl;
+      const triggerUrl = lease?.triggerUrl ?? accepted?.triggerUrl;
+      if (!source || source.event!=="orphan_recovered" || source.agentRunStatus!=="failed" || source.failureKind!=="ambiguous" ||
+          source.scopeMode!=="new-email-tickets" || source.batchSequence!==Number(body.triggerId.split("-")[1]) || source.attempt!==body.attempt ||
+          !source.failureDiagnostics?.some(item=>item.stage==="agent_callback" && item.errorCode==="result_callback_missing") ||
+          !startupLeaseUntouched(lease) || lease.manualStartupRecoveryRequested || !triggerUrl ||
+          conversationUrl!==`https://chatgpt.com/c/${proof.conversationId}` || lease.scope?.createdFrom!==source.scopeCreatedFrom ||
+          lease.scope?.createdTo!==source.scopeCreatedTo || store.listTriageAgentCaptures(body.triggerId,body.attempt).some(record=>record.kind==="apply_intent" || record.status!=="complete") ||
+          store.listTriageAgentCaptureFailures(body.triggerId,body.attempt).length>0 ||
+          state.dispatchHistory.some(event=>event.batchSequence===source.batchSequence && event.attempt===body.attempt &&
+            ["result_callback_received","result_callback_rejected","run_work_started"].includes(event.event))) return json({error:"unambiguous_inspected_startup_required"},409);
+      const originalScope = state.needsAttentionScopes.find(scope=>scope.mode==="new-email-tickets" && scope.source==="EMAIL" &&
+        scope.createdFrom===source.scopeCreatedFrom && scope.createdTo===source.scopeCreatedTo);
+      if (!originalScope) return json({error:"matching_attention_fence_not_found"},409);
+      const scope = {...originalScope,targetTicketNumbers:[body.ticketNumber],replayOfEventId:body.sourceEventId};
+      if (scopeOverlapsAttention(state,config,scope) || store.hasDispatchHistoryReplay(body.sourceEventId,body.ticketNumber)) return json({error:"overlap_or_recovery_already_requested"},409);
+      let capability;
+      try { const response = await config.runLeaseGuardService?.fetch(new Request("https://mcp.internal/internal/triage-run-lease-capability",{signal:AbortSignal.timeout(5000)}));
+        if (response?.ok) capability=await response.json(); } catch { }
+      if (capability?.enforced!==true || capability.protocol!==RUN_LEASE_PROTOCOL || capability.startGuardEnforced!==true || capability.startProtocol!==RUN_START_PROTOCOL) return json({error:"write_guard_not_ready"},409);
+      const diagnostics = await engine.deps.agent.getRunDiagnostics(lease.runId,triggerUrl);
+      if (diagnostics.status!=="failed" || diagnostics.httpStatus!==200 || !["run_failed","dispatch_failed"].includes(diagnostics.errorCode) ||
+          diagnostics.conversationId!==proof.conversationId) return json({error:"correlated_provider_failure_required"},409);
+      const preview = {status:body.dryRun?"recovery_preview":"recovery_scheduled",ticketNumber:body.ticketNumber,sourceEventId:body.sourceEventId,
+        scope,priorAttempt:body.attempt,attentionFencePreserved:true,oldAttemptRevoked:!body.dryRun,normalActionReviewRequired:true};
+      if (body.dryRun) return json(preview);
+      const now = Date.now();
+      lease.revokedAt ??= now;
+      lease.manualStartupRecoveryRequested = true;
+      state.triggerSequence += 1;
+      state.pending = true;
+      state.pendingReason = "new_message";
+      state.pendingTriggerId = `triage-${state.triggerSequence}-${crypto.randomUUID()}`;
+      state.pendingNotificationWindowStartedAt = Date.parse(scope.createdFrom);
+      state.pendingNotificationWindowEndedAt = Date.parse(scope.createdTo);
+      state.pendingNotificationLookbackMs = 0;
+      state.pendingTriggerScope = scope;
+      state.pendingDispatchWasQueued = false;
+      state.pendingDispatchWaitReason = null;
+      state.executionPhase = "pending_dispatch";
+      state.dispatchAttempt = 0;
+      state.resultDeadlineAt = null;
+      state.dueAt = Math.max(now,state.cooldownUntil);
+      state.retryCount = 0;
+      state.emptyTargetedRecoveryPending = false;
+      state.pendingTicketOutcomes = null;
+      state.acceptedRunLeaseUnknown = false;
+      recordDispatchHistory(state,now,{event:"manual_startup_recovery_requested",replayOfEventId:body.sourceEventId,
+        ticketNumber:body.ticketNumber,operatorConfirmedNoMcpCalls:true,waitReason:"bounded_recovery"},scope);
+      await store.save(state);
+      await store.setAlarm(state.dueAt);
+      return json(preview);
+    }
     if (request.method === "POST" && path === "/internal/triage-result-rejected") {
       let body;
       try { body = await request.json(); } catch { return json({error: "invalid_payload"}, 400); }
@@ -7867,6 +8041,9 @@ var index_default = {
         triageAcceptedRunMaxAgeMs: config.acceptedRunMaxAgeMs,
         triageConfigurationRetryExitEnabled: config.configurationRetryExitEnabled,
         triageAttentionTailIsolationEnabled: config.attentionTailIsolationEnabled,
+        triageStartupRecoveryEnabled: config.startupRecoveryEnabled,
+        triageStartupMaxRetries: 2,
+        triageStartupDeadlineMs: 600000,
         triageGraphSweepEnabled: config.graphSweepEnabled,
         triageGraphSweepLookbackMs: config.graphSweepLookbackMs,
         triageGraphSweepMaxMessages: config.graphSweepMaxMessages,

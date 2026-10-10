@@ -29,6 +29,7 @@
   ],
   "vars": {
     "TRIAGE_RUN_WRITE_GUARD_ENABLED": "true",
+    "TRIAGE_RUN_START_GUARD_ENABLED": "true",
     "SUPEROPS_GRAPHQL_CAPTURE_ENABLED": "true",
     "AUTH_MODE": "env",
     "SUPEROPS_REGION": "us",

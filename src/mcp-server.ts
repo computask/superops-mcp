@@ -11,7 +11,7 @@
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { assertTriageRunWriteLease, recordTriageRunQuery, runWithTriageRunContext } from "./triage-run-lease.js";
+import { assertTriageRunStart, assertTriageRunWriteLease, recordTriageRunQuery, runWithTriageRunContext } from "./triage-run-lease.js";
 import { attachSafeErrorContract, safeSuperOpsErrorMetadata } from "./error-contract.js";
 import {
   CallToolRequestSchema,
@@ -1077,8 +1077,9 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
       };
 
       try {
+        if (rawArgs.triageCapture !== undefined && !captureContext) throw new Error("Invalid automatic triage correlation; no tool executed.");
+        await assertTriageRunStart();
         if (name === "superops_tickets_apply_triage_plan") {
-          if (rawArgs.triageCapture !== undefined && !captureContext) throw new Error("Invalid automatic triage correlation; no apply permitted.");
           await assertTriageRunWriteLease({operationId: typeof args.batchId === "string" ? args.batchId : undefined});
         }
         let result = boundedToolResult(

@@ -1,5 +1,14 @@
 # Email triage trigger — Git deployment
 
+10 October 2026: startup recovery distinguishes `dispatch_failed` from generic
+`run_failed`. Guarded untouched dispatch failures get two bounded attempts (30s,
+60s) under the original ten-minute deadline. Each correlated MCP call persists
+an independent work-start marker before execution. Generic failures need a
+complete inspected workflow, Sam-only recovery preview, independent capture and
+lease checks, and one exact-ticket run through normal action review. Denials and
+possible writes stay fenced. The paused monitor stays paused. See
+`../../docs/triage-startup-recovery-plan-2026-10-10.md`.
+
 9 October 2026: pending first-query recovery now receives independent,
 content-free MCP observations. A missing callback can resume only the exact
 read-only window after provider completion and old-lease revocation, before the
@@ -101,7 +110,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-444cb22efd5db25d226e3ac3a00d2f472b83704a322716ba874b96195b27986d.
+ce233232d6266ffd2cd4eb0c9d2ad3b0aac20548dd6d6bac1e4834faa067b48c.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
