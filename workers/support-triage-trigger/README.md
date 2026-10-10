@@ -8,7 +8,9 @@ complete inspected workflow, Sam-only recovery preview, independent capture and
 lease checks, and one exact-ticket run through normal action review. Legacy
 accepted records without attempt numbers use only the same stored provider run
 ID to recover their original URLs; new records persist the attempt. Refused
-Sam-only previews expose fixed prerequisite names without run IDs or content. Denials and
+Sam-only previews expose fixed prerequisite names without run IDs or content.
+Read-only previews can inspect a failed run while unrelated work is active;
+scheduling still requires an idle coordinator. Denials and
 possible writes stay fenced. The paused monitor stays paused. See
 `../../docs/triage-startup-recovery-plan-2026-10-10.md`.
 
@@ -113,7 +115,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-c903313417021c813389c5ec39894f07f2a162f787896d94c0644693245038eb.
+dc1a979110286b26070a6b619aba7f17abbea924e6e0c218b0795466b8bb250d.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

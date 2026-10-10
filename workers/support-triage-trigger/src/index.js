@@ -7224,7 +7224,8 @@ var TriageCoordinator = class {
           proof.providerErrorSubcode!=="failed_during_run" || proof.providerCanRetry!==true) return json({error:"invalid_recovery_request"},400);
       if (!config.enabled || !config.startupRecoveryEnabled || config.scopeMode!=="new-email-tickets") return json({error:"startup_recovery_not_enabled"},409);
       const state = normalizeState(await store.load());
-      if (state.pending || state.queuedPending || state.unavailableRetryWindow || state.reconciliationHold || state.sharedRateLimitUntil>Date.now()) return json({error:"coordinator_not_idle"},409);
+      const coordinatorIdle = !(state.pending || state.queuedPending || state.unavailableRetryWindow || state.reconciliationHold || state.sharedRateLimitUntil>Date.now());
+      if (!coordinatorIdle && !body.dryRun) return json({error:"coordinator_not_idle"},409);
       const source = store.getDispatchHistoryEvent(body.sourceEventId);
       const lease = state.runWriteLeases.find(item=>item.triggerId===body.triggerId && item.attempt===body.attempt);
       // Older accepted records omitted attempt. The immutable provider run ID
@@ -7265,7 +7266,7 @@ var TriageCoordinator = class {
       if (diagnostics.status!=="failed" || diagnostics.httpStatus!==200 || !["run_failed","dispatch_failed"].includes(diagnostics.errorCode) ||
           diagnostics.conversationId!==proof.conversationId) return json({error:"correlated_provider_failure_required"},409);
       const preview = {status:body.dryRun?"recovery_preview":"recovery_scheduled",ticketNumber:body.ticketNumber,sourceEventId:body.sourceEventId,
-        scope,priorAttempt:body.attempt,attentionFencePreserved:true,oldAttemptRevoked:!body.dryRun,normalActionReviewRequired:true};
+        scope,priorAttempt:body.attempt,coordinatorIdle,attentionFencePreserved:true,oldAttemptRevoked:!body.dryRun,normalActionReviewRequired:true};
       if (body.dryRun) return json(preview);
       const now = Date.now();
       lease.revokedAt ??= now;

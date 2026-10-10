@@ -1127,6 +1127,13 @@ test('legacy accepted record without attempt correlates only by the exact stored
   assert(!JSON.stringify(reasons).includes('apirun_'));
   assert.equal(f.storage.value.pending,false);
 });
+test('startup preview remains read-only during unrelated work but scheduling cannot replace an active run',async()=>{
+  const f=operatorStartupRecovery();f.storage.value.pending=true;
+  const before=structuredClone(f.storage.value);
+  const preview=await f.request();assert.equal(preview.status,200);assert.equal((await preview.json()).coordinatorIdle,false);
+  assert.deepEqual(f.storage.value,before);
+  assert.equal((await f.request({dryRun:false})).status,409);assert.deepEqual(f.storage.value,before);
+});
 for(const blocker of [{mcpWorkStartedAt:1},{pendingRead:{}},{queryCompleted:true},{queryTicketNumbers:[]},{authorizedItems:['90101']},
   {operationReference:{}},{applyIntentObserved:true},{writeCheckObserved:true},{rejectedCallbackUnsafe:true},{manualStartupRecoveryRequested:true}]) {
   test('inspected startup recovery refuses '+Object.keys(blocker)[0],async()=>{
