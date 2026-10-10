@@ -95,3 +95,30 @@ retain their behavior. Missing upstream options remain empty; prepare/apply
 validation still refuses invalid or unavailable values. Regressions cover the
 two observed omissions, manual context isolation, missing upstream options and
 invalid input without any mutation.
+
+## Verified outcome at 2026-10-10 08:42 UTC
+
+The reviewed startup recovery was scheduled once, preserving the original
+one-ticket scope and revoking the old attempt. Batch 3693 attempt 3 reached
+normal prepare/review/apply. Its original durable operation is Completed with
+one successful verified item, no pending/failed/partial/unresolved-ambiguous
+items and no human reconciliation requirement. Continuations resumed existing
+receipts and completed classification, note and resolution verification.
+
+An independent safe ticket read confirms 63964 is Resolved, has its
+classification and closure fields populated, and has exactly one private
+TRIAGE SUMMARY note. Notes retrieval was available and untruncated. The pending
+independent display-number read resumed its original dispatcher receipt.
+
+Both Workers are live at 100% traffic. The downloaded MCP module contains the
+new start guard and automatic closure-field expansion; the coordinator module
+matches its reviewed source SHA-256. Durable bindings and secret names match
+the pre-change backup. The paused monitor was not resumed.
+
+Validation passed: 851 MCP Vitest tests, three instruction serialization tests,
+policy checksum validation, 155 actual coordinator runtime tests, the coordinator
+Miniflare verifier, both builds and `git diff --check`. These checks establish
+this recovery and the implemented safeguards; they do not prove all historical
+failure patterns eliminated. Generic provider `run_failed` still requires the
+complete-workflow inspection described above, because the status API does not
+expose the proof needed for an automatic safe retry.
