@@ -1122,7 +1122,9 @@ test('legacy accepted record without attempt correlates only by the exact stored
     conversationUrl:`https://chatgpt.com/c/${f.body.proof.conversationId}`};
   assert.equal((await f.request()).status,200);
   f.storage.value.lastAcceptedTrigger.runId='apirun_other_attempt';
-  assert.equal((await f.request({dryRun:false})).status,409);
+  const blocked=await f.request({dryRun:false});assert.equal(blocked.status,409);
+  const reasons=await blocked.json();assert.deepEqual(reasons.blockedBy,['accepted_run_url_available','conversation_correlation']);
+  assert(!JSON.stringify(reasons).includes('apirun_'));
   assert.equal(f.storage.value.pending,false);
 });
 for(const blocker of [{mcpWorkStartedAt:1},{pendingRead:{}},{queryCompleted:true},{queryTicketNumbers:[]},{authorizedItems:['90101']},

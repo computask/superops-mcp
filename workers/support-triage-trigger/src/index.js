@@ -7233,15 +7233,25 @@ var TriageCoordinator = class {
         ? state.lastAcceptedTrigger : undefined;
       const conversationUrl = lease?.conversationUrl ?? accepted?.conversationUrl;
       const triggerUrl = lease?.triggerUrl ?? accepted?.triggerUrl;
-      if (!source || source.event!=="orphan_recovered" || source.agentRunStatus!=="failed" || source.failureKind!=="ambiguous" ||
-          source.scopeMode!=="new-email-tickets" || source.batchSequence!==Number(body.triggerId.split("-")[1]) || source.attempt!==body.attempt ||
-          !source.failureDiagnostics?.some(item=>item.stage==="agent_callback" && item.errorCode==="result_callback_missing") ||
-          !startupLeaseUntouched(lease) || lease.manualStartupRecoveryRequested || !triggerUrl ||
-          conversationUrl!==`https://chatgpt.com/c/${proof.conversationId}` || lease.scope?.createdFrom!==source.scopeCreatedFrom ||
-          lease.scope?.createdTo!==source.scopeCreatedTo || store.listTriageAgentCaptures(body.triggerId,body.attempt).some(record=>record.kind==="apply_intent" || record.status!=="complete") ||
-          store.listTriageAgentCaptureFailures(body.triggerId,body.attempt).length>0 ||
-          state.dispatchHistory.some(event=>event.batchSequence===source.batchSequence && event.attempt===body.attempt &&
-            ["result_callback_received","result_callback_rejected","run_work_started"].includes(event.event))) return json({error:"unambiguous_inspected_startup_required"},409);
+      // Bounded private reasons make a refused preview reviewable without
+      // exposing the run credentials, captured content or mutable state.
+      const checks = {
+        source_failure_correlation: source?.event==="orphan_recovered" && source.agentRunStatus==="failed" && source.failureKind==="ambiguous" &&
+          source.scopeMode==="new-email-tickets" && source.batchSequence===Number(body.triggerId.split("-")[1]) && source.attempt===body.attempt &&
+          source.failureDiagnostics?.some(item=>item.stage==="agent_callback" && item.errorCode==="result_callback_missing"),
+        run_lease_available: Boolean(lease),
+        no_activity_observed: startupLeaseUntouched(lease),
+        not_already_recovered: lease && !lease.manualStartupRecoveryRequested,
+        accepted_run_url_available: Boolean(triggerUrl),
+        conversation_correlation: conversationUrl===`https://chatgpt.com/c/${proof.conversationId}`,
+        original_scope_correlation: Boolean(lease && source && lease.scope?.createdFrom===source.scopeCreatedFrom && lease.scope?.createdTo===source.scopeCreatedTo),
+        no_intent_or_capture_gap: !store.listTriageAgentCaptures(body.triggerId,body.attempt).some(record=>record.kind==="apply_intent" || record.status!=="complete") &&
+          store.listTriageAgentCaptureFailures(body.triggerId,body.attempt).length===0,
+        no_callback_or_work: !state.dispatchHistory.some(event=>event.batchSequence===source?.batchSequence && event.attempt===body.attempt &&
+          ["result_callback_received","result_callback_rejected","run_work_started"].includes(event.event))
+      };
+      const blockedBy = Object.entries(checks).filter(([,passed])=>!passed).map(([name])=>name);
+      if (blockedBy.length) return json({error:"unambiguous_inspected_startup_required",blockedBy},409);
       const originalScope = state.needsAttentionScopes.find(scope=>scope.mode==="new-email-tickets" && scope.source==="EMAIL" &&
         scope.createdFrom===source.scopeCreatedFrom && scope.createdTo===source.scopeCreatedTo);
       if (!originalScope) return json({error:"matching_attention_fence_not_found"},409);
