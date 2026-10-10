@@ -2133,6 +2133,7 @@ var WorkspaceAgentTriggerClient = class {
       const diagnostics = {
         status: safeRunStatus(body.status) ?? "unavailable",
         httpStatus: response.status,
+        ...(body.id === runId ? {runId} : {}),
         ...(typeof body.conversation_url === "string" && /^https:\/\/chatgpt\.com\/c\/[a-f0-9-]{36}$/.test(body.conversation_url)
           ? {conversationId: body.conversation_url.split("/").at(-1)} : {}),
         ...errorMetadata
@@ -7233,7 +7234,10 @@ var TriageCoordinator = class {
       const accepted = state.lastAcceptedTrigger?.triggerId===body.triggerId && state.lastAcceptedTrigger?.runId===lease?.runId
         ? state.lastAcceptedTrigger : undefined;
       const conversationUrl = lease?.conversationUrl ?? accepted?.conversationUrl;
-      const triggerUrl = lease?.triggerUrl ?? accepted?.triggerUrl;
+      // Historical leases predate URL persistence. The configured channel is
+      // only a lookup location; the provider must independently return the
+      // exact original lease run ID AND the inspected conversation ID below.
+      const triggerUrl = lease?.triggerUrl ?? accepted?.triggerUrl ?? config.workspaceAgentTriggerUrl;
       // Bounded private reasons make a refused preview reviewable without
       // exposing the run credentials, captured content or mutable state.
       const checks = {
@@ -7244,7 +7248,8 @@ var TriageCoordinator = class {
         no_activity_observed: startupLeaseUntouched(lease),
         not_already_recovered: lease && !lease.manualStartupRecoveryRequested,
         accepted_run_url_available: Boolean(triggerUrl),
-        conversation_correlation: conversationUrl===`https://chatgpt.com/c/${proof.conversationId}`,
+        stored_provider_run_available: /^apirun_[A-Za-z0-9_-]{1,128}$/.test(lease?.runId ?? ""),
+        conversation_correlation: conversationUrl===undefined || conversationUrl===`https://chatgpt.com/c/${proof.conversationId}`,
         original_scope_correlation: Boolean(lease && source && lease.scope?.createdFrom===source.scopeCreatedFrom && lease.scope?.createdTo===source.scopeCreatedTo),
         no_intent_or_capture_gap: !store.listTriageAgentCaptures(body.triggerId,body.attempt).some(record=>record.kind==="apply_intent" || record.status!=="complete") &&
           store.listTriageAgentCaptureFailures(body.triggerId,body.attempt).length===0,
@@ -7264,7 +7269,7 @@ var TriageCoordinator = class {
       if (capability?.enforced!==true || capability.protocol!==RUN_LEASE_PROTOCOL || capability.startGuardEnforced!==true || capability.startProtocol!==RUN_START_PROTOCOL) return json({error:"write_guard_not_ready"},409);
       const diagnostics = await engine.deps.agent.getRunDiagnostics(lease.runId,triggerUrl);
       if (diagnostics.status!=="failed" || diagnostics.httpStatus!==200 || !["run_failed","dispatch_failed"].includes(diagnostics.errorCode) ||
-          diagnostics.conversationId!==proof.conversationId) return json({error:"correlated_provider_failure_required"},409);
+          diagnostics.runId!==lease.runId || diagnostics.conversationId!==proof.conversationId) return json({error:"correlated_provider_failure_required"},409);
       const preview = {status:body.dryRun?"recovery_preview":"recovery_scheduled",ticketNumber:body.ticketNumber,sourceEventId:body.sourceEventId,
         scope,priorAttempt:body.attempt,coordinatorIdle,attentionFencePreserved:true,oldAttemptRevoked:!body.dryRun,normalActionReviewRequired:true};
       if (body.dryRun) return json(preview);

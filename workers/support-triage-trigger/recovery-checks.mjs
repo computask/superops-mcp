@@ -1092,9 +1092,9 @@ function operatorStartupRecovery(change={}) {
   const proof={conversationId,complete:true,workflowStepCount:0,toolCallCount:0,elicitationCount:0,denialObserved:false,
     providerErrorCode:'hermes_gpt_run_failed',providerErrorSubcode:'failed_during_run',providerCanRetry:true};
   const body={triggerId,attempt:1,sourceEventId:41,ticketNumber:'90101',dryRun:true,proof};
-  const request=async(patch={})=>{
+  const request=async(patch={},providerChange={})=>{
     const original=globalThis.fetch;
-    globalThis.fetch=async()=>Response.json({status:'failed',conversation_url:`https://chatgpt.com/c/${conversationId}`,error:{code:'run_failed'}});
+    globalThis.fetch=async()=>Response.json({id:'apirun_synthetic',status:'failed',conversation_url:`https://chatgpt.com/c/${conversationId}`,error:{code:'run_failed'},...providerChange});
     try { return await f.coordinator.fetch(new Request('https://coordinator.internal/internal/admin/startup-recovery',{
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,...patch})})); }
     finally { globalThis.fetch=original; }
@@ -1115,16 +1115,21 @@ test('inspected historical startup failure previews without writes and schedules
   f.storage.value.pending=false;
   assert.equal((await f.request({dryRun:false})).status,409,'repeat recovery stays blocked even after a later idle restart');
 });
-test('legacy accepted record without attempt correlates only by the exact stored provider run ID',async()=>{
+test('legacy leases without URLs require the exact original provider run and inspected conversation',async()=>{
   const f=operatorStartupRecovery({triggerUrl:undefined,conversationUrl:undefined});
   f.storage.value.lastAcceptedTrigger={triggerId:f.body.triggerId,runId:'apirun_synthetic',
     triggerUrl:'https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic/trigger',
     conversationUrl:`https://chatgpt.com/c/${f.body.proof.conversationId}`};
   assert.equal((await f.request()).status,200);
   f.storage.value.lastAcceptedTrigger.runId='apirun_other_attempt';
-  const blocked=await f.request({dryRun:false});assert.equal(blocked.status,409);
-  const reasons=await blocked.json();assert.deepEqual(reasons.blockedBy,['accepted_run_url_available','conversation_correlation']);
+  assert.equal((await f.request()).status,200,'unrelated latest run cannot replace the original lease identity');
+  const blocked=await f.request({dryRun:false},{id:'apirun_other_attempt'});assert.equal(blocked.status,409);
+  const reasons=await blocked.json();assert.equal(reasons.error,'correlated_provider_failure_required');
   assert(!JSON.stringify(reasons).includes('apirun_'));
+  assert.equal((await f.request({dryRun:false},{conversation_url:'https://chatgpt.com/c/00000000-0000-4000-8000-000000000025'})).status,409);
+  assert.equal((await f.request({dryRun:false},{status:'completed'})).status,409);
+  f.storage.value.runWriteLeases[0].conversationUrl='https://chatgpt.com/c/00000000-0000-4000-8000-000000000025';
+  const mismatch=await f.request();assert.equal(mismatch.status,409);assert.deepEqual((await mismatch.json()).blockedBy,['conversation_correlation']);
   assert.equal(f.storage.value.pending,false);
 });
 test('startup preview remains read-only during unrelated work but scheduling cannot replace an active run',async()=>{
