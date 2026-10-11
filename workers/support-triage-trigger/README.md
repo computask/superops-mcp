@@ -1,7 +1,21 @@
 # Email triage trigger — Git deployment
 
-11 October 2026: generated run input requires `ticketNumber` on every preparation
-action before both permitted calls. Callback stage/reason enums are generated
+11 October 2026 prevention rollout: the start guard accepts an optional
+preparation invocation ID and invalidates the preceding preparation outcome
+before the new tool executes. The internal preparation observer accepts only
+typed, content-free states for that exact invocation and the frozen query set.
+Lost, late, conflicting or unavailable observations cannot replace a newer result.
+After provider termination, a confirmed preparation validation failure with no
+intent, operation, write check or ambiguity is reported using canonical enums,
+even when the Agent callback is missing. The old attempt is revoked and the
+original attention fence is retained. This reports failure; it creates no new
+retry, approval, mutation or automatic construction-recovery path. Legacy MCP
+calls remain compatible while the receiver is deployed before the MCP sender.
+
+11 October 2026: generated run input checks each preparation action's immutable
+ID and exposed schema before both permitted calls. Legacy schemas still require
+the display number; current preparation can derive an omission by canonical ID
+inside the fixed candidate set. Callback stage/reason enums are generated
 from the Reporter contract; a preparation error uses coarse `validation` and
 retains `plan_validation_failed` only in safe cause diagnostics. Required fields,
 immutable identities, stale checks, approval and the one-correction limit remain.
@@ -133,7 +147,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-e7a07c0802936b421158fe46120c3a206558a1d45dfcf08d66a873f158a3e422.
+6a2d3286952182e1cf6bf28fa9d606341f3b853f31b75e011aaef7bf7ff733a0.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

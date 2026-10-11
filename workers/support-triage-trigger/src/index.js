@@ -2001,7 +2001,7 @@ __name(isExplicitChannelUnavailableResponse, "isExplicitChannelUnavailableRespon
 function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = false, captureEnabled = true) {
   const preparationInstructions = [
     "",
-    "Preparation construction preflight (before BOTH the first call and its one permitted correction): EVERY actions[i] must include ticketNumber as a string copied from that frozen candidate's displayId, plus action. expectedCandidateTicketNumbers is only the fixed-set fence; it does not populate actions[i].ticketNumber. expectedTicketId is an immutable identity check, not a substitute for ticketNumber. Check every entry for the required field before calling superops_tickets_prepare_triage_plan. If validation says ticketNumber is required, the one correction must add that missing field from the SAME frozen candidate; do not repeat the same invalid object, guess an ID, widen the set, omit identity/stale fences, or use an override. An unresolved construction error stops before intent/apply and is reported as validation.",
+    "Preparation construction preflight (before BOTH the first call and its one permitted correction): EVERY actions[i] must include expectedTicketId copied from the SAME frozen candidate's immutable ID, plus action and the frozen expectations. Include ticketNumber copied from displayId whenever the exposed preparation schema requires it. The current read-only preparer can derive an omitted ticketNumber by canonical immutable-ID lookup inside the exact expectedCandidateTicketNumbers fence; the fence alone never supplies identity. Never map by array position, refresh frozen timestamps, guess an ID, widen the set or enable overrides. A supplied identity conflict remains terminal and must not be repaired. If an older schema rejects an omitted ticketNumber, the one correction must add that missing field from the SAME frozen candidate. The complete returned preparedPlan always includes every ticketNumber; copy it unchanged into the separately reviewed apply. An unresolved construction error stops before intent/apply and is reported as validation.",
     "Policy contract version: 2026-10-04.1. Before any intent report or apply, call the read-only superops_tickets_prepare_triage_plan with the complete frozen eligible proposal and batchId equal to this Trigger ID. Require ok:true, complete:true, operationCreated:false and this policyContractVersion. Copy the entire preparedPlan unchanged, including preparationFingerprint and the returned dryRun:false, into the intent and the ONE reviewed apply call. Do not add dryRun or change defaults afterward. A checksum and preparation result never grant approval. Correct a construction error at most once by repeating read-only preparation using supported evidence, before any apply exists. This single allowance also permits ONE new complete preparation of eligibleCandidateTicketNumbers after a partial preparation; retain deferredCandidateTicketNumbers as explicit callback deferrals and copy the original frozen fences. Never apply a partial prepared plan or repair an immutable identity mismatch. After ANY actual apply response, even zero-call validation, do not resubmit or repair under the same operation ID. Terminal ledger status stops regardless of callback stage or replaySafe. Any observed platform denial remains terminal. Missing preparation action or contract mismatch is configuration failure before writes."
   ];
   const captureInstructions = captureEnabled ? [
@@ -3674,6 +3674,29 @@ async function readCorrelatedOperation(lease, config) {
     return record;
   } catch { return null; }
 }
+// A typed MCP validation failure is independent of the Agent's callback grammar.
+// This reports an observed failure only. It never schedules a retry or authorizes
+// a write, and any intent/operation/write uncertainty excludes this projection.
+function correlatedPreparationFailureReport(state) {
+  const lease = state.runWriteLeases.find(item => item.triggerId === state.pendingTriggerId && item.attempt === state.dispatchAttempt);
+  const observation = lease?.preparationObservation;
+  const candidates = lease?.queryTicketNumbers;
+  if (!lease || lease.startGuardProtocol !== RUN_START_PROTOCOL || !Number.isFinite(lease.mcpWorkStartedAt) ||
+      lease.queryCompleted !== true || !Array.isArray(candidates) || !candidates.length || candidates.length > 50 ||
+      candidates.some(id => typeof id !== "string" || !/^\d{1,24}$/.test(id)) || new Set(candidates).size !== candidates.length ||
+      observation?.state !== "validation_failed" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(observation.invocationId ?? "") ||
+      !Array.isArray(observation.ticketNumbers) || !observation.ticketNumbers.length || observation.ticketNumbers.length>50 ||
+      new Set(observation.ticketNumbers).size!==observation.ticketNumbers.length ||
+      observation.ticketNumbers.some(id => !candidates.includes(id)) ||
+      lease.pendingRead || lease.operationReference || lease.applyIntentObserved || lease.writeCheckObserved ||
+      lease.rejectedCallbackUnsafe || lease.authorizedItems.length || state.pendingTicketOutcomes?.length) return null;
+  return {triggerId: state.pendingTriggerId, attempt: state.dispatchAttempt, status: "terminal_failure", metadata: {
+    failureStage: "triage_apply", ticketsConsidered: candidates.length, ticketsCompleted: 0, ticketsDeferred: candidates.length,
+    ticketOutcomes: candidates.map(ticketNumber => ({ticketNumber, outcome: "not_attempted", stage: "triage_apply",
+      reasonCode: observation.ticketNumbers.includes(ticketNumber) ? "validation" : "unknown"})),
+    failureDiagnostics: [{stage: "triage_apply", errorType: "validation", errorCode: "plan_validation_failed"}],
+  }};
+}
 async function correlatedOperationReport(state, config, suppliedReport) {
   const lease = state.runWriteLeases.find(item => item.triggerId === state.pendingTriggerId && item.attempt === state.dispatchAttempt);
   const reference = lease?.operationReference;
@@ -4185,6 +4208,22 @@ var CoordinatorEngine = class {
             await this.deps.store.save(state);
             if (nextAt !== void 0) await this.deps.store.setAlarm(nextAt);
             return {status: "complete", triggerId: recovered.triggerId, nextAt};
+          }
+          const preparationFailure = correlatedPreparationFailureReport(state);
+          if (preparationFailure) {
+            const lease = state.runWriteLeases.find(item => item.triggerId === state.pendingTriggerId && item.attempt === state.dispatchAttempt);
+            lease.revokedAt ??= now;
+            state.lastResultReport = {...preparationFailure, recordedAt: new Date(now).toISOString()};
+            recordDispatchHistory(state, now, {event: "preparation_failure_reported", ...resultHistoryDetails(preparationFailure),
+              failureKind: "permanent", agentRunStatus: runStatus, agentRunIdPresent: true, waitReason: "result_watchdog"}, state.pendingTriggerScope);
+            // Preserve attention and release only unrelated queued work. This is
+            // terminal reporting, not a new automatic construction-recovery path.
+            if (state.pendingTriggerScope?.mode === "new-email-tickets") recordReconciliationNeedsAttention(state, state.pendingTriggerScope, now, state.retryCount);
+            markFailure(state, "permanent", now);
+            const nextAt = this.finishCurrent(state, now);
+            await this.deps.store.save(state);
+            if (nextAt !== void 0) await this.deps.store.setAlarm(nextAt);
+            return {status: "terminal_failure", triggerId: preparationFailure.triggerId, nextAt};
           }
           const pendingReadRecovery = schedulePendingFirstReadRecovery(state, this.deps.config, now, diagnostics);
           if (pendingReadRecovery) {
@@ -7193,11 +7232,36 @@ var TriageCoordinator = class {
       await store.save(state);
       return json({observed: true});
     }
+    if (request.method === "POST" && path === "/internal/run-preparation/observe") {
+      let body;
+      try { body = await request.json(); } catch { return json({error:"invalid_payload"},400); }
+      if (!isRecord(body) || !keysAreBounded(body,["triggerId","attempt","invocationId","state","ticketNumbers"]) ||
+          !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(body.invocationId ?? "") ||
+          !["validation_failed","ready","unavailable"].includes(body.state) || !Array.isArray(body.ticketNumbers) ||
+          body.ticketNumbers.length<1 || body.ticketNumbers.length>50 ||
+          !body.ticketNumbers.every(id=>typeof id==="string" && /^\d{1,24}$/.test(id)) ||
+          new Set(body.ticketNumbers).size!==body.ticketNumbers.length) return json({error:"invalid_payload"},400);
+      const state = normalizeState(await store.load()), now = Date.now();
+      const lease = state.runWriteLeases.find(item=>item.triggerId===body.triggerId && item.attempt===body.attempt);
+      if (!lease || lease.revokedAt!==null || lease.expiresAt<=now || !state.pending ||
+          state.executionPhase!=="awaiting_result" || state.pendingTriggerId!==body.triggerId || state.dispatchAttempt!==body.attempt ||
+          lease.startGuardProtocol!==RUN_START_PROTOCOL || lease.queryCompleted!==true ||
+          !Array.isArray(lease.queryTicketNumbers) || body.ticketNumbers.some(id=>!lease.queryTicketNumbers.includes(id)) ||
+          lease.preparationObservation?.invocationId!==body.invocationId) return json({error:"preparation_correlation_mismatch"},409);
+      const previous = lease.preparationObservation;
+      if (previous.state!=="in_progress" && (previous.state!==body.state || JSON.stringify(previous.ticketNumbers)!==JSON.stringify(body.ticketNumbers))) {
+        return json({error:"preparation_observation_conflict"},409);
+      }
+      lease.preparationObservation = {invocationId:body.invocationId,state:body.state,ticketNumbers:body.ticketNumbers};
+      await store.save(state);
+      return json({observed:true});
+    }
     if (request.method === "POST" && path === "/internal/run-work/start") {
       let body;
       try { body = await request.json(); } catch { return json({error:"invalid_payload"},400); }
-      if (!isRecord(body) || !keysAreBounded(body,["triggerId","attempt"]) || typeof body.triggerId !== "string" ||
+      if (!isRecord(body) || !keysAreBounded(body,["triggerId","attempt","preparationInvocationId"]) || typeof body.triggerId !== "string" ||
           !/^triage-\d+-[a-f0-9-]{36}$/i.test(body.triggerId) || !Number.isInteger(body.attempt) || body.attempt<1 || body.attempt>100) return json({error:"invalid_payload"},400);
+      if (body.preparationInvocationId!==undefined && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(body.preparationInvocationId)) return json({error:"invalid_payload"},400);
       const state = normalizeState(await store.load()), now = Date.now();
       ensureAcceptedWriteLease(state,config);
       const lease = state.runWriteLeases.find(item=>item.triggerId===body.triggerId && item.attempt===body.attempt);
@@ -7209,8 +7273,15 @@ var TriageCoordinator = class {
         lease.mcpWorkStartedAt = now;
         recordDispatchHistory(state,now,{event:"run_work_started",attempt:body.attempt},lease.scope);
       }
+      lease.startGuardProtocol = RUN_START_PROTOCOL;
+      if (body.preparationInvocationId!==undefined) {
+        // Begin before executing preparation. Every correction invalidates the
+        // previous result, including when its later outcome observation is lost.
+        lease.preparationObservation = {invocationId:body.preparationInvocationId,state:"in_progress"};
+      }
       await store.save(state);
-      return json({protocol:RUN_START_PROTOCOL,allowed:true,expiresAt:lease.expiresAt});
+      return json({protocol:RUN_START_PROTOCOL,allowed:true,expiresAt:lease.expiresAt,
+        ...(body.preparationInvocationId!==undefined ? {preparationInvocationId:body.preparationInvocationId} : {})});
     }
     if (request.method === "POST" && path === "/internal/admin/construction-recovery") {
       let body;

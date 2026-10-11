@@ -12,6 +12,71 @@ const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, reg
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
+const preparationInvocation='00000000-0000-4000-8000-000000000111';
+function preparationFailureFixture(changes={}) {
+  const f=fixture('completed');
+  const lease={triggerId:f.state.pendingTriggerId,attempt:1,scope:f.scope,
+    issuedAt:Date.parse(f.state.lastAcceptedTrigger.acceptedAt),expiresAt:Date.parse(f.state.lastAcceptedTrigger.acceptedAt)+600000,
+    revokedAt:null,authorizedItems:[],startGuardProtocol:'triage-run-start-v1',mcpWorkStartedAt:Date.parse(f.scope.createdFrom),
+    queryCompleted:true,queryTicketNumbers:['90101'],preparationObservation:{invocationId:preparationInvocation,state:'validation_failed',ticketNumbers:['90101']},...changes};
+  f.seed({runWriteLeases:[lease]});return f;
+}
+test('server-observed preparation failure reports canonical cause despite a missing Agent callback, without any replay',async()=>{
+  const f=preparationFailureFixture();f.expire();
+  assert.equal((await f.engine.processAlarm()).status,'terminal_failure');
+  assert.equal(f.calls.length,0);assert.equal(f.state.pending,false);assert.equal(f.state.runWriteLeases[0].revokedAt!==null,true);
+  assert.deepEqual(f.state.lastResultReport.metadata.ticketOutcomes,[{ticketNumber:'90101',outcome:'not_attempted',stage:'triage_apply',reasonCode:'validation'}]);
+  assert.deepEqual(f.state.lastResultReport.metadata.failureDiagnostics,[{stage:'triage_apply',errorType:'validation',errorCode:'plan_validation_failed'}]);
+  assert.deepEqual(f.state.needsAttentionScopes,[f.scope]);
+  assert(f.state.dispatchHistory.some(event=>event.event==='preparation_failure_reported'));
+  assert(!f.state.dispatchHistory.some(event=>event.event==='orphan_recovered'));
+  assert.equal(f.state.lastResultReport.metadata.operationId,undefined);
+});
+for(const changes of [
+  {preparationObservation:{invocationId:preparationInvocation,state:'ready',ticketNumbers:['90101']}},
+  {preparationObservation:{invocationId:preparationInvocation,state:'in_progress'}},
+  {preparationObservation:{invocationId:preparationInvocation,state:'unavailable',ticketNumbers:['90101']}},
+  {preparationObservation:{invocationId:preparationInvocation,state:'validation_failed',ticketNumbers:['90102']}},
+  {preparationObservation:{state:'validation_failed',ticketNumbers:['90101']}},
+  {operationReference:{operationId:'prior-operation'}},{applyIntentObserved:true},{writeCheckObserved:true},
+  {authorizedItems:['90101']},{rejectedCallbackUnsafe:true},{pendingRead:{requestId:'prior-read'}},
+  {queryCompleted:false},{startGuardProtocol:undefined},{mcpWorkStartedAt:undefined},
+]) test('preparation reporting refuses uncertain or superseded evidence: '+JSON.stringify(changes),async()=>{
+  const f=preparationFailureFixture(changes);f.expire();await f.engine.processAlarm();
+  assert.equal(f.calls.length,0);assert(!f.state.dispatchHistory.some(event=>event.event==='preparation_failure_reported'));
+});
+test('preparation failure reports the eligible subset without claiming unseen candidates succeeded or failed validation',async()=>{
+  const f=preparationFailureFixture({queryTicketNumbers:['90101','90102']});f.expire();await f.engine.processAlarm();
+  assert.deepEqual(f.state.lastResultReport.metadata.ticketOutcomes.map(item=>item.reasonCode),['validation','unknown']);
+  assert.equal(f.state.lastResultReport.metadata.ticketsCompleted,0);assert.equal(f.state.lastResultReport.metadata.ticketsConsidered,2);
+});
+test('preparation observation lifecycle invalidates older failures and rejects late completions, stale attempts and foreign scope',async()=>{
+  const now=Date.now(),triggerId='triage-71-00000000-0000-4000-8000-000000000071';
+  const scope={mode:'new-email-tickets',source:'EMAIL',createdFrom:new Date(now-60000).toISOString(),createdTo:new Date(now).toISOString()};
+  const lease={triggerId,attempt:1,scope,issuedAt:now-30000,expiresAt:now+270000,revokedAt:null,authorizedItems:[],
+    startGuardProtocol:'triage-run-start-v1',mcpWorkStartedAt:now-20000,queryCompleted:true,queryTicketNumbers:['90101']};
+  const {coordinator,storage}=replayCoordinator({...createInitialState(),pending:true,executionPhase:'awaiting_result',
+    pendingTriggerId:triggerId,pendingTriggerScope:scope,dispatchAttempt:1,runWriteLeases:[lease]});
+  const request=(path,fields)=>coordinator.fetch(new Request('https://coordinator.internal/internal/'+path,{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({triggerId,attempt:1,...fields})}));
+  const finish=fields=>request('run-preparation/observe',{invocationId:preparationInvocation,state:'validation_failed',ticketNumbers:['90101'],...fields});
+  assert.equal((await finish({})).status,409,'finish requires an independently acknowledged begin');
+  const acknowledgement=await request('run-work/start',{preparationInvocationId:preparationInvocation});
+  assert.equal(acknowledgement.status,200);assert.equal((await acknowledgement.json()).preparationInvocationId,preparationInvocation);
+  assert.equal((await finish({ticketNumbers:['90102']})).status,409);
+  assert.equal((await finish({attempt:2})).status,409);
+  assert.equal((await finish({note:'synthetic private content'})).status,400);
+  assert.equal((await finish({})).status,200);assert.equal(storage.value.runWriteLeases[0].preparationObservation.state,'validation_failed');
+  const newer='00000000-0000-4000-8000-000000000112';
+  assert.equal((await request('run-work/start',{preparationInvocationId:newer})).status,200);
+  assert.equal(storage.value.runWriteLeases[0].preparationObservation.state,'in_progress','lost correction outcome cannot reuse old failure');
+  assert.equal((await finish({})).status,409,'older invocation cannot overwrite the correction');
+  assert.equal((await finish({invocationId:newer,state:'ready'})).status,200);
+  assert.equal((await finish({invocationId:newer})).status,409,'one invocation cannot report conflicting final states');
+  assert.equal(storage.value.runWriteLeases[0].preparationObservation.state,'ready');
+  assert.equal(storage.value.dispatchAttempt,1);assert.equal(storage.value.retryCount,0);
+});
+
 test('channel cutover preserves the accepted run endpoint through durable state and polling',async()=>{
   const original='https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic_original/trigger';
   const replacement='https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic_replacement/trigger';
@@ -100,9 +165,11 @@ test('preparation contract remains mandatory without diagnostic capture or callb
 
 test('construction preflight preserves per-action identity and the callback uses the advertised coarse enums',()=>{
   const prompt=buildAgentInput('triage-24-00000000-0000-4000-8000-000000000024',replaySourceScope,1,true);
-  assert(prompt.includes('EVERY actions[i] must include ticketNumber'));
+  assert(prompt.includes('EVERY actions[i] must include expectedTicketId'));
   assert(prompt.includes('before BOTH the first call and its one permitted correction'));
-  assert(prompt.includes('it does not populate actions[i].ticketNumber'));
+  assert(prompt.includes('whenever the exposed preparation schema requires it'));
+  assert(prompt.includes('canonical immutable-ID lookup inside the exact expectedCandidateTicketNumbers fence'));
+  assert(prompt.includes('Never map by array position, refresh frozen timestamps'));
   assert(prompt.includes('the one correction must add that missing field from the SAME frozen candidate'));
   const outcomeSchema=toolDefinition().inputSchema.properties.metadata.properties.ticketOutcomes.items;
   assert(prompt.includes(`reasonCode must be one of ${outcomeSchema.properties.reasonCode.enum.join(', ')}`));

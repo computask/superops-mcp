@@ -7,7 +7,7 @@ const require=createRequire(import.meta.url);
 const wranglerRequire=createRequire(require.resolve('wrangler/package.json'));
 const {Miniflare}=wranglerRequire('miniflare');
 const code=readFileSync(new URL('./src/index.js',import.meta.url));
-assert.equal(createHash('sha256').update(code).digest('hex'),'e7a07c0802936b421158fe46120c3a206558a1d45dfcf08d66a873f158a3e422','Reviewed production module must match the provenance record');
+assert.equal(createHash('sha256').update(code).digest('hex'),'6a2d3286952182e1cf6bf28fa9d606341f3b853f31b75e011aaef7bf7ff733a0','Reviewed production module must match the provenance record');
 const config=JSON.parse(readFileSync(new URL('./wrangler.jsonc',import.meta.url),'utf8'));
 assert.equal(config.name,'support-triage-trigger');
 assert.equal(config.no_bundle,true);
@@ -39,6 +39,7 @@ try {
   assert.equal((await mf.dispatchFetch('http://local/internal/run-lease/check',{method:'POST',body:'{}'})).status,404);
   assert.equal((await mf.dispatchFetch('http://local/internal/run-query/observe',{method:'POST',body:'{}'})).status,404);
   assert.equal((await mf.dispatchFetch('http://local/internal/run-work/start',{method:'POST',body:'{}'})).status,404);
+  assert.equal((await mf.dispatchFetch('http://local/internal/run-preparation/observe',{method:'POST',body:'{}'})).status,404);
   assert.equal((await mf.dispatchFetch('http://local/internal/admin/startup-recovery',{method:'POST',body:'{}'})).status,404);
   assert.equal((await mf.dispatchFetch('http://local/admin/run/recover',{method:'POST',headers:{Authorization:'Bearer synthetic-replay-admin-token','Content-Type':'application/json'},body:'{}'})).status,409);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST',headers:{Authorization:'Bearer wrong-token'},body:'{}'})).status,401);
