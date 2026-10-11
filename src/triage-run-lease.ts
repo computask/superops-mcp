@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getExecutionState, recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
 import { currentOwnerHash } from "./operation-store.js";
-import { authorizeDispatcherReadRenewals, renewableTerminalRead, TERMINAL_READ_RENEWAL_PROTOCOL, type TerminalReadRenewal } from "./dispatcher-read-journal.js";
+import { authorizeDispatcherReadRenewals, observableTerminalRead, TERMINAL_READ_RENEWAL_PROTOCOL, type TerminalReadRenewal } from "./dispatcher-read-journal.js";
 
 export const TRIAGE_RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
 export const TRIAGE_RUN_START_PROTOCOL = "triage-run-start-v1";
@@ -68,7 +68,7 @@ export async function recordTriageRunReadFailure(toolName: string, error: unknow
   const failure = error as {state?: string; requestId?: string; upstreamHttpStatus?: number; errorClassification?: string;
     readRecovery?: {durable?: boolean; deadlineAt?: string; journalIdentity?: {workflowHash?: string; payloadHash?: string}}} | undefined;
   const journal = failure?.readRecovery?.journalIdentity;
-  if (!failure || failure.readRecovery?.durable !== true || !renewableTerminalRead(failure.state ?? "", failure.errorClassification, failure.upstreamHttpStatus) ||
+  if (!failure || failure.readRecovery?.durable !== true || !observableTerminalRead(failure.state ?? "", failure.errorClassification, failure.upstreamHttpStatus) ||
       !/^[A-Za-z0-9_-]{1,160}$/.test(failure.requestId ?? "") || !/^[a-f0-9]{64}$/.test(journal?.workflowHash ?? "") ||
       !/^[a-f0-9]{64}$/.test(journal?.payloadHash ?? "") || !failure.readRecovery.deadlineAt) return;
   let counted: ReturnType<typeof recordTypedSubrequestStart> | undefined;

@@ -693,6 +693,39 @@ const failedReadReport=f=>({triggerId:f.state.pendingTriggerId,attempt:f.state.d
   metadata:{failureStage:'triage_apply',ticketsConsidered:1,ticketsCompleted:0,ticketsDeferred:1,
     ticketOutcomes:[{ticketNumber:'90101',outcome:'deferred',stage:'triage_apply',reasonCode:'unknown'}],
     failureDiagnostics:[{stage:'triage_apply',errorCode:'HTTP_ERROR',httpStatus:401}]}});
+for(const status of [400,403,404]) test('confirmed HTTP '+status+' before apply stops after one Agent and keeps the attention fence',async()=>{
+  const f=terminalReadFixture();const original=f.state.runWriteLeases[0];
+  f.seed({runWriteLeases:[{...original,failedRead:{...original.failedRead,toolName:'superops_tickets_query',httpStatus:status},queryCompleted:false,queryTicketNumbers:undefined}]});
+  const report=failedReadReport(f);report.metadata.failureStage='bounded_query';
+  report.metadata.failureDiagnostics=[{stage:'bounded_query',errorCode:'HTTP_ERROR',httpStatus:status}];
+  assert.equal((await f.engine.reportResult(report)).status,'terminal_failure');
+  assert.equal(f.calls.length,0);assert.equal(f.state.pending,false);assert.equal(f.state.needsAttentionScopes.length,1);
+  assert(!f.state.dispatchHistory.some(e=>e.event==='retry_scheduled'));
+  assert(!f.state.runWriteLeases[0].readRenewals?.length);
+});
+test('a lost terminal read observation cannot fall through to generic retries of its old receipt',async()=>{
+  const f=terminalReadFixture({failedRead:undefined,queryCompleted:false,queryTicketNumbers:undefined});
+  const report=failedReadReport(f);report.metadata.failureStage='bounded_query';
+  assert.equal((await f.engine.reportResult(report)).status,'terminal_failure');assert.equal(f.calls.length,0);
+  assert.equal(f.state.pending,false);assert.equal(f.state.needsAttentionScopes.length,1);
+  assert(f.state.dispatchHistory.some(e=>e.event==='batch_failed' && e.failureDiagnostics.some(d=>d.errorCode==='failed_read_observation_unavailable')));
+});
+test('the real private observer accepts definite nonrenewable HTTP failures and refuses pending or possible-write evidence',async()=>{
+  const now=Date.now(),triggerId='triage-73-00000000-0000-4000-8000-000000000073';
+  const scope={mode:'new-email-tickets',source:'EMAIL',createdFrom:new Date(now-60000).toISOString(),createdTo:new Date(now).toISOString()};
+  const lease={triggerId,attempt:1,scope,issuedAt:now-30000,expiresAt:now+270000,revokedAt:null,authorizedItems:[],
+    startGuardProtocol:'triage-run-start-v1',mcpWorkStartedAt:now-20000};
+  const body={triggerId,attempt:1,toolName:'superops_tickets_query',requestId:'00000000-0000-4000-8000-000000000873',ownerHash:'12345678',
+    workflowHash:'a'.repeat(64),payloadHash:'b'.repeat(64),state:'failed',httpStatus:400,errorClassification:'HTTP_ERROR',deadlineAt:new Date(now+899000).toISOString()};
+  for(const change of [{},{state:'queued'},{writeCheckObserved:true}]){
+    const {coordinator,storage}=replayCoordinator({...createInitialState(),pending:true,executionPhase:'awaiting_result',pendingTriggerId:triggerId,
+      pendingTriggerScope:scope,dispatchAttempt:1,runWriteLeases:[{...lease,...(change.writeCheckObserved?{writeCheckObserved:true}:{})}]});
+    const response=await coordinator.fetch(new Request('https://coordinator.internal/internal/run-read-failure/observe',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,...(change.state?{state:change.state}:{})})}));
+    assert.equal(response.status,Object.keys(change).length?409:200);
+    assert.equal(Boolean(storage.value.runWriteLeases[0].failedRead),Object.keys(change).length===0);
+  }
+});
 test('the observed field-options 401 then first-query 401 renew both exact receipts across restored attempts without widening the scope',async()=>{
   const f=terminalReadFixture(),scope=structuredClone(f.state.pendingTriggerScope);
   assert.equal((await f.engine.reportResult(failedReadReport(f))).status,'retry_scheduled');

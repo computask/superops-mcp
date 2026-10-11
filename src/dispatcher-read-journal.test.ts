@@ -298,6 +298,38 @@ describe("durable dispatcher read receipts", () => {
     expect(JSON.stringify(observations)).not.toMatch(/apiToken|idempotencyKey|ticket description|note body/);
   });
 
+  it.each([400,403,404])("observes an asynchronous empty HTTP %s failure without granting renewal or another POST",async status=>{
+    vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(START);const ns=namespace(),methods:string[]=[],observations:Record<string,any>[]=[];
+    const triggerId="triage-10-00000000-0000-4000-8000-000000000010";
+    vi.stubGlobal("fetch",vi.fn(async (_url:string,init?:RequestInit)=>{
+      methods.push(init?.method??"GET");
+      return init?.method==="POST" ? Response.json({requestId:ID,status:"queued"},{status:202})
+        : Response.json({requestId:ID,source:"superops-mcp",status:"failed",httpStatus:status,errorClassification:"HTTP_ERROR",response:null});
+    }));
+    const env={TRIAGE_RUN_WRITE_GUARD_ENABLED:"true",TRIAGE_RUN_START_GUARD_ENABLED:"true",TRIAGE_RUN_COORDINATOR:{
+      idFromName:(name:string)=>name,get:()=>({fetch:async(request:Request)=>{
+        const body=await request.json() as Record<string,any>;
+        if(request.url.endsWith("/start"))return Response.json({protocol:"triage-run-start-v1",allowed:true,expiresAt:START+600000});
+        observations.push(body);return Response.json({observed:true});
+      }})}};
+    async function rpc(attempt:number){
+      const server=createMcpServer(),client=new Client({name:"nonrenewable-read-regression",version:"1"});
+      const [a,b]=InMemoryTransport.createLinkedPair();await server.connect(a);await client.connect(b);
+      try{return await runWithTriageLeaseEnvironment(env,()=>call(ns,"synthetic-reader",true,"outer",()=>client.callTool({
+        name:"superops_tickets_query",arguments:{createdFrom:new Date(START-60000).toISOString(),createdTo:new Date(START+60000).toISOString(),
+          status:["New Calls"],sources:["EMAIL"],fieldProfile:"minimal",maxPages:1,maxRecords:50,triageCapture:{triggerId,attempt}}})));}
+      finally{await client.close();await server.close();}
+    }
+    expect(await rpc(1)).toMatchObject({isError:true,structuredContent:{dispatcherPending:true,resumeSameRequest:true}});
+    vi.setSystemTime(START+1001);
+    expect(await rpc(2)).toMatchObject({isError:true});
+    expect(observations).toContainEqual(expect.objectContaining({triggerId,attempt:2,requestId:ID,state:"failed",httpStatus:status,errorClassification:"HTTP_ERROR"}));
+    expect(await rpc(3)).toMatchObject({isError:true});
+    expect(methods).toEqual(["POST","GET","GET"]);
+    expect(records(ns)[0]).toMatchObject({generation:1,requestId:ID,state:"failed",upstreamHttpStatus:status});
+    expect(JSON.stringify(observations)).not.toMatch(/idempotencyKey|apiToken|ticket description|note body/);
+  });
+
   it.each(["queued","running","retry_wait","uncertain","cancelled"])("a renewal grant never replaces a %s receipt",async state=>{
     vi.useFakeTimers();vi.setSystemTime(START);const ns=namespace();let posts=0;
     vi.stubGlobal("fetch",vi.fn(async(_url:string,init?:RequestInit)=>{

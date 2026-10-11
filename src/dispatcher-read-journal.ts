@@ -83,6 +83,13 @@ export function renewableTerminalRead(state: string, classification?: string, ht
   return state === "failed" && (classification === "HTTP_ERROR" && [401, 408, 429, 500, 502, 503, 504].includes(httpStatus ?? 0) ||
     ["TIMEOUT", "NETWORK_ERROR", "RATE_LIMITED"].includes(classification ?? ""));
 }
+/** Observe a definite failure even when renewal is forbidden. Otherwise the
+ * coordinator's generic retry could keep returning the same terminal receipt. */
+export function observableTerminalRead(state: string, classification?: string, httpStatus?: number): boolean {
+  return renewableTerminalRead(state, classification, httpStatus) ||
+    state === "failed" && classification === "HTTP_ERROR" && Number.isInteger(httpStatus) &&
+    (httpStatus ?? 0) >= 400 && (httpStatus ?? 0) <= 599;
+}
 
 async function digest(text: string): Promise<string> {
   return [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))].map(b => b.toString(16).padStart(2, "0")).join("");

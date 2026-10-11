@@ -14,6 +14,13 @@ with a recognized HTTP failure (401, 408, 429, 500, 502, 503 or 504), timeout,
 network error or rate-limit classification. Pending, unknown, cancelled and
 uncertain receipts never receive this exception. Synchronous failed HTTP replies
 retain their observed status and HTTP_ERROR classification in the read journal.
+Other definite HTTP failures, including 400, 403 and 404, are observed so the
+coordinator can stop immediately. They never receive a renewal grant. A guarded
+terminal read without an independently recorded receipt also stops with
+attention instead of falling through the older generic Agent retry. Live
+verification exposed an empty HTTP 400 reply being reread by successive Agents;
+it did not establish whether the upstream cause was a query or infrastructure
+error. Tests reproduce that asynchronous reply and prohibit a new POST.
 
 For a terminal callback, the coordinator requires the enforced start/write guards
 and bounded-terminal-read-v1 capability, the exact current scope, and no

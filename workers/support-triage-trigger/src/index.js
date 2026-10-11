@@ -3474,6 +3474,10 @@ function renewableReadFailure(read) {
   return read?.state === "failed" && (read.errorClassification === "HTTP_ERROR" && [401,408,429,500,502,503,504].includes(read.httpStatus) ||
     ["TIMEOUT","NETWORK_ERROR","RATE_LIMITED"].includes(read.errorClassification));
 }
+function observableReadFailure(read) {
+  return renewableReadFailure(read) || read?.state === "failed" && read.errorClassification === "HTTP_ERROR" &&
+    Number.isInteger(read.httpStatus) && read.httpStatus >= 400 && read.httpStatus <= 599;
+}
 function noPossibleAutomaticWrite(state, triggerId) {
   const leases = state.runWriteLeases.filter(lease => lease.triggerId === triggerId);
   return leases.length > 0 && leases.every(lease => !lease.operationReference && !lease.applyIntentObserved &&
@@ -3852,7 +3856,20 @@ function startupLeaseUntouched(lease) {
 async function scheduleTerminalReadRecovery(engine, state, report, now) {
   const config = engine.deps.config;
   const lease = state.runWriteLeases.find(item => item.triggerId === report.triggerId && item.attempt === report.attempt);
-  if (!lease?.failedRead || report.status !== "terminal_failure") return null;
+  if (report.status !== "terminal_failure") return null;
+  if (!lease?.failedRead) {
+    // A guarded read cannot be renewed without an independently recorded
+    // receipt. Stop instead of spending generic Agent retries on the same
+    // terminal failure when an observation was lost or unsupported.
+    if (lease?.startGuardProtocol === RUN_START_PROTOCOL && Number.isFinite(lease.mcpWorkStartedAt) && !lease.pendingRead &&
+        ["bounded_query","evidence_recovery","triage_apply"].includes(report.metadata?.failureStage) &&
+        noPossibleAutomaticWrite(state,report.triggerId) && !report.metadata?.operationId && !report.metadata?.operationStatus) {
+      return await engine.stopAutomaticRetry(state,{...report,metadata:{...report.metadata,
+        failureDiagnostics:[...report.metadata?.failureDiagnostics ?? [],{stage:report.metadata?.failureStage ?? "bounded_query",
+          errorCode:"failed_read_observation_unavailable"}].slice(-32)}},now);
+    }
+    return null;
+  }
   const count = lease.readFailureRetryCount ?? 0;
   const deadline = lease.readFailureDeadlineAt ?? Math.min(lease.issuedAt + 600_000, Date.parse(lease.failedRead.deadlineAt));
   const nextAt = Math.max(now + 30_000 * 2 ** count, state.cooldownUntil);
@@ -7456,7 +7473,7 @@ var TriageCoordinator = class {
           !/^[A-Za-z0-9_-]{1,160}$/.test(body.requestId ?? "") || !/^[a-f0-9]{8}(?:[a-f0-9]{56})?$/.test(body.ownerHash ?? "") ||
           !/^[a-f0-9]{64}$/.test(body.workflowHash ?? "") || !/^[a-f0-9]{64}$/.test(body.payloadHash ?? "") ||
           !safeHistoryTimestamp(body.deadlineAt) || Date.parse(body.deadlineAt) <= now || Date.parse(body.deadlineAt) > now + 900_000 ||
-          !renewableReadFailure(body) || !lease || lease.revokedAt !== null || lease.expiresAt <= now ||
+          !observableReadFailure(body) || !lease || lease.revokedAt !== null || lease.expiresAt <= now ||
           !state.pending || state.executionPhase !== "awaiting_result" || state.pendingTriggerId !== body.triggerId || state.dispatchAttempt !== body.attempt ||
           lease.startGuardProtocol !== RUN_START_PROTOCOL || !Number.isFinite(lease.mcpWorkStartedAt) ||
           !noPossibleAutomaticWrite(state,body.triggerId)) return json({error:"read_failure_correlation_mismatch"},409);
