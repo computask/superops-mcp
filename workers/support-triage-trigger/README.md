@@ -1,5 +1,20 @@
 # Email triage trigger — Git deployment
 
+11 October 2026: generated run input requires `ticketNumber` on every preparation
+action before both permitted calls. Callback stage/reason enums are generated
+from the Reporter contract; a preparation error uses coarse `validation` and
+retains `plan_validation_failed` only in safe cause diagnostics. Required fields,
+immutable identities, stale checks, approval and the one-correction limit remain.
+Sam-only MCP construction recovery requires an inspected complete workflow with
+only the three successful read actions, one or two schema-rejected preparation
+calls and a schema-rejected callback. Independent complete captures, a guarded
+completed single-ticket query, no intent/write/operation/ambiguity, an expired or
+revoked old attempt and a fresh matching provider completion are mandatory.
+Preview changes no state. Scheduling preserves the original attention fence and
+exact time window, revokes the old attempt, and creates one fresh normally reviewed
+ticket run. Every operator recovery type now participates in durable replay dedupe.
+See `../../docs/triage-construction-failure-2026-10-11.md`.
+
 10 October 2026: startup recovery distinguishes `dispatch_failed` from generic
 `run_failed`. Guarded untouched dispatch failures get two bounded attempts (30s,
 60s) under the original ten-minute deadline. Each correlated MCP call persists
@@ -116,7 +131,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-77078277c8e43287b3153c2484140605723681cb460ac20454aa017db38c448e.
+583f49762db17fc398e1c7bd12f74abe99605985211032c374c467a085707ee0.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

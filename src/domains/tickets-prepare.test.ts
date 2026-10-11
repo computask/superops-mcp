@@ -58,6 +58,17 @@ describe("read-only complete triage preparation", () => {
     expect(schema.items.properties.target.properties).not.toHaveProperty("techGroupName");
     expect(publishToolDefinition(definition).annotations?.readOnlyHint).toBe(true);
   });
+  it("requires every action ticket number even when the fixed candidate fence and immutable ID are present", async () => {
+    const input=proposal();
+    delete (input.actions[0] as Partial<typeof input.actions[0]>).ticketNumber;
+    const {data}=await prepare(input);
+    expect(data.complete).toBe(false);expect(data.error).toContain("actions[0].ticketNumber is required");
+    expect(data.operationCreated).toBe(false);expect(data.preparedPlan).toBeUndefined();
+    expect(query).not.toHaveBeenCalled();expect(mutate).not.toHaveBeenCalled();
+    expect(await getOperationStore().get(input.batchId,currentOwnerHash())).toBeUndefined();
+    const schema=getTicketsTools().tools.find(tool=>tool.name==="superops_tickets_prepare_triage_plan")!.inputSchema.properties.actions as {items:{required:string[]}};
+    expect(schema.items.required).toContain("ticketNumber");
+  });
   it("fills both fixed fallback fields for an explicit null client", async () => {
     query.mockImplementation(async (document: string) => document.includes("getFields") ? { getFields: fields() } :
       document.includes("getClientList") ? { getClientList: { clients: [{ name: "TaskGroup", accountId: "2993553194649526272" }], listInfo: { hasMore: false } } } : { getTicket: { ...original, client: null } });

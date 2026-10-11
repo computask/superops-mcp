@@ -98,6 +98,37 @@ test('preparation contract remains mandatory without diagnostic capture or callb
   }
 });
 
+test('construction preflight preserves per-action identity and the callback uses the advertised coarse enums',()=>{
+  const prompt=buildAgentInput('triage-24-00000000-0000-4000-8000-000000000024',replaySourceScope,1,true);
+  assert(prompt.includes('EVERY actions[i] must include ticketNumber'));
+  assert(prompt.includes('before BOTH the first call and its one permitted correction'));
+  assert(prompt.includes('it does not populate actions[i].ticketNumber'));
+  assert(prompt.includes('the one correction must add that missing field from the SAME frozen candidate'));
+  const outcomeSchema=toolDefinition().inputSchema.properties.metadata.properties.ticketOutcomes.items;
+  assert(prompt.includes(`reasonCode must be one of ${outcomeSchema.properties.reasonCode.enum.join(', ')}`));
+  assert(prompt.includes(`stage must be one of ${outcomeSchema.properties.stage.enum.join(', ')}`));
+  assert(prompt.includes('plan_validation_failed is NOT an allowed reasonCode'));
+  assert(prompt.includes('ticketOutcomes[i].reasonCode=validation'));
+  assert(prompt.includes('do not fabricate mcpExecution for a platform schema rejection'));
+});
+
+test('preparation-failure reporting rejects the observed invalid reason and accepts its canonical cause metadata without writing',async()=>{
+  const metadata={failureStage:'triage_apply',ticketsConsidered:1,ticketsCompleted:0,ticketsDeferred:1,
+    ticketOutcomes:[{ticketNumber:'90101',outcome:'not_attempted',stage:'triage_apply',reasonCode:'plan_validation_failed'}],
+    failureDiagnostics:[{stage:'triage_apply',errorType:'validation',errorCode:'plan_validation_failed'}]};
+  const reports=[];
+  const request=()=>new Request('http://local/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'triage_result_report',arguments:{triggerId:'triage-24-00000000-0000-4000-8000-000000000024',attempt:1,status:'terminal_failure',metadata}}})});
+  const callbacks={report:async report=>{reports.push(report);return {status:'recorded'};}};
+  const rejected=await handleTriageResultMcp(request(),callbacks);
+  assert.equal((await rejected.json()).result.isError,true);assert.equal(reports.length,0);
+  metadata.ticketOutcomes[0].reasonCode='validation';
+  const accepted=await handleTriageResultMcp(request(),callbacks);
+  assert.equal((await accepted.json()).result.isError,false);assert.equal(reports.length,1);
+  assert.deepEqual(reports[0].metadata.failureDiagnostics,metadata.failureDiagnostics);
+  assert.equal(reports[0].metadata.operationId,undefined);
+});
+
 test('apply intent parser preserves exact plan JSON and rejects credential-like fields',()=>{
   const triggerId='triage-81-60d4e73d-5c40-4a75-89b5-31ac48f25632';
   const applyArguments={policyMode:'email-new-calls-v2',expectedCandidateTicketNumbers:['62992'],actions:[{ticketNumber:'62992',action:'leave',note:'<strong>TRIAGE SUMMARY</strong><br><br>Customer-provided detail',target:{impact:'High',category:'Security'},allowWriteIfUpdatedTimeChanged:false}],verify:true,dedupeNotes:true,triageCapture:{triggerId,attempt:3}};
@@ -338,7 +369,9 @@ function replayCoordinator(seed, archivedEvents=seed.dispatchHistory??[], envOve
     sql:{exec(query,...args){
       let rows=[];
       if(query.includes('SELECT * FROM triage_dispatch_history WHERE event_id = ?')) rows=archivedEvents.filter(event=>event.eventId===args[0]).map(historyRow);
-      else if(query.includes("event_name = 'manual_replay_requested'")) rows=archivedEvents.filter(event=>event.event==='manual_replay_requested'&&event.replayOfEventId===args[0]&&event.ticketNumber===args[1]).map(()=>({found:1}));
+      else if(query.includes('SELECT 1 AS found') && query.includes('replay_of_event_id = ?')) rows=archivedEvents.filter(event=>
+        ['manual_replay_requested','manual_read_recovery_requested','manual_startup_recovery_requested','manual_construction_recovery_requested'].includes(event.event)&&
+        event.replayOfEventId===args[0]&&event.ticketNumber===args[1]).map(()=>({found:1}));
       return {toArray(){return rows;},one(){return {event_id:0};}};
     }}
   };
@@ -1101,6 +1134,75 @@ function operatorStartupRecovery(change={}) {
   };
   return {...f,body,request};
 }
+function operatorConstructionRecovery(change={}) {
+  const triggerId='triage-24-00000000-0000-4000-8000-000000000024',conversationId='00000000-0000-4000-8000-000000000024';
+  const source={...replayFailureEvent,agentRunStatus:'completed'};
+  const lease={triggerId,attempt:1,runId:'apirun_synthetic',triggerUrl:'https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic/trigger',
+    conversationUrl:`https://chatgpt.com/c/${conversationId}`,scope:replaySourceScope,issuedAt:1,expiresAt:2,revokedAt:null,authorizedItems:[],
+    startGuardProtocol:'triage-run-start-v1',mcpWorkStartedAt:1,queryCompleted:true,queryTicketNumbers:['90101'],...change};
+  const seed={...createInitialState(),triggerSequence:24,dispatchHistorySequence:41,dispatchHistory:[source],runWriteLeases:[lease],
+    needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true};
+  const f=replayCoordinator(seed,[source],{TRIAGE_STARTUP_RECOVERY_ENABLED:'true',WORKSPACE_AGENT_ACCESS_TOKEN:'synthetic-access-token',
+    TRIAGE_WRITE_GUARD_SERVICE:{fetch:async()=>Response.json(startCapability)}});
+  const proof={conversationId,complete:true,workflowStepCount:8,toolNames:['superops_tickets_query','superops_tickets_triage_evidence_recover',
+    'superops_tickets_field_options','superops_tickets_prepare_triage_plan','superops_tickets_prepare_triage_plan','triage_result_report'],
+    elicitationCount:0,denialObserved:false,preparationSchemaRejections:2,resultSchemaRejections:1,
+    preparationErrorCode:'missing_action_ticket_number',rejectedReasonCode:'plan_validation_failed'};
+  const body={triggerId,attempt:1,sourceEventId:41,ticketNumber:'90101',dryRun:true,proof,captureProof:{
+    createdFrom:replaySourceScope.createdFrom,createdTo:replaySourceScope.createdTo,ticketNumber:'90101',ticketId:'1000000000000000001',
+    captureIds:[1,2,3].map(i=>`00000000-0000-4000-8000-00000000000${i}`)}};
+  const request=async(patch={},providerChange={})=>{
+    const original=globalThis.fetch;
+    globalThis.fetch=async()=>Response.json({id:'apirun_synthetic',status:'completed',conversation_url:`https://chatgpt.com/c/${conversationId}`,...providerChange});
+    try { return await f.coordinator.fetch(new Request('https://coordinator.internal/internal/admin/construction-recovery',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,...patch})})); }
+    finally { globalThis.fetch=original; }
+  };
+  return {...f,body,request};
+}
+test('inspected read-only construction previews without changing state and schedules one normally reviewed fixed ticket',async()=>{
+  const f=operatorConstructionRecovery(),before=structuredClone(f.storage.value);
+  const preview=await f.request(),result=await preview.json();assert.equal(preview.status,200,JSON.stringify(result));
+  assert.deepEqual(f.storage.value,before);assert.equal(f.storage.alarm,null);
+  const scheduled=await f.request({dryRun:false});assert.equal(scheduled.status,200,JSON.stringify(await scheduled.json()));
+  assert.deepEqual(f.storage.value.pendingTriggerScope,{...replaySourceScope,targetTicketNumbers:['90101'],replayOfEventId:41});
+  assert.notEqual(f.storage.value.pendingTriggerId,f.body.triggerId);
+  assert.deepEqual(f.storage.value.needsAttentionScopes,[replaySourceScope]);
+  assert(f.storage.value.runWriteLeases[0].revokedAt!==null);assert.equal(f.storage.value.runWriteLeases[0].manualConstructionRecoveryRequested,true);
+  assert.equal(f.storage.value.dispatchHistory.at(-1).event,'manual_construction_recovery_requested');
+  assert.equal((await f.request({dryRun:false})).status,409);
+  f.storage.value.pending=false;
+  assert.equal((await f.request({dryRun:false})).status,409,'an idle coordinator still cannot schedule the same recovery twice');
+});
+for(const blocker of [{startGuardProtocol:undefined},{mcpWorkStartedAt:undefined},{queryCompleted:false},{queryTicketNumbers:[]},
+  {queryTicketNumbers:['90101','90102']},{pendingRead:{}},{authorizedItems:['90101']},{operationReference:{}},{applyIntentObserved:true},
+  {writeCheckObserved:true},{rejectedCallbackUnsafe:true},{manualConstructionRecoveryRequested:true},{expiresAt:Date.now()+60000},
+  {expiresAt:undefined,revokedAt:undefined}]) {
+  test('construction recovery refuses '+Object.keys(blocker)[0],async()=>{
+    const f=operatorConstructionRecovery(blocker),before=structuredClone(f.storage.value);
+    assert.equal((await f.request({dryRun:false})).status,409);assert.deepEqual(f.storage.value,before);
+  });
+}
+test('construction recovery rejects incomplete workflows, denials, identity changes, an active provider and absent guards',async()=>{
+  for(const change of [{complete:false},{denialObserved:true},{elicitationCount:1},{preparationSchemaRejections:0},
+    {toolNames:['superops_tickets_apply_triage_plan']},{preparationErrorCode:'permission_denied'}]) {
+    const f=operatorConstructionRecovery();assert.equal((await f.request({dryRun:false,proof:{...f.body.proof,...change}})).status,400);
+    assert.equal(f.storage.value.pending,false);
+  }
+  for(const provider of [{status:'in_progress'},{status:'failed',error:{code:'run_failed'}},{id:'apirun_other'},
+    {conversation_url:'https://chatgpt.com/c/00000000-0000-4000-8000-000000000025'}]) {
+    const f=operatorConstructionRecovery();assert.equal((await f.request({dryRun:false},provider)).status,409);assert.equal(f.storage.value.pending,false);
+  }
+  const f=operatorConstructionRecovery();f.coordinator.env.TRIAGE_WRITE_GUARD_SERVICE=undefined;
+  assert.equal((await f.request({dryRun:false})).status,409);assert.equal(f.storage.value.pending,false);
+});
+test('construction preview permits unrelated work but scheduling never replaces it or changes the original scope',async()=>{
+  const f=operatorConstructionRecovery();f.storage.value.pending=true;const before=structuredClone(f.storage.value);
+  const preview=await f.request();assert.equal(preview.status,200);assert.equal((await preview.json()).coordinatorIdle,false);
+  assert.equal((await f.request({dryRun:false})).status,409);assert.deepEqual(f.storage.value,before);
+  f.storage.value.pending=false;
+  assert.equal((await f.request({captureProof:{...f.body.captureProof,createdTo:'2026-09-25T11:00:00.000Z'}})).status,409);
+});
 test('inspected historical startup failure previews without writes and schedules one reviewed exact ticket',async()=>{
   const f=operatorStartupRecovery(),before=structuredClone(f.storage.value);
   const preview=await f.request();assert.equal(preview.status,200,JSON.stringify(await preview.json()));

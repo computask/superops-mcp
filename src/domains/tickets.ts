@@ -1048,7 +1048,7 @@ const TRIAGE_HISTORY_ASSESSMENT_SCHEMA = {
 const TRIAGE_PLAN_EXPECTATION_SCHEMA_PROPERTIES = {
   ticketNumber: {
     type: "string",
-    description: "Ticket number/display ID from the approved snapshot.",
+    description: "Required on EVERY action, including preparation and its one correction: copy the frozen candidate's display ID as a string. expectedTicketId and expectedCandidateTicketNumbers do not supply this field.",
   },
   expectedTicketId: {
     type: "string",
@@ -10010,7 +10010,7 @@ export function getTicketsTools(): DomainTools {
     tools: [
       {
         name: "superops_tickets_prepare_triage_plan",
-        description: "Read-only preparation of a complete frozen standing-policy triage proposal. Creates no operation and performs no mutations. Derives canonical client hashes, fills the fixed fallback only for explicit null clients, and checks stale identity, policy, private notes and live field dependencies. Only an entirely valid result contains preparedPlan. Copy that complete object unchanged to the separately reviewed apply action. A checksum never grants approval.",
+        description: "Read-only preparation of a complete frozen standing-policy triage proposal. EVERY actions entry must contain ticketNumber (the frozen display ID as a string) and action; listing a number in expectedCandidateTicketNumbers or supplying expectedTicketId does not supply actions[*].ticketNumber. Creates no operation and performs no mutations. Derives canonical client hashes, fills the fixed fallback only for explicit null clients, and checks stale identity, policy, private notes and live field dependencies. Only an entirely valid result contains preparedPlan. Copy that complete object unchanged to the separately reviewed apply action. A checksum never grants approval.",
         inputSchema: {
           type: "object",
           properties: {
