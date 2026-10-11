@@ -1106,7 +1106,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           }
         }
         if (name === "superops_tickets_query") {
-          try { await recordTriageRunQuery(args, JSON.parse(result.content.find(item => item.type === "text")?.text ?? "{}"), result.structuredContent); }
+          try { await recordTriageRunQuery(args, JSON.parse(result.content.find(item => item.type === "text")?.text ?? "{}"), result.structuredContent, dispatcherReadFailure()); }
           catch { /* An unavailable observation must not discard usable read evidence. */ }
         }
         if (name === "superops_tickets_prepare_triage_plan") {

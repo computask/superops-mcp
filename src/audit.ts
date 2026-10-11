@@ -573,7 +573,7 @@ export function errorSummaryFromResult(result: ToolResult): string | undefined {
     } catch {
       // Even a malformed/truncated JSON result must not become a customer
       // payload in routine audit records or callback diagnostic messages.
-      return /^\s*[\[{]/.test(item.text) ? "Structured tool error (details omitted)" : sanitizeText(item.text);
+      return /^\s*[[{]/.test(item.text) ? "Structured tool error (details omitted)" : sanitizeText(item.text);
     }
   }).filter(Boolean).join(" "));
 }

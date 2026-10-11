@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getExecutionState, recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
-import type { DispatcherReceipt } from "./dispatcher.js";
+import type { DispatcherEnvironment, DispatcherReceipt } from "./dispatcher.js";
+import { readDispatcherReceiptStatus } from "./dispatcher-read-status.js";
 
 type Namespace = { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
 type Storage = { get<T = unknown>(key: string): Promise<T | undefined>; put(key: string, value: unknown): Promise<void> };
@@ -114,7 +115,7 @@ function record(value: unknown): DispatcherReadRecord {
  * Atomic open persists identity before POST; uncertain/pending rows never renew.
  * Dispatcher receipts retain complete terminal history outside this bounded trail. */
 export class DispatcherReadJournal {
-  constructor(private readonly storage: TransactionalStorage) {}
+  constructor(private readonly storage: TransactionalStorage, private readonly env: DispatcherEnvironment = {}) {}
   async fetch(request: Request): Promise<Response> {
     try {
       if (request.method !== "POST" || Number(request.headers.get("Content-Length") ?? 0) > 16_384) throw new DispatcherReadJournalError("invalid_request");
@@ -122,7 +123,22 @@ export class DispatcherReadJournal {
       if (text.length > 16_384) throw new DispatcherReadJournalError("request_too_large");
       const input = object(JSON.parse(text)); identity(input);
       const action = new URL(request.url).pathname.split("/").at(-1);
-      if (!["open", "checkpoint", "delivered"].includes(action ?? "")) throw new DispatcherReadJournalError("invalid_action");
+      if (action === "status") {
+        // Private binding only. Select the receipt from the existing journal,
+        // never from an arbitrary Agent-supplied status URL or request body.
+        if (Object.keys(input).some(key => !["ownerHash", "workflowHash", "payloadHash", "requestId", "deadlineAt"].includes(key))) throw new DispatcherReadJournalError("unexpected_status_field");
+        const stored = await this.storage.get(`dispatcher-read:${input.payloadHash}`);
+        if (!stored) throw new DispatcherReadJournalError("unknown_read");
+        const saved = record(stored);
+        const deadlineAt = new Date(Math.min(Date.parse(saved.createdAt) + 900_000,
+          Date.parse(saved.recoveryDeadlineAt ?? "") || Infinity)).toISOString();
+        if (saved.ownerHash !== input.ownerHash || saved.workflowHash !== input.workflowHash ||
+            saved.payloadHash !== input.payloadHash || !saved.requestId || saved.requestId !== input.requestId ||
+            deadlineAt !== input.deadlineAt) throw new DispatcherReadJournalError("status_identity_conflict");
+        if (Date.now() >= Date.parse(deadlineAt)) return Response.json({requestId: saved.requestId, state: "expired", deadlineAt});
+        return Response.json({...await readDispatcherReceiptStatus(saved.requestId, this.env), deadlineAt});
+      }
+      if (!["open", "checkpoint", "delivered", "checkpointDelivered"].includes(action ?? "")) throw new DispatcherReadJournalError("invalid_action");
       if (typeof this.storage.transaction !== "function") throw new DispatcherReadJournalError("atomic_storage_unavailable");
       const result = await this.storage.transaction(async txn => {
         const key = `dispatcher-read:${input.payloadHash}`;
@@ -163,6 +179,10 @@ export class DispatcherReadJournal {
             recoveryDeadlineAt: previous.recoveryDeadlineAt ?? patch.recoveryDeadlineAt,
             upstreamHttpStatus: patch.upstreamHttpStatus ?? previous.upstreamHttpStatus,
             errorClassification: patch.errorClassification ?? previous.errorClassification });
+          if (action === "checkpointDelivered") {
+            if (previous.state !== "succeeded") throw new DispatcherReadJournalError("not_confirmed_success");
+            previous.delivered = true;
+          }
         }
         await txn.put(key, previous);
         return previous;
@@ -175,12 +195,19 @@ export class DispatcherReadJournal {
 }
 
 export class DispatcherReadSession {
+  private terminalReceipt?: DispatcherReadCheckpoint;
   constructor(public record: DispatcherReadRecord, private readonly stub: {fetch(request: Request): Promise<Response>},
     readonly refreshBeforeUse = false) {}
   private async save(action: string, patch: Record<string, unknown>): Promise<void> {
     this.record = await journalFetch(this.stub, action, {...this.record, history: undefined, ...patch}, true);
   }
   async checkpoint(receipt: DispatcherReadCheckpoint): Promise<void> {
+    if (receipt.state === "succeeded" && this.record.requestId === receipt.requestId && !this.record.delivered) {
+      // The identity is already durable. Keep the terminal outcome until the
+      // response has passed GraphQL validation, then persist both facts atomically.
+      this.terminalReceipt = receipt;
+      return;
+    }
     const {nextEligibleAt, recoveryStartedAt, recoveryDeadlineAt, upstreamHttpStatus, errorClassification} = receipt;
     if (this.record.requestId === receipt.requestId && this.record.state === receipt.state &&
       this.record.nextEligibleAt === nextEligibleAt && this.record.recoveryDeadlineAt === recoveryDeadlineAt &&
@@ -188,7 +215,19 @@ export class DispatcherReadSession {
     await this.save("checkpoint", {receipt: {requestId: receipt.requestId, idempotencyKey: receipt.idempotencyKey, state: receipt.state,
       nextEligibleAt, recoveryStartedAt, recoveryDeadlineAt, upstreamHttpStatus, errorClassification}});
   }
-  async delivered(): Promise<void> { await this.save("delivered", {}); }
+  async flushUndelivered(): Promise<void> {
+    if (!this.terminalReceipt) return;
+    const receipt = this.terminalReceipt;
+    await this.save("checkpoint", {receipt});
+    this.terminalReceipt = undefined;
+  }
+  async delivered(): Promise<void> {
+    if (this.terminalReceipt) {
+      await this.save("checkpointDelivered", {receipt: this.terminalReceipt});
+      this.terminalReceipt = undefined;
+    } else if (!this.record.delivered) await this.save("delivered", {});
+    if (this.record.state !== "succeeded" || !this.record.delivered) throw new DispatcherReadJournalError("delivery_not_confirmed");
+  }
 }
 async function journalFetch(stub: {fetch(request: Request): Promise<Response>}, action: string, body: unknown, allowSafetyMargin: boolean): Promise<DispatcherReadRecord> {
   const counted = recordTypedSubrequestStart({type: "custom", operationType: "durableObject", operationName: `dispatcherRead.${action}`, allowSafetyMargin});

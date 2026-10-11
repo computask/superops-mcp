@@ -8052,6 +8052,10 @@ async function applyApprovedTriageAction(params: {
         result.continuationRequired = false;
       }
 
+      // A note-only continuation starts with the prior write's partial flag.
+      // Clear it only after fresh target validation and all required private-
+      // note/final-state verification have completed successfully above.
+      if (resumeNoteOnly && result.verified === true) result.partialWrite = false;
       result.finalOutcome = action.action === "leave" ? "Left" : "Updated";
     }
     return result;

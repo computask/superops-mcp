@@ -1173,6 +1173,8 @@ async function handleBaseWorkerFetch(
       transport: "http",
       authMode: env.AUTH_MODE === "gateway" ? "gateway" : "env",
       graphqlCapture: {enabled: env.SUPEROPS_GRAPHQL_CAPTURE_ENABLED === "true", version: GRAPHQL_CAPTURE_VERSION, retentionDays: 7},
+      dispatcherReadRecovery: {statusProtocol: "dispatcher-read-status-v1", bookkeepingProtocol: "atomic-read-delivery-v1",
+        available: Boolean(env.DISPATCHER_TOKEN && env.SUPEROPS_OPERATION_LEDGER)},
       timestamp: new Date().toISOString(),
     });
   }

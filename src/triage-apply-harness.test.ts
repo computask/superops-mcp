@@ -896,6 +896,81 @@ describe("deterministic end-to-end apply-triage harness", () => {
     vi.useRealTimers();
   });
 
+  it("reduces queued-read bookkeeping under the production budget while preserving every write and verification", async () => {
+    const exercise = async (legacy: boolean) => {
+      vi.useRealTimers();
+      resetTicketFieldOptionsCacheForTests();
+      const harness = new TriageHarness(`queued-bookkeeping-${legacy ? "legacy" : "atomic"}`);
+      const network = globalThis.fetch, completed = new Map<string, unknown>(), counts = new Map<string, number>();
+      let measuring = false;
+      const count = () => {
+        const state = getExecutionState();
+        if (measuring && state) counts.set(state.invocationId, Math.max(counts.get(state.invocationId) ?? 0, state.subrequests));
+      };
+      vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        count();
+        if (init?.method === "GET") {
+          const id = String(url).split("/").at(-1)!;
+          expect(completed.has(id)).toBe(true);
+          return Response.json({requestId: id, source: "superops-mcp", type: "read", status: "succeeded", httpStatus: 200, response: completed.get(id)});
+        }
+        const body = JSON.parse(String(init?.body)) as {query: string};
+        const response = await network(url, init);
+        if (body.query.includes("mutation")) return response;
+        const id = response.headers.get("X-Dispatcher-Request-Id")!;
+        completed.set(id, await response.json());
+        return Response.json({requestId: id, source: "superops-mcp", status: "queued"}, {status: 202,
+          headers: {"X-Dispatcher-Request-Id": id, "Retry-After": "0"}});
+      }));
+      const get = harness.ledger.namespace.get.bind(harness.ledger.namespace);
+      harness.ledger.namespace.get = id => {
+        const stub = get(id);
+        return {fetch: async (request: Request) => {
+          count();
+          if (legacy && new URL(request.url).pathname.endsWith("/checkpointDelivered")) {
+            // Emulate the two original durable commands and account for both.
+            const receipt = await stub.fetch(new Request(request.url.replace("checkpointDelivered", "checkpoint"), request.clone()));
+            expect(receipt.ok).toBe(true);
+            recordTypedSubrequestStart({type: "custom", operationType: "durableObject", operationName: "dispatcherRead.delivered", allowSafetyMargin: true});
+            count();
+            return stub.fetch(new Request(request.url.replace("checkpointDelivered", "delivered"), request));
+          }
+          const response = await stub.fetch(request);
+          if (legacy && request.url.endsWith("/claim-next") && response.ok && response.status !== 204) {
+            const claim = await response.json() as Record<string, unknown>; delete claim.record;
+            return Response.json(claim); // Legacy caller needs a separate fresh GET.
+          }
+          return response;
+        }};
+      };
+      const config = {SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "45", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8"};
+      measuring = true;
+      await harness.invoke({actions: [{...leaveAction(), note: "JUNK"}]}, config);
+      measuring = false;
+      let terminal = await harness.record();
+      for (let n = 0; n < 8 && terminal.pendingItems.length; n++) {
+        if (terminal.nextEligibleTime) harness.clock.advanceTo(terminal.nextEligibleTime);
+        measuring = true; await harness.resume(terminal.nextEligibleTime, config); measuring = false;
+        terminal = await harness.record();
+      }
+      expect(terminal.state).toBe("Completed");
+      expect(itemResult(terminal)).toMatchObject({verified: true, partialWrite: false});
+      expect(terminal.partialWriteCount).toBe(0);
+      expect(harness.history.count("superops.write.classification")).toBe(1);
+      expect(harness.history.count("superops.write.note")).toBe(1);
+      expect(harness.history.count("superops.write.status")).toBe(0);
+      expect(harness.superops.ticket.status).toBe("New Calls");
+      harness.assertGlobalInvariants(terminal);
+      expect([...counts.values()].every(value => value <= 45)).toBe(true);
+      return {calls: [...counts.values()].reduce((sum, value) => sum + value, 0),
+        invocations: counts.size, continuations: terminal.continuationCount};
+    };
+    const legacy = await exercise(true), atomic = await exercise(false);
+    console.log(JSON.stringify({test: "queued-read-bookkeeping", budget: 45, reserve: 8, legacy, atomic}));
+    expect(atomic.calls).toBeLessThan(legacy.calls);
+    expect(atomic.continuations).toBeLessThanOrEqual(legacy.continuations);
+  });
+
   it("keeps the public ChatGPT mutation surface limited to durable triage controls", async () => {
     const blocked = await chatGptDirectBlockedToolNames({ reviewedTriagePlanAllowed: true });
     const exposedMutations = [...MUTATING_TOOL_NAMES].filter((name) => !blocked.has(name));

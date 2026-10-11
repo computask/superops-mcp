@@ -534,7 +534,7 @@ var SAFE_REFERENCE_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 var SAFE_ITEM_KEY_PATTERN = /^[A-Za-z0-9._:#-]{1,128}$/;
 var SAFE_TICKET_NUMBER_PATTERN = /^#?[0-9]{1,40}$/;
 // Telemetry also contains these fixed journal actions, not GraphQL operations.
-var SAFE_OPERATION_NAME_PATTERN = /^(?:[A-Za-z_][A-Za-z0-9_]{0,96}|dispatcherRead\.(?:open|checkpoint|delivered)|operationStore\.(?:put|get|getLegacy|list|getApprovedPrivateNote|getApprovedPrivateNoteLegacy|claimNextItem|completeItem|checkpointItem|scheduleContinuation|cancel|terminalizeContinuationFailure|getEmergingIssue|upsertEmergingIssue))$/;
+var SAFE_OPERATION_NAME_PATTERN = /^(?:[A-Za-z_][A-Za-z0-9_]{0,96}|dispatcherRead\.(?:open|checkpoint|delivered|checkpointDelivered)|operationStore\.(?:put|get|getLegacy|list|getApprovedPrivateNote|getApprovedPrivateNoteLegacy|claimNextItem|completeItem|checkpointItem|scheduleContinuation|cancel|terminalizeContinuationFailure|getEmergingIssue|upsertEmergingIssue))$/;
 var SAFE_DIAGNOSTIC_STAGE_PATTERN = /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/;
 var OPERATION_STATES = /* @__PURE__ */ new Set([
   "Running",
@@ -1076,6 +1076,8 @@ var DISPATCH_HISTORY_EVENTS = /* @__PURE__ */ new Set([
   "result_callback_received",
   "result_callback_rejected",
   "read_pending_recovered",
+  "read_receipt_wait",
+  "read_receipt_ready",
   "operation_status_recovered",
   "batch_completed",
   "batch_failed",
@@ -2016,7 +2018,7 @@ function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = 
     "Result callback required: true",
     `Dispatch attempt: ${attempt}`,
     "Callback contract preflight (before any SuperOps action, no network call required): check the exposed triage_result_report input schema supports metadata.operationStatus, metadata.ticketOutcomes, and metadata.mcpExecution. If one is absent, report terminal_failure with failureStage=configuration and safe errorCode=callback_schema_stale using only supported fields, then stop without any SuperOps read or write. Do not test this by making an invalid callback or bypass a denied action. If the callback action itself is unavailable, stop and explicitly identify that configuration error. Otherwise proceed with the bounded query; the connector's display version alone is not a failure.",
-    "Before ending, call triage_result_report exactly once with this Trigger ID and dispatch attempt. It is the NEXT action on every exit, before final prose, including failures, denials, empty queries and scheduled continuation handoffs.",
+    "Before ending, call triage_result_report exactly once with this Trigger ID and dispatch attempt. It is the NEXT action on every exit, before final prose, including failures, denials, empty queries and scheduled continuation handoffs. A query_already_completed rejection is not an accepted callback: follow its instruction to continue this same attempt using the already successful frozen query, then send the actual final or later-stage failure callback. Do not repeat that query or the rejected pending claim.",
     "Failure explanation (required, safe metadata only): apply_not_attempted describes an outcome, not a cause. When apply was not called, include failureDiagnostics using the existing stage/errorType/errorCode fields. Use the observed cause: missing_required_evidence, missing_client_identity, missing_field_options, plan_validation_failed, tool_unavailable, permission_denied, unacceptable_risk, or reason_unavailable if the cause genuinely cannot be established. Never guess a permission/risk denial. Keep any observed denial terminal; do not retry or bypass it. For a tool failure, copy its safe mcpExecution.failureDiagnostics and requestTrace exactly, retaining dispatcherRequestId, dispatcherState and errorClass. Do not substitute the last successful read as the failing call. A local timeout with no httpStatus must remain without httpStatus: never invent HTTP 400/429/502 or claim an upstream rate limit. In the Agent conversation, explain the missing prerequisite without reproducing customer content or secrets. Do not put free-text customer details in callback metadata.",
     "ZERO-CANDIDATE SHORT-CIRCUIT (mandatory immediately after the first query): if superops_tickets_query returns pagination.complete=true, pagination.truncated=false, errors=[], and records=[], call triage_result_report immediately with status=complete, failureStage=bounded_query, ticketsConsidered=0, ticketsCompleted=0, ticketsDeferred=0, and ticketOutcomes=[]; call no evidence recovery, history, field-options, apply, operation, or other action, do not invent mcpExecution, and stop. This conclusive empty result is still followed only by the Worker's single bounded ingestion recovery; do not widen the window or queue.",
     "Use complete only after the bounded run is complete with verified final effects or protected no-write skips, or after a scheduled pending durable continuation is confirmed by its safe operation state. Before apply, an unusable server-owned readRecoveryDurable:true, dispatcherPending:true result uses retryable_read_pending with its returned bounded retry time: the coordinator resumes the SAME durable read receipt for the SAME exact query in a fresh invocation, never a replacement read or widened window. Every non-complete callback, including retryable_read_pending, must retain the returned safe failureDiagnostics and the real mcpExecution failureDiagnostics/requestTrace from all response text blocks. Otherwise use retryable_rate_limit only when a SuperOps read rate limit prevents completion before apply; use terminal_failure for a terminal durable failure, unscheduled continuation, ambiguity, or other non-retryable failure. Never invent an upstream HTTP status or throttle from a pending dispatcher receipt.",
@@ -3674,6 +3676,50 @@ async function readCorrelatedOperation(lease, config) {
     return record;
   } catch { return null; }
 }
+// Gate a new Agent on the ORIGINAL read's status. The MCP ledger chooses the
+// persisted receipt and makes one GET; no GraphQL is submitted by this wake.
+async function waitForPendingRead(engine, state, now) {
+  const lease = [...state.runWriteLeases].reverse().find(item => item.triggerId === state.pendingTriggerId);
+  const read = lease?.pendingRead;
+  if (!read?.journal || lease.queryCompleted || lease.operationReference || lease.applyIntentObserved ||
+      lease.writeCheckObserved || lease.rejectedCallbackUnsafe || lease.authorizedItems.length ||
+      state.pendingTicketOutcomes?.length || JSON.stringify(lease.scope) !== JSON.stringify(state.pendingTriggerScope)) return null;
+  const deadline = Date.parse(read.deadlineAt);
+  const terminal = code => engine.stopAutomaticRetry(state, {triggerId: state.pendingTriggerId, attempt: state.dispatchAttempt,
+    status: "terminal_failure", metadata: {failureStage: "bounded_query",
+      failureDiagnostics: [{stage: "bounded_query", errorCode: code, itemKey: read.requestId}]}}, now);
+  if (!Number.isFinite(deadline) || deadline <= now) return terminal("dispatcher_read_recovery_expired");
+  let result;
+  if (Date.parse(read.nextEligibleAt) <= now) {
+    try {
+      const {ownerHash, requestId, deadlineAt, journal} = read;
+      const name = `dispatcher-reads:${ownerHash}:${journal.workflowHash}:${journal.payloadHash.slice(0, 2)}`;
+      const stub = engine.deps.config.operationLedger?.get(engine.deps.config.operationLedger.idFromName(name));
+      const response = await stub?.fetch(new Request("https://ledger.internal/dispatcher-reads/status", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ownerHash, requestId, deadlineAt, ...journal}), signal: AbortSignal.timeout(7000),
+      }));
+      if (response?.ok) result = await response.json();
+    } catch { }
+  }
+  if (result?.requestId !== read.requestId || result?.deadlineAt !== read.deadlineAt) result = undefined;
+  if (result?.state === "succeeded") {
+    recordDispatchHistory(state, now, {event: "read_receipt_ready", attempt: state.dispatchAttempt, retryCount: state.retryCount,
+      failureDiagnostics: [{stage: "bounded_query", errorCode: "original_read_ready", itemKey: read.requestId}]}, state.pendingTriggerScope);
+    return null; // Normal guarded Agent still reads/validates the original result.
+  }
+  if (["failed", "cancelled", "uncertain", "expired"].includes(result?.state)) return terminal("dispatcher_read_terminal");
+  const nextAt = Math.min(deadline, Math.max(now + engine.deps.config.resultWatchdogMs,
+    Date.parse(read.nextEligibleAt) || 0, safeHistoryTimestamp(result?.nextEligibleAt) ? Date.parse(result.nextEligibleAt) : 0));
+  read.nextEligibleAt = new Date(nextAt).toISOString();
+  state.dueAt = nextAt;
+  recordDispatchHistory(state, now, {event: "read_receipt_wait", attempt: state.dispatchAttempt, retryCount: state.retryCount,
+    nextAt: new Date(nextAt).toISOString(), waitMs: nextAt - now, waitReason: "bounded_recovery",
+    failureDiagnostics: [{stage: "bounded_query", errorCode: result ? "original_read_pending" : "original_read_status_unavailable", itemKey: read.requestId}]}, state.pendingTriggerScope);
+  await engine.deps.store.save(state);
+  await engine.deps.store.setAlarm(nextAt);
+  return {status: "retry_scheduled", triggerId: state.pendingTriggerId, nextAt};
+}
 // A typed MCP validation failure is independent of the Agent's callback grammar.
 // This reports an observed failure only. It never schedules a retry or authorizes
 // a write, and any intent/operation/write uncertainty excludes this projection.
@@ -3788,6 +3834,19 @@ function startupLeaseUntouched(lease) {
   return Boolean(lease && lease.mcpWorkStartedAt === undefined && !lease.queryCompleted && lease.queryTicketNumbers === undefined &&
     !lease.pendingRead && !lease.applyIntentObserved && !lease.writeCheckObserved && !lease.operationReference &&
     !lease.rejectedCallbackUnsafe && lease.authorizedItems.length === 0);
+}
+function completedQueryCallbackConflict(state, report, now) {
+  const lease = state.runWriteLeases.find(item => item.triggerId === report.triggerId && item.attempt === report.attempt);
+  if (!["retryable_read_pending", "retryable_rate_limit"].includes(report.status) ||
+      report.metadata?.failureStage !== "bounded_query" ||
+      (report.metadata.ticketsConsidered ?? 0) !== 0 || (report.metadata.ticketsCompleted ?? 0) !== 0 ||
+      (report.metadata.ticketsDeferred ?? 0) !== 0 || report.metadata.operationId || report.metadata.operationStatus ||
+      lease?.queryCompleted !== true || lease.pendingRead || lease.revokedAt !== null || lease.expiresAt <= now ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(lease.queryInvocationId ?? "") ||
+      !Array.isArray(lease.queryTicketNumbers)) return null;
+  return {status: "query_already_completed", triggerId: report.triggerId,
+    queryInvocationId: lease.queryInvocationId, ticketNumbers: lease.queryTicketNumbers,
+    instruction: "The latest server-observed bounded query completed successfully. Continue this attempt using that frozen query result and the normal evidence, preparation and apply safeguards. Do not repeat the query or report its older pending diagnostics. Report any actual later-stage failure, or the verified final outcome."};
 }
 async function scheduleStartupRecovery(engine, state, now, diagnostics) {
   const config = engine.deps.config;
@@ -4594,6 +4653,8 @@ var CoordinatorEngine = class {
       return await this.stopAutomaticRetry(state,{triggerId,attempt:state.dispatchAttempt,status:"terminal_failure",
         metadata:{failureStage:"agent_callback",failureDiagnostics:[{stage:"agent_callback",errorCode:"startup_recovery_deadline_expired"}]}},now);
     }
+    const pendingReadWait = await waitForPendingRead(this, state, now);
+    if (pendingReadWait) return pendingReadWait;
     const dispatchAttempt = state.dispatchAttempt + 1;
     const dispatchWasQueued = state.pendingDispatchWasQueued === true;
     const dispatchWaitReason = queuedDispatchWaitReason(state, dispatchWasQueued);
@@ -4647,8 +4708,29 @@ var CoordinatorEngine = class {
       report = authoritative;
       effectiveReport = authoritative;
     }
+    const queryConflict = completedQueryCallbackConflict(state, report, now);
+    if (queryConflict) {
+      recordDispatchHistory(state, now, {event: "result_callback_rejected", attempt: report.attempt,
+        failureDiagnostics: [{stage: "bounded_query", errorCode: "query_already_completed"}]}, state.pendingTriggerScope);
+      await this.deps.store.save(state);
+      return queryConflict;
+    }
     if (report.status !== "complete" && state.lastAcceptedTrigger?.runId) {
       const diagnostics = await this.deps.agent.getRunDiagnostics(state.lastAcceptedTrigger.runId, state.lastAcceptedTrigger.triggerUrl);
+      if (["retryable_read_pending", "retryable_rate_limit"].includes(report.status) && report.metadata?.failureStage === "bounded_query") {
+        // The query observer can finish while the provider lookup is in flight.
+        // Recheck durable state before committing an older pending callback.
+        const latest = normalizeState(await this.deps.store.load());
+        if (!latest.pending || latest.executionPhase !== "awaiting_result" || latest.pendingTriggerId !== report.triggerId ||
+            latest.dispatchAttempt !== report.attempt) return {status: "stale_or_unauthorized"};
+        const conflict = completedQueryCallbackConflict(latest, report, this.now());
+        if (conflict) {
+          recordDispatchHistory(latest, this.now(), {event: "result_callback_rejected", attempt: report.attempt,
+            failureDiagnostics: [{stage: "bounded_query", errorCode: "query_already_completed"}]}, latest.pendingTriggerScope);
+          await this.deps.store.save(latest);
+          return conflict;
+        }
+      }
       const runFailureDiagnostics = report.status === "terminal_failure" ? agentRunFailureDiagnostics(diagnostics) : [];
       if (runFailureDiagnostics.length > 0) {
         effectiveReport = {
@@ -5817,12 +5899,14 @@ function toolCallResult(outcome) {
   const text = JSON.stringify({
     status: outcome.status,
     triggerId: outcome.triggerId,
-    nextAt: outcome.nextAt === void 0 ? void 0 : new Date(outcome.nextAt).toISOString()
+    nextAt: outcome.nextAt === void 0 ? void 0 : new Date(outcome.nextAt).toISOString(),
+    ...(outcome.status === "query_already_completed" ? {queryInvocationId: outcome.queryInvocationId,
+      ticketNumbers: outcome.ticketNumbers, instruction: outcome.instruction} : {})
   });
   return {
     content: [{ type: "text", text }],
     structuredContent: JSON.parse(text),
-    isError: outcome.status === "callback_disabled" || outcome.status === "stale_or_unauthorized"
+    isError: ["callback_disabled", "stale_or_unauthorized", "query_already_completed"].includes(outcome.status)
   };
 }
 __name(toolCallResult, "toolCallResult");
@@ -7205,21 +7289,25 @@ var TriageCoordinator = class {
           state.executionPhase !== "awaiting_result") return json({error: "query_correlation_mismatch"}, 409);
       if (body.pendingRead !== undefined) {
         const read = body.pendingRead, now = Date.now();
-        if (!isRecord(read) || !keysAreBounded(read, ["requestId", "ownerHash", "nextEligibleAt", "deadlineAt"]) ||
+        if (!isRecord(read) || !keysAreBounded(read, ["requestId", "ownerHash", "nextEligibleAt", "deadlineAt", "journal"]) ||
             !/^[A-Za-z0-9_-]{1,160}$/.test(read.requestId ?? "") ||
             !/^[a-f0-9]{8}(?:[a-f0-9]{56})?$/.test(read.ownerHash ?? "") ||
             !safeHistoryTimestamp(read.nextEligibleAt) || !safeHistoryTimestamp(read.deadlineAt) ||
             Date.parse(read.deadlineAt) <= now || Date.parse(read.deadlineAt) > now + 900_000 ||
             Date.parse(read.deadlineAt) > lease.issuedAt + config.acceptedRunMaxAgeMs + 900_000 ||
+            read.journal !== undefined && (!isRecord(read.journal) || !keysAreBounded(read.journal, ["workflowHash", "payloadHash"]) ||
+              !/^[a-f0-9]{64}$/.test(read.journal.workflowHash ?? "") || !/^[a-f0-9]{64}$/.test(read.journal.payloadHash ?? "")) ||
             lease.queryCompleted || lease.operationReference || lease.applyIntentObserved || lease.writeCheckObserved ||
             lease.rejectedCallbackUnsafe || lease.authorizedItems.length ||
             lease.pendingRead && (lease.pendingRead.requestId !== read.requestId ||
-              lease.pendingRead.ownerHash !== read.ownerHash || lease.pendingRead.deadlineAt !== read.deadlineAt)) {
+              lease.pendingRead.ownerHash !== read.ownerHash || lease.pendingRead.deadlineAt !== read.deadlineAt ||
+              lease.pendingRead.journal && JSON.stringify(lease.pendingRead.journal) !== JSON.stringify(read.journal))) {
           return json({error: "pending_read_correlation_mismatch"}, 409);
         }
         lease.pendingRead = {...read};
       } else {
-        if (!Array.isArray(body.ticketNumbers) || body.ticketNumbers.length > 50 ||
+        if (body.invocationId !== undefined && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(body.invocationId) ||
+            !Array.isArray(body.ticketNumbers) || body.ticketNumbers.length > 50 ||
             !body.ticketNumbers.every(id => typeof id === "string" && /^\d{1,24}$/.test(id)) ||
             new Set(body.ticketNumbers).size !== body.ticketNumbers.length ||
             lease.queryTicketNumbers && JSON.stringify(lease.queryTicketNumbers) !== JSON.stringify(body.ticketNumbers)) {
@@ -7227,6 +7315,7 @@ var TriageCoordinator = class {
         }
         lease.queryTicketNumbers = body.ticketNumbers;
         lease.queryCompleted = true;
+        lease.queryInvocationId = body.invocationId;
         lease.pendingRead = undefined;
       }
       await store.save(state);
@@ -8231,6 +8320,8 @@ var index_default = {
         triageConfigurationRetryExitEnabled: config.configurationRetryExitEnabled,
         triageAttentionTailIsolationEnabled: config.attentionTailIsolationEnabled,
         triageStartupRecoveryEnabled: config.startupRecoveryEnabled,
+        triagePendingReadStatusProtocol: "dispatcher-read-status-v1",
+        triageCompletedQueryCallbackGuardProtocol: "completed-query-callback-v1",
         triageStartupMaxRetries: 2,
         triageStartupDeadlineMs: 600000,
         triageGraphSweepEnabled: config.graphSweepEnabled,

@@ -706,6 +706,59 @@ describe("durable continuation runner", () => {
     }
   );
 
+  it.each(["during-item", "before-resumed-item"] as const)(
+    "retains verified stage progress when budget stops %s without marking the operation complete", async stopAt => {
+      const ownerHash = stableHash("verified-budget-owner");
+      const operationId = `op-verified-budget-${stopAt}`;
+      const stop: OperationContinuationAdapter = {
+        toolName: "test_batch_tool",
+        estimateItemSubrequests: () => stopAt === "before-resumed-item" ? 38 : 1,
+        async processItem({ checkpoint }) {
+          await checkpoint({ stage: "Validated" });
+          await checkpoint({ stage: "WriteNotStarted" });
+          await checkpoint({ stage: "WriteStarted", writeAttempted: true, writeMayHaveSucceeded: true });
+          await checkpoint({ stage: "FieldsUpdated", partialWrite: true });
+          await checkpoint({ stage: "Verifying", verificationState: "Verified" });
+          const state = getExecutionState();
+          if (!state) throw new Error("missing execution state");
+          throw new ExecutionBudgetExceededError(state, 1);
+        },
+      };
+      await runWithOperationStore({}, async () => {
+        const store = getOperationStore();
+        const record = ledgerRecord({ operationId, ownerHash, itemKeys: ["verified-ticket"] });
+        if (stopAt === "before-resumed-item") Object.assign(record.itemStates["verified-ticket"], {
+          stage: "Verifying", verificationState: "Verified", writeAttempted: true,
+          writeMayHaveSucceeded: true, partialWrite: true,
+        });
+        await store.put(record);
+        const invoke = (adapter: OperationContinuationAdapter) => runWithExecutionConfig({
+          SUPEROPS_EXECUTION_SUBREQUEST_BUDGET: "45", SUPEROPS_EXECUTION_SUBREQUEST_SAFETY_MARGIN: "8",
+        }, () => runWithExecutionContext("test_batch_tool", () => runOperationContinuation({
+          operationId, ownerHash, adapter, leaseOwner: "verified-budget-invocation",
+        })));
+        await invoke(stop);
+        await expect(store.get(operationId)).resolves.toMatchObject({
+          state: "ContinuationRequired", pendingItems: ["verified-ticket"], completedItems: [],
+          itemStates: { "verified-ticket": { stage: "Verifying", verificationState: "Verified", partialWrite: true } },
+        });
+        const resume: OperationContinuationAdapter = {
+          toolName: "test_batch_tool", estimateItemSubrequests: () => 1,
+          async processItem({ claim }) {
+            expect(claim.item.verificationState).toBe("Verified");
+            countedRequest("verificationRead");
+            return { stage: "Completed", outcome: "Updated", writeAttempted: true,
+              writeMayHaveSucceeded: true, partialWrite: false, verified: true };
+          },
+        };
+        await invoke(resume);
+        await expect(store.get(operationId)).resolves.toMatchObject({
+          state: "Completed", pendingItems: [], partialWriteCount: 0,
+        });
+      });
+    }
+  );
+
   it("preserves a write-start checkpoint when the execution budget stops the item", async () => {
     const ownerHash = stableHash("owner@example.com");
     let resumedItems = 0;

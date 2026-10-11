@@ -139,6 +139,41 @@ describe("automatic triage write leases", () => {
     expect(observed).toMatchObject({triggerId, attempt: 1, pendingRead: {requestId: "synthetic-read", ownerHash: expect.stringMatching(/^[a-f0-9]{8}$/)}});
     expect(JSON.stringify(observed)).not.toMatch(/private|message|errorClass|idempotencyKey/);
   });
+  it("correlates a successful query with the server invocation without copying its body", async () => {
+    const {env, fetcher} = environment();
+    const args = {createdFrom: "2026-10-11T09:00:00.000Z", createdTo: "2026-10-11T09:02:00.000Z",
+      status: ["New Calls"], sources: ["EMAIL"], fieldProfile: "minimal"};
+    let invocationId: string | undefined;
+    await runWithExecutionContext("superops_tickets_query", () => runWithTriageLeaseEnvironment(env,
+      () => runWithTriageRunContext({triggerId, attempt: 1}, async () => {
+        invocationId = getExecutionState()?.invocationId;
+        await recordTriageRunQuery(args, {records: [{displayId: "90007", subject: "synthetic private text"}],
+          pagination: {complete: true}, errors: []});
+      })));
+    const observed = await fetcher.mock.calls[0][0].json();
+    expect(observed).toMatchObject({invocationId, ticketNumbers: ["90007"]});
+    expect(invocationId).toMatch(/^[a-f0-9-]{36}$/);
+    expect(JSON.stringify(observed)).not.toMatch(/private|subject/);
+  });
+  it("projects only validated private journal identity into a pending-query observation", async () => {
+    const {env, fetcher} = environment();
+    const args = {createdFrom: "2026-10-11T09:00:00.000Z", createdTo: "2026-10-11T09:02:00.000Z",
+      status: ["New Calls"], sources: ["EMAIL"], fieldProfile: "minimal"};
+    const failure = {errorClass: "DispatcherReadPending", dispatcherPending: true, readRecoveryDurable: true,
+      resumeSameRequest: true, dispatcherRequestId: "synthetic-read", nextEligibleAt: "2026-10-11T09:01:00.000Z",
+      readRecoveryDeadlineAt: "2026-10-11T09:15:00.000Z"};
+    await runWithTriageLeaseEnvironment(env, () => runWithTriageRunContext({triggerId, attempt: 1}, async () => {
+      for (const payloadHash of ["b".repeat(64), "invalid"]) {
+        await recordTriageRunQuery(args, {records: [], pagination: {complete: false}}, failure,
+          {readRecovery: {journalIdentity: {workflowHash: "a".repeat(64), payloadHash}}, message: "synthetic private text"});
+      }
+    }));
+    const first = await fetcher.mock.calls[0][0].json() as {pendingRead: {journal?: unknown}};
+    expect(first.pendingRead.journal).toEqual({workflowHash: "a".repeat(64), payloadHash: "b".repeat(64)});
+    const second = await fetcher.mock.calls[1][0].json() as {pendingRead: {journal?: unknown}};
+    expect(second.pendingRead.journal).toBeUndefined();
+    expect(JSON.stringify(first)).not.toMatch(/private|message|readRecovery|idempotency/);
+  });
   it("blocks a continuation's new POST after expiry while permitting same-receipt GET reconciliation", async () => {
     const {env, fetcher: guard} = environment(false);
     const upstream = vi.fn(async (_url: string, _init: RequestInit) => Response.json({source: "superops-mcp", status: "succeeded", requestId: "synthetic-receipt", httpStatus: 200, response: {data: {ok: true}}}));

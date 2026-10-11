@@ -20,6 +20,12 @@ describe("read recovery in the real Worker runtime", () => {
       export {SuperOpsOperationLedger as ReadLedger};
       export default { async fetch(request, env) {
         const now=Number(new URL(request.url).searchParams.get('at')); Date.now=()=>now;
+        if(new URL(request.url).pathname === '/readiness') {
+          const input=await request.json();
+          const name='dispatcher-reads:12345678:'+input.workflowHash+':'+input.payloadHash.slice(0,2);
+          return env.JOURNAL.get(env.JOURNAL.idFromName(name)).fetch(new Request('https://ledger.internal/dispatcher-reads/status',{
+            method:'POST',body:JSON.stringify({...input,ownerHash:'12345678'})}));
+        }
         return runWithExecutionConfig({SUPEROPS_EXECUTION_REQUEST_TIMEOUT_MS:'1000',SUPEROPS_EXECUTION_CALL_AUDIT_ENABLED:'false'},()=>
           runWithOperationStore({SUPEROPS_OPERATION_LEDGER:env.JOURNAL},()=>runWithExecutionContext('synthetic_worker_read',()=>
             withDispatcherReadScope({workflow:'synthetic-runtime-workflow',ownerHash:'12345678',automatic:true},async()=>{
@@ -31,25 +37,31 @@ describe("read recovery in the real Worker runtime", () => {
     const calls: Array<{method: string; url: string; key: string; body: string}> = [];
     const config = {name: "synthetic-read-recovery-worker", modules: true, script: bundle.outputFiles[0].text,
       compatibilityDate: "2026-07-01", compatibilityFlags: ["nodejs_compat"],
+      bindings: {DISPATCHER_TOKEN: "synthetic"},
       durableObjects: {JOURNAL: {className: "ReadLedger", useSQLite: true}}, durableObjectsPersist: persistence,
       outboundService: async (request: Request) => {
         calls.push({method: request.method, url: request.url, key: request.headers.get("Idempotency-Key") ?? "", body: request.method === "POST" ? await request.text() : ""});
         expect(request.url.startsWith("https://superops-api-dispatcher.taskgroup.co.uk/")).toBe(true);
         return request.method === "POST" ? Response.json({requestId: id, source: "superops-mcp", status: "retry_wait", httpStatus: 200, errorClassification: "RATE_LIMITED",
           nextRetryAt: new Date(start + 60_000).toISOString(), readRecovery: {startedAt: new Date(start).toISOString(), deadlineAt: new Date(start + 900_000).toISOString(), throttleCount: 1}},
-          {status: 202, headers: {"X-Dispatcher-Request-Id": id, "Retry-After": "60"}}) : Response.json({requestId: id, source: "superops-mcp", status: "succeeded", httpStatus: 200, response: {data: {__typename: "Query"}}});
+          {status: 202, headers: {"X-Dispatcher-Request-Id": id, "Retry-After": "60"}}) : Response.json({requestId: id, source: "superops-mcp", type: "read", status: "succeeded", httpStatus: 200, response: {data: {__typename: "Query"}}});
       }};
     let mf = new Miniflare(config);
     try {
-      expect(await (await mf.dispatchFetch(`http://localhost/?at=${start}`)).json()).toMatchObject({requestId: id, recovery: {durable: true}});
+      const first = await (await mf.dispatchFetch(`http://localhost/?at=${start}`)).json() as {recovery: {journalIdentity: {workflowHash: string; payloadHash: string}; deadlineAt: string}};
+      expect(first).toMatchObject({requestId: id, recovery: {durable: true}});
       await mf.dispose();
       mf = new Miniflare(config);
       expect(await (await mf.dispatchFetch(`http://localhost/?at=${start + 1000}`)).json()).toMatchObject({requestId: id, state: "retry_wait"});
       expect(calls).toHaveLength(1);
+      const readiness = await mf.dispatchFetch(`http://localhost/readiness?at=${start + 60_001}`, {method: "POST",body:JSON.stringify({
+        ...first.recovery.journalIdentity,requestId:id,deadlineAt:first.recovery.deadlineAt,
+      })});
+      expect(await readiness.json()).toEqual({requestId:id,state:"succeeded",deadlineAt:first.recovery.deadlineAt});
       expect(await (await mf.dispatchFetch(`http://localhost/?at=${start + 60_001}`)).json()).toEqual({data: {__typename: "Query"}});
-      expect(calls.map(c => c.method)).toEqual(["POST", "GET"]);
+      expect(calls.map(c => c.method)).toEqual(["POST", "GET", "GET"]);
       expect(calls[1].url).toBe(`https://superops-api-dispatcher.taskgroup.co.uk/v1/requests/${id}`);
-      expect(calls[1].key).toBe(calls[0].key);
+      expect(calls[2].key).toBe(calls[0].key);
     } finally {await mf.dispose();}
   }, 30_000);
 });

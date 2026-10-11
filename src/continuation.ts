@@ -244,7 +244,7 @@ export async function runOperationContinuation(
       return continuationResult(record, currentRecord.pendingItems.length > 0, "NoEligibleItem");
     }
 
-    record = (await store.get(params.operationId, params.ownerHash)) ?? record;
+    record = claim.record ?? (await store.get(params.operationId, params.ownerHash)) ?? record;
     const estimated = params.adapter.estimateItemSubrequests(record, claim.itemKey);
     if (!hasExecutionBudgetFor(estimated)) {
       // A resumed item may already be across a durable mutation boundary. Do
@@ -295,7 +295,7 @@ export async function runOperationContinuation(
           writeAttempted: claim.item.writeAttempted,
           writeMayHaveSucceeded: claim.item.writeMayHaveSucceeded,
           partialWrite: claim.item.partialWrite === true,
-          verificationState: "Pending",
+          verificationState: mutationBoundary ? "Pending" : claim.item.verificationState,
           errorClass: mutationBoundary ? "CloudflareConfiguredBudgetReached" : undefined,
           failureReason: mutationBoundary
             ? "Execution budget was insufficient to reconcile a possible write."
@@ -662,7 +662,10 @@ export async function runOperationContinuation(
             writeAttempted: currentItem?.writeAttempted === true,
             writeMayHaveSucceeded: currentItem?.writeMayHaveSucceeded === true,
             partialWrite: currentItem?.partialWrite === true,
-            verificationState: "Pending",
+            // A budget stop before the next mutation does not undo a durable
+            // verification of the prior stage. The adapter still takes fresh
+            // identity/target reads before continuing; the operation is pending.
+            verificationState: mutationBoundary ? "Pending" : currentItem?.verificationState ?? "Pending",
             nextEligibleTime: readEligibleAt,
             errorClass: pendingRead ? "DispatcherReadPending" : caughtError instanceof ExecutionBudgetExceededError
               ? "CloudflareConfiguredBudgetReached"

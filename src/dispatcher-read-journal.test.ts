@@ -31,9 +31,11 @@ class Storage {
 }
 function namespace() {
   const objects = new Map<string, Storage>();
-  return {objects, idFromName: (name: string) => name, get(id: unknown) {
+  const actions: string[] = [];
+  return {objects, actions, idFromName: (name: string) => name, get(id: unknown) {
     const name = String(id), storage = objects.get(name) ?? new Storage(); objects.set(name, storage);
     return {fetch(request: Request) {
+      actions.push(new URL(request.url).pathname.split("/").at(-1)!);
       // New object instance on every request: only durable storage survives.
       return new SuperOpsOperationLedger({storage} as unknown as ConstructorParameters<typeof SuperOpsOperationLedger>[0]).fetch(request);
     }};
@@ -60,6 +62,33 @@ function call(ns: ReturnType<typeof namespace>, owner = "synthetic-reader", auto
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("durable dispatcher read receipts", () => {
+  it("combines recovery success and delivery in one atomic checkpoint without changing the original read identity", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(START); const ns=namespace(), methods: string[]=[];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      methods.push(init?.method ?? "GET"); return init?.method === "POST" ? pending(1,202) : success();
+    }));
+    await expect(call(ns)).rejects.toMatchObject({requestId:ID});vi.advanceTimersByTime(61_000);
+    ns.actions.length=0;await expect(call(ns)).resolves.toHaveProperty("getTicket");
+    expect(ns.actions).toEqual(["open","checkpointDelivered"]);
+    expect(methods).toEqual(["POST","GET"]);
+    expect(records(ns)[0]).toMatchObject({requestId:ID,generation:1,state:"succeeded",delivered:true});
+  });
+
+  it("flushes a rejected terminal reply as undelivered and recovers it without a new POST", async () => {
+    vi.useFakeTimers();vi.setSystemTime(START);const ns=namespace();let reject=true,posts=0;
+    vi.stubGlobal("fetch",vi.fn(async (_url: string,init?:RequestInit)=>{
+      if(init?.method === "POST") {posts++;return pending(1,202);}
+      return reject ? Response.json({requestId:ID,source:"superops-mcp",status:"succeeded",httpStatus:200,
+        response:{errors:[{message:"synthetic malformed success"}]}}) : success();
+    }));
+    await expect(call(ns)).rejects.toMatchObject({requestId:ID});vi.advanceTimersByTime(61_000);
+    await expect(call(ns)).rejects.toThrow();
+    expect(records(ns)[0]).toMatchObject({requestId:ID,state:"succeeded",delivered:false,generation:1});
+    expect(ns.actions).not.toContain("checkpointDelivered");reject=false;
+    await expect(call(ns)).resolves.toHaveProperty("getTicket");expect(posts).toBe(1);
+    expect(records(ns)[0]).toMatchObject({generation:1,delivered:true});
+  });
+
   it.each([194_012, 91_207])("hands a partial first query through the real Reporter contract and resumes after %i ms", async delay => {
     vi.useFakeTimers(); vi.setSystemTime(START);
     const ns = namespace(), methods: string[] = [], observations: Record<string, unknown>[] = [];
@@ -101,6 +130,7 @@ describe("durable dispatcher read receipts", () => {
     expect(first.structuredContent).toMatchObject({dispatcherRequestId: ID, retryScope: "read"});
     expect(primary.mcpExecution.failureDiagnostics.length).toBeGreaterThan(0);
     expect(observations[0]).toMatchObject({triggerId, attempt: 1, pendingRead: {requestId: ID, deadlineAt: new Date(START + 900_000).toISOString()}});
+    expect(observations[0]).toMatchObject({pendingRead: {journal: {workflowHash: records(ns)[0].workflowHash, payloadHash: records(ns)[0].payloadHash}}});
     const source = readFileSync("workers/support-triage-trigger/src/index.js", "utf8");
     const executable = source.replace(/\nexport \{[\s\S]*$/, "");
     const reporter = runInNewContext(executable + ";({parseSafeMcpExecution,toolDefinition})", {crypto, Request, Response, URL, Date, TextEncoder, TextDecoder, console});

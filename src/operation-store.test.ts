@@ -1606,8 +1606,12 @@ describe("operation store", () => {
       })
     );
     expect(claimResponse.status).toBe(200);
-    const claim = (await claimResponse.json()) as { itemKey: string; lease: { leaseId: string } };
+    const claim = (await claimResponse.json()) as { itemKey: string; lease: { leaseId: string }; record: OperationLedgerRecord };
     expect(claim.itemKey).toBe("57401");
+    expect(claim.record).toEqual(values.get("op:op-do-claim"));
+    expect(claim.record.itemStates[claim.itemKey].lease?.leaseId).toBe(claim.lease.leaseId);
+    claim.record.itemStates[claim.itemKey].stage = "Completed";
+    expect((values.get("op:op-do-claim") as OperationLedgerRecord).itemStates[claim.itemKey].stage).not.toBe("Completed");
 
     const duplicateClaim = await durableObject.fetch(
       new Request("https://operation.local/operations/op-do-claim/claim-next", {

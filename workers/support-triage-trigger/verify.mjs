@@ -7,7 +7,7 @@ const require=createRequire(import.meta.url);
 const wranglerRequire=createRequire(require.resolve('wrangler/package.json'));
 const {Miniflare}=wranglerRequire('miniflare');
 const code=readFileSync(new URL('./src/index.js',import.meta.url));
-assert.equal(createHash('sha256').update(code).digest('hex'),'6a2d3286952182e1cf6bf28fa9d606341f3b853f31b75e011aaef7bf7ff733a0','Reviewed production module must match the provenance record');
+assert.equal(createHash('sha256').update(code).digest('hex'),'3f8a1cf63aaa16758c7e8e078792431b77b61298e3e3901bb83baeaf345a2171','Reviewed production module must match the provenance record');
 const config=JSON.parse(readFileSync(new URL('./wrangler.jsonc',import.meta.url),'utf8'));
 assert.equal(config.name,'support-triage-trigger');
 assert.equal(config.no_bundle,true);
@@ -32,6 +32,8 @@ try {
   assert.equal(health.ok,true);assert.equal(health.automatedTriageTriggerEnabled,false);
   assert.equal(health.triageAgentCaptureEnabled,true);
   assert.equal(health.triageAttentionTailIsolationEnabled,true);
+  assert.equal(health.triagePendingReadStatusProtocol,'dispatcher-read-status-v1');
+  assert.equal(health.triageCompletedQueryCallbackGuardProtocol,'completed-query-callback-v1');
   assert.equal(health.callsSuperOpsDirectly,false);assert.equal(health.consumesEmailBodies,false);
   assert.equal((await mf.dispatchFetch('http://local/admin/history/reset',{method:'POST'})).status,401);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST'})).status,401);

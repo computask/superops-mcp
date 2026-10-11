@@ -58,7 +58,8 @@ export function dispatcherConfigured(env = dispatcherEnvironment()): boolean {
 
 /** A receipt represents live or uncertain work, NOT permission to replay it. */
 export class DispatcherPendingError extends Error {
-  readRecovery?: {durable: boolean; nextEligibleAt?: string; deadlineAt?: string};
+  readRecovery?: {durable: boolean; nextEligibleAt?: string; deadlineAt?: string;
+    journalIdentity?: {workflowHash: string; payloadHash: string}};
   constructor(readonly requestId: string | undefined, readonly idempotencyKey: string,
     readonly state: string, readonly retryAfter?: number,
     readonly upstreamHttpStatus?: number, readonly errorClassification?: string,

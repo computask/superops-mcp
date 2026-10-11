@@ -147,7 +147,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-6a2d3286952182e1cf6bf28fa9d606341f3b853f31b75e011aaef7bf7ff733a0.
+3f8a1cf63aaa16758c7e8e078792431b77b61298e3e3901bb83baeaf345a2171.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
@@ -310,3 +310,15 @@ handshake, persists revocation, and retains the exact old EMAIL scope for
 reconciliation. It promotes only disjoint queued work and never replays an
 accepted mutation. See ../../docs/triage-run-expiry.md for the authenticated
 preview/recovery control, deployment ordering and rollback requirements.
+
+Reviewed delay repair, 11 October 2026: before starting a recovery Agent, the
+coordinator checks the original pending read through the existing private MCP
+ledger binding. Pending/unavailable receipts wait under their original deadline
+without spending another Agent attempt; only a validated succeeded receipt
+releases that wait. A server-observed completed query rejects an older zero-work
+pending callback with a correction for the same attempt. That rejection does
+not renew the attempt deadline or authorize a mutation. Later evidence failures
+remain reportable and durable operations retain precedence. See
+`../../docs/triage-delay-repair-2026-10-11.md` for measured budget regressions,
+deployment verification and limits. No configuration, Agent identity, namespace
+or shared dispatcher cooldown changes are part of this release.

@@ -12,6 +12,112 @@ const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, reg
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
+function receiptWaitFixture(state='queued') {
+  const f=fixture('completed'), polls=[];
+  const read={...firstReadLease(f).pendingRead,nextEligibleAt:'2026-09-24T06:00:00.000Z',
+    journal:{workflowHash:'a'.repeat(64),payloadHash:'b'.repeat(64)}};
+  f.seed({executionPhase:'retry_wait',retryCount:1,dueAt:Date.parse('2026-09-24T06:00:00Z'),
+    runWriteLeases:[firstReadLease(f,{pendingRead:read})],
+    lastResultReport:{triggerId:f.state.pendingTriggerId,attempt:1,status:'retryable_read_pending',metadata:{failureStage:'bounded_query'}}});
+  let status=state;
+  f.engine.deps.config.operationLedger={idFromName:name=>name,get:name=>({fetch:async request=>{
+    polls.push({name,url:request.url,method:request.method,body:await request.json()});
+    return Response.json({requestId:read.requestId,deadlineAt:read.deadlineAt,state:status});
+  }})};
+  return {...f,get state(){return f.state;},polls,read,setStatus:value=>{status=value;}};
+}
+
+test('coordinator waits across multiple alarms for the same receipt without spending Agent attempts or renewing its deadline',async()=>{
+  const f=receiptWaitFixture();
+  for(let n=0;n<5;n++) {
+    assert.equal((await f.engine.processAlarm()).status,'retry_scheduled');
+    assert.equal(f.calls.length,0);assert.equal(f.state.retryCount,1);assert.equal(f.state.dispatchAttempt,1);
+    assert.equal(f.state.runWriteLeases[0].pendingRead.deadlineAt,f.read.deadlineAt);f.advance();
+  }
+  assert.equal(f.polls.length,5);
+  for(const poll of f.polls) {
+    assert.equal(poll.name,'dispatcher-reads:12345678:'+f.read.journal.workflowHash+':bb');
+    assert.equal(poll.url,'https://ledger.internal/dispatcher-reads/status');
+    assert.deepEqual(poll.body,{ownerHash:'12345678',requestId:f.read.requestId,deadlineAt:f.read.deadlineAt,...f.read.journal});
+    assert(!JSON.stringify(poll).includes('idempotencyKey'));
+  }
+  f.setStatus('succeeded');assert.equal((await f.engine.processAlarm()).status,'accepted');
+  assert.equal(f.calls.length,1);assert.equal(f.calls[0][2],2);assert.deepEqual(f.calls[0][1],f.scope);
+  const lease=f.state.runWriteLeases.at(-1);
+  assert.equal(lease.pendingRead.requestId,f.read.requestId);assert.notEqual(lease.queryCompleted,true);
+  assert(f.state.dispatchHistory.some(e=>e.event==='read_receipt_ready'));
+});
+test('coordinator honors saved eligibility without a receipt poll, then uses bounded unavailable waits',async()=>{
+  const f=receiptWaitFixture();f.seed({runWriteLeases:[firstReadLease(f,{pendingRead:{...f.read,nextEligibleAt:'2026-09-24T06:02:00.000Z'}})]});
+  assert.equal((await f.engine.processAlarm()).nextAt,Date.parse('2026-09-24T06:02:00Z'));
+  assert.equal(f.polls.length,0);assert.equal(f.calls.length,0);
+  f.advance();f.engine.deps.config.operationLedger.get=()=>({fetch:async()=>{throw Error('synthetic unavailable');}});
+  assert.equal((await f.engine.processAlarm()).status,'retry_scheduled');assert.equal(f.calls.length,0);
+  f.setNow('2026-09-24T06:10:00.001Z');assert.equal((await f.engine.processAlarm()).status,'terminal_failure');
+  assert.equal(f.calls.length,0);assert.equal(f.state.needsAttentionScopes.length,1);
+});
+for(const state of ['failed','cancelled','uncertain','expired']) test('terminal read readiness cannot launch an Agent: '+state,async()=>{
+  const f=receiptWaitFixture(state);assert.equal((await f.engine.processAlarm()).status,'terminal_failure');
+  assert.equal(f.calls.length,0);assert.equal(f.state.needsAttentionScopes.length,1);
+});
+test('a foreign receipt or deadline cannot release the read wait',async()=>{
+  for(const patch of [{requestId:'foreign'},{deadlineAt:'2026-09-24T07:00:00.000Z'},{state:'invalid'}]) {
+    const f=receiptWaitFixture('succeeded');f.engine.deps.config.operationLedger.get=()=>({fetch:async()=>Response.json({
+      requestId:f.read.requestId,deadlineAt:f.read.deadlineAt,state:'succeeded',...patch})});
+    assert.equal((await f.engine.processAlarm()).status,'retry_scheduled');assert.equal(f.calls.length,0);
+  }
+});
+test('a successful current query rejects older pending diagnostics and accepts the subsequent valid completion without a new Agent',async()=>{
+  const f=fixture('in_progress');const invocation='00000000-0000-4000-8000-000000000501';
+  f.seed({runWriteLeases:[firstReadLease(f,{pendingRead:undefined,queryCompleted:true,queryTicketNumbers:['90101'],queryInvocationId:invocation})]});
+  const deadline=f.state.resultDeadlineAt;
+  const report={triggerId:f.state.pendingTriggerId,attempt:1,status:'retryable_read_pending',metadata:{failureStage:'bounded_query',
+    ticketsConsidered:0,ticketsCompleted:0,ticketsDeferred:0,failureDiagnostics:[{stage:'bounded_query',errorCode:'dispatcher_read_pending'}]}};
+  const rejected=await f.engine.reportResult(report);
+  assert.equal(rejected.status,'query_already_completed');assert.equal(rejected.queryInvocationId,invocation);
+  assert.deepEqual(rejected.ticketNumbers,['90101']);assert.match(rejected.instruction,/Continue this attempt/);
+  assert.equal(f.state.executionPhase,'awaiting_result');assert.equal(f.state.resultDeadlineAt,deadline);
+  assert.equal(f.state.retryCount,0);assert.equal(f.state.lastResultReport,null);assert.equal(f.calls.length,0);
+  assert.equal((await f.engine.reportResult(report)).status,'query_already_completed');
+  assert.equal((await f.engine.reportResult({triggerId:report.triggerId,attempt:1,status:'complete',metadata:{
+    failureStage:'evidence_recovery',ticketsConsidered:1,ticketsCompleted:1,ticketsDeferred:0,
+    mcpExecution:{toolName:'superops_tickets_triage_evidence_recover',requestsByType:{duplicateNoteCheck:1,verificationRead:1}},
+    ticketOutcomes:[{ticketNumber:'90101',outcome:'skipped',stage:'evidence_recovery',reasonCode:'already_handled'}]}})).status,'complete');
+  assert.equal(f.calls.length,0);
+});
+test('the query callback guard does not suppress a later evidence read failure or trust legacy completion without invocation proof',async()=>{
+  for(const legacy of [false,true]) {
+    const f=fixture('completed');f.seed({runWriteLeases:[firstReadLease(f,{pendingRead:undefined,queryCompleted:true,
+      queryTicketNumbers:['90101'],...(!legacy?{queryInvocationId:'00000000-0000-4000-8000-000000000501'}:{})})]});
+    const result=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'retryable_read_pending',
+      metadata:{failureStage:legacy?'bounded_query':'safe_content',ticketsConsidered:legacy?0:1,ticketsCompleted:0,ticketsDeferred:legacy?0:1}});
+    assert.notEqual(result.status,'query_already_completed');
+  }
+});
+test('a successful query observed during provider diagnostics cannot be overwritten by a racing pending callback',async()=>{
+  const f=fixture('in_progress');f.seed({runWriteLeases:[firstReadLease(f)]});
+  f.engine.deps.agent.getRunDiagnostics=async()=>{
+    f.seed({runWriteLeases:[firstReadLease(f,{pendingRead:undefined,queryCompleted:true,queryTicketNumbers:['90101'],
+      queryInvocationId:'00000000-0000-4000-8000-000000000501'})]});
+    return {status:'in_progress',httpStatus:200};
+  };
+  const result=await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'retryable_read_pending',
+    metadata:{failureStage:'bounded_query',ticketsConsidered:0,ticketsCompleted:0,ticketsDeferred:0}});
+  assert.equal(result.status,'query_already_completed');assert.equal(f.state.runWriteLeases[0].queryCompleted,true);
+  assert.equal(f.state.executionPhase,'awaiting_result');assert.equal(f.state.retryCount,0);assert.equal(f.calls.length,0);
+});
+test('the Reporter returns the correction instruction as an error without acknowledging triage completion',async()=>{
+  const triggerId='triage-71-00000000-0000-4000-8000-000000000071';
+  const response=await handleTriageResultMcp(new Request('https://reporter.local/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'triage_result_report',arguments:{triggerId,attempt:1,
+      status:'retryable_read_pending',metadata:{failureStage:'bounded_query',ticketsConsidered:0,ticketsCompleted:0,ticketsDeferred:0}}}})}),
+    {report:async()=>({status:'query_already_completed',triggerId,queryInvocationId:'00000000-0000-4000-8000-000000000501',
+      ticketNumbers:['90101'],instruction:'Continue this attempt using the successful frozen query.'})});
+  const result=(await response.json()).result;assert.equal(result.isError,true);
+  assert.deepEqual(result.structuredContent.ticketNumbers,['90101']);assert.match(result.content[0].text,/Continue this attempt/);
+  assert.equal(result.structuredContent.status,'query_already_completed');
+});
+
 const preparationInvocation='00000000-0000-4000-8000-000000000111';
 function preparationFailureFixture(changes={}) {
   const f=fixture('completed');
@@ -1150,7 +1256,7 @@ test('pending observations are exact-scope, owner/receipt/deadline stable, and s
 test('fixed journal labels and all emitted internal statuses satisfy the same callback schema and parser',()=>{
   const schema=toolDefinition().inputSchema.properties.metadata.properties.mcpExecution.properties.requestTrace.items;
   const statuses=schema.properties.status.oneOf[1].enum;
-  for(const operationName of ['dispatcherRead.open','dispatcherRead.checkpoint','dispatcherRead.delivered']) {
+  for(const operationName of ['dispatcherRead.open','dispatcherRead.checkpoint','dispatcherRead.delivered','dispatcherRead.checkpointDelivered']) {
     assert(new RegExp(schema.properties.operationName.pattern).test(operationName));
     for(const status of statuses) assert(parseSafeMcpExecution({requestTrace:[{index:1,type:'custom',operationType:'durableObject',operationName,status,ok:false}]}));
   }

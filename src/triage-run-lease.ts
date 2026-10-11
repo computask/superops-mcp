@@ -88,7 +88,7 @@ export async function recordTriageRunPreparation(args: Record<string, unknown>, 
 
 /** Content-free proof of a complete or durably pending first query. Losing this optional
  * observation leaves the coordinator conservative; it never grants writes. */
-export async function recordTriageRunQuery(args: Record<string, unknown>, result: unknown, readFailure?: unknown): Promise<void> {
+export async function recordTriageRunQuery(args: Record<string, unknown>, result: unknown, readFailure?: unknown, internalFailure?: unknown): Promise<void> {
   const env = environments.getStore(), run = runs.getStore();
   if (!run || !triageLeaseCapability(env ?? {}).enforced || !result || typeof result !== "object") return;
   const value = result as {records?: Array<{displayId?: unknown}>; pagination?: {complete?: boolean}; errors?: unknown[]};
@@ -110,8 +110,11 @@ export async function recordTriageRunQuery(args: Record<string, unknown>, result
     typeof failure.dispatcherRequestId === "string" && /^[A-Za-z0-9_-]{1,160}$/.test(failure.dispatcherRequestId) &&
     timestamp(failure.nextEligibleAt) && timestamp(failure.readRecoveryDeadlineAt);
   if (!complete && !pending) return;
+  const journal = (internalFailure as {readRecovery?: {journalIdentity?: {workflowHash?: string; payloadHash?: string}}} | undefined)?.readRecovery?.journalIdentity;
   const pendingRead = pending ? {requestId: failure!.dispatcherRequestId, ownerHash: currentOwnerHash(),
-    nextEligibleAt: failure!.nextEligibleAt, deadlineAt: failure!.readRecoveryDeadlineAt} : undefined;
+    nextEligibleAt: failure!.nextEligibleAt, deadlineAt: failure!.readRecoveryDeadlineAt,
+    ...(journal && /^[a-f0-9]{64}$/.test(journal.workflowHash ?? "") && /^[a-f0-9]{64}$/.test(journal.payloadHash ?? "")
+      ? {journal: {workflowHash: journal.workflowHash, payloadHash: journal.payloadHash}} : {})} : undefined;
   let counted: ReturnType<typeof recordTypedSubrequestStart> | undefined;
   try {
     counted = recordTypedSubrequestStart({type: "custom", operationType: "durableObject", operationName: "triageRunQueryObservation", allowSafetyMargin: true});
@@ -119,7 +122,7 @@ export async function recordTriageRunQuery(args: Record<string, unknown>, result
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-query/observe", {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({...run, createdFrom: args.createdFrom, createdTo: args.createdTo,
-        ...(pendingRead ? {pendingRead} : {ticketNumbers})}), signal: AbortSignal.timeout(5000),
+        ...(pendingRead ? {pendingRead} : {ticketNumbers, invocationId: getExecutionState()?.invocationId})}), signal: AbortSignal.timeout(5000),
     }));
     recordSubrequestFinish(counted, response.status, response.ok);
   } catch { if (counted) recordSubrequestFinish(counted, "observationUnavailable", false); }

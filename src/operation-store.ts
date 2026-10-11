@@ -324,6 +324,8 @@ export interface OperationItemClaim {
   itemKey: string;
   lease: OperationLease;
   item: OperationItemState;
+  /** Snapshot persisted atomically with this lease. Legacy stores may omit it. */
+  record?: OperationLedgerRecord;
 }
 
 export interface OperationClaimNextParams {
@@ -481,6 +483,9 @@ interface StoredTriageAgentMcpCaptureMetadata {
 }
 
 interface DurableContinuationEnv {
+  DISPATCHER_TOKEN?: string;
+  CF_ACCESS_CLIENT_ID?: string;
+  CF_ACCESS_CLIENT_SECRET?: string;
   SUPEROPS_CONTINUATION_WORKFLOW?: {
     createBatch(options: Array<{ id: string; params: Record<string, unknown> }>): Promise<Array<{ id: string }>>;
   };
@@ -2344,7 +2349,7 @@ class MemoryOperationStore implements OperationStore {
     const { record, claim } = claimNextItemInRecord(cloneRecord(existing), params);
     const retainedRecord = startTerminalRetention(existing, record);
     memoryRecords.set(params.operationId, retainedRecord);
-    return claim;
+    return claim ? {...claim, record: cloneRecord(retainedRecord)} : undefined;
   }
 
   async completeItem(params: OperationCompleteItemParams): Promise<OperationLedgerRecord> {
@@ -2587,7 +2592,14 @@ class DurableObjectOperationStore implements OperationStore {
     );
     if (response.status === 204 || response.status === 404) return undefined;
     if (!response.ok) throw await operationStoreFailure(response, "Operation store claim failed");
-    return (await response.json()) as OperationItemClaim;
+    const claim = (await response.json()) as OperationItemClaim;
+    if (claim.record) {
+      assertOperationRecord(claim.record);
+      assertRecordOwner(claim.record, params.ownerHash);
+      if (claim.record.operationId !== params.operationId || claim.record.currentItem !== claim.itemKey ||
+          claim.record.itemStates[claim.itemKey]?.lease?.leaseId !== claim.lease.leaseId) throw new MalformedStoredOperationError("Claim snapshot does not match its persisted lease.");
+    }
+    return claim;
   }
 
   async completeItem(params: OperationCompleteItemParams): Promise<OperationLedgerRecord> {
@@ -3829,7 +3841,7 @@ export class SuperOpsOperationLedger {
   }
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/dispatcher-reads/")) return new DispatcherReadJournal(this.state.storage).fetch(request);
+    if (url.pathname.startsWith("/dispatcher-reads/")) return new DispatcherReadJournal(this.state.storage, this.env).fetch(request);
     if (url.pathname === "/graphql-captures") return this.graphqlCaptures.fetch(request);
     const pathParts = url.pathname.split("/").filter(Boolean);
     const approvedPrivateNoteMatch = pathParts.length === 4 &&
@@ -4161,7 +4173,7 @@ export class SuperOpsOperationLedger {
         const retainedRecord = startTerminalRetention(record, claimed.record);
         await this.persistRecord(retainedRecord);
         await this.setRecordAlarm(retainedRecord);
-        return claimed.claim ? json(claimed.claim) : new Response(null, { status: 204 });
+        return claimed.claim ? json({...claimed.claim, record: retainedRecord}) : new Response(null, { status: 204 });
       }
 
       if (action === "complete-item") {

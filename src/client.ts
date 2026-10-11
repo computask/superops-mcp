@@ -89,6 +89,9 @@ export class SuperOpsClient {
         recordDispatcherReadFailure(undefined);
         return value;
       } catch (cause) {
+        // A known receipt's terminal checkpoint can be combined with delivery
+        // only after GraphQL validation succeeds. Preserve failures durably too.
+        await readSession?.flushUndelivered();
         let error = cause;
         if (readSession && ["failed", "cancelled", "uncertain"].includes(readSession.record.state) && !(error instanceof DispatcherPendingError)) {
           error = new DispatcherPendingError(readSession.record.requestId, idempotencyKey, readSession.record.state,
@@ -105,7 +108,8 @@ export class SuperOpsClient {
               error.upstreamHttpStatus,"READ_RECOVERY_EXPIRED",error.dispatcherHttpStatus)
             : error;
           pendingError.readRecovery = {durable: true,
-            nextEligibleAt: readSession.record.nextEligibleAt, deadlineAt: new Date(deadlineMs).toISOString()};
+            nextEligibleAt: readSession.record.nextEligibleAt, deadlineAt: new Date(deadlineMs).toISOString(),
+            journalIdentity: {workflowHash: readSession.record.workflowHash, payloadHash: readSession.record.payloadHash}};
           const state = dispatcherReadRecoveryState(pendingError.state);
           pendingError.message = state.pending
             ? "Dispatcher read remains pending; resume the original receipt after its saved retry time."
