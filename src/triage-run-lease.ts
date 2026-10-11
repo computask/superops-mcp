@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
+import { getExecutionState, recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
 import { currentOwnerHash } from "./operation-store.js";
 
 export const TRIAGE_RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
@@ -35,7 +35,7 @@ export function triageLeaseCapability(env: TriageLeaseEnvironment) {
 
 /** Authoritative attempt activity, persisted before any correlated tool executes.
  * Diagnostic capture availability never decides whether this check is required. */
-export async function assertTriageRunStart(): Promise<void> {
+export async function assertTriageRunStart(input: {preparationInvocationId?: string} = {}): Promise<void> {
   const env = environments.getStore(), run = runs.getStore();
   if (!run || env?.TRIAGE_RUN_START_GUARD_ENABLED !== "true") return;
   if (!triageLeaseCapability(env).startGuardEnforced) throw new Error("Triage run start guard unavailable; no tool executed.");
@@ -43,16 +43,47 @@ export async function assertTriageRunStart(): Promise<void> {
   try {
     const stub = env.TRIAGE_RUN_COORDINATOR!.get(env.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-work/start", {
-      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(run), signal: AbortSignal.timeout(5000),
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({...run, ...input}), signal: AbortSignal.timeout(5000),
     }));
-    const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number};
+    const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number; preparationInvocationId?: string};
     if (!response.ok || result.protocol !== TRIAGE_RUN_START_PROTOCOL || result.allowed !== true ||
+        input.preparationInvocationId !== undefined && result.preparationInvocationId !== input.preparationInvocationId ||
         typeof result.expiresAt !== "number" || result.expiresAt <= Date.now()) throw Error("rejected");
     recordSubrequestFinish(counted, response.status, true);
   } catch {
     recordSubrequestFinish(counted, "triageStartRejected", false);
     throw new Error("Triage run start guard rejected or unavailable; no tool executed.");
   }
+}
+
+/** Only typed preparation state crosses this boundary. Starting each preparation
+ * invalidates older failure evidence; the exact invocation must finish it. A lost
+ * observation leaves in_progress and cannot synthesize a failure or permit replay. */
+export async function recordTriageRunPreparation(args: Record<string, unknown>, result: unknown): Promise<void> {
+  const env = environments.getStore(), run = runs.getStore();
+  const invocationId = getExecutionState()?.invocationId;
+  if (!run || !invocationId || env?.TRIAGE_RUN_START_GUARD_ENABLED !== "true" ||
+      !triageLeaseCapability(env).startGuardEnforced || args.batchId !== run.triggerId) return;
+  const value = result as Record<string, unknown> | undefined;
+  const numbers = args.expectedCandidateTicketNumbers;
+  if (!Array.isArray(numbers) || numbers.length === 0 || numbers.length > 50 ||
+      !numbers.every((id): id is string => typeof id === "string" && /^\d{1,24}$/.test(id)) ||
+      new Set(numbers).size !== numbers.length) return;
+  const state = value?.preparationOnly === true && value.operationCreated === false &&
+      value.ok === false && value.complete === false && value.preparationOutcome === "validation_failed"
+    ? "validation_failed" : value?.preparationOnly === true && value.operationCreated === false &&
+      value.ok === true && value.complete === true && value.preparationOutcome === "ready" ? "ready" : "unavailable";
+  let counted: ReturnType<typeof recordTypedSubrequestStart> | undefined;
+  try {
+    counted = recordTypedSubrequestStart({type: "custom", operationType: "durableObject",
+      operationName: "triageRunPreparationObservation", allowSafetyMargin: true});
+    const stub = env.TRIAGE_RUN_COORDINATOR!.get(env.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
+    const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-preparation/observe", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({...run, invocationId, state, ticketNumbers: numbers}), signal: AbortSignal.timeout(5000),
+    }));
+    recordSubrequestFinish(counted, response.status, response.ok);
+  } catch { if (counted) recordSubrequestFinish(counted, "observationUnavailable", false); }
 }
 
 /** Content-free proof of a complete or durably pending first query. Losing this optional

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertTriageRunStart, assertTriageRunWriteLease, recordTriageRunQuery, runWithTriageLeaseEnvironment, runWithTriageRunContext, triageLeaseCapability } from "./triage-run-lease.js";
+import { assertTriageRunStart, assertTriageRunWriteLease, recordTriageRunQuery, recordTriageRunPreparation, runWithTriageLeaseEnvironment, runWithTriageRunContext, triageLeaseCapability } from "./triage-run-lease.js";
 import { dispatcherFetch, withDispatcherOperation } from "./dispatcher.js";
-import { runWithExecutionContext, executionDiagnostics } from "./execution.js";
+import { runWithExecutionContext, executionDiagnostics, getExecutionState } from "./execution.js";
 
 const triggerId = "triage-7-00000000-0000-4000-8000-000000000007";
 const scope = {operationId: `synthetic-owner:${triggerId}`, itemKey: "90007"};
@@ -43,6 +43,38 @@ describe("automatic triage write leases", () => {
     const {env,fetcher} = environment();
     await runWithTriageLeaseEnvironment({...env,TRIAGE_RUN_START_GUARD_ENABLED:"true"},()=>assertTriageRunStart());
     expect(fetcher).not.toHaveBeenCalled();
+  });
+  it("binds preparation begin and its typed outcome to the same invocation without retaining plan content",async()=>{
+    const {env,fetcher}=environment();
+    fetcher.mockImplementation(async request=>Response.json(new URL(request.url).pathname.endsWith("/start")
+      ? {protocol:"triage-run-start-v1",allowed:true,expiresAt:Date.now()+60000,
+        preparationInvocationId:(await request.clone().json() as {preparationInvocationId:string}).preparationInvocationId}:{observed:true}));
+    await runWithTriageLeaseEnvironment({...env,TRIAGE_RUN_START_GUARD_ENABLED:"true"},()=>
+      runWithTriageRunContext({triggerId,attempt:1},()=>runWithExecutionContext("superops_tickets_prepare_triage_plan",async()=>{
+        const args={batchId:triggerId,expectedCandidateTicketNumbers:["90007"],actions:[{note:"synthetic private body"}]};
+        await assertTriageRunStart({preparationInvocationId:getExecutionState()!.invocationId});
+        await recordTriageRunPreparation(args,{ok:false,complete:false,preparationOnly:true,operationCreated:false,
+          preparationOutcome:"validation_failed",error:"synthetic private diagnostic"});
+      })));
+    const start=await fetcher.mock.calls[0][0].json() as {preparationInvocationId:string},observation=await fetcher.mock.calls[1][0].json();
+    expect(observation).toEqual({triggerId,attempt:1,invocationId:start.preparationInvocationId,state:"validation_failed",ticketNumbers:["90007"]});
+    expect(JSON.stringify(observation)).not.toMatch(/private|note|error|actions/);
+  });
+  it("marks an untyped preparation error unavailable instead of fabricating a validation cause",async()=>{
+    const {env,fetcher}=environment();
+    await runWithTriageLeaseEnvironment({...env,TRIAGE_RUN_START_GUARD_ENABLED:"true"},()=>
+      runWithTriageRunContext({triggerId,attempt:1},()=>runWithExecutionContext("prepare",async()=>{
+        await recordTriageRunPreparation({batchId:triggerId,expectedCandidateTicketNumbers:["90007"]},{error:"missing ticket number"});
+        await recordTriageRunPreparation({batchId:"other",expectedCandidateTicketNumbers:["90007"]},{preparationOutcome:"validation_failed"});
+      })));
+    expect(fetcher).toHaveBeenCalledTimes(1);expect(await fetcher.mock.calls[0][0].json()).toMatchObject({state:"unavailable"});
+  });
+  it("requires acknowledgement of the exact preparation invocation before execution",async()=>{
+    const {env,fetcher}=environment();
+    fetcher.mockImplementation(async()=>Response.json({protocol:"triage-run-start-v1",allowed:true,expiresAt:Date.now()+60000}));
+    await expect(runWithTriageLeaseEnvironment({...env,TRIAGE_RUN_START_GUARD_ENABLED:"true"},()=>
+      runWithTriageRunContext({triggerId,attempt:1},()=>assertTriageRunStart({preparationInvocationId:"00000000-0000-4000-8000-000000000111"}))))
+      .rejects.toThrow("no tool executed");
   });
   it("counts the independent guard check and binds its request to the global coordinator and live ticket metadata", async () => {
     const {env, fetcher} = environment();

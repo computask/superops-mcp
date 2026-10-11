@@ -1191,8 +1191,13 @@ const TRIAGE_PLAN_ACTION_SCHEMA = {
 // Keep the legacy apply schema unchanged while avoiding an unusable proposal field.
 const TRIAGE_PREPARATION_ACTION_SCHEMA = {
   ...TRIAGE_PLAN_ACTION_SCHEMA,
+  required: ["expectedTicketId", "action"],
   properties: {
     ...TRIAGE_PLAN_ACTION_SCHEMA.properties,
+    ticketNumber: {
+      type: "string",
+      description: "Optional during read-only preparation only. When omitted, the server derives the display number from expectedTicketId and requires it to belong to the exact fixed candidate set. A supplied conflicting number is rejected. The returned prepared apply action always includes ticketNumber.",
+    },
     target: {
       ...TRIAGE_PLAN_ACTION_SCHEMA.properties.target,
       properties: Object.fromEntries(Object.entries(TRIAGE_PLAN_ACTION_SCHEMA.properties.target.properties)
@@ -1771,7 +1776,7 @@ function jsonRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
-function validateTriagePlanActionShape(rawAction: unknown, index: number): string | undefined {
+function validateTriagePlanActionShape(rawAction: unknown, index: number, allowCanonicalNumber = false): string | undefined {
   const action = jsonRecord(rawAction);
   const label = `actions[${index}]`;
   if (!action) {
@@ -1786,7 +1791,8 @@ function validateTriagePlanActionShape(rawAction: unknown, index: number): strin
   }
 
   const ticketNumber = normaliseTicketNumber(action.ticketNumber);
-  if (!ticketNumber) {
+  if (!ticketNumber && !(allowCanonicalNumber && action.ticketNumber === undefined &&
+      typeof action.expectedTicketId === "string" && action.expectedTicketId.trim().length > 0)) {
     return `${label}.ticketNumber is required.`;
   }
 
@@ -1870,9 +1876,9 @@ function validateTriagePlanActionShape(rawAction: unknown, index: number): strin
   }
 }
 
-function validateTriagePlanActions(actions: unknown[]): string | undefined {
+function validateTriagePlanActions(actions: unknown[], allowCanonicalNumber = false): string | undefined {
   for (const [index, action] of actions.entries()) {
-    const validationError = validateTriagePlanActionShape(action, index);
+    const validationError = validateTriagePlanActionShape(action, index, allowCanonicalNumber);
     if (validationError) return validationError;
   }
 }
@@ -2254,7 +2260,8 @@ function looksLikeOutlookReactionDigestSubject(subject: string): boolean {
 function validateScheduledNewCallsPolicy(
   request: ApplyTriagePlanParams,
   expected: string[],
-  actions: TriagePlanAction[]
+  actions: TriagePlanAction[],
+  allowCanonicalNumber = false
 ): string | undefined {
   if (!isScheduledNewCallsPolicy(request.policyMode)) return undefined;
   const policyLabel = request.policyMode === EMAIL_NEW_CALLS_V2_POLICY
@@ -2269,11 +2276,12 @@ function validateScheduledNewCallsPolicy(
   if (actions.length !== expected.length) {
     return `${policyLabel} requires exactly one action for every fixed candidate.`;
   }
-  const actionNumbers = actions.map((action) => normaliseTicketNumber(action.ticketNumber));
+  const actionNumbers = actions.filter(action => !(allowCanonicalNumber && action.ticketNumber === undefined))
+    .map((action) => normaliseTicketNumber(action.ticketNumber));
   if (new Set(actionNumbers).size !== actionNumbers.length) {
     return `${policyLabel} actions must not contain duplicate ticket numbers.`;
   }
-  if (expected.some((ticketNumber) => !actionNumbers.includes(ticketNumber)) ||
+  if ((!allowCanonicalNumber && expected.some((ticketNumber) => !actionNumbers.includes(ticketNumber))) ||
       actionNumbers.some((ticketNumber) => !expected.includes(ticketNumber))) {
     return `${policyLabel} actions must exactly cover the fixed candidate set.`;
   }
@@ -9921,6 +9929,7 @@ async function prepareTriagePlan(client: SuperOpsClientInstance, proposal: Apply
   const actions = Array.isArray(proposal.actions) ? structuredClone(proposal.actions) : [];
   const invalid = (error: string) => ({ content: [{ type: "text", text: JSON.stringify({
     ok: false, complete: false, preparationOnly: true, operationCreated: false,
+    preparationOutcome: "validation_failed",
     policyContractVersion: TRIAGE_POLICY_CONTRACT_VERSION, error,
   }) }], isError: true });
   if (expected.length === 0 || expected.length > 50 || expected.some(value => !value) || new Set(expected).size !== expected.length) {
@@ -9933,10 +9942,41 @@ async function prepareTriagePlan(client: SuperOpsClientInstance, proposal: Apply
   if (proposal.preparationFingerprint || proposal.expectedOperationUpdatedAt || proposal.dryRun === true) {
     return invalid("Prepare a new proposal before an operation exists; do not pass recovery or dryRun arguments.");
   }
-  const shapeError = validateTriagePlanActions(actions);
+  const shapeError = validateTriagePlanActions(actions, true);
   if (shapeError) return invalid(shapeError);
-  const policyError = validateScheduledNewCallsPolicy(proposal, expected, actions);
+  const policyError = validateScheduledNewCallsPolicy(proposal, expected, actions, true);
   if (policyError) return invalid(policyError);
+  // Preparation may omit the redundant display number, never the immutable ID.
+  // Derive it by canonical ID, not array position, a guessed candidate or a fresh
+  // snapshot. Reuse this read below; this repair adds no SuperOps read per item.
+  const canonicalTickets = new Map<string, Ticket>();
+  const immutableIds = actions.map(action => action.expectedTicketId!.trim());
+  if (new Set(immutableIds).size !== immutableIds.length) return invalid("Preparation actions must have unique immutable ticket IDs.");
+  const numberCorrections: Array<{ticketNumber: string; fields: string[]}> = [];
+  try {
+    for (const action of actions) {
+      if (action.ticketNumber !== undefined) continue;
+      assertExecutionBudget();
+      const ticket = await getTicketByInternalId(client, action.expectedTicketId!.trim());
+      const number = normaliseTicketNumber(ticket?.displayId);
+      if (!ticket || ticket.ticketId !== action.expectedTicketId!.trim() || !number || !expected.includes(number)) {
+        return invalid("Canonical immutable identity must match a ticket in the fixed candidate set.");
+      }
+      action.ticketNumber = number;
+      canonicalTickets.set(action.expectedTicketId!.trim(), ticket);
+      numberCorrections.push({ticketNumber: number, fields: ["ticketNumber"]});
+    }
+  } catch (error) {
+    const metadata = safeSuperOpsErrorMetadata(error, true);
+    return {content: [{type: "text", text: JSON.stringify({ok: false, complete: false,
+      preparationOnly: true, operationCreated: false, preparationOutcome: "unavailable",
+      policyContractVersion: TRIAGE_POLICY_CONTRACT_VERSION,
+      error: "Canonical preparation read was unavailable; no prepared plan is available.",
+      ...(metadata ? {readFailure: metadata} : {}),
+    })}], isError: true};
+  }
+  const canonicalPolicyError = validateScheduledNewCallsPolicy(proposal, expected, actions);
+  if (canonicalPolicyError) return invalid(canonicalPolicyError);
   const plan: ApplyTriagePlanParams = { ...proposal, actions,
     expectedCandidateTicketNumbers: expected, dryRun: false, verify: true, dedupeNotes: true,
     stopOnFirstFailure: false,
@@ -9945,7 +9985,7 @@ async function prepareTriagePlan(client: SuperOpsClientInstance, proposal: Apply
     allowWriteWithoutVerifiedContent: proposal.allowWriteWithoutVerifiedContent ?? false,
     policyContractVersion: TRIAGE_POLICY_CONTRACT_VERSION };
   const results: ApplyTriagePlanResult[] = [];
-  const corrections: Array<{ticketNumber: string; fields: string[]}> = [];
+  const corrections: Array<{ticketNumber: string; fields: string[]}> = [...numberCorrections];
   // Per-invocation field metadata reuse, without changing the apply validator.
   const options = new Map<ValidatedTicketOptionField, SuperOpsField>();
   const provider: TicketOptionFieldsProvider = async fields => {
@@ -9962,7 +10002,8 @@ async function prepareTriagePlan(client: SuperOpsClientInstance, proposal: Apply
     }
     try {
       assertExecutionBudget();
-      const lookup = await lookupApprovedTicket(client, number, action.expectedTicketId);
+      const prefetched = canonicalTickets.get(action.expectedTicketId!.trim());
+      const lookup = prefetched ? {ticket: prefetched, error: undefined} : await lookupApprovedTicket(client, number, action.expectedTicketId);
       const ticket = lookup.ticket;
       if (!ticket || lookup.error) throw new Error("Canonical ticket identity could not be established.");
       if (ticket.client === undefined) throw new Error("Canonical client data is unavailable; missing data cannot authorize fallback assignment.");
@@ -10000,6 +10041,7 @@ async function prepareTriagePlan(client: SuperOpsClientInstance, proposal: Apply
   if (complete) plan.preparationFingerprint = triagePreparationFingerprint(plan);
   return { content: [{ type: "text", text: JSON.stringify({ ok: complete, complete,
     preparationOnly: true, operationCreated: false, policyContractVersion: TRIAGE_POLICY_CONTRACT_VERSION,
+    preparationOutcome: complete ? "ready" : "unavailable",
     eligibleCandidateTicketNumbers: results.filter(result => result.writeMethod === "dryRun").map(result => result.ticketNumber),
     deferredCandidateTicketNumbers: results.filter(result => result.writeMethod !== "dryRun").map(result => result.ticketNumber),
     corrections, results, ...(complete ? { preparedPlan: plan } : {}) }) }], ...(!complete ? { isError: true } : {}) };
@@ -10010,7 +10052,7 @@ export function getTicketsTools(): DomainTools {
     tools: [
       {
         name: "superops_tickets_prepare_triage_plan",
-        description: "Read-only preparation of a complete frozen standing-policy triage proposal. EVERY actions entry must contain ticketNumber (the frozen display ID as a string) and action; listing a number in expectedCandidateTicketNumbers or supplying expectedTicketId does not supply actions[*].ticketNumber. Creates no operation and performs no mutations. Derives canonical client hashes, fills the fixed fallback only for explicit null clients, and checks stale identity, policy, private notes and live field dependencies. Only an entirely valid result contains preparedPlan. Copy that complete object unchanged to the separately reviewed apply action. A checksum never grants approval.",
+        description: "Read-only preparation of a complete frozen standing-policy triage proposal. Every action requires expectedTicketId and action. An omitted ticketNumber is derived from that immutable ID by a canonical read and must match the fixed candidate set; conflicting identities, duplicates and scope changes fail closed. Creates no operation and performs no mutations. Derives canonical client hashes, fills the fixed fallback only for explicit null clients, and checks stale identity, policy, private notes and live field dependencies. Only an entirely valid result contains preparedPlan, with every ticketNumber populated. Copy that complete object unchanged to the separately reviewed apply action. A checksum never grants approval.",
         inputSchema: {
           type: "object",
           properties: {

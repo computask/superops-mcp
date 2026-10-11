@@ -7,6 +7,34 @@ operation or calling a SuperOps mutation. A complete successful response alone
 contains `preparedPlan`. A partial or invalid preparation returns every candidate
 result and no plan.
 
+During preparation only, `ticketNumber` may be omitted when the action contains
+its frozen `expectedTicketId`. The preparer derives the display number by that
+immutable ID, checks it against the complete fixed candidate set and reuses the
+canonical read for the existing validators. It never assigns actions by array
+position or guesses a candidate. Supplied conflicting numbers, duplicate IDs,
+missing IDs, scope mismatches and changed snapshot expectations remain blocked.
+Every returned apply action still contains the required display number. The
+public apply contract and its review, checksum, stale checks and dedupe are
+unchanged. Callers with an older cached preparation schema continue supplying
+both identifiers until their catalogue refreshes.
+
+Automatic preparation begins with an independently acknowledged invocation ID
+under the existing run-start guard. The coordinator invalidates any older
+preparation outcome before execution. Its private internal observer retains only
+that ID, fixed candidate numbers and `ready`, `validation_failed` or `unavailable`.
+A lost observation leaves `in_progress`; older or conflicting outcomes cannot
+overwrite a correction. One additional internal observation is budget-accounted;
+number derivation adds no SuperOps read per item and no write.
+
+After provider termination, a missing Agent callback can be replaced by a
+canonical failure report only for the latest server-observed validation failure,
+a complete frozen query and no pending read, apply intent, operation, write check,
+authorized item or unsafe callback claim. The coordinator reports `not_attempted`
+with coarse `validation`, retains `plan_validation_failed` in cause diagnostics,
+revokes the attempt and preserves attention. Unseen candidates remain `unknown`.
+This does not schedule a retry or claim success. Platform rejections that never
+reach the MCP and incomplete/read failures retain conservative handling.
+
 For an assigned client, supply its frozen canonical `expectedClient` name. The
 preparer derives `expectedClientHash` from that name; an account ID is not a hash.
 For an explicitly null client, it adds both fixed TaskGroup target fields if

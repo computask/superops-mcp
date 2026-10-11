@@ -11,7 +11,7 @@
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { assertTriageRunStart, assertTriageRunWriteLease, recordTriageRunQuery, runWithTriageRunContext } from "./triage-run-lease.js";
+import { assertTriageRunStart, assertTriageRunWriteLease, recordTriageRunQuery, recordTriageRunPreparation, runWithTriageRunContext } from "./triage-run-lease.js";
 import { attachSafeErrorContract, safeSuperOpsErrorMetadata } from "./error-contract.js";
 import {
   CallToolRequestSchema,
@@ -1078,7 +1078,8 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
 
       try {
         if (rawArgs.triageCapture !== undefined && !captureContext) throw new Error("Invalid automatic triage correlation; no tool executed.");
-        await assertTriageRunStart();
+        await assertTriageRunStart(name === "superops_tickets_prepare_triage_plan"
+          ? {preparationInvocationId: getExecutionState()?.invocationId} : {});
         if (name === "superops_tickets_apply_triage_plan") {
           await assertTriageRunWriteLease({operationId: typeof args.batchId === "string" ? args.batchId : undefined});
         }
@@ -1107,6 +1108,10 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
         if (name === "superops_tickets_query") {
           try { await recordTriageRunQuery(args, JSON.parse(result.content.find(item => item.type === "text")?.text ?? "{}"), result.structuredContent); }
           catch { /* An unavailable observation must not discard usable read evidence. */ }
+        }
+        if (name === "superops_tickets_prepare_triage_plan") {
+          try { await recordTriageRunPreparation(args, JSON.parse(result.content.find(item => item.type === "text")?.text ?? "{}")); }
+          catch { /* Lost reporting evidence stays conservative; preparation grants no approval. */ }
         }
         metadata = enrichAuditMetadataFromResult(name, result, metadata);
         const errorSummary = result.structuredContent?.readRecoveryDurable === true

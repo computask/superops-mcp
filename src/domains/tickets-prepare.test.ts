@@ -58,16 +58,63 @@ describe("read-only complete triage preparation", () => {
     expect(schema.items.properties.target.properties).not.toHaveProperty("techGroupName");
     expect(publishToolDefinition(definition).annotations?.readOnlyHint).toBe(true);
   });
-  it("requires every action ticket number even when the fixed candidate fence and immutable ID are present", async () => {
+  it("derives an omitted display number from the exact immutable identity without another read or a write", async () => {
     const input=proposal();
     delete (input.actions[0] as Partial<typeof input.actions[0]>).ticketNumber;
     const {data}=await prepare(input);
-    expect(data.complete).toBe(false);expect(data.error).toContain("actions[0].ticketNumber is required");
-    expect(data.operationCreated).toBe(false);expect(data.preparedPlan).toBeUndefined();
-    expect(query).not.toHaveBeenCalled();expect(mutate).not.toHaveBeenCalled();
+    expect(data.complete).toBe(true);expect(data.preparationOutcome).toBe("ready");
+    expect(data.preparedPlan.actions[0]).toMatchObject({ticketNumber:"90101",expectedTicketId:original.ticketId});
+    expect(data.corrections).toContainEqual({ticketNumber:"90101",fields:["ticketNumber"]});
+    expect(query.mock.calls.filter(([document])=>document.includes("getTicket(")).length).toBe(1);
+    expect(data.operationCreated).toBe(false);expect(mutate).not.toHaveBeenCalled();
     expect(await getOperationStore().get(input.batchId,currentOwnerHash())).toBeUndefined();
     const schema=getTicketsTools().tools.find(tool=>tool.name==="superops_tickets_prepare_triage_plan")!.inputSchema.properties.actions as {items:{required:string[]}};
-    expect(schema.items.required).toContain("ticketNumber");
+    expect(schema.items.required).toEqual(["expectedTicketId","action"]);
+    const applySchema=getTicketsTools().tools.find(tool=>tool.name==="superops_tickets_apply_triage_plan")!.inputSchema.properties.actions as {items:{required:string[]}};
+    expect(applySchema.items.required).toContain("ticketNumber");
+  });
+  it.each([null,""," "])("rejects a supplied invalid display number instead of correcting it",async ticketNumber=>{
+    const input=proposal();Object.assign(input.actions[0],{ticketNumber});
+    const {data}=await prepare(input);expect(data.preparationOutcome).toBe("validation_failed");
+    expect(data.preparedPlan).toBeUndefined();expect(query).not.toHaveBeenCalled();expect(mutate).not.toHaveBeenCalled();
+  });
+  it("rejects missing immutable identity before reads even when the display number is omitted",async()=>{
+    const input=proposal();delete (input.actions[0] as Partial<typeof input.actions[0]>).ticketNumber;
+    delete (input.actions[0] as Partial<typeof input.actions[0]>).expectedTicketId;
+    const {data}=await prepare(input);expect(data.complete).toBe(false);expect(data.preparationOutcome).toBe("validation_failed");
+    expect(query).not.toHaveBeenCalled();expect(mutate).not.toHaveBeenCalled();
+  });
+  it.each([{ticketId:"different"},{displayId:"90102"},{displayId:undefined}])("rejects canonical identity or fixed-scope disagreement",async change=>{
+    const input=proposal();delete (input.actions[0] as Partial<typeof input.actions[0]>).ticketNumber;
+    query.mockResolvedValue({getTicket:{...original,...change}});
+    const {data}=await prepare(input);expect(data.complete).toBe(false);expect(data.preparationOutcome).toBe("validation_failed");
+    expect(data.preparedPlan).toBeUndefined();expect(mutate).not.toHaveBeenCalled();
+  });
+  it("maps reversed decisions by immutable ID, never by candidate array position",async()=>{
+    const input=proposal();input.expectedCandidateTicketNumbers.push("90102");
+    input.actions.unshift({...structuredClone(input.actions[0]),ticketNumber:"90102",expectedTicketId:"synthetic-ticket-90102"});
+    for(const action of input.actions) delete (action as Partial<typeof action>).ticketNumber;
+    query.mockImplementation(async(document:string,variables:{input?:{ticketId?:string}})=>document.includes("getFields")?{getFields:fields()}:
+      {getTicket:{...original,ticketId:variables.input?.ticketId,displayId:variables.input?.ticketId==="synthetic-ticket-90102"?"90102":"90101"}});
+    const {data}=await prepare(input);expect(data.complete).toBe(true);
+    expect(data.preparedPlan.actions.map((action:{ticketNumber:string})=>action.ticketNumber)).toEqual(["90102","90101"]);
+    expect(query.mock.calls.filter(([document])=>document.includes("getTicket(")).length).toBe(2);expect(mutate).not.toHaveBeenCalled();
+  });
+  it("rejects duplicate immutable IDs before reads",async()=>{
+    const input=proposal();input.expectedCandidateTicketNumbers.push("90102");
+    input.actions.push({...structuredClone(input.actions[0]),ticketNumber:"90102"});
+    const {data}=await prepare(input);expect(data.complete).toBe(false);expect(query).not.toHaveBeenCalled();expect(mutate).not.toHaveBeenCalled();
+  });
+  it("does not replace frozen expectations when a staff edit occurs during number derivation",async()=>{
+    const input=proposal();delete (input.actions[0] as Partial<typeof input.actions[0]>).ticketNumber;
+    query.mockResolvedValue({getTicket:{...original,updatedTime:"2026-10-04T09:01:00Z"}});
+    const {data}=await prepare(input);expect(data.complete).toBe(false);expect(data.preparedPlan).toBeUndefined();expect(mutate).not.toHaveBeenCalled();
+  });
+  it("keeps an unavailable canonical read distinct from a validation failure",async()=>{
+    const input=proposal();delete (input.actions[0] as Partial<typeof input.actions[0]>).ticketNumber;
+    query.mockRejectedValue(new SuperOpsError("synthetic provider error","rate_limit_exceeded",120));
+    const {data}=await prepare(input);expect(data.preparationOutcome).toBe("unavailable");expect(data.preparedPlan).toBeUndefined();
+    expect(mutate).not.toHaveBeenCalled();
   });
   it("fills both fixed fallback fields for an explicit null client", async () => {
     query.mockImplementation(async (document: string) => document.includes("getFields") ? { getFields: fields() } :
