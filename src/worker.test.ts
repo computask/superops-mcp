@@ -11,6 +11,7 @@ import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import worker, { gatewayOwnerHash, type Env } from "./worker.js";
 import { chatGptDirectBlockedToolNames } from "./mcp-server.js";
 import { constructionCaptures, constructionWorkflow } from "./test-fixtures/triage-construction.js";
+import { failedReadCaptures } from "./test-fixtures/triage-failed-reads.js";
 import { MUTATING_TOOL_NAMES, READ_ONLY_TOOL_NAMES } from "./tool-catalogue.js";
 import { getOperationStore, runWithOperationStore, stableHash, SuperOpsOperationLedger, type OperationLedgerRecord } from "./operation-store.js";
 
@@ -702,6 +703,30 @@ describe("Cloudflare Worker entrypoint", () => {
     expect(result.result.isError).toBe(true);
     expect(result.result.content[0].text).toContain("no tool executed");
     expect(start).toHaveBeenCalledOnce();
+  });
+
+  it("requires Sam and complete read-only 401 evidence for every historical attempt before privately forwarding failed-read recovery",async()=>{
+    const url=`https://${DIRECT_HOST}/admin/triage-read-failure-recovery`,triggerId=`triage-2-${crypto.randomUUID()}`;
+    const body={triggerId,attempt:3,sourceEventId:9,ticketNumber:"90101",dryRun:true};
+    const captures=failedReadCaptures(triggerId);let index=0;
+    const forward=vi.fn(async(_request:Request)=>Response.json({status:"recovery_preview",ticketNumber:"90101"}));
+    const captureRead=vi.fn(async()=>Response.json(captures[index++%3]));
+    const env=chatGptEnv({SUPEROPS_OPERATION_LEDGER:{idFromName:(name:string)=>name,get:()=>({fetch:captureRead})},
+      TRIAGE_RUN_START_GUARD_ENABLED:"true",TRIAGE_RUN_WRITE_GUARD_ENABLED:"true",TRIAGE_RUN_COORDINATOR:{idFromName:name=>name,get:()=>({fetch:forward})}});
+    const request=(jwt?:string,value:unknown=body)=>new Request(url,{method:"POST",headers:{"Content-Type":"application/json",
+      ...(jwt?{"CF-Access-Jwt-Assertion":jwt}:{})},body:JSON.stringify(value)});
+    expect((await worker.fetch(request(),env)).status).toBe(403);
+    expect((await worker.fetch(request(await cloudflareAccessJwt(ADDITIONAL_ALLOWED_EMAIL)),env)).status).toBe(403);
+    const sam=await cloudflareAccessJwt(ALLOWED_EMAIL);
+    expect((await worker.fetch(request(sam,{...body,proof:{override:true}}),env)).status).toBe(400);
+    expect(captureRead).not.toHaveBeenCalled();
+    captures[1].captureFailureCount=1;
+    expect((await worker.fetch(request(sam),env)).status).toBe(409);expect(forward).not.toHaveBeenCalled();
+    captures[1].captureFailureCount=0;
+    const preview=await worker.fetch(request(sam),env);expect(preview.status).toBe(200);expect(preview.headers.get("Cache-Control")).toBe("no-store, private");
+    expect(forward).toHaveBeenCalledOnce();expect(await forward.mock.calls[0][0].json()).toMatchObject({...body,proof:{attempts:[1,2,3],ticketNumber:"90101"}});
+    expect((await worker.fetch(request(sam),{...env,TRIAGE_RUN_START_GUARD_ENABLED:"false"})).status).toBe(503);
+    expect(forward).toHaveBeenCalledOnce();expect((await worker.fetch(new Request(url),env)).status).toBe(405);
   });
 
   it("restricts inspected startup recovery to Sam, requires proof and independent complete captures, and privately forwards a preview",async()=>{

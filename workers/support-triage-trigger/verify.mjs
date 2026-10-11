@@ -7,7 +7,7 @@ const require=createRequire(import.meta.url);
 const wranglerRequire=createRequire(require.resolve('wrangler/package.json'));
 const {Miniflare}=wranglerRequire('miniflare');
 const code=readFileSync(new URL('./src/index.js',import.meta.url));
-assert.equal(createHash('sha256').update(code).digest('hex'),'3f8a1cf63aaa16758c7e8e078792431b77b61298e3e3901bb83baeaf345a2171','Reviewed production module must match the provenance record');
+assert.equal(createHash('sha256').update(code).digest('hex'),'f1bc2b6fa34bfb8e371cc31c51932660bdda4184503a466ea4ec9824f750d462','Reviewed production module must match the provenance record');
 const config=JSON.parse(readFileSync(new URL('./wrangler.jsonc',import.meta.url),'utf8'));
 assert.equal(config.name,'support-triage-trigger');
 assert.equal(config.no_bundle,true);
@@ -34,6 +34,7 @@ try {
   assert.equal(health.triageAttentionTailIsolationEnabled,true);
   assert.equal(health.triagePendingReadStatusProtocol,'dispatcher-read-status-v1');
   assert.equal(health.triageCompletedQueryCallbackGuardProtocol,'completed-query-callback-v1');
+  assert.equal(health.triageTerminalReadRenewalProtocol,'bounded-terminal-read-v1');
   assert.equal(health.callsSuperOpsDirectly,false);assert.equal(health.consumesEmailBodies,false);
   assert.equal((await mf.dispatchFetch('http://local/admin/history/reset',{method:'POST'})).status,401);
   assert.equal((await mf.dispatchFetch('http://local/admin/replay',{method:'POST'})).status,401);
@@ -41,6 +42,8 @@ try {
   assert.equal((await mf.dispatchFetch('http://local/internal/run-lease/check',{method:'POST',body:'{}'})).status,404);
   assert.equal((await mf.dispatchFetch('http://local/internal/run-query/observe',{method:'POST',body:'{}'})).status,404);
   assert.equal((await mf.dispatchFetch('http://local/internal/run-work/start',{method:'POST',body:'{}'})).status,404);
+  assert.equal((await mf.dispatchFetch('http://local/internal/run-read-failure/observe',{method:'POST',body:'{}'})).status,404);
+  assert.equal((await mf.dispatchFetch('http://local/internal/admin/failed-read-recovery',{method:'POST',body:'{}'})).status,404);
   assert.equal((await mf.dispatchFetch('http://local/internal/run-preparation/observe',{method:'POST',body:'{}'})).status,404);
   assert.equal((await mf.dispatchFetch('http://local/internal/admin/startup-recovery',{method:'POST',body:'{}'})).status,404);
   assert.equal((await mf.dispatchFetch('http://local/admin/run/recover',{method:'POST',headers:{Authorization:'Bearer synthetic-replay-admin-token','Content-Type':'application/json'},body:'{}'})).status,409);

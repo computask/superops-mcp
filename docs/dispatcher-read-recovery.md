@@ -13,8 +13,9 @@ are resubmitted. Dispatcher idempotency prevents another logical submission.
 Retry timing survives Worker restart; a cooldown extending beyond the recovery
 deadline still permits checking expiry on the original receipt at that deadline.
 
-Automatic callers retain terminal failed/cancelled receipts and do not silently
-start another generation. Uncertain receipts never renew. A separate deliberate
+Automatic callers retain terminal failed/cancelled receipts unless the private
+coordinator has granted the bounded, exact-receipt exception described in
+[failed-read recovery](triage-read-failure-recovery.md). Uncertain receipts never renew. A separate deliberate
 manual read after failure links its new generation to the earlier receipt.
 Confirmed successful reads may renew, retaining that link, so later evidence is
 fresh. Before a mutation stage uses a read recovered from an earlier execution,

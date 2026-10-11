@@ -147,10 +147,20 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-3f8a1cf63aaa16758c7e8e078792431b77b61298e3e3901bb83baeaf345a2171.
+f1bc2b6fa34bfb8e371cc31c51932660bdda4184503a466ea4ec9824f750d462.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
+
+Confirmed failed-read recovery, 11 October 2026: a terminal read callback now
+uses the MCP's private exact-receipt observation and enforced start/write guards
+to renew only eligible failed reads before preparation or possible writes. Two
+recovery attempts retain their original deadline and scope; persistent faults
+stop with attention. Failed queries do not trigger empty-window widening.
+Historical 401 recovery is Sam-only, independently corroborates all retained
+read attempts and schedules one exact ticket through normal review. Generic
+provider run_failed still requires inspected startup proof; it is not inferred
+from empty captures. See ../../docs/triage-read-failure-recovery.md.
 
 Timing instrumentation, 27 September 2026: the existing pre-apply report emits
 content-free `received` and `response_ready` markers to the private Tail Worker.

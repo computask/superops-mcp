@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getExecutionState, recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
 import { currentOwnerHash } from "./operation-store.js";
+import { authorizeDispatcherReadRenewals, renewableTerminalRead, TERMINAL_READ_RENEWAL_PROTOCOL, type TerminalReadRenewal } from "./dispatcher-read-journal.js";
 
 export const TRIAGE_RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
 export const TRIAGE_RUN_START_PROTOCOL = "triage-run-start-v1";
@@ -30,12 +31,12 @@ export function triageLeaseCapability(env: TriageLeaseEnvironment) {
     typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function",
     startProtocol: TRIAGE_RUN_START_PROTOCOL, startGuardEnforced: env.TRIAGE_RUN_START_GUARD_ENABLED === "true" &&
       env.TRIAGE_RUN_WRITE_GUARD_ENABLED === "true" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function" &&
-      typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function" };
+      typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function", terminalReadRenewalProtocol: TERMINAL_READ_RENEWAL_PROTOCOL };
 }
 
 /** Authoritative attempt activity, persisted before any correlated tool executes.
  * Diagnostic capture availability never decides whether this check is required. */
-export async function assertTriageRunStart(input: {preparationInvocationId?: string} = {}): Promise<void> {
+export async function assertTriageRunStart(input: {preparationInvocationId?: string; readRecoveryToolName?: string} = {}): Promise<void> {
   const env = environments.getStore(), run = runs.getStore();
   if (!run || env?.TRIAGE_RUN_START_GUARD_ENABLED !== "true") return;
   if (!triageLeaseCapability(env).startGuardEnforced) throw new Error("Triage run start guard unavailable; no tool executed.");
@@ -45,15 +46,43 @@ export async function assertTriageRunStart(input: {preparationInvocationId?: str
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-work/start", {
       method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({...run, ...input}), signal: AbortSignal.timeout(5000),
     }));
-    const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number; preparationInvocationId?: string};
+    const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number; preparationInvocationId?: string; readRenewals?: TerminalReadRenewal[]};
     if (!response.ok || result.protocol !== TRIAGE_RUN_START_PROTOCOL || result.allowed !== true ||
         input.preparationInvocationId !== undefined && result.preparationInvocationId !== input.preparationInvocationId ||
         typeof result.expiresAt !== "number" || result.expiresAt <= Date.now()) throw Error("rejected");
     recordSubrequestFinish(counted, response.status, true);
+    if (Array.isArray(result.readRenewals) && result.readRenewals.length <= 2) authorizeDispatcherReadRenewals(result.readRenewals);
   } catch {
     recordSubrequestFinish(counted, "triageStartRejected", false);
     throw new Error("Triage run start guard rejected or unavailable; no tool executed.");
   }
+}
+
+/** A typed failed READ is authoritative evidence; a callback's empty count is not.
+ * This observation grants neither a new read nor a write. The coordinator decides
+ * whether another attempt may receive an exact-receipt, bounded renewal grant. */
+export async function recordTriageRunReadFailure(toolName: string, error: unknown): Promise<void> {
+  const env = environments.getStore(), run = runs.getStore();
+  if (!run || !triageLeaseCapability(env ?? {}).startGuardEnforced ||
+      !["superops_tickets_query", "superops_tickets_triage_evidence_recover", "superops_tickets_field_options"].includes(toolName)) return;
+  const failure = error as {state?: string; requestId?: string; upstreamHttpStatus?: number; errorClassification?: string;
+    readRecovery?: {durable?: boolean; deadlineAt?: string; journalIdentity?: {workflowHash?: string; payloadHash?: string}}} | undefined;
+  const journal = failure?.readRecovery?.journalIdentity;
+  if (!failure || failure.readRecovery?.durable !== true || !renewableTerminalRead(failure.state ?? "", failure.errorClassification, failure.upstreamHttpStatus) ||
+      !/^[A-Za-z0-9_-]{1,160}$/.test(failure.requestId ?? "") || !/^[a-f0-9]{64}$/.test(journal?.workflowHash ?? "") ||
+      !/^[a-f0-9]{64}$/.test(journal?.payloadHash ?? "") || !failure.readRecovery.deadlineAt) return;
+  let counted: ReturnType<typeof recordTypedSubrequestStart> | undefined;
+  try {
+    counted = recordTypedSubrequestStart({type: "custom", operationType: "durableObject", operationName: "triageRunReadFailureObservation", allowSafetyMargin: true});
+    const stub = env!.TRIAGE_RUN_COORDINATOR!.get(env!.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
+    const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-read-failure/observe", {
+      method: "POST", headers: {"Content-Type": "application/json"}, signal: AbortSignal.timeout(5000),
+      body: JSON.stringify({...run, toolName, requestId: failure.requestId, ownerHash: currentOwnerHash(),
+        ...journal, deadlineAt: failure.readRecovery.deadlineAt, state: failure.state,
+        httpStatus: failure.upstreamHttpStatus, errorClassification: failure.errorClassification}),
+    }));
+    recordSubrequestFinish(counted, response.status, response.ok);
+  } catch { if (counted) recordSubrequestFinish(counted, "observationUnavailable", false); }
 }
 
 /** Only typed preparation state crosses this boundary. Starting each preparation

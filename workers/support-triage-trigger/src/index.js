@@ -2910,12 +2910,14 @@ function isProvenAlreadyHandledCompletion(report) {
   return mcpExecution?.toolName === EVIDENCE_RECOVERY_TOOL_NAME && (metadata.failureDiagnostics?.length ?? 0) === 0 && (mcpExecution.failureDiagnostics?.length ?? 0) === 0 && (requestsByType?.duplicateNoteCheck ?? 0) >= ticketOutcomes.length && (requestsByType?.verificationRead ?? 0) >= ticketOutcomes.length;
 }
 __name(isProvenAlreadyHandledCompletion, "isProvenAlreadyHandledCompletion");
+function observedTriageDenial(report) {
+  return [...report.metadata?.failureDiagnostics ?? [], ...report.metadata?.mcpExecution?.failureDiagnostics ?? []].some(entry =>
+    entry.errorType === "risk_gate" || ["unacceptable_risk", "apply_rejected", "permission_denied", "access_denied"].includes(entry.errorCode));
+}
 function terminalApplyFailureNeedsHumanReconciliation(report) {
   // No-write telemetry proves only that an action has not executed. It is not
   // permission to retry a policy/security denial as a transient validation error.
-  const diagnostics = [...report.metadata?.failureDiagnostics ?? [], ...report.metadata?.mcpExecution?.failureDiagnostics ?? []];
-  if (diagnostics.some((entry) => entry.errorType === "risk_gate" ||
-    ["unacceptable_risk", "apply_rejected", "permission_denied", "access_denied"].includes(entry.errorCode))) return true;
+  if (observedTriageDenial(report)) return true;
   if (report.status !== "terminal_failure" || report.metadata?.failureStage !== "triage_apply") {
     return false;
   }
@@ -3467,6 +3469,16 @@ __name(recoverStaleAcceptedRun, "recoverStaleAcceptedRun");
 // It cannot authorize a plan; the MCP's existing approval/stale/dedupe gates remain.
 const RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
 const RUN_START_PROTOCOL = "triage-run-start-v1";
+const TERMINAL_READ_RENEWAL_PROTOCOL = "bounded-terminal-read-v1";
+function renewableReadFailure(read) {
+  return read?.state === "failed" && (read.errorClassification === "HTTP_ERROR" && [401,408,429,500,502,503,504].includes(read.httpStatus) ||
+    ["TIMEOUT","NETWORK_ERROR","RATE_LIMITED"].includes(read.errorClassification));
+}
+function noPossibleAutomaticWrite(state, triggerId) {
+  const leases = state.runWriteLeases.filter(lease => lease.triggerId === triggerId);
+  return leases.length > 0 && leases.every(lease => !lease.operationReference && !lease.applyIntentObserved &&
+    !lease.writeCheckObserved && !lease.preparationObservation && !lease.nonReadWorkObserved && !lease.rejectedCallbackUnsafe && lease.authorizedItems.length === 0);
+}
 function ensureAcceptedWriteLease(state, config) {
   const accepted = state.lastAcceptedTrigger;
   const issuedAt = Date.parse(accepted?.acceptedAt ?? "");
@@ -3481,7 +3493,9 @@ function ensureAcceptedWriteLease(state, config) {
     ...(previous ? {pendingRead: previous.pendingRead, queryCompleted: previous.queryCompleted,
       applyIntentObserved: previous.applyIntentObserved, writeCheckObserved: previous.writeCheckObserved,
       rejectedCallbackUnsafe: previous.rejectedCallbackUnsafe,
-      startupRetryCount: previous.startupRetryCount, startupDeadlineAt: previous.startupDeadlineAt} : {})});
+      startupRetryCount: previous.startupRetryCount, startupDeadlineAt: previous.startupDeadlineAt,
+      readRenewals: previous.readRenewals, readFailureRetryCount: previous.readFailureRetryCount,
+      readFailureDeadlineAt: previous.readFailureDeadlineAt} : {})});
   state.runWriteLeases = state.runWriteLeases.slice(-256);
 }
 function checkRunWriteLease(state, config, body, now, validatedContinuationLeaseUntil) {
@@ -3833,7 +3847,48 @@ function schedulePendingFirstReadRecovery(state, config, now, diagnostics) {
 function startupLeaseUntouched(lease) {
   return Boolean(lease && lease.mcpWorkStartedAt === undefined && !lease.queryCompleted && lease.queryTicketNumbers === undefined &&
     !lease.pendingRead && !lease.applyIntentObserved && !lease.writeCheckObserved && !lease.operationReference &&
-    !lease.rejectedCallbackUnsafe && lease.authorizedItems.length === 0);
+    !lease.rejectedCallbackUnsafe && !lease.failedRead && !lease.readRenewals?.length && lease.authorizedItems.length === 0);
+}
+async function scheduleTerminalReadRecovery(engine, state, report, now) {
+  const config = engine.deps.config;
+  const lease = state.runWriteLeases.find(item => item.triggerId === report.triggerId && item.attempt === report.attempt);
+  if (!lease?.failedRead || report.status !== "terminal_failure") return null;
+  const count = lease.readFailureRetryCount ?? 0;
+  const deadline = lease.readFailureDeadlineAt ?? Math.min(lease.issuedAt + 600_000, Date.parse(lease.failedRead.deadlineAt));
+  const nextAt = Math.max(now + 30_000 * 2 ** count, state.cooldownUntil);
+  const stop = () => engine.stopAutomaticRetry(state, {...report,metadata:{...report.metadata,
+    failureDiagnostics:[...report.metadata?.failureDiagnostics ?? [],{stage:report.metadata?.failureStage ?? "bounded_query",
+      errorCode:"terminal_read_recovery_blocked",itemKey:lease.failedRead.requestId}].slice(-32)}},now);
+  if (!config.startupRecoveryEnabled || config.scopeMode !== "new-email-tickets" || lease.revokedAt !== null || lease.expiresAt <= now ||
+      lease.startGuardProtocol !== RUN_START_PROTOCOL || !Number.isFinite(lease.mcpWorkStartedAt) ||
+      JSON.stringify(lease.scope) !== JSON.stringify(state.pendingTriggerScope) || !renewableReadFailure(lease.failedRead) ||
+      !noPossibleAutomaticWrite(state,report.triggerId) || observedTriageDenial(report) ||
+      report.metadata?.operationId || report.metadata?.operationStatus || !Number.isInteger(count) || count < 0 || count >= 2 ||
+      state.retryCount >= config.resultMaxRetries || !Number.isFinite(deadline) || nextAt >= deadline) return await stop();
+  let capability;
+  try { const response = await config.runLeaseGuardService?.fetch(new Request("https://mcp.internal/internal/triage-run-lease-capability",{signal:AbortSignal.timeout(5000)}));
+    if (response?.ok) capability = await response.json(); } catch { }
+  if (capability?.enforced !== true || capability.startGuardEnforced !== true || capability.startProtocol !== RUN_START_PROTOCOL ||
+      capability.terminalReadRenewalProtocol !== TERMINAL_READ_RENEWAL_PROTOCOL) return await stop();
+  const read = lease.failedRead;
+  const grant = {protocol:TERMINAL_READ_RENEWAL_PROTOCOL,requestId:read.requestId,ownerHash:read.ownerHash,
+    workflowHash:read.workflowHash,payloadHash:read.payloadHash,deadlineAt:new Date(deadline).toISOString()};
+  lease.readRenewals = [...(lease.readRenewals ?? []).filter(value => value.workflowHash !== read.workflowHash || value.payloadHash !== read.payloadHash),grant].slice(-2);
+  lease.readFailureRetryCount = count + 1;
+  lease.readFailureDeadlineAt = deadline;
+  lease.revokedAt = now;
+  state.retryCount += 1;
+  state.executionPhase = "retry_wait";
+  state.resultDeadlineAt = null;
+  state.dueAt = nextAt;
+  markFailure(state,"transient",now,nextAt);
+  recordDispatchHistory(state,now,{event:"retry_scheduled",...resultHistoryDetails(report),failureKind:"transient",
+    nextAt:new Date(nextAt).toISOString(),waitMs:nextAt-now,waitReason:"bounded_recovery",
+    failureDiagnostics:[{stage:report.metadata?.failureStage ?? "bounded_query",errorCode:"known_failed_read_renewal",
+      itemKey:read.requestId,httpStatus:read.httpStatus}]},state.pendingTriggerScope);
+  await engine.deps.store.save(state);
+  await engine.deps.store.setAlarm(nextAt);
+  return {status:"retry_scheduled",triggerId:report.triggerId,nextAt};
 }
 function completedQueryCallbackConflict(state, report, now) {
   const lease = state.runWriteLeases.find(item => item.triggerId === report.triggerId && item.attempt === report.attempt);
@@ -4120,6 +4175,10 @@ var CoordinatorEngine = class {
     const leaseRecovery = await recoverExpiredWriteLease(this, state, now);
     if (leaseRecovery) return leaseRecovery;
     const readLease = state.runWriteLeases.find(lease => lease.triggerId === state.pendingTriggerId && lease.attempt === state.dispatchAttempt);
+    if (readLease?.readFailureDeadlineAt && readLease.readFailureDeadlineAt <= now) {
+      return await this.stopAutomaticRetry(state,{triggerId:state.pendingTriggerId,attempt:state.dispatchAttempt,status:"terminal_failure",
+        metadata:{failureStage:"bounded_query",failureDiagnostics:[{stage:"bounded_query",errorCode:"terminal_read_recovery_expired"}]}},now);
+    }
     if (state.executionPhase === "retry_wait" && readLease?.startupRetryCount > 0 && readLease.startupDeadlineAt <= now) {
       return await this.stopAutomaticRetry(state,{triggerId:state.pendingTriggerId,attempt:state.dispatchAttempt,status:"terminal_failure",
         metadata:{failureStage:"agent_callback",failureDiagnostics:[{stage:"agent_callback",errorCode:"startup_recovery_deadline_expired"}]}},now);
@@ -4649,6 +4708,10 @@ var CoordinatorEngine = class {
     // A held startup retry may have been promoted into pending_dispatch after
     // fresh work. Its original deadline still applies immediately before POST.
     const startupLease = [...state.runWriteLeases].reverse().find(lease => lease.triggerId === triggerId);
+    if (startupLease?.readFailureDeadlineAt && startupLease.readFailureDeadlineAt <= now) {
+      return await this.stopAutomaticRetry(state,{triggerId,attempt:state.dispatchAttempt,status:"terminal_failure",
+        metadata:{failureStage:"bounded_query",failureDiagnostics:[{stage:"bounded_query",errorCode:"terminal_read_recovery_expired"}]}},now);
+    }
     if (startupLease?.startupRetryCount > 0 && startupLease.startupDeadlineAt <= now) {
       return await this.stopAutomaticRetry(state,{triggerId,attempt:state.dispatchAttempt,status:"terminal_failure",
         metadata:{failureStage:"agent_callback",failureDiagnostics:[{stage:"agent_callback",errorCode:"startup_recovery_deadline_expired"}]}},now);
@@ -4789,6 +4852,8 @@ var CoordinatorEngine = class {
     const firstEmptyTargetedQuery = !state.emptyTargetedRecoveryPending && this.deps.config.fastTargetedModeEnabled && state.pendingTriggerScope?.mode === "new-email-tickets" && state.pendingTriggerScope.targetTicketNumbers === void 0 && isEmptyTargetedQueryCompletion(report);
     const settledEmptyTargetedRetry = !firstEmptyTargetedQuery && state.retryCount > 0 && this.deps.config.scopeMode === "new-email-tickets" && state.pendingTriggerScope?.mode === "new-email-tickets" && isEmptyTargetedQueryCompletion(report);
     const continuationDisposition = operationContinuationDisposition(effectiveReport);
+    const terminalReadRecovery = await scheduleTerminalReadRecovery(this,state,effectiveReport,now);
+    if (terminalReadRecovery) return terminalReadRecovery;
     if (continuationDisposition === "terminal_failure" ||
         report.status !== "complete" && state.retryCount >= this.deps.config.resultMaxRetries) {
       return await this.stopAutomaticRetry(state, effectiveReport, now);
@@ -4912,7 +4977,11 @@ var CoordinatorEngine = class {
       }
       return { status: "retry_scheduled", triggerId: report.triggerId, nextAt: nextAt2 };
     }
-    const retryableEmptyTargetedQuery = report.status === "terminal_failure" && !state.emptyTargetedRecoveryPending && this.deps.config.fastTargetedModeEnabled && state.pendingTriggerScope?.mode === "new-email-tickets" && report.metadata?.failureStage === "bounded_query" && (report.metadata.ticketsConsidered ?? 0) === 0 && (report.metadata.ticketsCompleted ?? 0) === 0 && (report.metadata.ticketsDeferred ?? 0) === 0;
+    const queryLease = state.runWriteLeases.find(lease => lease.triggerId === report.triggerId && lease.attempt === report.attempt);
+    const retryableEmptyTargetedQuery = report.status === "terminal_failure" && queryLease?.queryCompleted === true &&
+      Array.isArray(queryLease.queryTicketNumbers) && queryLease.queryTicketNumbers.length === 0 && queryLease.queryInvocationId &&
+      !effectiveReport.metadata?.failureDiagnostics?.length && !effectiveReport.metadata?.mcpExecution?.failureDiagnostics?.length &&
+      !state.emptyTargetedRecoveryPending && this.deps.config.fastTargetedModeEnabled && state.pendingTriggerScope?.mode === "new-email-tickets" && report.metadata?.failureStage === "bounded_query" && (report.metadata.ticketsConsidered ?? 0) === 0 && (report.metadata.ticketsCompleted ?? 0) === 0 && (report.metadata.ticketsDeferred ?? 0) === 0;
     if (retryableEmptyTargetedQuery) {
       widenTargetedEmailScopeForRecovery(state, this.deps.config);
       state.emptyTargetedRecoveryPending = true;
@@ -7348,7 +7417,7 @@ var TriageCoordinator = class {
     if (request.method === "POST" && path === "/internal/run-work/start") {
       let body;
       try { body = await request.json(); } catch { return json({error:"invalid_payload"},400); }
-      if (!isRecord(body) || !keysAreBounded(body,["triggerId","attempt","preparationInvocationId"]) || typeof body.triggerId !== "string" ||
+      if (!isRecord(body) || !keysAreBounded(body,["triggerId","attempt","preparationInvocationId","readRecoveryToolName"]) || typeof body.triggerId !== "string" ||
           !/^triage-\d+-[a-f0-9-]{36}$/i.test(body.triggerId) || !Number.isInteger(body.attempt) || body.attempt<1 || body.attempt>100) return json({error:"invalid_payload"},400);
       if (body.preparationInvocationId!==undefined && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(body.preparationInvocationId)) return json({error:"invalid_payload"},400);
       const state = normalizeState(await store.load()), now = Date.now();
@@ -7363,6 +7432,9 @@ var TriageCoordinator = class {
         recordDispatchHistory(state,now,{event:"run_work_started",attempt:body.attempt},lease.scope);
       }
       lease.startGuardProtocol = RUN_START_PROTOCOL;
+      if (!["superops_tickets_query","superops_tickets_triage_evidence_recover","superops_tickets_field_options"].includes(body.readRecoveryToolName)) {
+        lease.nonReadWorkObserved = true;
+      }
       if (body.preparationInvocationId!==undefined) {
         // Begin before executing preparation. Every correction invalidates the
         // previous result, including when its later outcome observation is lost.
@@ -7370,7 +7442,90 @@ var TriageCoordinator = class {
       }
       await store.save(state);
       return json({protocol:RUN_START_PROTOCOL,allowed:true,expiresAt:lease.expiresAt,
+        ...(noPossibleAutomaticWrite(state,body.triggerId) && lease.readFailureDeadlineAt > now
+          ? {readRenewals:lease.readRenewals ?? []} : {}),
         ...(body.preparationInvocationId!==undefined ? {preparationInvocationId:body.preparationInvocationId} : {})});
+    }
+    if (request.method === "POST" && path === "/internal/run-read-failure/observe") {
+      let body;
+      try { body = await request.json(); } catch { return json({error:"invalid_payload"},400); }
+      const state = normalizeState(await store.load()), now = Date.now();
+      const lease = state.runWriteLeases.find(item => item.triggerId === body?.triggerId && item.attempt === body?.attempt);
+      if (!isRecord(body) || !keysAreBounded(body,["triggerId","attempt","toolName","requestId","ownerHash","workflowHash","payloadHash","deadlineAt","state","httpStatus","errorClassification"]) ||
+          !["superops_tickets_query","superops_tickets_triage_evidence_recover","superops_tickets_field_options"].includes(body.toolName) ||
+          !/^[A-Za-z0-9_-]{1,160}$/.test(body.requestId ?? "") || !/^[a-f0-9]{8}(?:[a-f0-9]{56})?$/.test(body.ownerHash ?? "") ||
+          !/^[a-f0-9]{64}$/.test(body.workflowHash ?? "") || !/^[a-f0-9]{64}$/.test(body.payloadHash ?? "") ||
+          !safeHistoryTimestamp(body.deadlineAt) || Date.parse(body.deadlineAt) <= now || Date.parse(body.deadlineAt) > now + 900_000 ||
+          !renewableReadFailure(body) || !lease || lease.revokedAt !== null || lease.expiresAt <= now ||
+          !state.pending || state.executionPhase !== "awaiting_result" || state.pendingTriggerId !== body.triggerId || state.dispatchAttempt !== body.attempt ||
+          lease.startGuardProtocol !== RUN_START_PROTOCOL || !Number.isFinite(lease.mcpWorkStartedAt) ||
+          !noPossibleAutomaticWrite(state,body.triggerId)) return json({error:"read_failure_correlation_mismatch"},409);
+      const {triggerId,attempt,...read} = body;
+      if (lease.failedRead && JSON.stringify(lease.failedRead) !== JSON.stringify(read)) return json({error:"read_failure_conflict"},409);
+      lease.failedRead = read;
+      await store.save(state);
+      return json({observed:true});
+    }
+    if (request.method === "POST" && path === "/internal/admin/failed-read-recovery") {
+      let body;
+      try {body=await request.json();} catch {return json({error:"invalid_payload"},400);}
+      const proof=body?.proof;
+      if (!isRecord(body) || !keysAreBounded(body,["triggerId","attempt","sourceEventId","ticketNumber","dryRun","proof"]) ||
+          !/^triage-\d+-[a-f0-9-]{36}$/i.test(body.triggerId ?? "") || !Number.isInteger(body.attempt) || body.attempt<1 || body.attempt>3 ||
+          !Number.isSafeInteger(body.sourceEventId) || body.sourceEventId<1 || !/^\d{1,24}$/.test(body.ticketNumber ?? "") || typeof body.dryRun!=="boolean" ||
+          !isRecord(proof) || !keysAreBounded(proof,["createdFrom","createdTo","ticketNumber","ticketId","captureIds","failedRequestIds","attempts"]) ||
+          proof.ticketNumber!==body.ticketNumber || !/^\d{1,24}$/.test(proof.ticketId ?? "") ||
+          !safeHistoryTimestamp(proof.createdFrom) || !safeHistoryTimestamp(proof.createdTo) || Date.parse(proof.createdFrom)>=Date.parse(proof.createdTo) ||
+          !Array.isArray(proof.attempts) || proof.attempts.length!==body.attempt || !proof.attempts.every((value,index)=>value===index+1) ||
+          !Array.isArray(proof.captureIds) || proof.captureIds.length<body.attempt || proof.captureIds.length>15 || new Set(proof.captureIds).size!==proof.captureIds.length ||
+          !proof.captureIds.every(id=>/^[a-f0-9-]{36}$/i.test(id)) || !Array.isArray(proof.failedRequestIds) || proof.failedRequestIds.length<1 || proof.failedRequestIds.length>3 ||
+          !proof.failedRequestIds.every(id=>/^[a-f0-9-]{36}$/i.test(id))) return json({error:"invalid_recovery_request"},400);
+      if (!config.enabled || !config.startupRecoveryEnabled || config.scopeMode!=="new-email-tickets") return json({error:"failed_read_recovery_not_enabled"},409);
+      const state=normalizeState(await store.load()),now=Date.now();
+      const idle=!(state.pending || state.queuedPending || state.unavailableRetryWindow || state.reconciliationHold || state.sharedRateLimitUntil>now);
+      if (!idle && !body.dryRun) return json({error:"coordinator_not_idle"},409);
+      const source=store.getDispatchHistoryEvent(body.sourceEventId);
+      const leases=state.runWriteLeases.filter(lease=>lease.triggerId===body.triggerId);
+      const finalLease=leases.find(lease=>lease.attempt===body.attempt);
+      const checks={
+        correlated_known_read_failure:source?.event==="batch_failed" && source.resultStatus==="terminal_failure" && source.scopeMode==="new-email-tickets" &&
+          source.batchSequence===Number(body.triggerId.split("-")[1]) && source.attempt===body.attempt && source.failureStage==="bounded_query" &&
+          source.failureDiagnostics?.some(item=>item.errorCode==="HTTP_ERROR") && !observedTriageDenial({metadata:source}),
+        complete_attempt_lineage:leases.length===body.attempt && proof.attempts.every(attempt=>leases.some(lease=>lease.attempt===attempt)),
+        no_possible_write:noPossibleAutomaticWrite(state,body.triggerId),
+        old_attempts_fenced:leases.length>0 && leases.every(lease=>Number.isFinite(lease.revokedAt) || lease.expiresAt<=now),
+        positive_guarded_read:leases.every(lease=>lease.startGuardProtocol===RUN_START_PROTOCOL && Number.isFinite(lease.mcpWorkStartedAt)),
+        original_scope:source && proof.createdTo===source.scopeCreatedTo && Date.parse(proof.createdFrom)>=Date.parse(source.scopeCreatedFrom) &&
+          finalLease?.scope?.createdFrom===source.scopeCreatedFrom && finalLease?.scope?.createdTo===source.scopeCreatedTo,
+        no_prior_recovery:!finalLease?.manualFailedReadRecoveryRequested && !store.hasDispatchHistoryReplay(body.sourceEventId,body.ticketNumber),
+        no_intent_or_gap:proof.attempts.every(attempt=>!store.listTriageAgentCaptures(body.triggerId,attempt).some(record=>record.kind==="apply_intent" || record.status!=="complete") &&
+          store.listTriageAgentCaptureFailures(body.triggerId,attempt).length===0)
+      };
+      const blockedBy=Object.entries(checks).filter(([,passed])=>!passed).map(([name])=>name);
+      if(blockedBy.length)return json({error:"unambiguous_failed_read_history_required",blockedBy},409);
+      let capability;
+      try{const response=await config.runLeaseGuardService?.fetch(new Request("https://mcp.internal/internal/triage-run-lease-capability",{signal:AbortSignal.timeout(5000)}));
+        if(response?.ok)capability=await response.json();}catch{}
+      if(capability?.enforced!==true || capability.startGuardEnforced!==true || capability.startProtocol!==RUN_START_PROTOCOL ||
+          capability.terminalReadRenewalProtocol!==TERMINAL_READ_RENEWAL_PROTOCOL)return json({error:"write_guard_not_ready"},409);
+      const diagnostics=await engine.deps.agent.getRunDiagnostics(finalLease.runId,finalLease.triggerUrl ?? config.workspaceAgentTriggerUrl);
+      if(diagnostics.status!=="completed" || diagnostics.httpStatus!==200 || diagnostics.errorCode || diagnostics.runId!==finalLease.runId) return json({error:"correlated_provider_completion_required"},409);
+      const originalScope={mode:"new-email-tickets",source:"EMAIL",createdFrom:source.scopeCreatedFrom,createdTo:source.scopeCreatedTo};
+      const scope={...originalScope,targetTicketNumbers:[body.ticketNumber],replayOfEventId:body.sourceEventId};
+      if(scopeOverlapsAttention(state,config,scope))return json({error:"overlapping_attention_scope"},409);
+      const preview={status:body.dryRun?"recovery_preview":"recovery_scheduled",ticketNumber:body.ticketNumber,sourceEventId:body.sourceEventId,
+        scope,priorAttempt:body.attempt,coordinatorIdle:idle,priorFailedRequestIds:proof.failedRequestIds,attentionFencePreserved:true,normalActionReviewRequired:true};
+      if(body.dryRun)return json(preview);
+      leases.forEach(lease=>{lease.revokedAt ??= now;});finalLease.manualFailedReadRecoveryRequested=true;
+      if(!state.needsAttentionScopes.some(value=>JSON.stringify(value)===JSON.stringify(originalScope)))recordReconciliationNeedsAttention(state,originalScope,now,state.retryCount);
+      state.triggerSequence+=1;state.pending=true;state.pendingReason="new_message";state.pendingTriggerId=`triage-${state.triggerSequence}-${crypto.randomUUID()}`;
+      state.pendingNotificationWindowStartedAt=Date.parse(scope.createdFrom);state.pendingNotificationWindowEndedAt=Date.parse(scope.createdTo);
+      state.pendingNotificationLookbackMs=0;state.pendingTriggerScope=scope;state.pendingDispatchWasQueued=false;state.pendingDispatchWaitReason=null;
+      state.executionPhase="pending_dispatch";state.dispatchAttempt=0;state.resultDeadlineAt=null;state.dueAt=Math.max(now,state.cooldownUntil);
+      state.retryCount=0;state.emptyTargetedRecoveryPending=false;state.pendingTicketOutcomes=null;state.acceptedRunLeaseUnknown=false;
+      recordDispatchHistory(state,now,{event:"manual_read_recovery_requested",replayOfEventId:body.sourceEventId,ticketNumber:body.ticketNumber,waitReason:"bounded_recovery",
+        failureDiagnostics:proof.failedRequestIds.map(requestId=>({stage:"bounded_query",errorCode:"operator_verified_terminal_reads",itemKey:requestId}))},scope);
+      await store.save(state);await store.setAlarm(state.dueAt);return json(preview);
     }
     if (request.method === "POST" && path === "/internal/admin/construction-recovery") {
       let body;
@@ -8322,6 +8477,7 @@ var index_default = {
         triageStartupRecoveryEnabled: config.startupRecoveryEnabled,
         triagePendingReadStatusProtocol: "dispatcher-read-status-v1",
         triageCompletedQueryCallbackGuardProtocol: "completed-query-callback-v1",
+        triageTerminalReadRenewalProtocol: TERMINAL_READ_RENEWAL_PROTOCOL,
         triageStartupMaxRetries: 2,
         triageStartupDeadlineMs: 600000,
         triageGraphSweepEnabled: config.graphSweepEnabled,

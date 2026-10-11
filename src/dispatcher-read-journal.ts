@@ -8,7 +8,12 @@ type Storage = { get<T = unknown>(key: string): Promise<T | undefined>; put(key:
 type TransactionalStorage = Storage & { transaction?<T>(fn: (txn: Storage) => Promise<T>): Promise<T> };
 type Environment = { namespace: Namespace; owner: () => string };
 type Scope = { workflow: string; automatic: boolean; ownerHash?: string; strictFresh?: boolean };
-type ReadContext = Scope & { failure?: unknown };
+export const TERMINAL_READ_RENEWAL_PROTOCOL = "bounded-terminal-read-v1";
+export interface TerminalReadRenewal {
+  protocol: typeof TERMINAL_READ_RENEWAL_PROTOCOL;
+  requestId: string; ownerHash: string; workflowHash: string; payloadHash: string; deadlineAt: string;
+}
+type ReadContext = Scope & { failure?: unknown; renewals?: TerminalReadRenewal[] };
 const environments = new AsyncLocalStorage<Environment | undefined>();
 const scopes = new AsyncLocalStorage<ReadContext>();
 const TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
@@ -49,6 +54,8 @@ export interface DispatcherReadRecord {
   recoveryDeadlineAt?: string;
   upstreamHttpStatus?: number;
   errorClassification?: string;
+  terminalRenewalCount?: number;
+  terminalRenewalDeadlineAt?: string;
   history: Array<{ requestId: string; generation: number; state: string; completedAt: string }>;
 }
 export class DispatcherReadJournalError extends Error {
@@ -66,6 +73,15 @@ export function dispatcherReadFailure(): unknown { return scopes.getStore()?.fai
 export function recordDispatcherReadFailure(error: unknown): void {
   const scope = scopes.getStore();
   if (scope) scope.failure = error;
+}
+/** Only the private, fail-closed coordinator start check supplies these grants. */
+export function authorizeDispatcherReadRenewals(renewals: TerminalReadRenewal[]): void {
+  const scope = scopes.getStore();
+  if (scope?.automatic) scope.renewals = renewals;
+}
+export function renewableTerminalRead(state: string, classification?: string, httpStatus?: number): boolean {
+  return state === "failed" && (classification === "HTTP_ERROR" && [401, 408, 429, 500, 502, 503, 504].includes(httpStatus ?? 0) ||
+    ["TIMEOUT", "NETWORK_ERROR", "RATE_LIMITED"].includes(classification ?? ""));
 }
 
 async function digest(text: string): Promise<string> {
@@ -89,7 +105,7 @@ function record(value: unknown): DispatcherReadRecord {
   const v = object(value); identity(v);
   const fields = new Set(["version", "ownerHash", "workflowHash", "payloadHash", "generation", "invocationId", "idempotencyKey",
     "requestId", "previousRequestId", "state", "createdAt", "updatedAt", "delivered", "nextEligibleAt", "recoveryStartedAt",
-    "recoveryDeadlineAt", "upstreamHttpStatus", "errorClassification", "history"]);
+    "recoveryDeadlineAt", "upstreamHttpStatus", "errorClassification", "history", "terminalRenewalCount", "terminalRenewalDeadlineAt"]);
   if (Object.keys(v).some(key => !fields.has(key))) throw new DispatcherReadJournalError("unexpected_record_field");
   if (v.version !== 1 || !Number.isSafeInteger(v.generation) || Number(v.generation) < 1 || Number(v.generation) > 1_000_000 ||
     typeof v.invocationId !== "string" || !/^[A-Za-z0-9_.:-]{1,160}$/.test(v.invocationId) ||
@@ -98,7 +114,8 @@ function record(value: unknown): DispatcherReadRecord {
     typeof v.delivered !== "boolean" || (v.requestId !== undefined && !receiptId(v.requestId)) ||
     (v.previousRequestId !== undefined && !receiptId(v.previousRequestId)) || !Array.isArray(v.history) || v.history.length > MAX_HISTORY ||
     JSON.stringify(v).length > 8192) throw new DispatcherReadJournalError("invalid_record");
-  for (const field of ["nextEligibleAt", "recoveryStartedAt", "recoveryDeadlineAt"]) if (v[field] !== undefined && !timestamp(v[field])) throw new DispatcherReadJournalError("invalid_timestamp");
+  for (const field of ["nextEligibleAt", "recoveryStartedAt", "recoveryDeadlineAt", "terminalRenewalDeadlineAt"]) if (v[field] !== undefined && !timestamp(v[field])) throw new DispatcherReadJournalError("invalid_timestamp");
+  if (v.terminalRenewalCount !== undefined && (!Number.isInteger(v.terminalRenewalCount) || Number(v.terminalRenewalCount) < 1 || Number(v.terminalRenewalCount) > 2 || !timestamp(v.terminalRenewalDeadlineAt))) throw new DispatcherReadJournalError("invalid_renewal_count");
   if (v.errorClassification !== undefined && (typeof v.errorClassification !== "string" || !/^[A-Z0-9_]{1,100}$/.test(v.errorClassification))) throw new DispatcherReadJournalError("invalid_classification");
   if (v.upstreamHttpStatus !== undefined && (!Number.isInteger(v.upstreamHttpStatus) || Number(v.upstreamHttpStatus) < 100 || Number(v.upstreamHttpStatus) > 599)) throw new DispatcherReadJournalError("invalid_status");
   for (const item of v.history as unknown[]) {
@@ -148,8 +165,19 @@ export class DispatcherReadJournal {
         const now = new Date().toISOString();
         if (action === "open") {
           if (typeof input.invocationId !== "string" || !/^[A-Za-z0-9_.:-]{1,160}$/.test(input.invocationId) || typeof input.automatic !== "boolean") throw new DispatcherReadJournalError("invalid_scope");
+          const grant = input.renewal as TerminalReadRenewal | undefined;
+          const renewFailed = Boolean(previous && input.automatic === true && grant &&
+            Object.keys(grant).length === 6 && grant.protocol === TERMINAL_READ_RENEWAL_PROTOCOL &&
+            grant.requestId === previous.requestId && grant.ownerHash === previous.ownerHash &&
+            grant.workflowHash === previous.workflowHash && grant.payloadHash === previous.payloadHash &&
+            timestamp(grant.deadlineAt) && Date.parse(grant.deadlineAt) > Date.now() &&
+            Date.parse(grant.deadlineAt) <= Date.parse(previous.createdAt) + 900_000 &&
+            (!previous.recoveryDeadlineAt || Date.parse(grant.deadlineAt) <= Date.parse(previous.recoveryDeadlineAt)) &&
+            (!previous.terminalRenewalDeadlineAt || grant.deadlineAt === previous.terminalRenewalDeadlineAt) &&
+            (previous.terminalRenewalCount ?? 0) < 2 && input.invocationId !== previous.invocationId &&
+            renewableTerminalRead(previous.state, previous.errorClassification, previous.upstreamHttpStatus));
           const fresh = previous?.state === "succeeded" && previous.delivered ||
-            previous && ["failed", "cancelled"].includes(previous.state) && input.automatic === false && input.invocationId !== previous.invocationId;
+            previous && ["failed", "cancelled"].includes(previous.state) && input.automatic === false && input.invocationId !== previous.invocationId || renewFailed;
           if (previous && !fresh) return previous;
           const count = await txn.get<number>("dispatcher-read:slot-count") ?? 0;
           if (!previous && count >= MAX_SLOTS) throw new DispatcherReadJournalError("slot_limit");
@@ -157,7 +185,8 @@ export class DispatcherReadJournal {
           const next: DispatcherReadRecord = { version: 1, ownerHash: String(input.ownerHash), workflowHash: String(input.workflowHash), payloadHash: String(input.payloadHash),
             generation: (previous?.generation ?? 0) + 1, invocationId: input.invocationId,
             idempotencyKey: `superops-mcp:read:${crypto.randomUUID()}`, state: "submission_unknown", createdAt: now, updatedAt: now, delivered: false,
-            previousRequestId: previous?.requestId, history: [...(previous?.history ?? []), ...(previous?.requestId ? [{requestId: previous.requestId, generation: previous.generation, state: previous.state, completedAt: previous.updatedAt}] : [])].slice(-MAX_HISTORY) };
+            previousRequestId: previous?.requestId, history: [...(previous?.history ?? []), ...(previous?.requestId ? [{requestId: previous.requestId, generation: previous.generation, state: previous.state, completedAt: previous.updatedAt}] : [])].slice(-MAX_HISTORY),
+            ...(renewFailed ? {terminalRenewalCount: (previous?.terminalRenewalCount ?? 0) + 1, terminalRenewalDeadlineAt: grant!.deadlineAt} : {}) };
           await txn.put(key, next);
           if (!previous) await txn.put("dispatcher-read:slot-count", count + 1);
           return next;
@@ -250,7 +279,8 @@ export async function prepareDispatcherRead(body: string): Promise<DispatcherRea
   const stub = env.namespace.get(env.namespace.idFromName(`dispatcher-reads:${ownerHash}:${workflowHash}:${payloadHash.slice(0, 2)}`));
   const invocationId = getExecutionState()?.invocationId ?? crypto.randomUUID();
   const value = await journalFetch(stub, "open", {ownerHash, workflowHash, payloadHash,
-    invocationId, automatic: scope.automatic}, false);
+    invocationId, automatic: scope.automatic,
+    renewal: scope.renewals?.find(grant => grant.ownerHash === ownerHash && grant.workflowHash === workflowHash && grant.payloadHash === payloadHash)}, false);
   if (value.ownerHash !== ownerHash || value.workflowHash !== workflowHash || value.payloadHash !== payloadHash) throw new DispatcherReadJournalError("response_identity_conflict");
   return new DispatcherReadSession(value, stub, scope.strictFresh === true && value.invocationId !== invocationId);
 }

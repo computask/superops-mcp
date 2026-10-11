@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SuperOpsClient, runWithCredentials } from "./client.js";
 import { DispatcherPendingError, reconcileCurrentDispatcherReceipt, withDispatcherOperation } from "./dispatcher.js";
-import { DispatcherReadJournal, type DispatcherReadRecord, withDispatcherReadScope } from "./dispatcher-read-journal.js";
+import { authorizeDispatcherReadRenewals, DispatcherReadJournal, type DispatcherReadRecord, TERMINAL_READ_RENEWAL_PROTOCOL, type TerminalReadRenewal, withDispatcherReadScope } from "./dispatcher-read-journal.js";
 import { SuperOpsOperationLedger, runWithOperationStore } from "./operation-store.js";
 import { runWithAuditContext } from "./audit.js";
 import { runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
@@ -226,6 +226,92 @@ describe("durable dispatcher read receipts", () => {
     await expect(call(ns, "synthetic-reader", false)).rejects.toMatchObject({requestId: ID});
     expect(posts).toBe(2); expect(records(ns)[0]).toMatchObject({generation: 2, previousRequestId: ID, history: [{requestId: ID, state: "failed"}]});
     fail = false;
+  });
+
+  it("renews only the exact failed read granted by the coordinator, retains its receipt chain, and stops after two renewals across cold objects", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(START); const ns = namespace(); let posts = 0;
+    const ids = [1,2,3].map(n => `00000000-0000-4000-8000-00000000070${n}`);
+    const failure = (id: string) => Response.json({requestId:id,source:"superops-mcp",status:"failed",httpStatus:401,errorClassification:"HTTP_ERROR"},
+      {headers:{"X-Dispatcher-Request-Id":id,"X-Dispatcher-Status":"failed"}});
+    vi.stubGlobal("fetch",vi.fn(async (_url:string,init?:RequestInit) => init?.method === "POST"
+      ? new Response(null,{status:401,headers:{"X-Dispatcher-Request-Id":ids[posts++],"X-Dispatcher-Status":"failed"}})
+      : failure(ids[posts-1])));
+    const grant = (): TerminalReadRenewal => {const value = records(ns)[0]; return {protocol:TERMINAL_READ_RENEWAL_PROTOCOL,
+      requestId:value.requestId!,ownerHash:value.ownerHash,workflowHash:value.workflowHash,payloadHash:value.payloadHash,
+      deadlineAt:new Date(START+600_000).toISOString()};};
+    const renew = (value:TerminalReadRenewal) => call(ns,"synthetic-reader",true,"synthetic-triage-read",async()=>{
+      authorizeDispatcherReadRenewals([value]);return new SuperOpsClient(credentials).query(QUERY,VARIABLES);
+    });
+    await expect(call(ns)).rejects.toMatchObject({state:"failed",upstreamHttpStatus:401});
+    await expect(call(ns)).rejects.toMatchObject({requestId:ids[0]});expect(posts).toBe(1);
+    const first = grant();
+    await expect(renew({...first,requestId:"foreign-receipt"})).rejects.toMatchObject({requestId:ids[0]});expect(posts).toBe(1);
+    vi.advanceTimersByTime(30_000);
+    await expect(renew(first)).rejects.toMatchObject({requestId:ids[1]});
+    expect(records(ns)[0]).toMatchObject({generation:2,terminalRenewalCount:1,previousRequestId:ids[0]});
+    await expect(renew(first)).rejects.toMatchObject({requestId:ids[1]});expect(posts).toBe(2);
+    vi.advanceTimersByTime(60_000);
+    await expect(renew(grant())).rejects.toMatchObject({requestId:ids[2]});
+    await expect(renew(grant())).rejects.toMatchObject({requestId:ids[2]});expect(posts).toBe(3);
+    expect(records(ns)[0]).toMatchObject({generation:3,terminalRenewalCount:2,
+      history:[{requestId:ids[0],state:"failed"},{requestId:ids[1],state:"failed"}]});
+  });
+
+  it("hands the real MCP failed first query through the private observer and consumes the next attempt's exact renewal grant",async()=>{
+    vi.useFakeTimers();vi.setSystemTime(START);const ns=namespace();let posts=0;
+    const triggerId="triage-9-00000000-0000-4000-8000-000000000009",nextId="00000000-0000-4000-8000-000000000702";
+    const observations:Record<string,any>[]=[];
+    vi.stubGlobal("fetch",vi.fn(async (_url:string,init?:RequestInit)=>{
+      if(init?.method==="POST") {
+        posts++;
+        if(posts===1)return new Response(null,{status:401,headers:{"X-Dispatcher-Request-Id":ID,"X-Dispatcher-Status":"failed"}});
+        return Response.json({data:{getTicketList:{tickets:[{ticketId:"900000000000001",displayId:"90101",status:"New Calls",source:"EMAIL",
+          createdTime:new Date(START).toISOString(),updatedTime:new Date(START).toISOString()}],listInfo:{page:1,pageSize:100,hasMore:false,totalCount:1}}}},
+          {headers:{"X-Dispatcher-Request-Id":nextId,"X-Dispatcher-Status":"succeeded"}});
+      }
+      return Response.json({requestId:ID,source:"superops-mcp",status:"failed",httpStatus:401,errorClassification:"HTTP_ERROR"});
+    }));
+    const env={TRIAGE_RUN_WRITE_GUARD_ENABLED:"true",TRIAGE_RUN_START_GUARD_ENABLED:"true",TRIAGE_RUN_COORDINATOR:{
+      idFromName:(name:string)=>name,get:()=>({fetch:async(request:Request)=>{
+        const body=await request.json() as Record<string,any>;
+        if(request.url.endsWith("/start")) {
+          const proof=observations.find(item=>item.state==="failed");
+          return Response.json({protocol:"triage-run-start-v1",allowed:true,expiresAt:START+600000,
+            ...(body.attempt===2 && proof ? {readRenewals:[{protocol:TERMINAL_READ_RENEWAL_PROTOCOL,requestId:proof.requestId,ownerHash:proof.ownerHash,
+              workflowHash:proof.workflowHash,payloadHash:proof.payloadHash,deadlineAt:new Date(START+600000).toISOString()}]}:{})});
+        }
+        observations.push(body);return Response.json({observed:true});
+      }})}};
+    const args={createdFrom:new Date(START-60000).toISOString(),createdTo:new Date(START+60000).toISOString(),status:["New Calls"],sources:["EMAIL"],fieldProfile:"minimal",maxPages:1,maxRecords:50};
+    async function rpc(attempt:number) {
+      const server=createMcpServer(),client=new Client({name:"terminal-read-regression",version:"1"});
+      const [a,b]=InMemoryTransport.createLinkedPair();await server.connect(a);await client.connect(b);
+      try{return await runWithTriageLeaseEnvironment(env,()=>call(ns,"synthetic-reader",true,"outer",()=>client.callTool({
+        name:"superops_tickets_query",arguments:{...args,triageCapture:{triggerId,attempt}}})));}
+      finally{await client.close();await server.close();}
+    }
+    expect(await rpc(1)).toMatchObject({isError:true});
+    expect(observations.find(item=>item.state==="failed")).toMatchObject({triggerId,attempt:1,toolName:"superops_tickets_query",requestId:ID,
+      state:"failed",httpStatus:401,errorClassification:"HTTP_ERROR"});
+    vi.advanceTimersByTime(30000);expect(await rpc(2)).not.toHaveProperty("isError",true);
+    expect(posts).toBe(2);expect(records(ns)[0]).toMatchObject({generation:2,previousRequestId:ID,delivered:true,terminalRenewalCount:1});
+    expect(JSON.stringify(observations)).not.toMatch(/apiToken|idempotencyKey|ticket description|note body/);
+  });
+
+  it.each(["queued","running","retry_wait","uncertain","cancelled"])("a renewal grant never replaces a %s receipt",async state=>{
+    vi.useFakeTimers();vi.setSystemTime(START);const ns=namespace();let posts=0;
+    vi.stubGlobal("fetch",vi.fn(async(_url:string,init?:RequestInit)=>{
+      if(init?.method==="POST") posts++;
+      return Response.json({requestId:ID,source:"superops-mcp",status:state,httpStatus:401,errorClassification:"HTTP_ERROR"},
+        {headers:{"X-Dispatcher-Request-Id":ID,"X-Dispatcher-Status":state}});
+    }));
+    await expect(call(ns)).rejects.toMatchObject({requestId:ID});const value=records(ns)[0];
+    await expect(call(ns,"synthetic-reader",true,"synthetic-triage-read",async()=>{
+      authorizeDispatcherReadRenewals([{protocol:TERMINAL_READ_RENEWAL_PROTOCOL,requestId:ID,ownerHash:value.ownerHash,
+        workflowHash:value.workflowHash,payloadHash:value.payloadHash,deadlineAt:new Date(START+600_000).toISOString()}]);
+      return new SuperOpsClient(credentials).query(QUERY,VARIABLES);
+    })).rejects.toMatchObject({requestId:ID});
+    expect(posts).toBe(1);expect(records(ns)[0].generation).toBe(1);
   });
 
   it("isolates owners, payloads and workflow identities and refuses an inconsistent receipt", async () => {

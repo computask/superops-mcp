@@ -11,7 +11,7 @@
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { assertTriageRunStart, assertTriageRunWriteLease, recordTriageRunQuery, recordTriageRunPreparation, runWithTriageRunContext } from "./triage-run-lease.js";
+import { assertTriageRunStart, assertTriageRunWriteLease, recordTriageRunQuery, recordTriageRunPreparation, recordTriageRunReadFailure, runWithTriageRunContext } from "./triage-run-lease.js";
 import { attachSafeErrorContract, safeSuperOpsErrorMetadata } from "./error-contract.js";
 import {
   CallToolRequestSchema,
@@ -1078,8 +1078,8 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
 
       try {
         if (rawArgs.triageCapture !== undefined && !captureContext) throw new Error("Invalid automatic triage correlation; no tool executed.");
-        await assertTriageRunStart(name === "superops_tickets_prepare_triage_plan"
-          ? {preparationInvocationId: getExecutionState()?.invocationId} : {});
+        await assertTriageRunStart({readRecoveryToolName:name,...(name === "superops_tickets_prepare_triage_plan"
+          ? {preparationInvocationId: getExecutionState()?.invocationId} : {})});
         if (name === "superops_tickets_apply_triage_plan") {
           await assertTriageRunWriteLease({operationId: typeof args.batchId === "string" ? args.batchId : undefined});
         }
@@ -1113,6 +1113,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           try { await recordTriageRunPreparation(args, JSON.parse(result.content.find(item => item.type === "text")?.text ?? "{}")); }
           catch { /* Lost reporting evidence stays conservative; preparation grants no approval. */ }
         }
+        if (result.isError) await recordTriageRunReadFailure(name, dispatcherReadFailure());
         metadata = enrichAuditMetadataFromResult(name, result, metadata);
         const errorSummary = result.structuredContent?.readRecoveryDurable === true
           ? `Dispatcher read recovery: ${result.structuredContent.reasonCode}` : errorSummaryFromResult(result);
@@ -1132,6 +1133,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
         return finalResult as never;
       } catch (error) {
         timingOutcome = "error";
+        await recordTriageRunReadFailure(name, dispatcherReadFailure() ?? error);
         const safeMetadata = safeSuperOpsErrorMetadata(error, ["read", "custom_query"].includes(classifyTool(name).category));
         const result = errorResult(safeMetadata
           ? safeMetadata.rateLimited ? "SuperOps request was rate limited; use the bounded retry metadata." : "SuperOps request failed; inspect safe diagnostics."

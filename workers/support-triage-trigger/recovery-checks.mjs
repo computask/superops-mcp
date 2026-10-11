@@ -508,6 +508,7 @@ function historyRow(entry) {
   const row={event_id:entry.eventId,occurred_at:entry.at,batch_sequence:entry.batchSequence??null,event_name:entry.event,
     scope_mode:entry.scopeMode??null,scope_created_from:entry.scopeCreatedFrom??null,scope_created_to:entry.scopeCreatedTo??null,
     failure_kind:entry.failureKind??null,error_type:entry.errorType??null,error_code:entry.errorCode??null,attempt:entry.attempt??null,
+    result_status:entry.resultStatus??null,failure_stage:entry.failureStage??null,
     agent_run_status:entry.agentRunStatus??null,agent_run_id_present:entry.agentRunIdPresent?1:0,
     failure_diagnostics_json:entry.failureDiagnostics?JSON.stringify(entry.failureDiagnostics):null,
     replay_of_event_id:entry.replayOfEventId??null,ticket_number:entry.ticketNumber??null,
@@ -677,6 +678,85 @@ function fixture(status, age = 120000, configOverrides = {}) {
 }
 
 const startCapability={protocol:'triage-run-lease-v1',enforced:true,startProtocol:'triage-run-start-v1',startGuardEnforced:true};
+const readRenewalCapability={...startCapability,terminalReadRenewalProtocol:'bounded-terminal-read-v1'};
+function terminalReadFixture(changes={}) {
+  const now=Date.parse('2026-09-24T06:00:00Z');
+  const f=startupFixture({mcpWorkStartedAt:now-90000,queryCompleted:true,queryTicketNumbers:['90101'],
+    failedRead:{toolName:'superops_tickets_field_options',requestId:'00000000-0000-4000-8000-000000000801',
+      ownerHash:'12345678',workflowHash:'a'.repeat(64),payloadHash:'b'.repeat(64),state:'failed',
+      httpStatus:401,errorClassification:'HTTP_ERROR',deadlineAt:new Date(now+600000).toISOString()},...changes},
+    {status:'completed',httpStatus:200});
+  f.engine.deps.config.runLeaseGuardService={fetch:async()=>Response.json(readRenewalCapability)};
+  return f;
+}
+const failedReadReport=f=>({triggerId:f.state.pendingTriggerId,attempt:f.state.dispatchAttempt,status:'terminal_failure',
+  metadata:{failureStage:'triage_apply',ticketsConsidered:1,ticketsCompleted:0,ticketsDeferred:1,
+    ticketOutcomes:[{ticketNumber:'90101',outcome:'deferred',stage:'triage_apply',reasonCode:'unknown'}],
+    failureDiagnostics:[{stage:'triage_apply',errorCode:'HTTP_ERROR',httpStatus:401}]}});
+test('the observed field-options 401 then first-query 401 renew both exact receipts across restored attempts without widening the scope',async()=>{
+  const f=terminalReadFixture(),scope=structuredClone(f.state.pendingTriggerScope);
+  assert.equal((await f.engine.reportResult(failedReadReport(f))).status,'retry_scheduled');
+  const deadline=f.state.runWriteLeases[0].readFailureDeadlineAt;
+  assert.equal(f.state.runWriteLeases[0].revokedAt,Date.parse('2026-09-24T06:00:00Z'));
+  assert.equal(f.state.emptyTargetedRecoveryPending,false);assert.deepEqual(f.state.pendingTriggerScope,scope);
+  assert.equal(f.calls.length,0);f.advance();await f.engine.processAlarm();assert.equal(f.calls.length,1);
+  let lease=f.state.runWriteLeases.at(-1);
+  assert.equal(lease.attempt,2);assert.equal(lease.readFailureRetryCount,1);assert.equal(lease.readRenewals.length,1);
+  f.seed({runWriteLeases:f.state.runWriteLeases.map(value=>value===lease?{...lease,mcpWorkStartedAt:Date.parse('2026-09-24T06:00:30Z'),
+    failedRead:{...f.state.runWriteLeases[0].failedRead,toolName:'superops_tickets_query',requestId:'00000000-0000-4000-8000-000000000802',
+      workflowHash:'c'.repeat(64),payloadHash:'d'.repeat(64)}}:value)});
+  const queryReport={...failedReadReport(f),metadata:{failureStage:'bounded_query',ticketsConsidered:0,ticketsCompleted:0,ticketsDeferred:0,
+    failureDiagnostics:[{stage:'bounded_query',errorCode:'HTTP_ERROR',httpStatus:401}]}};
+  assert.equal((await f.engine.reportResult(queryReport)).status,'retry_scheduled');f.advance();await f.engine.processAlarm();
+  assert.equal(f.calls.length,2);lease=f.state.runWriteLeases.at(-1);
+  assert.equal(lease.attempt,3);assert.equal(lease.readFailureRetryCount,2);assert.equal(lease.readFailureDeadlineAt,deadline);
+  assert.deepEqual(lease.readRenewals.map(value=>value.requestId),['00000000-0000-4000-8000-000000000801','00000000-0000-4000-8000-000000000802']);
+  assert.deepEqual(f.state.pendingTriggerScope,scope);assert.equal(f.state.emptyTargetedRecoveryPending,false);
+  assert.equal((await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:3,status:'complete',metadata:{
+    failureStage:'evidence_recovery',ticketsConsidered:1,ticketsCompleted:1,ticketsDeferred:0,
+    mcpExecution:{toolName:'superops_tickets_triage_evidence_recover',requestsByType:{duplicateNoteCheck:1,verificationRead:1}},
+    ticketOutcomes:[{ticketNumber:'90101',outcome:'skipped',stage:'evidence_recovery',reasonCode:'already_handled'}]}})).status,'complete');
+});
+for(const blocker of [{operationReference:{}},{applyIntentObserved:true},{writeCheckObserved:true},{preparationObservation:{state:'ready'}},
+  {nonReadWorkObserved:true},{rejectedCallbackUnsafe:true},{authorizedItems:['90101']},{readFailureRetryCount:2},
+  {readFailureDeadlineAt:Date.parse('2026-09-24T06:00:29Z')},{failedRead:{state:'uncertain',httpStatus:401,errorClassification:'HTTP_ERROR'}}]) {
+  test('terminal read renewal stops with attention instead of falling through another retry: '+JSON.stringify(blocker),async()=>{
+    const f=terminalReadFixture(blocker);
+    assert.equal((await f.engine.reportResult(failedReadReport(f))).status,'terminal_failure');
+    assert.equal(f.calls.length,0);assert.equal(f.state.needsAttentionScopes.length,1);
+  });
+}
+test('observed policy denial and unsupported renewal capability remain terminal even with a known failed read',async()=>{
+  for(const kind of ['denial','old_mcp']) {
+    const f=terminalReadFixture(),report=failedReadReport(f);
+    if(kind==='denial') report.metadata.failureDiagnostics.push({stage:'triage_apply',errorCode:'unacceptable_risk'});
+    else f.engine.deps.config.runLeaseGuardService={fetch:async()=>Response.json(startCapability)};
+    assert.equal((await f.engine.reportResult(report)).status,'terminal_failure');assert.equal(f.calls.length,0);
+  }
+});
+test('a terminal query error without authoritative read evidence cannot trigger empty-window widening',async()=>{
+  const f=fixture('completed');const scope=structuredClone(f.scope);
+  assert.equal((await f.engine.reportResult({triggerId:f.state.pendingTriggerId,attempt:1,status:'terminal_failure',metadata:{
+    failureStage:'bounded_query',ticketsConsidered:0,ticketsCompleted:0,ticketsDeferred:0,
+    failureDiagnostics:[{stage:'bounded_query',errorCode:'HTTP_ERROR',httpStatus:401}]}})).status,'terminal_failure');
+  assert.equal(f.state.emptyTargetedRecoveryPending,false);assert.equal(f.calls.length,0);
+  assert.equal(f.state.dispatchHistory.find(event=>event.event==='batch_failed').scopeCreatedFrom,scope.createdFrom);
+});
+test('the private start guard grants exact read renewals only before possible write work and rejects late old attempts',async()=>{
+  const now=Date.now(),triggerId='triage-71-00000000-0000-4000-8000-000000000071';
+  const renewals=[{protocol:'bounded-terminal-read-v1',requestId:'00000000-0000-4000-8000-000000000801',ownerHash:'12345678',
+    workflowHash:'a'.repeat(64),payloadHash:'b'.repeat(64),deadlineAt:new Date(now+60000).toISOString()}];
+  const lease={triggerId,attempt:2,scope:{mode:'new-email-tickets',source:'EMAIL',createdFrom:new Date(now-60000).toISOString(),createdTo:new Date(now).toISOString()},
+    issuedAt:now-30000,expiresAt:now+270000,revokedAt:null,authorizedItems:[],readRenewals:renewals,readFailureDeadlineAt:now+60000};
+  const f=replayCoordinator({...createInitialState(),pending:true,executionPhase:'awaiting_result',pendingTriggerId:triggerId,
+    pendingTriggerScope:lease.scope,dispatchAttempt:2,runWriteLeases:[lease]});
+  const start=fields=>f.coordinator.fetch(new Request('https://coordinator.internal/internal/run-work/start',{method:'POST',
+    body:JSON.stringify({triggerId,attempt:2,readRecoveryToolName:'superops_tickets_query',...fields})}));
+  assert.deepEqual((await (await start({})).json()).readRenewals,renewals);
+  assert.equal((await start({attempt:1})).status,409);
+  await start({readRecoveryToolName:'superops_tickets_prepare_triage_plan'});
+  assert.equal((await (await start({})).json()).readRenewals,undefined);
+});
 function startupFixture(changes={},diagnostics={status:'failed',httpStatus:200,errorCode:'dispatch_failed'}) {
   const f=fixture('failed',120000,{startupRecoveryEnabled:true,runLeaseGuardService:{fetch:async()=>Response.json(startCapability)}});
   const triggerId='triage-9001-00000000-0000-4000-8000-000000009001';
@@ -1349,6 +1429,49 @@ function operatorConstructionRecovery(change={}) {
   };
   return {...f,body,request};
 }
+function operatorFailedReadRecovery(change={},sourceChange={}) {
+  const triggerId='triage-24-00000000-0000-4000-8000-000000000024';
+  const source={...replayFailureEvent,event:'batch_failed',resultStatus:'terminal_failure',failureStage:'bounded_query',failureKind:'permanent',
+    failureDiagnostics:[{stage:'bounded_query',errorCode:'HTTP_ERROR'}],...sourceChange};
+  const lease={triggerId,attempt:1,runId:'apirun_synthetic',triggerUrl:'https://api.chatgpt.com/v1/workspace_agents/agtch_synthetic/trigger',
+    scope:replaySourceScope,issuedAt:1,expiresAt:2,revokedAt:null,authorizedItems:[],startGuardProtocol:'triage-run-start-v1',mcpWorkStartedAt:1,...change};
+  const f=replayCoordinator({...createInitialState(),triggerSequence:24,dispatchHistorySequence:41,dispatchHistory:[source],runWriteLeases:[lease],
+    needsAttentionScope:replaySourceScope,needsAttentionScopes:[replaySourceScope],candidateAttentionFenceActive:true},[source],{
+    TRIAGE_STARTUP_RECOVERY_ENABLED:'true',WORKSPACE_AGENT_ACCESS_TOKEN:'synthetic-access-token',TRIAGE_WRITE_GUARD_SERVICE:{fetch:async()=>Response.json(readRenewalCapability)}});
+  const body={triggerId,attempt:1,sourceEventId:41,ticketNumber:'90101',dryRun:true,proof:{...replaySourceScope,
+    ticketNumber:'90101',ticketId:'1000000000000000001',captureIds:['00000000-0000-4000-8000-000000000081'],
+    failedRequestIds:['00000000-0000-4000-8000-000000000082'],attempts:[1]}};
+  delete body.proof.mode;delete body.proof.source;
+  const request=async(patch={},providerChange={})=>{
+    const original=globalThis.fetch;globalThis.fetch=async()=>Response.json({id:'apirun_synthetic',status:'completed',...providerChange});
+    try{return await f.coordinator.fetch(new Request('https://coordinator.internal/internal/admin/failed-read-recovery',{
+      method:'POST',body:JSON.stringify({...body,...patch})}));}finally{globalThis.fetch=original;}
+  };
+  return {...f,body,request};
+}
+test('historical failed-read recovery previews without changing state, retains old receipts and scopes, then schedules one normally reviewed ticket',async()=>{
+  const f=operatorFailedReadRecovery(),before=structuredClone(f.storage.value);
+  const preview=await f.request();assert.equal(preview.status,200,JSON.stringify(await preview.clone().json()));assert.deepEqual(f.storage.value,before);
+  assert.equal((await preview.json()).normalActionReviewRequired,true);
+  const scheduled=await f.request({dryRun:false});assert.equal(scheduled.status,200,JSON.stringify(await scheduled.clone().json()));
+  assert.equal(f.storage.value.pending,true);assert.notEqual(f.storage.value.pendingTriggerId,f.body.triggerId);
+  assert.deepEqual(f.storage.value.pendingTriggerScope,{...replaySourceScope,targetTicketNumbers:['90101'],replayOfEventId:41});
+  assert.deepEqual(f.storage.value.needsAttentionScopes,[replaySourceScope]);assert(f.storage.value.runWriteLeases[0].revokedAt!==null);
+  assert.equal(f.storage.value.dispatchHistory.at(-1).event,'manual_read_recovery_requested');assert.equal((await f.request({dryRun:false})).status,409);
+});
+for(const blocker of [{operationReference:{}},{applyIntentObserved:true},{writeCheckObserved:true},{preparationObservation:{state:'ready'}},
+  {nonReadWorkObserved:true},{authorizedItems:['90101']},{rejectedCallbackUnsafe:true},{startGuardProtocol:'old'},{manualFailedReadRecoveryRequested:true}]) {
+  test('historical known-read failure cannot bypass possible work, missing guards or one-shot history: '+JSON.stringify(blocker),async()=>{
+    const f=operatorFailedReadRecovery(blocker);assert.equal((await f.request()).status,409);assert.equal(f.storage.value.pending,false);
+  });
+}
+test('generic provider failures, uncorrelated history, observed denial, and a running old Agent cannot authorize historical failed-read recovery',async()=>{
+  for(const change of [{event:'orphan_recovered'},{failureDiagnostics:[]},{failureDiagnostics:[{errorCode:'HTTP_ERROR'},{errorCode:'permission_denied'}]}]) {
+    const f=operatorFailedReadRecovery({},change);assert.equal((await f.request()).status,409);assert.equal(f.storage.value.pending,false);
+  }
+  const f=operatorFailedReadRecovery();assert.equal((await f.request({}, {status:'in_progress'})).status,409);
+  assert.equal((await f.request({}, {id:'foreign-run'})).status,409);assert.equal(f.storage.value.pending,false);
+});
 test('inspected read-only construction previews without changing state and schedules one normally reviewed fixed ticket',async()=>{
   const f=operatorConstructionRecovery(),before=structuredClone(f.storage.value);
   const preview=await f.request(),result=await preview.json();assert.equal(preview.status,200,JSON.stringify(result));

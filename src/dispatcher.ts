@@ -272,7 +272,9 @@ export async function dispatcherFetch(body: string, options: {
         const syncId = response.headers.get("X-Dispatcher-Request-Id");
         if (syncId && /^[A-Za-z0-9_-]{1,160}$/.test(syncId)) {
           const receipt = {requestId: syncId, idempotencyKey: options.idempotencyKey, state: response.headers.get("X-Dispatcher-Status") ?? "unknown"};
-          if (!options.mutation) await options.checkpointReadReceipt?.(receipt);
+          if (!options.mutation) await options.checkpointReadReceipt?.({...receipt,
+            ...(receipt.state === "failed" && response.status >= 400
+              ? {upstreamHttpStatus:response.status,errorClassification:"HTTP_ERROR"} : {})});
           publishReceipt(receipt, options, body);
           if (options.mutation) await operation.getStore()?.checkpoint?.(receipt);
         }

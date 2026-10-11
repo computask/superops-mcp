@@ -34,6 +34,7 @@ import { runWithTriageLeaseEnvironment, triageLeaseCapability, type TriageLeaseE
 import { firstReadRecoveryProof } from "./triage-read-recovery.js";
 import { emptyStartupCaptures, inspectedStartupProof } from "./triage-startup-recovery.js";
 import { constructionCaptureProof, inspectedConstructionProof } from "./triage-construction-recovery.js";
+import { historicalFailedReadProof } from "./triage-terminal-read-recovery.js";
 import {
   blockedToolNamesByCategory,
   chatGptDirectBlockedToolNames,
@@ -1243,6 +1244,39 @@ async function handleBaseWorkerFetch(
       }));
       return new Response(response.body,{status:response.status,headers:{...privateHeaders,"Content-Type":"application/json"}});
     } catch { return json({error:"recovery_dependency_unavailable"},503,privateHeaders); }
+  }
+
+  if (url.pathname === "/admin/triage-read-failure-recovery") {
+    const privateHeaders = {"Cache-Control":"no-store, private"};
+    if (request.method !== "POST") return json({error:"Method not allowed"},405,{...privateHeaders,Allow:"POST"});
+    const access = await requireAllowedAccessUser(request,env,new Set([TRIAGE_CAPTURE_ADMIN_EMAIL]));
+    if (access instanceof Response) return new Response(access.body,{status:access.status,headers:privateHeaders});
+    let body: Record<string,unknown>;
+    try {
+      const text = await request.text();if (text.length > 2048) throw Error("size");
+      body = JSON.parse(text);if (!body || typeof body !== "object" || Array.isArray(body)) throw Error("shape");
+    } catch {return json({error:"invalid_recovery_request"},400,privateHeaders);}
+    if (Object.keys(body).some(key=>!["triggerId","attempt","sourceEventId","ticketNumber","dryRun"].includes(key)) ||
+        typeof body.triggerId !== "string" || !TRIAGE_CAPTURE_TRIGGER_ID_PATTERN.test(body.triggerId) ||
+        !Number.isInteger(body.attempt) || Number(body.attempt)<1 || Number(body.attempt)>3 ||
+        !Number.isSafeInteger(body.sourceEventId) || Number(body.sourceEventId)<1 ||
+        typeof body.ticketNumber !== "string" || !/^\d{1,24}$/.test(body.ticketNumber) || typeof body.dryRun !== "boolean") return json({error:"invalid_recovery_request"},400,privateHeaders);
+    if (!triageLeaseCapability(env).startGuardEnforced) return json({error:"coordinator_guard_unavailable"},503,privateHeaders);
+    try {
+      const pages: unknown[] = [];
+      for (let attempt=1;attempt<=Number(body.attempt);attempt++) {
+        const response = await readTriageAgentMcpCaptures(env,body.triggerId,attempt,5,0);
+        if (!response.ok) return json({error:"capture_corroboration_unavailable"},503,privateHeaders);
+        pages.push(await response.json());
+      }
+      const proof = historicalFailedReadProof(pages,body.triggerId,Number(body.attempt),body.ticketNumber);
+      if (!proof) return json({error:"complete_read_only_401_corroboration_required"},409,privateHeaders);
+      const coordinator = env.TRIAGE_RUN_COORDINATOR!.get(env.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
+      const response = await coordinator.fetch(new Request("https://coordinator.internal/internal/admin/failed-read-recovery",{
+        method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...body,proof}),signal:AbortSignal.timeout(15000),
+      }));
+      return new Response(response.body,{status:response.status,headers:{...privateHeaders,"Content-Type":"application/json"}});
+    } catch {return json({error:"recovery_dependency_unavailable"},503,privateHeaders);}
   }
 
   if (url.pathname === "/admin/triage-startup-recovery") {
