@@ -10,6 +10,8 @@ only the three successful read actions, one or two schema-rejected preparation
 calls and a schema-rejected callback. Independent complete captures, a guarded
 completed single-ticket query, no intent/write/operation/ambiguity, an expired or
 revoked old attempt and a fresh matching provider completion are mandatory.
+The Reporter schema/parser also accept only the fourteen fixed `operationStore.*`
+labels emitted by the MCP; arbitrary dotted names and content remain rejected.
 Preview changes no state. Scheduling preserves the original attention fence and
 exact time window, revokes the old attempt, and creates one fresh normally reviewed
 ticket run. Every operator recovery type now participates in durable replay dedupe.
@@ -131,7 +133,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-583f49762db17fc398e1c7bd12f74abe99605985211032c374c467a085707ee0.
+e7a07c0802936b421158fe46120c3a206558a1d45dfcf08d66a873f158a3e422.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

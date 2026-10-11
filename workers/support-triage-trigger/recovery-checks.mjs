@@ -1091,6 +1091,22 @@ test('fixed journal labels and all emitted internal statuses satisfy the same ca
     assert.equal(parseSafeMcpExecution({requestTrace:[{index:1,type:'custom',operationName}]}),null);
   }
 });
+test('every emitted fixed ledger label satisfies the callback schema and parser, including fresh-operation 404 probes',()=>{
+  const ledger=readFileSync(new URL('../../src/operation-store.ts',import.meta.url),'utf8');
+  const names=[...new Set([...ledger.matchAll(/"(operationStore\.[A-Za-z]+)"/g)].map(match=>match[1]))];
+  assert(names.includes('operationStore.get'));assert(names.includes('operationStore.getLegacy'));assert.equal(names.length,14);
+  const schema=toolDefinition().inputSchema.properties.metadata.properties.mcpExecution.properties.requestTrace.items;
+  for(const operationName of names) {
+    assert(new RegExp(schema.properties.operationName.pattern).test(operationName));
+    assert(parseSafeMcpExecution({requestTrace:[{index:1,type:'custom',provider:'internal',operationType:'durableObject',operationName,
+      status:404,httpStatus:404,ok:false}]}),'Internal status is not an upstream throttle or write result');
+  }
+  for(const operationName of ['operationStore.customerBody','operationStore.get.secret','operationStore.anything']) {
+    assert(!new RegExp(schema.properties.operationName.pattern).test(operationName));
+    assert.equal(parseSafeMcpExecution({requestTrace:[{index:1,type:'custom',operationName}]}),null);
+  }
+});
+
 test('rejected callback diagnostics retain only fixed field paths and never raw arguments',async()=>{
   const observations=[];
   const result=await handleTriageResultMcp(new Request('http://local/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'triage_result_report',arguments:{triggerId:'synthetic-trigger',attempt:1,status:'retryable_read_pending',metadata:{mcpExecution:{requestTrace:[{index:1,type:'custom',operationName:'private customer body'}]}}}}})}),{reportRejected:async value=>observations.push(value),report:async()=>{throw Error('Invalid callback must never reach report');}});

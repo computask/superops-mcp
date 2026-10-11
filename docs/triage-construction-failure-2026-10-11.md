@@ -72,6 +72,29 @@ body, note or captured argument object is copied into these tests or this record
 The full MCP suite passed 890 Vitest cases and three instruction-serialization
 cases, with the policy checksum check and TypeScript build. The trigger's actual
 module suite and local Miniflare verifier passed; its syntax build also passed.
-Production deployment and the exact-ticket recovery are pending live verification.
+The first Git deployment of commit `fecae7a` was verified at 100% traffic in both
+Workers. MCP version `5d1e0153-c967-440b-8b73-ccb3b157b11c` and coordinator version
+`cd01f8d3-d7f7-4dda-bf60-4eed9d3f1b09` preserved durable bindings and secret names.
+The exact-ticket preview passed, then recovery batch 3707 was scheduled once.
+Its actual input contained the new preflight and reason-code rules.
+
+Private capture coverage is complete: exactly five MCP calls, comprising query,
+evidence, options, one valid complete preparation and one apply. The apply used
+the returned preparation fingerprint. Three fresh continuation wakes completed
+the operation. Independent status is `Completed`, one completed item and zero
+pending, failed, partial or ambiguous writes. Independent ticket read verifies
+Low impact, Medium urgency, category Security Incident, subcategory Security alert
+and exactly one private TRIAGE SUMMARY. The planned action was `leave`, so its
+New Calls status is retained. The note is verified, including one physical write.
+
+Inspection also found valid `operationStore.*` trace names rejected by the
+Reporter operation-name pattern. The narrow allowlist now includes all fourteen
+fixed labels emitted by the ledger client. An actual-module regression checks
+every label, permits internal fresh-operation 404 lookup telemetry, and rejects
+arbitrary dotted names. This affects diagnostic reporting rather than the
+successful ticket outcome. Its 175 coordinator regressions and local Miniflare
+verification passed. The release gate requires the final live coordinator module
+to match the recorded source SHA-256 after Git publication, with stable bindings,
+secret names and live Reporter schema/parser acceptance of the captured trace.
 The existing monitor remains paused. These checks improve construction and
 recovery; they do not prove that every possible Agent error is eliminated.

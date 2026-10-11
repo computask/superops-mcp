@@ -534,7 +534,7 @@ var SAFE_REFERENCE_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 var SAFE_ITEM_KEY_PATTERN = /^[A-Za-z0-9._:#-]{1,128}$/;
 var SAFE_TICKET_NUMBER_PATTERN = /^#?[0-9]{1,40}$/;
 // Telemetry also contains these fixed journal actions, not GraphQL operations.
-var SAFE_OPERATION_NAME_PATTERN = /^(?:[A-Za-z_][A-Za-z0-9_]{0,96}|dispatcherRead\.(?:open|checkpoint|delivered))$/;
+var SAFE_OPERATION_NAME_PATTERN = /^(?:[A-Za-z_][A-Za-z0-9_]{0,96}|dispatcherRead\.(?:open|checkpoint|delivered)|operationStore\.(?:put|get|getLegacy|list|getApprovedPrivateNote|getApprovedPrivateNoteLegacy|claimNextItem|completeItem|checkpointItem|scheduleContinuation|cancel|terminalizeContinuationFailure|getEmergingIssue|upsertEmergingIssue))$/;
 var SAFE_DIAGNOSTIC_STAGE_PATTERN = /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/;
 var OPERATION_STATES = /* @__PURE__ */ new Set([
   "Running",
