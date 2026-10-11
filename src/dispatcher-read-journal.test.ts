@@ -322,12 +322,38 @@ describe("durable dispatcher read receipts", () => {
     }
     expect(await rpc(1)).toMatchObject({isError:true,structuredContent:{dispatcherPending:true,resumeSameRequest:true}});
     vi.setSystemTime(START+1001);
-    expect(await rpc(2)).toMatchObject({isError:true});
+    const failed = await rpc(2) as {isError?:boolean;structuredContent?:Record<string,any>;content:Array<{type:"text";text:string}>};
+    expect(failed).toMatchObject({isError:true,structuredContent:{dispatcherRequestId:ID,dispatcherState:"failed",dispatcherTerminal:true,
+      mcpExecution:{toolName:"superops_tickets_query",failureDiagnostics:expect.arrayContaining([expect.objectContaining({errorCode:"HTTP_ERROR"})])}}});
+    const primary = JSON.parse((failed.content[0] as {text:string}).text);
+    const standalone = failed.content.filter(item=>item.type==="text").map(item=>JSON.parse((item as {text:string}).text))
+      .find(item=>item.mcpExecution && Object.keys(item).length===1);
+    expect(failed.structuredContent?.mcpExecution).toEqual(primary.mcpExecution);
+    expect(failed.structuredContent?.mcpExecution).toEqual(standalone.mcpExecution);
+    expect(JSON.stringify(failed.structuredContent)).not.toMatch(/synthetic-dispatcher|unused-synthetic|idempotencyKey|apiToken|ticket description|note body/);
     expect(observations).toContainEqual(expect.objectContaining({triggerId,attempt:2,requestId:ID,state:"failed",httpStatus:status,errorClassification:"HTTP_ERROR"}));
     expect(await rpc(3)).toMatchObject({isError:true});
     expect(methods).toEqual(["POST","GET","GET"]);
     expect(records(ns)[0]).toMatchObject({generation:1,requestId:ID,state:"failed",upstreamHttpStatus:status});
     expect(JSON.stringify(observations)).not.toMatch(/idempotencyKey|apiToken|ticket description|note body/);
+  });
+
+  it("retains server-owned structured telemetry for a validation error without dispatching any upstream request",async()=>{
+    const ns=namespace(),fetch=vi.fn();vi.stubGlobal("fetch",fetch);
+    const server=createMcpServer(),client=new Client({name:"error-telemetry-regression",version:"1"});
+    const [a,b]=InMemoryTransport.createLinkedPair();await server.connect(a);await client.connect(b);
+    try{
+      const result=await call(ns,"synthetic-reader",true,"outer",()=>client.callTool({name:"superops_tickets_query",arguments:{
+        createdFrom:new Date(START+60000).toISOString(),createdTo:new Date(START-60000).toISOString(),fieldProfile:"minimal",maxPages:1,maxRecords:50}})) as
+        {isError?:boolean;structuredContent?:Record<string,any>;content:Array<{text:string}>};
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent?.mcpExecution).toMatchObject({toolName:"superops_tickets_query",subrequestsUsed:0,requestTrace:[]});
+      const textTelemetry={mcpExecution:result.structuredContent?.mcpExecution};
+      expect(JSON.parse(result.content.at(-1)!.text)).toEqual(textTelemetry);
+      expect(result.content[0].text).toContain(JSON.stringify(textTelemetry));
+      expect(JSON.stringify(result.structuredContent)).not.toMatch(/synthetic-dispatcher|unused-synthetic|idempotencyKey|apiToken|ticket description|note body/);
+      expect(fetch).not.toHaveBeenCalled();
+    }finally{await client.close();await server.close();}
   });
 
   it.each(["queued","running","retry_wait","uncertain","cancelled"])("a renewal grant never replaces a %s receipt",async state=>{

@@ -22,6 +22,15 @@ verification exposed an empty HTTP 400 reply being reread by successive Agents;
 it did not establish whether the upstream cause was a query or infrastructure
 error. Tests reproduce that asynchronous reply and prohibit a new POST.
 
+Live callback inspection also found a transport gap: failed tool text included
+the server-owned mcpExecution trace, while structuredContent contained only
+the allowlisted error metadata. Structured errors now include the identical
+bounded execution trace after that metadata is sanitized. Error classification,
+isError and review requirements remain unchanged; arbitrary fields, customer
+content and credentials are not passed through. Regressions cover real MCP
+400/403/404 failures and validation errors with no upstream request. This is a
+forward-looking response fix, not permission to replay a denied callback.
+
 For a terminal callback, the coordinator requires the enforced start/write guards
 and bounded-terminal-read-v1 capability, the exact current scope, and no
 preparation, apply intent, operation, write check, authorized item, unknown tool

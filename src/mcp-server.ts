@@ -963,6 +963,12 @@ function appendTriageExecutionTelemetry(
   // result shape for existing clients, but also place the safe telemetry in
   // the primary text item so the Agent cannot silently lose the call trace.
   const telemetryText = JSON.stringify({ mcpExecution: trace });
+  // Error metadata has already passed the strict allowlist. Add only this
+  // server-owned trace afterwards, so structured-only clients retain the
+  // same execution evidence without passing through arbitrary result fields.
+  const structuredErrorTelemetry = result.isError
+    ? { structuredContent: { ...result.structuredContent, mcpExecution: trace } }
+    : {};
   const [firstContent, ...remainingContent] = result.content;
   if (firstContent?.type === "text") {
     let primaryText = firstContent.text;
@@ -982,6 +988,7 @@ function appendTriageExecutionTelemetry(
 
     return {
       ...result,
+      ...structuredErrorTelemetry,
       content: [
         { ...firstContent, text: primaryText },
         ...remainingContent,
@@ -992,6 +999,7 @@ function appendTriageExecutionTelemetry(
 
   return {
     ...result,
+    ...structuredErrorTelemetry,
     content: [
       ...result.content,
       { type: "text", text: telemetryText },
@@ -1126,7 +1134,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           metadata,
         });
         logExecutionDiagnostics(!result.isError, errorSummary);
-        const finalResult = boundedToolResult(attachSafeErrorContract(appendTriageExecutionTelemetry(name, result) as ToolResult));
+        const finalResult = boundedToolResult(appendTriageExecutionTelemetry(name, attachSafeErrorContract(result)));
         timingOutcome = result.isError ? "error" : "success";
         timing("execution_finished", timingOutcome);
         await captureResult(finalResult);
@@ -1148,7 +1156,7 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
           metadata,
         });
         logExecutionDiagnostics(false, errorSummary);
-        const finalResult = boundedToolResult(attachSafeErrorContract(appendTriageExecutionTelemetry(name, result) as ToolResult));
+        const finalResult = boundedToolResult(appendTriageExecutionTelemetry(name, attachSafeErrorContract(result)));
         timing("execution_finished", "error");
         await captureResult(finalResult);
         return finalResult as never;
