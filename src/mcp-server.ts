@@ -1055,6 +1055,9 @@ export function createMcpServer(options: McpServerOptions = {}): Server {
 
     return runWithTriageRunContext(captureContext, () => runWithExecutionContext(name, () => withDispatcherReadScope({
       workflow: JSON.stringify(["tool", captureContext?.triggerId ?? "manual", name]), automatic: Boolean(captureContext),
+      // Evidence is a frozen snapshot. Resume its exact successful receipts;
+      // apply/verification continue to use fresh authoritative read scopes.
+      reuseDelivered: Boolean(captureContext) && name === "superops_tickets_triage_evidence_recover",
     }, async () => {
       const started = Date.now();
       const timing = beginTriageTiming(name, rawArgs, getExecutionState()?.invocationId);

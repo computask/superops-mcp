@@ -7,7 +7,7 @@ type Namespace = { idFromName(name: string): unknown; get(id: unknown): { fetch(
 type Storage = { get<T = unknown>(key: string): Promise<T | undefined>; put(key: string, value: unknown): Promise<void> };
 type TransactionalStorage = Storage & { transaction?<T>(fn: (txn: Storage) => Promise<T>): Promise<T> };
 type Environment = { namespace: Namespace; owner: () => string };
-type Scope = { workflow: string; automatic: boolean; ownerHash?: string; strictFresh?: boolean };
+type Scope = { workflow: string; automatic: boolean; ownerHash?: string; strictFresh?: boolean; reuseDelivered?: boolean };
 export const TERMINAL_READ_RENEWAL_PROTOCOL = "bounded-terminal-read-v1";
 export interface TerminalReadRenewal {
   protocol: typeof TERMINAL_READ_RENEWAL_PROTOCOL;
@@ -183,7 +183,9 @@ export class DispatcherReadJournal {
             (!previous.terminalRenewalDeadlineAt || grant.deadlineAt === previous.terminalRenewalDeadlineAt) &&
             (previous.terminalRenewalCount ?? 0) < 2 && input.invocationId !== previous.invocationId &&
             renewableTerminalRead(previous.state, previous.errorClassification, previous.upstreamHttpStatus));
-          const fresh = previous?.state === "succeeded" && previous.delivered ||
+          const reuse = input.automatic === true && input.reuseDelivered === true && previous?.state === "succeeded" && previous.delivered;
+          if (reuse && Date.now() >= Date.parse(previous!.createdAt) + 900_000) throw new DispatcherReadJournalError("evidence_checkpoint_expired");
+          const fresh = previous?.state === "succeeded" && previous.delivered && !reuse ||
             previous && ["failed", "cancelled"].includes(previous.state) && input.automatic === false && input.invocationId !== previous.invocationId || renewFailed;
           if (previous && !fresh) return previous;
           const count = await txn.get<number>("dispatcher-read:slot-count") ?? 0;
@@ -238,6 +240,8 @@ export class DispatcherReadSession {
     this.record = await journalFetch(this.stub, action, {...this.record, history: undefined, ...patch}, true);
   }
   async checkpoint(receipt: DispatcherReadCheckpoint): Promise<void> {
+    if (receipt.state === "succeeded" && this.record.state === "succeeded" &&
+        this.record.requestId === receipt.requestId && this.record.delivered) return;
     if (receipt.state === "succeeded" && this.record.requestId === receipt.requestId && !this.record.delivered) {
       // The identity is already durable. Keep the terminal outcome until the
       // response has passed GraphQL validation, then persist both facts atomically.
@@ -286,7 +290,7 @@ export async function prepareDispatcherRead(body: string): Promise<DispatcherRea
   const stub = env.namespace.get(env.namespace.idFromName(`dispatcher-reads:${ownerHash}:${workflowHash}:${payloadHash.slice(0, 2)}`));
   const invocationId = getExecutionState()?.invocationId ?? crypto.randomUUID();
   const value = await journalFetch(stub, "open", {ownerHash, workflowHash, payloadHash,
-    invocationId, automatic: scope.automatic,
+    invocationId, automatic: scope.automatic, reuseDelivered: scope.reuseDelivered === true && scope.strictFresh !== true,
     renewal: scope.renewals?.find(grant => grant.ownerHash === ownerHash && grant.workflowHash === workflowHash && grant.payloadHash === payloadHash)}, false);
   if (value.ownerHash !== ownerHash || value.workflowHash !== workflowHash || value.payloadHash !== payloadHash) throw new DispatcherReadJournalError("response_identity_conflict");
   return new DispatcherReadSession(value, stub, scope.strictFresh === true && value.invocationId !== invocationId);

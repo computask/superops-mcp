@@ -1,5 +1,20 @@
 # Email triage trigger — Git deployment
 
+18 October 2026 subset recovery: `triage-subset-operations-v1` separates the
+parent trigger correlation from deterministic, disjoint approved child operations.
+The private MCP binding registers candidate membership against the frozen query;
+overlapping subsets and changed approved input remain rejected. Retry leases keep
+the original candidate fence and operation references. Before returning evidence,
+the coordinator independently reads the linked ledgers and identifies verified
+completed tickets so they cannot receive another triage note. A missing callback
+can recover verified subset progress and retry unfinished original candidates;
+unsettled intent, denial, unknown operations and ambiguous writes remain fenced.
+Protocol negotiation preserves compatibility during Git deployment ordering.
+The MCP resumes frozen evidence from the original dispatcher receipts for at most
+15 minutes. Apply and continuation retain fresh concurrency, dedupe and final
+verification reads. No ticket bodies are added to coordinator or operation state.
+The new `subset-checks.mjs` harness covers mixed subset completion and lost callbacks.
+
 11 October 2026 prevention rollout: the start guard accepts an optional
 preparation invocation ID and invalidates the preceding preparation outcome
 before the new tool executes. The internal preparation observer accepts only
@@ -147,7 +162,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-5618a401525fde3a2342761cc594fea8f4635db66e3e6ef5a4321ba12d6ea9da.
+c1d3df3d37b51662ae2efbd6267518c9f3ecd829c7e211957bdc93975c074a23.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.

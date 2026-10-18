@@ -5,6 +5,7 @@ import { authorizeDispatcherReadRenewals, observableTerminalRead, TERMINAL_READ_
 
 export const TRIAGE_RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
 export const TRIAGE_RUN_START_PROTOCOL = "triage-run-start-v1";
+export const TRIAGE_SUBSET_PROTOCOL = "triage-subset-operations-v1";
 export interface TriageLeaseEnvironment {
   TRIAGE_RUN_WRITE_GUARD_ENABLED?: string;
   TRIAGE_RUN_START_GUARD_ENABLED?: string;
@@ -14,21 +15,32 @@ export interface TriageLeaseEnvironment {
   };
 }
 const environments = new AsyncLocalStorage<TriageLeaseEnvironment>();
-const runs = new AsyncLocalStorage<{ triggerId: string; attempt: number } | undefined>();
+const runs = new AsyncLocalStorage<{ triggerId: string; attempt: number; subsetProtocol?: string; settledTicketNumbers?: string[] } | undefined>();
 const AUTOMATIC_ID = /(?:^|:)(triage-\d+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 
 export function runWithTriageLeaseEnvironment<T>(env: TriageLeaseEnvironment, fn: () => T): T {
   return environments.run(env, fn);
 }
 export function runWithTriageRunContext<T>(run: { triggerId: string; attempt: number } | undefined, fn: () => T): T {
-  return runs.run(run, fn);
+  return runs.run(run ? {triggerId: run.triggerId, attempt: run.attempt} : undefined, fn);
 }
 export function automaticTriageRunActive(): boolean {
   return runs.getStore() !== undefined;
 }
+export function settledAutomaticTriageTicket(ticketNumber: string): boolean {
+  return runs.getStore()?.settledTicketNumbers?.includes(ticketNumber) === true;
+}
+export function automaticTriageSubsetOperationId(batchId: string, ticketNumbers: string[]): string {
+  const run = runs.getStore();
+  if (run?.subsetProtocol !== TRIAGE_SUBSET_PROTOCOL || batchId !== run.triggerId) return batchId;
+  let hash = 2166136261;
+  for (const c of JSON.stringify([...ticketNumbers].sort())) hash = Math.imul(hash ^ c.charCodeAt(0), 16777619);
+  return `subset-${(hash >>> 0).toString(16).padStart(8, "0")}:${batchId}`;
+}
 export function triageLeaseCapability(env: TriageLeaseEnvironment) {
   return { protocol: TRIAGE_RUN_LEASE_PROTOCOL, enforced: env.TRIAGE_RUN_WRITE_GUARD_ENABLED === "true" &&
     typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function",
+    subsetOperationProtocol: TRIAGE_SUBSET_PROTOCOL, evidenceCheckpointProtocol: "dispatcher-evidence-checkpoint-v1",
     startProtocol: TRIAGE_RUN_START_PROTOCOL, startGuardEnforced: env.TRIAGE_RUN_START_GUARD_ENABLED === "true" &&
       env.TRIAGE_RUN_WRITE_GUARD_ENABLED === "true" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function" &&
       typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function", terminalReadRenewalProtocol: TERMINAL_READ_RENEWAL_PROTOCOL };
@@ -44,13 +56,17 @@ export async function assertTriageRunStart(input: {preparationInvocationId?: str
   try {
     const stub = env.TRIAGE_RUN_COORDINATOR!.get(env.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-work/start", {
-      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({...run, ...input}), signal: AbortSignal.timeout(5000),
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({triggerId:run.triggerId,attempt:run.attempt,...input}), signal: AbortSignal.timeout(5000),
     }));
-    const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number; preparationInvocationId?: string; readRenewals?: TerminalReadRenewal[]};
+    const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number; preparationInvocationId?: string; readRenewals?: TerminalReadRenewal[]; subsetProtocol?: string; settledTicketNumbers?: string[]};
     if (!response.ok || result.protocol !== TRIAGE_RUN_START_PROTOCOL || result.allowed !== true ||
         input.preparationInvocationId !== undefined && result.preparationInvocationId !== input.preparationInvocationId ||
         typeof result.expiresAt !== "number" || result.expiresAt <= Date.now()) throw Error("rejected");
     recordSubrequestFinish(counted, response.status, true);
+    run.subsetProtocol = result.subsetProtocol;
+    run.settledTicketNumbers = undefined;
+    if (result.subsetProtocol === TRIAGE_SUBSET_PROTOCOL && Array.isArray(result.settledTicketNumbers) && result.settledTicketNumbers.length <= 50 &&
+        result.settledTicketNumbers.every(id => typeof id === "string" && /^\d{1,24}$/.test(id))) run.settledTicketNumbers = result.settledTicketNumbers;
     if (Array.isArray(result.readRenewals) && result.readRenewals.length <= 2) authorizeDispatcherReadRenewals(result.readRenewals);
   } catch {
     recordSubrequestFinish(counted, "triageStartRejected", false);
@@ -77,7 +93,7 @@ export async function recordTriageRunReadFailure(toolName: string, error: unknow
     const stub = env!.TRIAGE_RUN_COORDINATOR!.get(env!.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-read-failure/observe", {
       method: "POST", headers: {"Content-Type": "application/json"}, signal: AbortSignal.timeout(5000),
-      body: JSON.stringify({...run, toolName, requestId: failure.requestId, ownerHash: currentOwnerHash(),
+      body: JSON.stringify({triggerId:run.triggerId,attempt:run.attempt,toolName,requestId: failure.requestId,ownerHash: currentOwnerHash(),
         ...journal, deadlineAt: failure.readRecovery.deadlineAt, state: failure.state,
         httpStatus: failure.upstreamHttpStatus, errorClassification: failure.errorClassification}),
     }));
@@ -109,7 +125,7 @@ export async function recordTriageRunPreparation(args: Record<string, unknown>, 
     const stub = env.TRIAGE_RUN_COORDINATOR!.get(env.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-preparation/observe", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({...run, invocationId, state, ticketNumbers: numbers}), signal: AbortSignal.timeout(5000),
+      body: JSON.stringify({triggerId:run.triggerId,attempt:run.attempt,invocationId,state,ticketNumbers: numbers}), signal: AbortSignal.timeout(5000),
     }));
     recordSubrequestFinish(counted, response.status, response.ok);
   } catch { if (counted) recordSubrequestFinish(counted, "observationUnavailable", false); }
@@ -150,7 +166,7 @@ export async function recordTriageRunQuery(args: Record<string, unknown>, result
     const stub = env!.TRIAGE_RUN_COORDINATOR!.get(env!.TRIAGE_RUN_COORDINATOR!.idFromName("supportdesk-global"));
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-query/observe", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({...run, createdFrom: args.createdFrom, createdTo: args.createdTo,
+      body: JSON.stringify({triggerId:run.triggerId,attempt:run.attempt,createdFrom: args.createdFrom,createdTo: args.createdTo,
         ...(pendingRead ? {pendingRead} : {ticketNumbers, invocationId: getExecutionState()?.invocationId})}), signal: AbortSignal.timeout(5000),
     }));
     recordSubrequestFinish(counted, response.status, response.ok);
@@ -163,6 +179,7 @@ export async function recordTriageRunQuery(args: Record<string, unknown>, result
  * Receipt GETs remain available for reconciliation after expiry. */
 export async function assertTriageRunWriteLease(input: {
   operationId?: string; ownerHash?: string; itemKey?: string; ticketCreatedTime?: string; ticketSource?: string;
+  expectedTicketNumbers?: string[];
 } = {}): Promise<void> {
   const env = environments.getStore();
   if (env?.TRIAGE_RUN_WRITE_GUARD_ENABLED !== "true") return;
@@ -172,8 +189,9 @@ export async function assertTriageRunWriteLease(input: {
   if (run && operationTrigger && run.triggerId !== operationTrigger) throw new Error("Triage run correlation mismatch; no new mutation permitted.");
   if (run && input.operationId && !operationTrigger) throw new Error("Automatic triage requires its exact Trigger ID as batchId.");
   const triggerId = operationTrigger ?? run!.triggerId;
-  const ownerPrefix = operationTrigger && input.operationId?.endsWith(`:${operationTrigger}`)
-    ? input.operationId.slice(0, -(operationTrigger.length + 1)) : undefined;
+  const referenceId = input.operationId?.match(/(?:^|:)(subset-[a-f0-9]{8}:triage-\d+-[a-f0-9-]{36})$/i)?.[1] ?? operationTrigger;
+  const ownerPrefix = referenceId && input.operationId?.endsWith(`:${referenceId}`)
+    ? input.operationId.slice(0, -(referenceId.length + 1)) : undefined;
   const ownerHash = input.ownerHash ?? (ownerPrefix && /^[a-f0-9]{8}(?:[a-f0-9]{56})?$/.test(ownerPrefix)
     ? ownerPrefix : currentOwnerHash());
   if (!triageLeaseCapability(env).enforced) throw new Error("Triage run write guard unavailable; no new mutation permitted.");
@@ -183,7 +201,8 @@ export async function assertTriageRunWriteLease(input: {
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-lease/check", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ triggerId, ...(run ? {attempt: run.attempt} : {}), ...input,
-        ...(operationTrigger ? {operationReference: {operationId: operationTrigger, ownerHash}} : {}) }),
+        ...(operationTrigger && !(run?.subsetProtocol === TRIAGE_SUBSET_PROTOCOL && input.operationId === triggerId && !input.itemKey && !input.expectedTicketNumbers)
+          ? {operationReference: {operationId: referenceId, ownerHash}} : {}) }),
       signal: AbortSignal.timeout(5000),
     }));
     const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number};

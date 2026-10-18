@@ -18,6 +18,6 @@ export default defineConfig({
     // The D1/SQLite integration check is a Node test and is run explicitly
     // with `node --test`; keep Vitest focused on the Worker/Node TypeScript
     // suite rather than asking Vite to bundle node:sqlite.
-    exclude: ["**/node_modules/**", "**/dist/**", "diagnostics/**"],
+    exclude: ["**/node_modules/**", "**/dist/**", "diagnostics/**", ".wrangler/**"],
   },
 });

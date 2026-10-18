@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 import { DispatcherPendingError } from "../dispatcher.js";
-import { runWithTriageRunContext } from "../triage-run-lease.js";
+import { assertTriageRunStart, runWithTriageLeaseEnvironment, runWithTriageRunContext } from "../triage-run-lease.js";
 
 vi.mock("../client.js", () => ({
   getClient: vi.fn(() => ({
@@ -3210,6 +3210,21 @@ describe("Tickets Domain", () => {
     expect(safeMetadataQueries).not.toHaveLength(0);
     expect(safeMetadataQueries.every((query) => !query.includes("customFields"))).toBe(true);
     expect(mockClient.mutate).not.toHaveBeenCalled();
+  });
+
+  it("projects coordinator-verified completed tickets without re-reading their conversations or adding notes", async()=>{
+    const triggerId="triage-89-00000000-0000-4000-8000-000000000089";
+    const env={TRIAGE_RUN_WRITE_GUARD_ENABLED:"true",TRIAGE_RUN_START_GUARD_ENABLED:"true",TRIAGE_RUN_COORDINATOR:{
+      idFromName:(name:string)=>name,get:()=>({fetch:async()=>Response.json({protocol:"triage-run-start-v1",allowed:true,
+        expiresAt:Date.now()+60000,subsetProtocol:"triage-subset-operations-v1",settledTicketNumbers:["62850"]})})}};
+    mockClient.query.mockResolvedValue({getTicket:{ticketId:"900000000000001",displayId:"62850",status:"New Calls"}});
+    const result=await runWithTriageLeaseEnvironment(env,()=>runWithTriageRunContext({triggerId,attempt:2},async()=>{
+      await assertTriageRunStart({readRecoveryToolName:"superops_tickets_triage_evidence_recover"});
+      return getTicketsTools().handleCall("superops_tickets_triage_evidence_recover",{ticketIds:["900000000000001"],includeNotes:true,includeConversations:true});
+    }));
+    const item=JSON.parse(result.content[0].text).results[0];
+    expect(item).toMatchObject({ok:true,ticketId:"900000000000001",ticketNumber:"62850",alreadyHandled:true,verificationSource:"durable_operation"});
+    expect(item.evidence).toBeUndefined();expect(mockClient.query).toHaveBeenCalledTimes(1);expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
   it("applies triage snapshot item-count limits after ordering safe content", async () => {
@@ -6576,6 +6591,29 @@ describe("Tickets Domain", () => {
       expect(mockClient.query).not.toHaveBeenCalled();
       expect(mockClient.mutate).not.toHaveBeenCalled();
     });
+  });
+
+  it("keeps disjoint automatic subsets in distinct durable operations and rejects changed approved input for an existing subset", async()=>{
+    const triggerId="triage-88-00000000-0000-4000-8000-000000000088";
+    const env={TRIAGE_RUN_WRITE_GUARD_ENABLED:"true",TRIAGE_RUN_START_GUARD_ENABLED:"true",TRIAGE_RUN_COORDINATOR:{
+      idFromName:(name:string)=>name,get:()=>({fetch:async(request:Request)=>Response.json({
+        protocol:request.url.endsWith("/start")?"triage-run-start-v1":"triage-run-lease-v1",allowed:true,
+        expiresAt:Date.now()+60000,subsetProtocol:"triage-subset-operations-v1",settledTicketNumbers:[],
+      })})}};
+    await runWithOperationStore({},()=>runWithTriageLeaseEnvironment(env,async()=>{
+      const apply=(numbers:string[],extra={})=>runWithTriageRunContext({triggerId,attempt:1},()=>runWithExecutionContext("superops_tickets_apply_triage_plan",async()=>{
+        await assertTriageRunStart();
+        return getTicketsTools().handleCall("superops_tickets_apply_triage_plan",{batchId:triggerId,expectedCandidateTicketNumbers:numbers,actions:[],...extra});
+      }));
+      const first=JSON.parse((await apply(["59009"])).content[0].text);
+      const second=JSON.parse((await apply(["59012"])).content[0].text);
+      expect(first.operation.state).toBe("Completed"); expect(second.operation.state).toBe("Completed");
+      expect(first.operation.operationId).not.toBe(second.operation.operationId);
+      for(const id of [first.operation.operationId,second.operation.operationId]) expect(id).toMatch(/^subset-[a-f0-9]{8}:triage-/);
+      const changed=await apply(["59009"],{verify:false});
+      expect(changed.isError).toBe(true); expect(changed.content[0].text).toContain("already exists with different ownership or approved input");
+    }));
+    expect(mockClient.mutate).not.toHaveBeenCalled();
   });
 
   it("resumes a stored approved operation from a compact batch envelope without replay", async () => {

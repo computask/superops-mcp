@@ -1176,6 +1176,8 @@ async function handleBaseWorkerFetch(
       graphqlCapture: {enabled: env.SUPEROPS_GRAPHQL_CAPTURE_ENABLED === "true", version: GRAPHQL_CAPTURE_VERSION, retentionDays: 7},
       dispatcherReadRecovery: {statusProtocol: "dispatcher-read-status-v1", bookkeepingProtocol: "atomic-read-delivery-v1",
         available: Boolean(env.DISPATCHER_TOKEN && env.SUPEROPS_OPERATION_LEDGER)},
+      triageRecovery: {subsetOperationProtocol: "triage-subset-operations-v1", evidenceCheckpointProtocol: "dispatcher-evidence-checkpoint-v1",
+        enforced: triageLeaseCapability(env).enforced && triageLeaseCapability(env).startGuardEnforced},
       timestamp: new Date().toISOString(),
     });
   }

@@ -1,5 +1,25 @@
 # SuperOps MCP Execution Safety Verification
 
+## Partial batch evidence and operation identity — 18 October 2026
+
+The automatic trigger remains the parent correlation key. Each disjoint approved
+candidate subset receives a deterministic child operation ID, registered through
+the private coordinator write guard before operation creation. Membership is
+checked against the original query, owner and earlier subsets; the existing
+exact-approved-input hash still rejects changes to an existing child. Linked
+operation state supplies verified completion independently of the Agent callback.
+Unknown, failed, denied and ambiguous work does not grant another write.
+
+Frozen evidence recovery reuses successful dispatcher receipt IDs across fresh
+invocations within a fixed 15-minute bound. It stores only existing receipt
+metadata, never ticket bodies. Already delivered successful receipts need no
+repeat terminal checkpoint write. Other tools and strict fresh verification
+retain their original read behavior, so stale timestamps, dedupe and final
+verification remain authoritative. The four-ticket real-client/ledger harness
+checks forward progress under the unchanged 45/8 budget and one submission per
+read payload. Node coordinator tests cover disjoint subsets, lost callbacks,
+overlap/ownership rejection, and denial/ambiguity fences.
+
 ## Verified-checkpoint budget progress — 8 October 2026
 
 A resumed staged resolve used to repeat classification and private-note reads

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertTriageRunStart, assertTriageRunWriteLease, recordTriageRunQuery, recordTriageRunPreparation, runWithTriageLeaseEnvironment, runWithTriageRunContext, triageLeaseCapability } from "./triage-run-lease.js";
+import { assertTriageRunStart, assertTriageRunWriteLease, automaticTriageSubsetOperationId, settledAutomaticTriageTicket, recordTriageRunQuery, recordTriageRunPreparation, runWithTriageLeaseEnvironment, runWithTriageRunContext, triageLeaseCapability } from "./triage-run-lease.js";
 import { dispatcherFetch, withDispatcherOperation } from "./dispatcher.js";
 import { runWithExecutionContext, executionDiagnostics, getExecutionState } from "./execution.js";
 
@@ -13,6 +13,43 @@ function environment(allowed = true, expiresAt = Date.now() + 60000) {
 }
 afterEach(() => { vi.unstubAllGlobals(); });
 describe("automatic triage write leases", () => {
+  it("keeps negotiated capabilities private to the invocation and out of capture arguments and observer payloads",async()=>{
+    const {env,fetcher}=environment(),capture={triggerId,attempt:1};
+    fetcher.mockImplementation(async request=>Response.json(request.url.endsWith("/start")?
+      {protocol:"triage-run-start-v1",allowed:true,expiresAt:Date.now()+60000,subsetProtocol:"triage-subset-operations-v1",settledTicketNumbers:["90007"]}:{observed:true}));
+    await runWithTriageLeaseEnvironment({...env,TRIAGE_RUN_START_GUARD_ENABLED:"true"},()=>runWithTriageRunContext(capture,async()=>{
+      await assertTriageRunStart();await assertTriageRunStart();
+      await recordTriageRunQuery({createdFrom:"2026-10-18T06:00:00.000Z",createdTo:"2026-10-18T06:01:00.000Z",fieldProfile:"minimal",status:["New Calls"],sources:["EMAIL"]},
+        {records:[{displayId:"90007"}],pagination:{complete:true},errors:[]});
+      await recordTriageRunPreparation({batchId:triggerId,expectedCandidateTicketNumbers:["90007"]},{preparationOnly:true,operationCreated:false,ok:true,complete:true,preparationOutcome:"ready"});
+    }));
+    expect(capture).toEqual({triggerId,attempt:1});
+    for(const [request] of fetcher.mock.calls) {
+      const body=await request.clone().json();expect(body).not.toHaveProperty("subsetProtocol");expect(body).not.toHaveProperty("settledTicketNumbers");
+    }
+  });
+  it("negotiates stable subset operation identities and uses the exact child reference for continuation", async()=>{
+    const {env,fetcher}=environment();
+    fetcher.mockImplementation(async request=>Response.json(new URL(request.url).pathname.endsWith("/start")
+      ? {protocol:"triage-run-start-v1",allowed:true,expiresAt:Date.now()+60000,subsetProtocol:"triage-subset-operations-v1",settledTicketNumbers:["90007"]}
+      : {protocol:"triage-run-lease-v1",allowed:true,expiresAt:Date.now()+60000}));
+    let child="";
+    await runWithTriageLeaseEnvironment({...env,TRIAGE_RUN_START_GUARD_ENABLED:"true"},()=>runWithTriageRunContext({triggerId,attempt:2},async()=>{
+      expect(automaticTriageSubsetOperationId(triggerId,["90008"])).toBe(triggerId);
+      await assertTriageRunStart();
+      expect(settledAutomaticTriageTicket("90007")).toBe(true); expect(settledAutomaticTriageTicket("90008")).toBe(false);
+      child=automaticTriageSubsetOperationId(triggerId,["90008"]);
+      expect(child).toMatch(/^subset-[a-f0-9]{8}:triage-/);
+      expect(child).not.toBe(automaticTriageSubsetOperationId(triggerId,["90007"]));
+      expect(automaticTriageSubsetOperationId(triggerId,["90008","90009"])).toBe(automaticTriageSubsetOperationId(triggerId,["90009","90008"]));
+      await assertTriageRunWriteLease({operationId:triggerId});
+      await assertTriageRunWriteLease({operationId:child,expectedTicketNumbers:["90008"]});
+    }));
+    expect(await fetcher.mock.calls[1][0].json()).not.toHaveProperty("operationReference");
+    expect(await fetcher.mock.calls[2][0].json()).toMatchObject({operationReference:{operationId:child},expectedTicketNumbers:["90008"]});
+    await runWithTriageLeaseEnvironment(env,()=>assertTriageRunWriteLease({operationId:`12345678:${child}`,ownerHash:"12345678",itemKey:"90008"}));
+    expect(await fetcher.mock.calls[3][0].json()).toMatchObject({triggerId,operationReference:{operationId:child,ownerHash:"12345678"}});
+  });
   it("persists independent work-start acknowledgement before executing a correlated tool", async () => {
     const {env,fetcher} = environment();
     fetcher.mockImplementation(async()=>Response.json({protocol:"triage-run-start-v1",allowed:true,expiresAt:Date.now()+60000}));

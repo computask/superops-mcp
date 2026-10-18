@@ -1,5 +1,5 @@
 import { paginatedClient } from "../pagination.js";
-import { assertTriageRunWriteLease, automaticTriageRunActive } from "../triage-run-lease.js";
+import { assertTriageRunWriteLease, automaticTriageRunActive, automaticTriageSubsetOperationId, settledAutomaticTriageTicket } from "../triage-run-lease.js";
 import { DispatcherPendingError, reconcileCurrentDispatcherReceipt } from "../dispatcher.js";
 import { dispatcherReadRecoveryState } from "../dispatcher-read-journal.js";
 /**
@@ -11221,6 +11221,11 @@ export function getTicketsTools(): DomainTools {
                   });
                   continue;
                 }
+                if (ticket.displayId && settledAutomaticTriageTicket(ticket.displayId)) {
+                  recovered.push({ticketId, ticketNumber: ticket.displayId, ok: true, alreadyHandled: true,
+                    verificationSource: "durable_operation", contentEvidenceState: "not_requested"});
+                  continue;
+                }
                 const collection = await collectSafeTicketContent({
                   client,
                   ticket,
@@ -11578,8 +11583,10 @@ export function getTicketsTools(): DomainTools {
             }
 
             const diagnosticsBefore = executionDiagnostics();
-            const operationId = params.batchId ??
+            const suppliedOperationId = params.batchId ??
               (diagnosticsBefore?.operationId as string | undefined) ?? `triage-${Date.now()}`;
+            const operationId = automaticTriageSubsetOperationId(suppliedOperationId, expected);
+            if (operationId !== suppliedOperationId) await assertTriageRunWriteLease({operationId, expectedTicketNumbers: expected});
             const ownerHash = currentOwnerHash();
             const store = getOperationStore();
             const initialSummary = summarizeApplyResults([]);

@@ -62,6 +62,63 @@ function call(ns: ReturnType<typeof namespace>, owner = "synthetic-reader", auto
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("durable dispatcher read receipts", () => {
+  it("finishes a four-ticket evidence batch across fresh 45-call budgets without restarting completed upstream reads", async()=>{
+    vi.useFakeTimers();vi.setSystemTime(START);
+    const ns=namespace(), receipts=new Map<string,unknown>(), postCounts=new Map<string,number>();
+    const ids=["900000000000001","900000000000002","900000000000003","900000000000004"];
+    vi.stubGlobal("fetch",vi.fn(async(url:string,init?:RequestInit)=>{
+      if(init?.method!=="POST") {
+        const requestId=url.split('/').at(-1)!;
+        return Response.json({requestId,source:"superops-mcp",status:"succeeded",httpStatus:200,response:receipts.get(requestId)});
+      }
+      const body=String(init.body),{query,variables}=JSON.parse(body),id=variables.input.ticketId;
+      postCounts.set(body,(postCounts.get(body)??0)+1);
+      const data=query.includes("getTicketConversationList")?{getTicketConversationList:[{conversationId:`description-${id}`,type:"DESCRIPTION",
+        time:new Date(START).toISOString(),content:"Synthetic support request."}]}:query.includes("getTicketNoteList")?{getTicketNoteList:[]}:
+        {getTicket:{ticketId:id,displayId:String(90101+ids.indexOf(id)),status:"New Calls",source:"EMAIL",client:null,
+          updatedTime:new Date(START).toISOString(),createdTime:new Date(START).toISOString()}};
+      const requestId=crypto.randomUUID();receipts.set(requestId,{data});
+      return Response.json({data},{headers:{"X-Dispatcher-Request-Id":requestId,"X-Dispatcher-Status":"succeeded"}});
+    }));
+    const env={TRIAGE_RUN_WRITE_GUARD_ENABLED:"true",TRIAGE_RUN_START_GUARD_ENABLED:"true",TRIAGE_RUN_COORDINATOR:{
+      idFromName:(name:string)=>name,get:()=>({fetch:async()=>Response.json({protocol:"triage-run-start-v1",allowed:true,
+        expiresAt:START+300000,subsetProtocol:"triage-subset-operations-v1",settledTicketNumbers:[]})})}};
+    const progress:number[]=[];
+    for(let attempt=1;attempt<=4;attempt++) {
+      const server=createMcpServer(),client=new Client({name:"evidence-budget-harness",version:"1"});
+      const [a,b]=InMemoryTransport.createLinkedPair();await server.connect(a);await client.connect(b);
+      try {
+        const result=await runWithTriageLeaseEnvironment(env,()=>call(ns,"synthetic-reader",true,"outer",()=>client.callTool({
+          name:"superops_tickets_triage_evidence_recover",arguments:{ticketIds:ids,includeDescription:false,includeNotes:true,
+            includeConversations:true,attachments:"none",triageCapture:{triggerId:"triage-88-00000000-0000-4000-8000-000000000088",attempt}}}))) as {content:Array<{text:string}>};
+        const evidence=JSON.parse(result.content[0].text);progress.push(evidence.recoveredCount);
+        if(evidence.complete)break;
+      } finally {await client.close();await server.close();}
+    }
+    expect(progress[0]).toBeLessThan(4);expect(progress.at(-1),JSON.stringify({progress,postCounts:postCounts.size,records:records(ns).map(r=>({generation:r.generation,state:r.state,delivered:r.delivered,http:r.upstreamHttpStatus}))})).toBe(4);
+    expect(progress.length).toBeLessThanOrEqual(3);
+    expect([...postCounts.values()].every(count=>count===1)).toBe(true);
+    expect(postCounts.size).toBe(12);
+    expect(records(ns).every(record=>record.generation===1)).toBe(true);
+  });
+  it("checkpoints frozen evidence receipts across invocations without re-POSTing completed reads, while fresh validation renews them", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(START); const ns=namespace(); let posts=0, gets=0;
+    vi.stubGlobal("fetch",vi.fn(async (_url:string,init?:RequestInit)=>{
+      if(init?.method==="POST") {posts++; return Response.json({data:{getTicket:{ticketId:"synthetic-ticket",status:"New Calls"}}},
+        {headers:{"X-Dispatcher-Request-Id":ID,"X-Dispatcher-Status":"succeeded"}});}
+      gets++; return success();
+    }));
+    const evidence=(strictFresh=false)=>call(ns,"synthetic-reader",true,"outer",()=>
+      withDispatcherReadScope({workflow:"frozen-evidence",automatic:true,reuseDelivered:true,strictFresh},()=>
+        new SuperOpsClient(credentials).query(QUERY,VARIABLES)));
+    for(let attempt=0;attempt<4;attempt++) await expect(evidence()).resolves.toHaveProperty("getTicket");
+    expect(posts).toBe(1); expect(gets).toBe(3); expect(records(ns)[0]).toMatchObject({generation:1,delivered:true});
+    await expect(evidence(true)).resolves.toHaveProperty("getTicket"); expect(posts).toBe(2);
+    expect(records(ns)[0]).toMatchObject({generation:2,delivered:true});
+    vi.advanceTimersByTime(900_001);
+    await expect(evidence()).rejects.toThrow("journal"); expect(posts).toBe(2);
+    expect(JSON.stringify([...ns.objects.values()].map(s=>[...s.values.values()]))).not.toContain("New Calls");
+  });
   it("combines recovery success and delivery in one atomic checkpoint without changing the original read identity", async () => {
     vi.useFakeTimers(); vi.setSystemTime(START); const ns=namespace(), methods: string[]=[];
     vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {

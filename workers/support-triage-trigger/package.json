@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node verify.mjs && node --test recovery-checks.mjs",
+    "test": "node verify.mjs && node --test recovery-checks.mjs subset-checks.mjs",
     "build": "node --check src/index.js",
     "deploy:ci": "wrangler deploy --config wrangler.jsonc"
   }
