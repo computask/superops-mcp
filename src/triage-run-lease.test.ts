@@ -13,6 +13,14 @@ function environment(allowed = true, expiresAt = Date.now() + 60000) {
 }
 afterEach(() => { vi.unstubAllGlobals(); });
 describe("automatic triage write leases", () => {
+  it.each([0,3,1.5,"1",undefined])("rejects an invalid server reassessment generation %s before executing a tool",async generation=>{
+    const {env,fetcher}=environment();
+    fetcher.mockImplementation(async()=>Response.json({protocol:"triage-run-start-v1",allowed:true,expiresAt:Date.now()+60000,
+      reassessment:{protocol:"triage-prewrite-reassessment-v1",generation}}));
+    await expect(runWithTriageLeaseEnvironment({...env,TRIAGE_RUN_START_GUARD_ENABLED:"true"},()=>
+      runWithTriageRunContext({triggerId,attempt:2},()=>assertTriageRunStart({readRecoveryToolName:"superops_tickets_query"}))))
+      .rejects.toThrow("no tool executed");
+  });
   it("keeps negotiated capabilities private to the invocation and out of capture arguments and observer payloads",async()=>{
     const {env,fetcher}=environment(),capture={triggerId,attempt:1};
     fetcher.mockImplementation(async request=>Response.json(request.url.endsWith("/start")?

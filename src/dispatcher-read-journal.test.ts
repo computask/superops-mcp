@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SuperOpsClient, runWithCredentials } from "./client.js";
 import { DispatcherPendingError, reconcileCurrentDispatcherReceipt, withDispatcherOperation } from "./dispatcher.js";
-import { authorizeDispatcherReadRenewals, DispatcherReadJournal, type DispatcherReadRecord, TERMINAL_READ_RENEWAL_PROTOCOL, type TerminalReadRenewal, withDispatcherReadScope } from "./dispatcher-read-journal.js";
+import { authorizeDispatcherReadRenewals, authorizeDispatcherReadReassessment, DispatcherReadJournal, type DispatcherReadRecord, TERMINAL_READ_RENEWAL_PROTOCOL, type TerminalReadRenewal, withDispatcherReadScope } from "./dispatcher-read-journal.js";
 import { SuperOpsOperationLedger, runWithOperationStore } from "./operation-store.js";
 import { runWithAuditContext } from "./audit.js";
 import { runWithExecutionConfig, runWithExecutionContext } from "./execution.js";
@@ -62,6 +62,32 @@ function call(ns: ReturnType<typeof namespace>, owner = "synthetic-reader", auto
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("durable dispatcher read receipts", () => {
+  it("keeps frozen candidates while reassessment obtains fresh evidence once per bounded generation",async()=>{
+    vi.useFakeTimers();vi.setSystemTime(START);
+    const ns=namespace(),replies=new Map<string,number>();let posts=0;
+    vi.stubGlobal("fetch",vi.fn(async(url:string,init?:RequestInit)=>{
+      if(init?.method!=="POST") {
+        const requestId=url.split('/').at(-1)!;
+        return Response.json({requestId,source:"superops-mcp",status:"succeeded",httpStatus:200,response:{data:{revision:replies.get(requestId)}}});
+      }
+      posts++;const requestId=crypto.randomUUID();replies.set(requestId,posts);
+      return Response.json({data:{revision:posts}},{headers:{"X-Dispatcher-Request-Id":requestId,"X-Dispatcher-Status":"succeeded"}});
+    }));
+    const read=(name:string,generation=0)=>call(ns,"synthetic-reader",true,"outer",()=>withDispatcherReadScope({workflow:name,automatic:true,
+      reuseDelivered:name==="superops_tickets_triage_evidence_recover"},()=>{
+        if(generation) {authorizeDispatcherReadReassessment(generation,name);authorizeDispatcherReadReassessment(generation,name);}
+        return new SuperOpsClient(credentials).query(QUERY,VARIABLES);
+      }));
+    const evidence="superops_tickets_triage_evidence_recover",query="superops_tickets_query";
+    expect(await read(evidence)).toEqual({revision:1});expect(await read(evidence)).toEqual({revision:1});
+    expect(await read(evidence,1)).toEqual({revision:2});expect(await read(evidence,1)).toEqual({revision:2});
+    expect(await read(evidence,2)).toEqual({revision:3});expect(await read(evidence,2)).toEqual({revision:3});
+    expect(await read(query)).toEqual({revision:4});
+    expect(await read(query,1)).toEqual({revision:4});expect(await read(query,2)).toEqual({revision:4});
+    expect(posts).toBe(4);
+    expect(records(ns)).toHaveLength(4);
+    expect(records(ns).every(r=>r.generation===1&&r.delivered)).toBe(true);
+  });
   it("finishes a four-ticket evidence batch across fresh 45-call budgets without restarting completed upstream reads", async()=>{
     vi.useFakeTimers();vi.setSystemTime(START);
     const ns=namespace(), receipts=new Map<string,unknown>(), postCounts=new Map<string,number>();

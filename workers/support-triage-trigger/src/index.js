@@ -151,6 +151,7 @@ function loadConfig(env) {
     attentionTailIsolationEnabled: parseBoolean(get(env, "TRIAGE_ATTENTION_TAIL_ISOLATION_ENABLED"), false),
     runLeaseExpiryEnabled: get(env, "TRIAGE_RUN_LEASE_EXPIRY_ENABLED") === "true",
     startupRecoveryEnabled: get(env, "TRIAGE_STARTUP_RECOVERY_ENABLED") === "true",
+    prewriteReassessmentEnabled: get(env, "TRIAGE_PREWRITE_REASSESSMENT_ENABLED") === "true",
     runLeaseGuardService: env.TRIAGE_WRITE_GUARD_SERVICE,
     acceptedRunMaxAgeMs: parsePositiveSeconds(
       get(env, "TRIAGE_ACCEPTED_RUN_MAX_AGE_SECONDS"),
@@ -1103,7 +1104,8 @@ var DISPATCH_HISTORY_EVENTS = /* @__PURE__ */ new Set([
   "startup_retry_scheduled",
   "startup_recovery_blocked",
   "manual_startup_recovery_requested",
-  "manual_construction_recovery_requested"
+  "manual_construction_recovery_requested",
+  "prewrite_reassessment_scheduled"
 ]);
 var DISPATCH_HISTORY_WAIT_REASONS = /* @__PURE__ */ new Set([
   "active_agent_run",
@@ -2000,9 +2002,13 @@ function isExplicitChannelUnavailableResponse(status, errorMetadata) {
   return status === 409 && errorMetadata.errorType === "invalid_request_error" && errorMetadata.errorMessage?.replace(/[.!?]+$/, "").trim().toLowerCase() === "the workspace agent trigger is not currently available";
 }
 __name(isExplicitChannelUnavailableResponse, "isExplicitChannelUnavailableResponse");
-function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = false, captureEnabled = true) {
+function buildAgentInput(triggerId, scope, attempt = 1, resultCallbackEnabled = false, captureEnabled = true, reassessment) {
   const preparationInstructions = [
     "",
+    ...(reassessment ? [
+      `FRESH PRE-WRITE REASSESSMENT ${reassessment.generation} of at most 2: the previous Agent failed after preparation and the server fenced it before any write intent, write check or durable operation. This is a new assessment, not approval to replay its old plan.`,
+      "Keep the original bounded query and frozen candidate identities. The MCP reuses that candidate query and starts a separate fresh evidence checkpoint. Recover current ticket state and private notes again before preparing anything. If staff changed a ticket's updatedTime or status, preserve their work and report a protected stale/skip outcome; never refresh the old expectations to force an apply. Skip an already present canonical TRIAGE SUMMARY. Rebuild a fresh prepared plan only for unchanged, verified eligible tickets and pass it through the normal action review, stale checks, note dedupe and final verification. Never replay a prior mutation, bypass a denial or widen the candidate set. Report the result or the original durable operation handoff normally."
+    ] : []),
     "Preparation construction preflight (before BOTH the first call and its one permitted correction): EVERY actions[i] must include expectedTicketId copied from the SAME frozen candidate's immutable ID, plus action and the frozen expectations. Include ticketNumber copied from displayId whenever the exposed preparation schema requires it. The current read-only preparer can derive an omitted ticketNumber by canonical immutable-ID lookup inside the exact expectedCandidateTicketNumbers fence; the fence alone never supplies identity. Never map by array position, refresh frozen timestamps, guess an ID, widen the set or enable overrides. A supplied identity conflict remains terminal and must not be repaired. If an older schema rejects an omitted ticketNumber, the one correction must add that missing field from the SAME frozen candidate. The complete returned preparedPlan always includes every ticketNumber; copy it unchanged into the separately reviewed apply. An unresolved construction error stops before intent/apply and is reported as validation.",
     "Policy contract version: 2026-10-04.1. Before any intent report or apply, call the read-only superops_tickets_prepare_triage_plan with the complete frozen eligible proposal and batchId equal to this Trigger ID. Require ok:true, complete:true, operationCreated:false and this policyContractVersion. Copy the entire preparedPlan unchanged, including preparationFingerprint and the returned dryRun:false, into the intent and the ONE reviewed apply call. Do not add dryRun or change defaults afterward. A checksum and preparation result never grant approval. Correct a construction error at most once by repeating read-only preparation using supported evidence, before any apply exists. This single allowance also permits ONE new complete preparation of eligibleCandidateTicketNumbers after a partial preparation; retain deferredCandidateTicketNumbers as explicit callback deferrals and copy the original frozen fences. Never apply a partial prepared plan or repair an immutable identity mismatch. After ANY actual apply response, even zero-call validation, do not resubmit or repair under the same operation ID. Terminal ledger status stops regardless of callback stage or replaySafe. Any observed platform denial remains terminal. Missing preparation action or contract mismatch is configuration failure before writes."
   ];
@@ -2168,14 +2174,14 @@ var WorkspaceAgentTriggerClient = class {
   async getRunStatus(runId, acceptedTriggerUrl) {
     return (await this.getRunDiagnostics(runId, acceptedTriggerUrl)).status;
   }
-  async trigger(triggerId, scope, attempt = 1, resultCallbackEnabled = false) {
+  async trigger(triggerId, scope, attempt = 1, resultCallbackEnabled = false, reassessment) {
     if (missingAgentConfiguration(this.config).length > 0) {
       this.logger?.warn("agent_trigger_not_configured");
       return { kind: "configuration" };
     }
     try {
       const captureEnabled = Boolean(this.config.triageCaptureReadToken);
-      const input = buildAgentInput(triggerId, scope, attempt, resultCallbackEnabled, captureEnabled);
+      const input = buildAgentInput(triggerId, scope, attempt, resultCallbackEnabled, captureEnabled, reassessment);
       const requestBody = JSON.stringify({ input });
       try {
         if (captureEnabled) {
@@ -3471,6 +3477,7 @@ __name(recoverStaleAcceptedRun, "recoverStaleAcceptedRun");
 const RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
 const RUN_START_PROTOCOL = "triage-run-start-v1";
 const SUBSET_OPERATION_PROTOCOL = "triage-subset-operations-v1";
+const PREWRITE_REASSESSMENT_PROTOCOL = "triage-prewrite-reassessment-v1";
 function subsetOperationId(triggerId, numbers) {
   let hash = 2166136261;
   for (const c of JSON.stringify([...numbers].sort())) hash = Math.imul(hash ^ c.charCodeAt(0), 16777619);
@@ -3510,15 +3517,19 @@ function ensureAcceptedWriteLease(state, config) {
   const previous = [...state.runWriteLeases].reverse().find(lease => lease.triggerId === accepted.triggerId);
   state.runWriteLeases.push({triggerId: accepted.triggerId, attempt, runId: accepted.runId,
     triggerUrl: accepted.triggerUrl, conversationUrl: accepted.conversationUrl,
-    scope: state.pendingTriggerScope, issuedAt, expiresAt: issuedAt + config.acceptedRunMaxAgeMs,
+    scope: state.pendingTriggerScope, issuedAt, expiresAt: Math.min(issuedAt + config.acceptedRunMaxAgeMs,
+      previous?.prewriteReassessmentCount ? previous.prewriteReassessmentDeadlineAt : Infinity),
     revokedAt: null, authorizedItems: [],
+    assessmentTrackingProtocol: previous ? previous.assessmentTrackingProtocol : PREWRITE_REASSESSMENT_PROTOCOL,
+    assessmentOnly: previous ? previous.assessmentOnly : true,
     ...(previous ? {pendingRead: previous.pendingRead, queryCompleted: previous.queryCompleted,
-      queryTicketNumbers: previous.queryTicketNumbers, operationReference: previous.operationReference,
+      queryTicketNumbers: previous.queryTicketNumbers, queryInvocationId: previous.queryInvocationId, operationReference: previous.operationReference,
       operationReferences: previous.operationReferences, subsetProtocol: previous.subsetProtocol,
       intentUnsettled: previous.intentUnsettled,
       applyIntentObserved: previous.applyIntentObserved, writeCheckObserved: previous.writeCheckObserved,
       rejectedCallbackUnsafe: previous.rejectedCallbackUnsafe,
       startupRetryCount: previous.startupRetryCount, startupDeadlineAt: previous.startupDeadlineAt,
+      prewriteReassessmentCount: previous.prewriteReassessmentCount, prewriteReassessmentDeadlineAt: previous.prewriteReassessmentDeadlineAt,
       readRenewals: previous.readRenewals, readFailureRetryCount: previous.readFailureRetryCount,
       readFailureDeadlineAt: previous.readFailureDeadlineAt} : {})});
   state.runWriteLeases = state.runWriteLeases.slice(-256);
@@ -4035,6 +4046,63 @@ async function scheduleStartupRecovery(engine, state, now, diagnostics) {
     failureDiagnostics:[{stage:"agent_callback",errorCode:"provider_dispatch_failed_before_work"}]},state.pendingTriggerScope);
   return {status:"retry_scheduled",nextAt,triggerId:state.pendingTriggerId};
 }
+function prewriteReassessmentProof(state, config, now, diagnostics) {
+  const lease = state.runWriteLeases.find(item=>item.triggerId===state.pendingTriggerId && item.attempt===state.dispatchAttempt);
+  const observation = lease?.preparationObservation, candidates = lease?.queryTicketNumbers;
+  const leases = state.runWriteLeases.filter(item=>item.triggerId===state.pendingTriggerId);
+  if (!config.enabled || !config.resultCallbackEnabled || !config.prewriteReassessmentEnabled ||
+      config.scopeMode!=="new-email-tickets" || !state.pending || state.executionPhase!=="awaiting_result" ||
+      state.pendingTriggerScope?.mode!=="new-email-tickets" || diagnostics.status!=="failed" ||
+      diagnostics.httpStatus!==200 || diagnostics.errorCode!=="run_failed" || !lease ||
+      diagnostics.runId!==lease.runId || diagnostics.runId!==state.lastAcceptedTrigger?.runId ||
+      !/^apirun_[A-Za-z0-9_-]{1,128}$/.test(lease.runId ?? "") || lease.revokedAt!==null || now>=lease.expiresAt ||
+      lease.startGuardProtocol!==RUN_START_PROTOCOL || !Number.isFinite(lease.mcpWorkStartedAt) ||
+      JSON.stringify(lease.scope)!==JSON.stringify(state.pendingTriggerScope) ||
+      lease.queryCompleted!==true || !Array.isArray(candidates) || candidates.length<1 || candidates.length>50 ||
+      candidates.some(id=>typeof id!=="string" || !/^\d{1,24}$/.test(id)) || new Set(candidates).size!==candidates.length ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(lease.queryInvocationId ?? "") ||
+      observation?.state!=="ready" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(observation.invocationId ?? "") ||
+      !Array.isArray(observation.ticketNumbers) || JSON.stringify([...observation.ticketNumbers].sort())!==JSON.stringify([...candidates].sort()) ||
+      state.pendingTicketOutcomes?.length || state.lastResultReport?.triggerId===state.pendingTriggerId && state.lastResultReport.attempt===state.dispatchAttempt ||
+      leases.some(item=>item.assessmentTrackingProtocol!==PREWRITE_REASSESSMENT_PROTOCOL || item.assessmentOnly!==true ||
+        item.applyIntentObserved || item.intentUnsettled || item.writeCheckObserved || operationReferences(item).length ||
+        item.rejectedCallbackUnsafe || item.authorizedItems.length || item.pendingRead) ||
+      observedTriageDenial({metadata:{failureDiagnostics:[diagnostics]}}) ||
+      state.dispatchHistory.some(event=>event.batchSequence===batchSequenceFromTriggerId(state.pendingTriggerId) && observedTriageDenial({metadata:event}))) return null;
+  const count = lease.prewriteReassessmentCount ?? 0;
+  const deadline = lease.prewriteReassessmentDeadlineAt ?? lease.issuedAt + 600000;
+  const nextAt = Math.max(now + 30000 * 2 ** count,state.cooldownUntil);
+  if (!Number.isInteger(count) || count<0 || count>=2 || state.retryCount>=config.resultMaxRetries ||
+      !Number.isFinite(deadline) || deadline>lease.issuedAt+600000 || nextAt>=deadline) return null;
+  return {lease,count,deadline,nextAt};
+}
+async function schedulePrewriteReassessment(engine, state, now, diagnostics) {
+  if (!prewriteReassessmentProof(state,engine.deps.config,now,diagnostics)) return null;
+  let capability;
+  try { const response=await engine.deps.config.runLeaseGuardService?.fetch(new Request("https://mcp.internal/internal/triage-run-lease-capability",{signal:AbortSignal.timeout(5000)}));
+    if (response?.ok) capability=await response.json(); } catch { }
+  if (capability?.enforced!==true || capability.protocol!==RUN_LEASE_PROTOCOL || capability.startGuardEnforced!==true ||
+      capability.startProtocol!==RUN_START_PROTOCOL || capability.reassessmentProtocol!==PREWRITE_REASSESSMENT_PROTOCOL) return null;
+  const current=normalizeState(await engine.deps.store.load());
+  if (current.pendingTriggerId!==state.pendingTriggerId || current.dispatchAttempt!==state.dispatchAttempt) return {status:"awaiting_result",stateChanged:true};
+  Object.assign(state,current);
+  const proof=prewriteReassessmentProof(current,engine.deps.config,now,diagnostics);
+  if (!proof) return null;
+  const {lease,count,deadline,nextAt}=proof;
+  lease.revokedAt=now;
+  lease.prewriteReassessmentCount=count+1;
+  lease.prewriteReassessmentDeadlineAt=deadline;
+  state.retryCount+=1;
+  state.executionPhase="retry_wait";
+  state.resultDeadlineAt=null;
+  state.dueAt=nextAt;
+  markFailure(state,"transient",now,nextAt);
+  recordDispatchHistory(state,now,{event:"prewrite_reassessment_scheduled",attempt:state.dispatchAttempt,retryCount:state.retryCount,
+    agentRunStatus:"failed",errorCode:"provider_failed_before_write",nextAt:new Date(nextAt).toISOString(),
+    waitMs:nextAt-now,waitReason:"bounded_recovery",
+    failureDiagnostics:[{stage:"agent_callback",errorCode:"fresh_prewrite_reassessment"}]},state.pendingTriggerScope);
+  return {status:"retry_scheduled",nextAt,triggerId:state.pendingTriggerId};
+}
 function completionReportIsConsistent(report) {
   if (report.status !== "complete" || !report.metadata) return true;
   const metadata = report.metadata;
@@ -4451,6 +4519,13 @@ var CoordinatorEngine = class {
             await this.deps.store.setAlarm(pendingReadRecovery.nextAt);
             return pendingReadRecovery;
           }
+          const reassessment = await schedulePrewriteReassessment(this,state,now,diagnostics);
+          if (reassessment) {
+            if (reassessment.stateChanged) return reassessment;
+            await this.deps.store.save(state);
+            await this.deps.store.setAlarm(reassessment.nextAt);
+            return reassessment;
+          }
           const startupRecovery = await scheduleStartupRecovery(this,state,now,diagnostics);
           if (startupRecovery) {
             await this.deps.store.save(state);
@@ -4847,7 +4922,9 @@ var CoordinatorEngine = class {
       triggerId,
       scope,
       dispatchAttempt,
-      this.deps.config.resultCallbackEnabled
+      this.deps.config.resultCallbackEnabled,
+      (()=>{const lease=[...state.runWriteLeases].reverse().find(item=>item.triggerId===triggerId);
+        return lease?.prewriteReassessmentCount ? {generation:lease.prewriteReassessmentCount} : undefined;})()
     );
     return this.recordAttempt(state, attempt, triggerId, scope, dispatchAttempt, now);
   }
@@ -7548,6 +7625,7 @@ var TriageCoordinator = class {
       }
       if (!["superops_tickets_query","superops_tickets_triage_evidence_recover","superops_tickets_field_options"].includes(body.readRecoveryToolName)) {
         lease.nonReadWorkObserved = true;
+        if (body.readRecoveryToolName!=="superops_tickets_prepare_triage_plan" || body.preparationInvocationId===undefined) lease.assessmentOnly=false;
       }
       if (body.preparationInvocationId!==undefined) {
         // Begin before executing preparation. Every correction invalidates the
@@ -7556,6 +7634,7 @@ var TriageCoordinator = class {
       }
       await store.save(state);
       return json({protocol:RUN_START_PROTOCOL,allowed:true,expiresAt:lease.expiresAt,subsetProtocol:SUBSET_OPERATION_PROTOCOL,settledTicketNumbers,
+        ...(lease.prewriteReassessmentCount ? {reassessment:{protocol:PREWRITE_REASSESSMENT_PROTOCOL,generation:lease.prewriteReassessmentCount}} : {}),
         ...(noPossibleAutomaticWrite(state,body.triggerId) && lease.readFailureDeadlineAt > now
           ? {readRenewals:lease.readRenewals ?? []} : {}),
         ...(body.preparationInvocationId!==undefined ? {preparationInvocationId:body.preparationInvocationId} : {})});
@@ -8589,6 +8668,10 @@ var index_default = {
         triageConfigurationRetryExitEnabled: config.configurationRetryExitEnabled,
         triageAttentionTailIsolationEnabled: config.attentionTailIsolationEnabled,
         triageStartupRecoveryEnabled: config.startupRecoveryEnabled,
+        triagePrewriteReassessmentEnabled: config.prewriteReassessmentEnabled,
+        triagePrewriteReassessmentProtocol: PREWRITE_REASSESSMENT_PROTOCOL,
+        triagePrewriteReassessmentMaxRetries: 2,
+        triagePrewriteReassessmentDeadlineMs: 600000,
         triagePendingReadStatusProtocol: "dispatcher-read-status-v1",
         triageCompletedQueryCallbackGuardProtocol: "completed-query-callback-v1",
         triageTerminalReadRenewalProtocol: TERMINAL_READ_RENEWAL_PROTOCOL,

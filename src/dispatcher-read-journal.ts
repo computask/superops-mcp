@@ -13,7 +13,7 @@ export interface TerminalReadRenewal {
   protocol: typeof TERMINAL_READ_RENEWAL_PROTOCOL;
   requestId: string; ownerHash: string; workflowHash: string; payloadHash: string; deadlineAt: string;
 }
-type ReadContext = Scope & { failure?: unknown; renewals?: TerminalReadRenewal[] };
+type ReadContext = Scope & { failure?: unknown; renewals?: TerminalReadRenewal[]; reassessmentGeneration?: number };
 const environments = new AsyncLocalStorage<Environment | undefined>();
 const scopes = new AsyncLocalStorage<ReadContext>();
 const TERMINAL = new Set(["succeeded", "failed", "cancelled"]);
@@ -78,6 +78,19 @@ export function recordDispatcherReadFailure(error: unknown): void {
 export function authorizeDispatcherReadRenewals(renewals: TerminalReadRenewal[]): void {
   const scope = scopes.getStore();
   if (scope?.automatic) scope.renewals = renewals;
+}
+/** A new assessment keeps the original candidate query, but starts a separate
+ * evidence checkpoint. Pending reads within that assessment retain identity. */
+export function authorizeDispatcherReadReassessment(generation: number, toolName?: string): void {
+  const scope = scopes.getStore();
+  if (!scope?.automatic || !Number.isInteger(generation) || generation < 1 || generation > 2) return;
+  if (scope.reassessmentGeneration !== undefined) {
+    if (scope.reassessmentGeneration !== generation) throw new DispatcherReadJournalError("reassessment_generation_conflict");
+    return;
+  }
+  scope.reassessmentGeneration = generation;
+  if (toolName === "superops_tickets_query") scope.reuseDelivered = true;
+  else scope.workflow = JSON.stringify([scope.workflow, "prewrite-reassessment", generation]);
 }
 export function renewableTerminalRead(state: string, classification?: string, httpStatus?: number): boolean {
   return state === "failed" && (classification === "HTTP_ERROR" && [401, 408, 429, 500, 502, 503, 504].includes(httpStatus ?? 0) ||

@@ -1,11 +1,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getExecutionState, recordSubrequestFinish, recordTypedSubrequestStart } from "./execution.js";
 import { currentOwnerHash } from "./operation-store.js";
-import { authorizeDispatcherReadRenewals, observableTerminalRead, TERMINAL_READ_RENEWAL_PROTOCOL, type TerminalReadRenewal } from "./dispatcher-read-journal.js";
+import { authorizeDispatcherReadRenewals, authorizeDispatcherReadReassessment, observableTerminalRead, TERMINAL_READ_RENEWAL_PROTOCOL, type TerminalReadRenewal } from "./dispatcher-read-journal.js";
 
 export const TRIAGE_RUN_LEASE_PROTOCOL = "triage-run-lease-v1";
 export const TRIAGE_RUN_START_PROTOCOL = "triage-run-start-v1";
 export const TRIAGE_SUBSET_PROTOCOL = "triage-subset-operations-v1";
+export const TRIAGE_REASSESSMENT_PROTOCOL = "triage-prewrite-reassessment-v1";
 export interface TriageLeaseEnvironment {
   TRIAGE_RUN_WRITE_GUARD_ENABLED?: string;
   TRIAGE_RUN_START_GUARD_ENABLED?: string;
@@ -43,7 +44,8 @@ export function triageLeaseCapability(env: TriageLeaseEnvironment) {
     subsetOperationProtocol: TRIAGE_SUBSET_PROTOCOL, evidenceCheckpointProtocol: "dispatcher-evidence-checkpoint-v1",
     startProtocol: TRIAGE_RUN_START_PROTOCOL, startGuardEnforced: env.TRIAGE_RUN_START_GUARD_ENABLED === "true" &&
       env.TRIAGE_RUN_WRITE_GUARD_ENABLED === "true" && typeof env.TRIAGE_RUN_COORDINATOR?.get === "function" &&
-      typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function", terminalReadRenewalProtocol: TERMINAL_READ_RENEWAL_PROTOCOL };
+      typeof env.TRIAGE_RUN_COORDINATOR?.idFromName === "function", terminalReadRenewalProtocol: TERMINAL_READ_RENEWAL_PROTOCOL,
+    reassessmentProtocol: TRIAGE_REASSESSMENT_PROTOCOL };
 }
 
 /** Authoritative attempt activity, persisted before any correlated tool executes.
@@ -58,7 +60,7 @@ export async function assertTriageRunStart(input: {preparationInvocationId?: str
     const response = await stub.fetch(new Request("https://coordinator.internal/internal/run-work/start", {
       method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({triggerId:run.triggerId,attempt:run.attempt,...input}), signal: AbortSignal.timeout(5000),
     }));
-    const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number; preparationInvocationId?: string; readRenewals?: TerminalReadRenewal[]; subsetProtocol?: string; settledTicketNumbers?: string[]};
+    const result = await response.json() as {protocol?: string; allowed?: boolean; expiresAt?: number; preparationInvocationId?: string; readRenewals?: TerminalReadRenewal[]; subsetProtocol?: string; settledTicketNumbers?: string[]; reassessment?: {protocol?: string; generation?: number}};
     if (!response.ok || result.protocol !== TRIAGE_RUN_START_PROTOCOL || result.allowed !== true ||
         input.preparationInvocationId !== undefined && result.preparationInvocationId !== input.preparationInvocationId ||
         typeof result.expiresAt !== "number" || result.expiresAt <= Date.now()) throw Error("rejected");
@@ -68,6 +70,11 @@ export async function assertTriageRunStart(input: {preparationInvocationId?: str
     if (result.subsetProtocol === TRIAGE_SUBSET_PROTOCOL && Array.isArray(result.settledTicketNumbers) && result.settledTicketNumbers.length <= 50 &&
         result.settledTicketNumbers.every(id => typeof id === "string" && /^\d{1,24}$/.test(id))) run.settledTicketNumbers = result.settledTicketNumbers;
     if (Array.isArray(result.readRenewals) && result.readRenewals.length <= 2) authorizeDispatcherReadRenewals(result.readRenewals);
+    if (result.reassessment !== undefined) {
+      if (result.reassessment.protocol !== TRIAGE_REASSESSMENT_PROTOCOL || !Number.isInteger(result.reassessment.generation) ||
+          result.reassessment.generation! < 1 || result.reassessment.generation! > 2) throw Error("reassessmentRejected");
+      authorizeDispatcherReadReassessment(result.reassessment.generation!, input.readRecoveryToolName);
+    }
   } catch {
     recordSubrequestFinish(counted, "triageStartRejected", false);
     throw new Error("Triage run start guard rejected or unavailable; no tool executed.");

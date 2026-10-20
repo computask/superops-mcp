@@ -1,5 +1,26 @@
 # SuperOps MCP Execution Safety Verification
 
+## Pre-write reassessment — 20 October 2026
+
+A terminal Workspace Agent failure after successful preparation can now schedule
+a bounded fresh assessment when the independent coordinator proves that no
+attempt reached intent, a write check or an operation. The original attempt is
+revoked first. There are at most two assessments under the original ten-minute
+deadline; the existing retry cap also applies. Unknown/legacy activity, pending
+reads, denied actions and ambiguous writes remain quarantined.
+
+The original complete query stays frozen. A private start-check grant gives each
+assessment a distinct evidence checkpoint, so current ticket state and notes are
+read again while pending reads and delivered evidence within that assessment
+remain recoverable by their original receipts. Plans are rebuilt and reviewed;
+existing stale checks protect staff edits and mutation/verification safeguards are
+unchanged. Already-started writes continue through their original durable ledger.
+No customer content is added to coordinator state or routine logs. Synthetic
+regressions cover the exact prepared-then-failed sequence, atomic old-attempt
+fencing, two-retry/deadline limits, racing writes, fresh evidence, original query
+identity and every unsafe eligibility exclusion. Deployment and ticket recovery
+must be verified separately; local checks alone do not establish either.
+
 ## Partial batch evidence and operation identity — 18 October 2026
 
 The automatic trigger remains the parent correlation key. Each disjoint approved

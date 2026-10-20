@@ -1366,6 +1366,26 @@ test('pending observations are exact-scope, owner/receipt/deadline stable, and s
   assert.equal(storage.value.runWriteLeases[0].queryCompleted,true);
   assert.equal((await observe({pendingRead})).status,409);
 });
+test('assessment-only tracking permits preparation but latches other work before it executes, and revoked attempts cannot restart',async()=>{
+  const now=Date.now(),triggerId='triage-44-00000000-0000-4000-8000-000000000044';
+  const scope={mode:'new-email-tickets',source:'EMAIL',createdFrom:new Date(now-60000).toISOString(),createdTo:new Date(now).toISOString()};
+  const lease={triggerId,attempt:1,scope,issuedAt:now-30000,expiresAt:now+270000,revokedAt:null,authorizedItems:[],
+    assessmentTrackingProtocol:'triage-prewrite-reassessment-v1',assessmentOnly:true,prewriteReassessmentCount:1};
+  const {coordinator,storage}=replayCoordinator({...createInitialState(),pending:true,executionPhase:'awaiting_result',pendingTriggerId:triggerId,
+    pendingTriggerScope:scope,dispatchAttempt:1,runWriteLeases:[lease]});
+  const start=body=>coordinator.fetch(new Request('https://coordinator.internal/internal/run-work/start',{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({triggerId,attempt:1,...body})}));
+  const reply=await start({readRecoveryToolName:'superops_tickets_query'});
+  assert.deepEqual((await reply.json()).reassessment,{protocol:'triage-prewrite-reassessment-v1',generation:1});
+  assert.equal(storage.value.runWriteLeases[0].assessmentOnly,true);
+  assert.equal((await start({readRecoveryToolName:'superops_tickets_prepare_triage_plan',preparationInvocationId:'00000000-0000-4000-8000-000000000044'})).status,200);
+  assert.equal(storage.value.runWriteLeases[0].assessmentOnly,true);
+  assert.equal((await start({readRecoveryToolName:'superops_tickets_add_note'})).status,200);
+  assert.equal(storage.value.runWriteLeases[0].assessmentOnly,false);
+  await start({readRecoveryToolName:'superops_tickets_query'});assert.equal(storage.value.runWriteLeases[0].assessmentOnly,false);
+  storage.value.runWriteLeases[0].revokedAt=now;
+  assert.equal((await start({readRecoveryToolName:'superops_tickets_query'})).status,409);
+});
 test('fixed journal labels and all emitted internal statuses satisfy the same callback schema and parser',()=>{
   const schema=toolDefinition().inputSchema.properties.metadata.properties.mcpExecution.properties.requestTrace.items;
   const statuses=schema.properties.status.oneOf[1].enum;

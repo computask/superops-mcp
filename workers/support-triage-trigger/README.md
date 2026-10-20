@@ -1,5 +1,21 @@
 # Email triage trigger — Git deployment
 
+20 October 2026 pre-write reassessment: `triage-prewrite-reassessment-v1`
+allows at most two fresh assessments within one immutable ten-minute deadline
+after a correlated provider `run_failed`. Eligibility requires a complete frozen
+query, a server-observed ready preparation covering that set, and positive
+assessment-only tracking across every attempt. Any intent, write check, operation
+reference, pending read, unsafe callback, known denial or unknown work blocks it.
+The old attempt is revoked before scheduling. The MCP retains the original
+candidate-query receipt and uses a separate evidence checkpoint for each
+assessment generation; retries inside a generation keep their exact receipts.
+The Agent must re-read notes and ticket state, protect staff edits, rebuild a new
+plan and obtain normal action review. Existing subset ledgers/continuations retain
+precedence for work that already wrote. Legacy leases are not upgraded into proof.
+`TRIAGE_PREWRITE_REASSESSMENT_ENABLED=false` disables this path. Health advertises
+the effective flag, protocol, two-retry cap and fixed deadline. No historical
+quarantine is automatically replayed, and no root cause is inferred from recovery.
+
 18 October 2026 subset recovery: `triage-subset-operations-v1` separates the
 parent trigger correlation from deterministic, disjoint approved child operations.
 The private MCP binding registers candidate membership against the frozen query;
@@ -162,7 +178,7 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-c1d3df3d37b51662ae2efbd6267518c9f3ecd829c7e211957bdc93975c074a23.
+ec2adc901f9f7fb2ba0d1e476b6d1848bc0e2fabb7f486bd25ab8f73b6cc8e35.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
