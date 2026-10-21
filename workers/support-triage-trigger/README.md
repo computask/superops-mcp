@@ -178,10 +178,21 @@ callback. Terminal retry runs also bypass stale-run recovery, because their
 callback already selected the safe recovery path. The awaiting-result watchdog,
 ambiguous-write protections, active-run exclusion and immutable window remain.
 Current module SHA-256:
-ec2adc901f9f7fb2ba0d1e476b6d1848bc0e2fabb7f486bd25ab8f73b6cc8e35.
+6c19d7804be2d196dbc453027afaa230ba1a4b0a9f0d540998d76021f7715934.
 `recovery-checks.mjs` exercises the actual module with synthetic storage/Agent
 responses; no production test endpoint is introduced. Revert this reviewed
 commit through Git for rollback. Existing attention records are not cleared.
+
+Empty-query ingestion handoff, 21 October 2026: when the existing one-shot
+empty-result recovery authorises a wider email creation window, the new attempt
+must collect its own candidate snapshot instead of inheriting the old empty
+list. This requires a completed, server-observed empty query and no possible
+write, preparation, unsettled intent, pending receipt or operation in any prior
+attempt. The original lease and recovery deadlines remain intact. Exact scope
+checks still apply, and the new query freezes its candidates before any subset
+can be authorised. Normal retries, named-ticket replays and runs with possible
+writes keep their existing snapshots. Deployment does not reopen historical
+quarantines or replay old writes.
 
 Confirmed failed-read recovery, 11 October 2026: a terminal read callback now
 uses the MCP's private exact-receipt observation and enforced start/write guards

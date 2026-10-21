@@ -7,8 +7,8 @@ import test from 'node:test'; // Independent Node harness, not a Vitest suite.
 const source = readFileSync(new URL('./src/index.js', import.meta.url), 'utf8');
 const testableSource = source.replace(/\nexport \{\s*TriageCoordinator,\s*index_default as default\s*\};\s*\/\/# sourceMappingURL=index\.js\.map\s*$/, '\n');
 assert.notEqual(testableSource, source, 'The preserved production module export footer must be isolated for the in-memory test harness');
-const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen, listRelevantDispatchHistory, checkRunWriteLease, ensureAcceptedWriteLease} = await import(
-  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen, listRelevantDispatchHistory, checkRunWriteLease, ensureAcceptedWriteLease};').toString('base64')}`
+const {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen, listRelevantDispatchHistory, checkRunWriteLease, ensureAcceptedWriteLease, subsetOperationId} = await import(
+  `data:text/javascript;base64,${Buffer.from(testableSource + '\nexport {CoordinatorEngine, TriageCoordinator, createInitialState, loadConfig, registerCreatedNotification, createPendingTriggerScope, parseSafeMcpExecution, toolDefinition, applyIntentToolDefinition, parseTriageApplyIntentReport, handleTriageResultMcp, WorkspaceAgentTriggerClient, DurableObjectStore, storeTriageAgentCapture, listTriageAgentCaptures, listTriageAgentCaptureFailures, lookupTriageAgentCaptureTriggerId, pruneTriageAgentCaptures, buildAgentInput, refreshQueuedAttentionBlock, blockPendingIfAttentionOverlaps, widenTargetedEmailScopeForRecovery, scopeOverlapsAttention, normalizeState, coordinatorProgressFields, migrateLegacyAttentionBlockedQueue, currentBatchIsFrozen, listRelevantDispatchHistory, checkRunWriteLease, ensureAcceptedWriteLease, subsetOperationId};').toString('base64')}`
 );
 const vars = JSON.parse(readFileSync(new URL('./wrangler.jsonc', import.meta.url), 'utf8')).vars;
 
@@ -1365,6 +1365,49 @@ test('pending observations are exact-scope, owner/receipt/deadline stable, and s
   assert.equal((await observe({ticketNumbers:['90101']})).status,200);
   assert.equal(storage.value.runWriteLeases[0].queryCompleted,true);
   assert.equal((await observe({pendingRead})).status,409);
+});
+test('a completed empty-query callback hands its widened retry to a fresh candidate snapshot',async()=>{
+  const f=fixture('completed'),triggerId=f.state.pendingTriggerId,scope=structuredClone(f.scope);
+  const original={triggerId,attempt:1,scope:{...scope},issuedAt:Date.parse(f.state.lastAcceptedTrigger.acceptedAt),
+    expiresAt:Date.parse(scope.createdTo)+180000,revokedAt:null,authorizedItems:[],queryCompleted:true,queryTicketNumbers:[],
+    queryInvocationId:'00000000-0000-4000-8000-000000000044'};
+  f.seed({runWriteLeases:[original]});
+  const result=await f.engine.reportResult({triggerId,attempt:1,status:'complete',metadata:{failureStage:'bounded_query',
+    ticketsConsidered:0,ticketsCompleted:0,ticketsDeferred:0,ticketOutcomes:[]}});
+  assert.equal(result.status,'retry_scheduled');assert.equal(f.state.emptyTargetedRecoveryPending,true);
+  assert(Date.parse(f.state.pendingTriggerScope.createdTo)>Date.parse(scope.createdTo));
+  assert.deepEqual(f.state.runWriteLeases[0],original);
+  f.seed(normalizeState(JSON.parse(JSON.stringify(f.state))));f.advance();
+  assert.equal((await f.engine.processAlarm()).status,'accepted');assert.equal(f.calls.length,1);
+  assert.equal(f.state.runWriteLeases.at(-1).queryCompleted,undefined);
+  assert.equal(f.state.runWriteLeases.at(-1).queryTicketNumbers,undefined);
+  assert.deepEqual(f.state.runWriteLeases[0],original);
+});
+test('a widened empty-query ingestion retry accepts and freezes newly observed candidates after durable reload',async()=>{
+  const now=Date.now(),triggerId='triage-44-00000000-0000-4000-8000-000000000044';
+  const scope={mode:'new-email-tickets',source:'EMAIL',createdFrom:new Date(now-240000).toISOString(),createdTo:new Date(now-60000).toISOString()};
+  const oldScope={...scope,createdFrom:new Date(now-180000).toISOString(),createdTo:new Date(now-120000).toISOString()};
+  const original={triggerId,attempt:1,scope:oldScope,issuedAt:now-120000,expiresAt:now+180000,revokedAt:null,authorizedItems:[],
+    queryCompleted:true,queryTicketNumbers:[],queryInvocationId:'00000000-0000-4000-8000-000000000044'};
+  const seed={...createInitialState(),pending:true,executionPhase:'awaiting_result',pendingTriggerId:triggerId,pendingTriggerScope:scope,
+    dispatchAttempt:2,emptyTargetedRecoveryPending:true,lastAcceptedTrigger:{triggerId,attempt:2,acceptedAt:new Date(now).toISOString()},runWriteLeases:[original]};
+  const f=replayCoordinator(JSON.parse(JSON.stringify(seed)));
+  const observe=(coordinator,body)=>coordinator.fetch(new Request('https://coordinator.internal/internal/run-query/observe',{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({triggerId,attempt:2,createdFrom:scope.createdFrom,createdTo:scope.createdTo,
+      invocationId:'00000000-0000-4000-8000-000000000045',ticketNumbers:['90001'],...body})}));
+  assert.equal((await observe(f.coordinator,{createdTo:oldScope.createdTo})).status,409,'only the exact new scope is authorised');
+  assert.equal((await observe(f.coordinator,{attempt:1})).status,409,'the old attempt cannot replace its snapshot');
+  assert.equal((await observe(f.coordinator,{})).status,200);
+  const restored=JSON.parse(JSON.stringify(f.storage.value)),lease=restored.runWriteLeases.at(-1);
+  assert.deepEqual(restored.runWriteLeases[0],original);assert.deepEqual(lease.queryTicketNumbers,['90001']);assert.equal(lease.queryCompleted,true);
+  const reloaded=replayCoordinator(restored);
+  assert.equal((await observe(reloaded.coordinator,{ticketNumbers:['90002']})).status,409,'the new snapshot is immutable too');
+  const config=loadConfig(vars),operationId=subsetOperationId(triggerId,['90001']);
+  const reference={operationId,ownerHash:'12345678',ticketNumbers:['90001']};
+  assert.equal(checkRunWriteLease(restored,config,{triggerId,attempt:2,operationReference:reference,expectedTicketNumbers:['90001']},now).allowed,true);
+  assert.equal(checkRunWriteLease(restored,config,{triggerId,attempt:2,itemKey:'90001',operationReference:reference,
+    ticketCreatedTime:new Date(now-90000).toISOString(),ticketSource:'EMAIL'},now).allowed,true);
+  assert.equal(checkRunWriteLease(restored,config,{triggerId,attempt:1},now).allowed,false);
 });
 test('assessment-only tracking permits preparation but latches other work before it executes, and revoked attempts cannot restart',async()=>{
   const now=Date.now(),triggerId='triage-44-00000000-0000-4000-8000-000000000044';

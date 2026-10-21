@@ -60,6 +60,63 @@ test('new attempts retain frozen query candidates and linked operation identitie
   assert.deepEqual(state.runWriteLeases[1].operationReferences,state.runWriteLeases[0].operationReferences);
   assert.equal(state.runWriteLeases[1].revokedAt,null);
 });
+
+function emptyIngestionRetry() {
+  const f=fixture(),state=f.state;
+  const originalScope={...f.scope,createdFrom:new Date(f.now-180000).toISOString(),createdTo:new Date(f.now-120000).toISOString()};
+  state.pendingTriggerScope={...originalScope,createdFrom:new Date(f.now-240000).toISOString(),createdTo:new Date(f.now-60000).toISOString()};
+  state.emptyTargetedRecoveryPending=true;state.dispatchAttempt=2;
+  state.lastAcceptedTrigger={...state.lastAcceptedTrigger,attempt:2,acceptedAt:new Date(f.now).toISOString()};
+  state.runWriteLeases=[{triggerId,attempt:1,scope:originalScope,issuedAt:f.now-120000,expiresAt:f.now+180000,revokedAt:null,
+    authorizedItems:[],queryCompleted:true,queryTicketNumbers:[],queryInvocationId:'00000000-0000-4000-8000-000000000088',
+    startupRetryCount:1,startupDeadlineAt:f.now+300000,readRenewals:1,readFailureDeadlineAt:f.now+600000}];
+  return {...f,state};
+}
+
+test('an authorised wider ingestion retry gets a fresh query while preserving its original empty snapshot and recovery limits',()=>{
+  const f=emptyIngestionRetry(),original=structuredClone(f.state.runWriteLeases[0]);
+  ensureAcceptedWriteLease(f.state,f.config);
+  const next=f.state.runWriteLeases.at(-1);
+  assert.equal(next.queryCompleted,undefined);assert.equal(next.queryTicketNumbers,undefined);assert.equal(next.queryInvocationId,undefined);
+  assert.deepEqual(f.state.runWriteLeases[0],original);
+  assert.notEqual(next.scope,f.state.pendingTriggerScope,'later pending-scope changes cannot alter the recorded lease scope');
+  for(const field of ['startupRetryCount','startupDeadlineAt','readRenewals','readFailureDeadlineAt']) assert.equal(next[field],original[field]);
+  assert.equal(checkRunWriteLease(f.state,f.config,{triggerId,attempt:2,operationReference:f.ref(['90001']),expectedTicketNumbers:['90001']},f.now).allowed,false,
+    'new candidates cannot be written before the wider query completes');
+});
+
+for(const [name,block] of Object.entries({
+  same_scope:f=>{f.state.pendingTriggerScope={...f.state.runWriteLeases[0].scope};},
+  unauthorised_retry:f=>{f.state.emptyTargetedRecoveryPending=false;},
+  disabled_fast_mode:f=>{f.config.fastTargetedModeEnabled=false;},
+  nonempty_snapshot:f=>{f.state.runWriteLeases[0].queryTicketNumbers=['90002'];},
+  incomplete_query:f=>{f.state.runWriteLeases[0].queryCompleted=false;},
+  missing_observation:f=>{delete f.state.runWriteLeases[0].queryInvocationId;},
+  narrowed_scope:f=>{f.state.pendingTriggerScope.createdFrom=new Date(f.now-150000).toISOString();},
+  changed_source:f=>{f.state.pendingTriggerScope.source='PHONE';},
+  named_ticket_replay:f=>{f.state.pendingTriggerScope.targetTicketNumbers=['90001'];},
+  pending_read:f=>{f.state.runWriteLeases[0].pendingRead={requestId:'synthetic-original-receipt'};},
+  operation:f=>{f.state.runWriteLeases[0].operationReference=f.ref(['90001']);},
+  child_operations:f=>{f.state.runWriteLeases[0].operationReferences=[f.ref(['90001'])];},
+  unsettled_intent:f=>{f.state.runWriteLeases[0].intentUnsettled=true;},
+  apply_intent:f=>{f.state.runWriteLeases[0].applyIntentObserved=true;},
+  write_check:f=>{f.state.runWriteLeases[0].writeCheckObserved=true;},
+  preparation:f=>{f.state.runWriteLeases[0].preparationObservation={state:'ready'};},
+  unknown_work:f=>{f.state.runWriteLeases[0].nonReadWorkObserved=true;},
+  unsafe_callback:f=>{f.state.runWriteLeases[0].rejectedCallbackUnsafe=true;},
+  authorised_item:f=>{f.state.runWriteLeases[0].authorizedItems=['90001'];},
+  earlier_write:f=>{f.state.runWriteLeases.unshift({...f.state.runWriteLeases[0],attempt:0,writeCheckObserved:true});}
+})) {
+  test('empty-query handoff retains the existing candidate fence for '+name,()=>{
+    const f=emptyIngestionRetry();block(f);
+    const previous=f.state.runWriteLeases.at(-1),snapshot=structuredClone(previous);
+    ensureAcceptedWriteLease(f.state,f.config);
+    const next=f.state.runWriteLeases.at(-1);
+    for(const field of ['queryCompleted','queryTicketNumbers','queryInvocationId','pendingRead','operationReference','operationReferences','intentUnsettled'])
+      assert.deepEqual(next[field],snapshot[field]);
+    assert.deepEqual(previous,snapshot);
+  });
+}
 test('a lost callback reconciles verified subset progress and retries only the unfinished original batch',async()=>{
   const f=fixture();
   assert.equal((await f.engine.processAlarm()).status,'retry_scheduled');

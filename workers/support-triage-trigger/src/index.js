@@ -3508,6 +3508,28 @@ function noPossibleAutomaticWrite(state, triggerId) {
   return leases.length > 0 && leases.every(lease => !lease.operationReference && !lease.applyIntentObserved &&
     !lease.writeCheckObserved && !lease.preparationObservation && !lease.nonReadWorkObserved && !lease.rejectedCallbackUnsafe && lease.authorizedItems.length === 0);
 }
+function canRefreshEmptyQuerySnapshot(state, config, previous, attempt) {
+  const scope = state.pendingTriggerScope, oldScope = previous?.scope;
+  if (!config.fastTargetedModeEnabled || !state.pending || state.executionPhase !== "awaiting_result" ||
+      !state.emptyTargetedRecoveryPending || attempt !== state.dispatchAttempt || !(attempt > previous?.attempt) ||
+      previous.queryCompleted !== true || !Array.isArray(previous.queryTicketNumbers) || previous.queryTicketNumbers.length !== 0 ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(previous.queryInvocationId ?? "") ||
+      scope?.mode !== "new-email-tickets" || oldScope?.mode !== "new-email-tickets" ||
+      scope.source !== "EMAIL" || oldScope.source !== scope.source ||
+      scope.targetTicketNumbers !== undefined || oldScope.targetTicketNumbers !== undefined ||
+      scope.replayOfEventId !== undefined || oldScope.replayOfEventId !== undefined) return false;
+  const from = Date.parse(scope.createdFrom), to = Date.parse(scope.createdTo);
+  const oldFrom = Date.parse(oldScope.createdFrom), oldTo = Date.parse(oldScope.createdTo);
+  if (![from, to, oldFrom, oldTo].every(Number.isFinite) || oldFrom >= oldTo ||
+      from > oldFrom || to < oldTo || from === oldFrom && to === oldTo) return false;
+  // Only the existing empty-result ingestion retry may acquire a new snapshot.
+  // Preserve every previous lease and fail closed after any possible write.
+  return noPossibleAutomaticWrite(state, previous.triggerId) && state.runWriteLeases
+    .filter(lease => lease.triggerId === previous.triggerId).every(lease =>
+      !lease.pendingRead && !lease.intentUnsettled &&
+      (lease.operationReferences === undefined || Array.isArray(lease.operationReferences) && lease.operationReferences.length === 0) &&
+      (lease.queryTicketNumbers === undefined || Array.isArray(lease.queryTicketNumbers) && lease.queryTicketNumbers.length === 0));
+}
 function ensureAcceptedWriteLease(state, config) {
   const accepted = state.lastAcceptedTrigger;
   const issuedAt = Date.parse(accepted?.acceptedAt ?? "");
@@ -3515,15 +3537,17 @@ function ensureAcceptedWriteLease(state, config) {
   const attempt = accepted.attempt ?? state.dispatchAttempt;
   if (state.runWriteLeases.some(lease => lease.triggerId === accepted.triggerId && lease.attempt === attempt)) return;
   const previous = [...state.runWriteLeases].reverse().find(lease => lease.triggerId === accepted.triggerId);
+  const freshQuery = canRefreshEmptyQuerySnapshot(state, config, previous, attempt);
   state.runWriteLeases.push({triggerId: accepted.triggerId, attempt, runId: accepted.runId,
     triggerUrl: accepted.triggerUrl, conversationUrl: accepted.conversationUrl,
-    scope: state.pendingTriggerScope, issuedAt, expiresAt: Math.min(issuedAt + config.acceptedRunMaxAgeMs,
+    scope: {...state.pendingTriggerScope}, issuedAt, expiresAt: Math.min(issuedAt + config.acceptedRunMaxAgeMs,
       previous?.prewriteReassessmentCount ? previous.prewriteReassessmentDeadlineAt : Infinity),
     revokedAt: null, authorizedItems: [],
     assessmentTrackingProtocol: previous ? previous.assessmentTrackingProtocol : PREWRITE_REASSESSMENT_PROTOCOL,
     assessmentOnly: previous ? previous.assessmentOnly : true,
-    ...(previous ? {pendingRead: previous.pendingRead, queryCompleted: previous.queryCompleted,
-      queryTicketNumbers: previous.queryTicketNumbers, queryInvocationId: previous.queryInvocationId, operationReference: previous.operationReference,
+    ...(previous ? {pendingRead: previous.pendingRead, queryCompleted: freshQuery ? undefined : previous.queryCompleted,
+      queryTicketNumbers: freshQuery ? undefined : previous.queryTicketNumbers,
+      queryInvocationId: freshQuery ? undefined : previous.queryInvocationId, operationReference: previous.operationReference,
       operationReferences: previous.operationReferences, subsetProtocol: previous.subsetProtocol,
       intentUnsettled: previous.intentUnsettled,
       applyIntentObserved: previous.applyIntentObserved, writeCheckObserved: previous.writeCheckObserved,
